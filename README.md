@@ -1,0 +1,2 @@
+# trAIde
+GenAI Trader
