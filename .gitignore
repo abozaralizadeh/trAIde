@@ -120,6 +120,12 @@ ipython_config.py
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
+# Node
+node_modules/
+pnpm-lock.yaml
+package-lock.json
+dist/
+
 # Celery stuff
 celerybeat-schedule
 celerybeat.pid
