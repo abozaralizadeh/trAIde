@@ -1,6 +1,6 @@
 # trAIde
 
-Automatic AI Agent crypto trader powered by Azure OpenAI (gpt-5.2) and Kucoin APIs.
+Automatic AI Agent crypto trader powered by Azure OpenAI (gpt-5.2) and Kucoin APIs — now in Python.
 
 ## Setup
 - Copy `.env.example` to `.env` and fill Azure + Kucoin credentials.
@@ -10,8 +10,10 @@ Automatic AI Agent crypto trader powered by Azure OpenAI (gpt-5.2) and Kucoin AP
 
 ## Install & Run
 ```bash
-npm install
-npm run start
+python -m venv .venv
+source .venv/bin/activate  # or .venv\\Scripts\\activate on Windows
+pip install -r requirements.txt
+python -m src.main
 ```
 
-The agent pulls balances and tickers, sends them to Azure OpenAI with trading tools, and either submits (or simulates) Kucoin market orders with a safety-first narrative.
+The agent pulls balances and tickers, sends them to Azure OpenAI with trading tools, and either submits (or simulates) Kucoin market orders with a safety-first narrative. Keep PAPER_TRADING=true while testing.
