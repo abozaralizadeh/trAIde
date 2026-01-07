@@ -5,8 +5,11 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-import requests
-from openai import OpenAI
+from agents import Agent, InputGuardrail, GuardrailFunctionOutput, Runner, OpenAIChatCompletionsModel, OpenAIResponsesModel
+from agents import set_default_openai_client
+from agents.items import ToolCallOutputItem
+from agents.tool import WebSearchTool, function_tool
+from openai import AsyncAzureOpenAI
 
 from .config import AppConfig
 from .kucoin import KucoinAccount, KucoinClient, KucoinOrderRequest, KucoinTicker
@@ -21,84 +24,40 @@ class TradingSnapshot:
   min_confidence: float
 
 
-@dataclass
-class ToolResult:
-  name: str
-  result: Any
-
-
-def _build_openai_client(cfg: AppConfig) -> OpenAI:
-  base_url = cfg.azure.endpoint.rstrip("/")
-  deployment = cfg.azure.deployment
-  return OpenAI(
+def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
+  return AsyncAzureOpenAI(
     api_key=cfg.azure.api_key,
-    base_url=f"{base_url}/openai/deployments/{deployment}",
-    default_query={"api-version": cfg.azure.api_version},
+    api_version=cfg.azure.api_version,
+    azure_endpoint=cfg.azure.endpoint,
+    azure_deployment=cfg.azure.deployment,
   )
 
 
-def run_trading_agent(
+def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
+  user_content = {
+    "tickers": {k: vars(v) for k, v in snapshot.tickers.items()},
+    "balances": balances_by_currency,
+    "paperTrading": snapshot.paper_trading,
+    "maxPositionUsd": snapshot.max_position_usd,
+    "minConfidence": snapshot.min_confidence,
+    "guidance": "If you place an order, prefer market orders sized in USDT funds.",
+  }
+  return json.dumps(user_content)
+
+
+async def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
   kucoin: KucoinClient,
 ) -> dict[str, Any]:
-  client = _build_openai_client(cfg)
-  tools = [
-    {
-      "type": "function",
-      "function": {
-        "name": "web_search",
-        "description": "Search the web for latest market/news/sentiment on the symbols. Do this before trading.",
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "query": {"type": "string", "description": "Search query for tickers/market context."},
-          },
-          "required": ["query"],
-        },
-      },
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "place_market_order",
-        "description": (
-          "Execute a market order on Kucoin. Respect maxPositionUsd and available balances. "
-          "Use funds for quote size in USDT."
-        ),
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "symbol": {"type": "string", "description": "Symbol like BTC-USDT"},
-            "side": {"type": "string", "enum": ["buy", "sell"]},
-            "funds": {
-              "type": "number",
-              "description": "Quote amount in USDT to spend/receive. Must be <= maxPositionUsd.",
-            },
-          },
-          "required": ["symbol", "side", "funds"],
-        },
-      },
-    },
-    {
-      "type": "function",
-      "function": {
-        "name": "decline_trade",
-        "description": (
-          "Use this when conditions are not favorable or confidence is too low. "
-          "Provide rationale to avoid unnecessary risk."
-        ),
-        "parameters": {
-          "type": "object",
-          "properties": {
-            "reason": {"type": "string"},
-            "confidence": {"type": "number"},
-          },
-          "required": ["reason", "confidence"],
-        },
-      },
-    },
-  ]
+  # Azure OpenAI async client configured for Agents SDK.
+  openai_client = _build_openai_client(cfg)
+  set_default_openai_client(openai_client, use_for_tracing=False)
+
+  model = OpenAIResponsesModel(
+    model=cfg.azure.deployment,
+    openai_client=openai_client,
+  )
 
   balances_by_currency: Dict[str, float] = {}
   for bal in snapshot.balances:
@@ -106,10 +65,38 @@ def run_trading_agent(
       bal.available or 0
     )
 
-  system_message = (
+  @function_tool
+  async def place_market_order(symbol: str, side: str, funds: float) -> Dict[str, Any]:
+    """Place a market order on Kucoin using quote funds in USDT. Respects maxPositionUsd and paper_trading flag."""
+    try:
+      funds_val = float(funds or 0)
+    except (TypeError, ValueError):
+      funds_val = 0.0
+    if funds_val <= 0 or not symbol:
+      return {"error": "Invalid funds or symbol"}
+    if funds_val > snapshot.max_position_usd:
+      return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
+
+    order_req = KucoinOrderRequest(
+      symbol=symbol,
+      side="buy" if side == "buy" else "sell",  # enforce allowed values
+      type="market",
+      funds=f"{funds_val:.2f}",
+      clientOid=str(uuid.uuid4()),
+    )
+    if snapshot.paper_trading:
+      return {"paper": True, "orderRequest": order_req.__dict__}
+    return kucoin.place_order(order_req).__dict__
+
+  @function_tool
+  async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
+    """Decline trading due to low confidence or risk."""
+    return {"skipped": True, "reason": reason, "confidence": confidence}
+
+  instructions = (
     "You are a disciplined quantitative crypto trader using Azure OpenAI gpt-5.2.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
-    "- First, run a deep web search on the symbols/market to gather fresh sentiment, news, catalysts.\n"
+    "- First, run a web_search on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
     f"- Consider only the provided symbols and market snapshot.\n"
@@ -120,130 +107,22 @@ def run_trading_agent(
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, just simulate orders via the tool."
   )
 
-  user_content = {
-    "tickers": {k: vars(v) for k, v in snapshot.tickers.items()},
-    "balances": balances_by_currency,
-    "paperTrading": snapshot.paper_trading,
-    "maxPositionUsd": snapshot.max_position_usd,
-    "minConfidence": snapshot.min_confidence,
-    "guidance": "If you place an order, prefer market orders sized in USDT funds.",
-  }
+  trading_agent = Agent(
+    name="Trading Agent",
+    instructions=instructions,
+    tools=[WebSearchTool(search_context_size="medium"), place_market_order, decline_trade],
+    model=model,
+  )
 
-  messages: List[Dict[str, Any]] = [
-    {"role": "system", "content": system_message},
-    {"role": "user", "content": [{"type": "text", "text": json.dumps(user_content)}]},
-  ]
+  # Provide snapshot as serialized context input.
+  input_payload = _format_snapshot(snapshot, balances_by_currency)
 
-  tool_results: List[ToolResult] = []
-  max_rounds = 3
-  round_count = 0
+  result = await Runner.run(trading_agent, input_payload)
+  narrative = str(result.final_output)
 
-  while round_count < max_rounds:
-    round_count += 1
-    response = client.chat.completions.create(
-      model=cfg.azure.deployment,
-      messages=messages,
-      tools=tools,
-      tool_choice="auto",
-      temperature=0.2,
-    )
+  tool_outputs: List[Any] = []
+  for item in result.new_items:
+    if isinstance(item, ToolCallOutputItem):
+      tool_outputs.append(item.output)
 
-    msg = response.choices[0].message if response.choices else None
-    tool_calls = msg.tool_calls if msg else []
-
-    if msg and tool_calls:
-      messages.append(msg.model_dump(exclude_unset=True))
-    elif msg and not tool_calls:
-      return {
-        "narrative": msg.content if msg else "No action",
-        "tool_results": [tr.__dict__ for tr in tool_results],
-      }
-    else:
-      break
-
-    for call in tool_calls:
-      if call.function is None:
-        continue
-      args = json.loads(call.function.arguments or "{}")
-
-      if call.function.name == "web_search":
-        query = args.get("query") or ""
-        result = perform_web_search(query)
-        tool_results.append(ToolResult(call.function.name, result))
-        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
-
-      elif call.function.name == "place_market_order":
-        try:
-          funds = float(args.get("funds", 0) or 0)
-        except (TypeError, ValueError):
-          funds = 0.0
-        symbol = str(args.get("symbol", ""))
-        side = "buy" if args.get("side") == "buy" else "sell"
-
-        if funds <= 0 or not symbol:
-          result = {"error": "Invalid funds or symbol"}
-          tool_results.append(ToolResult(call.function.name, result))
-          messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
-          continue
-
-        if funds > snapshot.max_position_usd:
-          result = {"rejected": True, "reason": "Exceeds maxPositionUsd"}
-          tool_results.append(ToolResult(call.function.name, result))
-          messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
-          continue
-
-        order_req = KucoinOrderRequest(
-          symbol=symbol,
-          side=side,  # type: ignore[arg-type]
-          type="market",
-          funds=f"{funds:.2f}",
-          clientOid=str(uuid.uuid4()),
-        )
-
-        result = (
-          {"paper": True, "orderRequest": order_req.__dict__}
-          if snapshot.paper_trading
-          else kucoin.place_order(order_req).__dict__
-        )
-
-        tool_results.append(ToolResult(call.function.name, result))
-        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
-
-      elif call.function.name == "decline_trade":
-        result = {
-          "skipped": True,
-          "reason": args.get("reason", "No reason supplied"),
-          "confidence": args.get("confidence"),
-        }
-        tool_results.append(ToolResult(call.function.name, result))
-        messages.append({"role": "tool", "tool_call_id": call.id, "content": json.dumps(result)})
-
-  return {
-    "narrative": "No narrative.",
-    "tool_results": [tr.__dict__ for tr in tool_results],
-  }
-
-
-def perform_web_search(query: str) -> Dict[str, Any]:
-  if not query:
-    return {"error": "Empty query"}
-  try:
-    resp = requests.get(
-      "https://api.duckduckgo.com/",
-      params={"q": query, "format": "json", "no_redirect": 1, "no_html": 1},
-      timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    related = []
-    for item in data.get("RelatedTopics", [])[:5]:
-      if isinstance(item, dict) and item.get("Text"):
-        related.append({"text": item.get("Text"), "first_url": item.get("FirstURL")})
-    return {
-      "query": query,
-      "abstract": data.get("AbstractText", ""),
-      "heading": data.get("Heading", ""),
-      "related": related,
-    }
-  except Exception as exc:
-    return {"error": f"search_failed: {exc}", "query": query}
+  return {"narrative": narrative, "tool_results": tool_outputs}

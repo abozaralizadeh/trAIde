@@ -35,6 +35,9 @@ class TradingConfig:
   paper_trading: bool
   max_position_usd: float
   min_confidence: float
+  poll_interval_sec: float
+  price_change_trigger_pct: float
+  max_idle_polls: int
 
 
 @dataclass
@@ -66,6 +69,9 @@ def load_config() -> AppConfig:
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
       max_position_usd=float(os.getenv("MAX_POSITION_USD", "100")),
       min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.6")),
+      poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "30")),
+      price_change_trigger_pct=float(os.getenv("PRICE_CHANGE_TRIGGER_PCT", "0.5")),
+      max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
     ),
   )
 
