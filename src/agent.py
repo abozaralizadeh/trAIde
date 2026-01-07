@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -65,6 +66,8 @@ async def run_trading_agent(
       bal.available or 0
     )
 
+  allowed_symbols = set(snapshot.tickers.keys())
+
   @function_tool
   async def place_market_order(symbol: str, side: str, funds: float) -> Dict[str, Any]:
     """Place a market order on Kucoin using quote funds in USDT. Respects maxPositionUsd and paper_trading flag."""
@@ -93,10 +96,62 @@ async def run_trading_agent(
     """Decline trading due to low confidence or risk."""
     return {"skipped": True, "reason": reason, "confidence": confidence}
 
+  @function_tool
+  async def fetch_recent_candles(
+    symbol: str,
+    interval: str = "1min",
+    lookback_minutes: int = 120,
+  ) -> Dict[str, Any]:
+    """Fetch recent candles for symbol. Interval options: 1min, 5min, 15min, 1hour. Caps to 500 rows."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+
+    interval_seconds = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600}
+    if interval not in interval_seconds:
+      return {"error": "Invalid interval", "allowed": list(interval_seconds.keys())}
+
+    lookback_min = max(1, min(int(lookback_minutes or 0), 720))
+    end_at = int(time.time())
+    # bound number of points to avoid oversized responses
+    max_points = 500
+    interval_sec = interval_seconds[interval]
+    points = min(max_points, max(1, int(lookback_min * 60 / interval_sec)))
+    start_at = end_at - points * interval_sec
+
+    candles = kucoin.get_candles(
+      symbol,
+      interval=interval,
+      start_at=start_at,
+      end_at=end_at,
+    )
+
+    return {
+      "symbol": symbol,
+      "interval": interval,
+      "startAt": start_at,
+      "endAt": end_at,
+      "points": candles[:max_points],
+      "rows": len(candles),
+    }
+
+  @function_tool
+  async def fetch_orderbook(symbol: str, depth: int = 20) -> Dict[str, Any]:
+    """Fetch level2 orderbook snapshot (depth 20 or 100)."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    depth_safe = 20 if depth <= 20 else 100
+    ob = kucoin.get_orderbook_levels(symbol, depth=depth_safe)
+    # trim in case API returns more than requested
+    ob["bids"] = ob.get("bids", [])[:depth_safe]
+    ob["asks"] = ob.get("asks", [])[:depth_safe]
+    return {"symbol": symbol, "depth": depth_safe, "orderbook": ob}
+
   instructions = (
     "You are a disciplined quantitative crypto trader using Azure OpenAI gpt-5.2.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
-    "- First, run a web_search on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
+    "- First, run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
+    "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
+    "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
     f"- Consider only the provided symbols and market snapshot.\n"
@@ -110,7 +165,13 @@ async def run_trading_agent(
   trading_agent = Agent(
     name="Trading Agent",
     instructions=instructions,
-    tools=[WebSearchTool(search_context_size="medium"), place_market_order, decline_trade],
+    tools=[
+      WebSearchTool(search_context_size="high"),
+      fetch_recent_candles,
+      fetch_orderbook,
+      place_market_order,
+      decline_trade,
+    ],
     model=model,
   )
 

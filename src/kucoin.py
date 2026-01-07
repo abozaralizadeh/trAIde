@@ -129,6 +129,39 @@ class KucoinClient:
     )
     return KucoinTicker(**data)
 
+  def get_candles(
+    self,
+    symbol: str,
+    *,
+    interval: str = "1min",
+    start_at: Optional[int] = None,
+    end_at: Optional[int] = None,
+  ) -> list[list[str]]:
+    """Fetch recent candles. Interval examples: 1min, 5min, 15min, 1hour."""
+    query: Dict[str, str | int] = {"symbol": symbol, "type": interval}
+    if start_at is not None:
+      query["startAt"] = start_at
+    if end_at is not None:
+      query["endAt"] = end_at
+
+    data = self._request(
+      "GET",
+      "/api/v1/market/candles",
+      query=query,
+    )
+    # API returns list of [time, open, close, high, low, volume, turnover].
+    return data
+
+  def get_orderbook_levels(self, symbol: str, depth: int = 20) -> Dict[str, Any]:
+    """Fetch level2 orderbook snapshot. Depth must be 20 or 100."""
+    depth_allowed = 20 if depth <= 20 else 100
+    path = "/api/v1/market/orderbook/level2_20" if depth_allowed == 20 else "/api/v1/market/orderbook/level2_100"
+    return self._request(
+      "GET",
+      path,
+      query={"symbol": symbol},
+    )
+
   def place_order(self, order: KucoinOrderRequest) -> KucoinOrderResponse:
     payload = {k: v for k, v in order.__dict__.items() if v is not None}
     data = self._request(
