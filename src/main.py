@@ -6,7 +6,7 @@ from typing import Dict
 
 from .agent import TradingSnapshot, run_trading_agent
 from .config import load_config
-from .kucoin import KucoinClient
+from .kucoin import KucoinClient, KucoinFuturesClient
 
 
 def build_snapshot(cfg, kucoin: KucoinClient) -> TradingSnapshot:
@@ -22,12 +22,15 @@ def build_snapshot(cfg, kucoin: KucoinClient) -> TradingSnapshot:
     paper_trading=cfg.trading.paper_trading,
     max_position_usd=cfg.trading.max_position_usd,
     min_confidence=cfg.trading.min_confidence,
+    max_leverage=cfg.trading.max_leverage,
+    futures_enabled=cfg.kucoin_futures.enabled,
   )
 
 
 async def trading_loop() -> None:
   cfg = load_config()
   kucoin = KucoinClient(cfg)
+  kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
   idle_polls = 0
 
@@ -57,7 +60,7 @@ async def trading_loop() -> None:
     if should_run:
       idle_polls = 0
       print(f"Running agent. Triggers: {triggers or ['idle_threshold']}")
-      result = await run_trading_agent(cfg, snapshot, kucoin)
+      result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures)
       print("\n--- Agent Decision Narrative ---")
       print(result["narrative"])
       print("\n--- Tool Results ---")

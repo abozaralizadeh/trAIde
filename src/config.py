@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -30,6 +30,15 @@ class KucoinConfig:
 
 
 @dataclass
+class KucoinFuturesConfig:
+  enabled: bool
+  api_key: Optional[str]
+  secret: Optional[str]
+  passphrase: Optional[str]
+  base_url: str
+
+
+@dataclass
 class TradingConfig:
   coins: List[str]
   paper_trading: bool
@@ -38,13 +47,16 @@ class TradingConfig:
   poll_interval_sec: float
   price_change_trigger_pct: float
   max_idle_polls: int
+  max_leverage: float
 
 
 @dataclass
 class AppConfig:
   azure: AzureConfig
   kucoin: KucoinConfig
+  kucoin_futures: KucoinFuturesConfig
   trading: TradingConfig
+  memory_file: str
 
 
 def load_config() -> AppConfig:
@@ -64,6 +76,13 @@ def load_config() -> AppConfig:
       passphrase=os.getenv("KUCOIN_API_PASSPHRASE", ""),
       base_url=os.getenv("KUCOIN_BASE_URL", "https://api.kucoin.com"),
     ),
+    kucoin_futures=KucoinFuturesConfig(
+      enabled=_as_bool(os.getenv("KUCOIN_FUTURES_ENABLED"), False),
+      api_key=os.getenv("KUCOIN_FUTURES_API_KEY"),
+      secret=os.getenv("KUCOIN_FUTURES_API_SECRET"),
+      passphrase=os.getenv("KUCOIN_FUTURES_API_PASSPHRASE"),
+      base_url=os.getenv("KUCOIN_FUTURES_BASE_URL", "https://api-futures.kucoin.com"),
+    ),
     trading=TradingConfig(
       coins=coins,
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
@@ -72,7 +91,9 @@ def load_config() -> AppConfig:
       poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "30")),
       price_change_trigger_pct=float(os.getenv("PRICE_CHANGE_TRIGGER_PCT", "0.5")),
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
+      max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
     ),
+    memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
   )
 
   validate_config(config)
@@ -95,6 +116,13 @@ def validate_config(cfg: AppConfig) -> None:
     missing.append("KUCOIN_API_PASSPHRASE")
   if not cfg.trading.coins:
     missing.append("COINS (e.g., BTC-USDT)")
+  if cfg.kucoin_futures.enabled:
+    if not cfg.kucoin_futures.api_key:
+      missing.append("KUCOIN_FUTURES_API_KEY")
+    if not cfg.kucoin_futures.secret:
+      missing.append("KUCOIN_FUTURES_API_SECRET")
+    if not cfg.kucoin_futures.passphrase:
+      missing.append("KUCOIN_FUTURES_API_PASSPHRASE")
 
   if missing:
     raise ValueError(

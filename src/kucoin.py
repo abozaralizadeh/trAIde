@@ -54,6 +54,23 @@ class KucoinOrderResponse:
   clientOid: str
 
 
+@dataclass
+class KucoinFuturesOrderRequest:
+  symbol: str
+  side: Literal["buy", "sell"]
+  type: Literal["market", "limit"]
+  leverage: str
+  size: str
+  price: Optional[str] = None
+  clientOid: Optional[str] = None
+
+
+@dataclass
+class KucoinFuturesOrderResponse:
+  orderId: str
+  clientOid: str
+
+
 class KucoinClient:
   def __init__(self, cfg: AppConfig) -> None:
     self.api_key = cfg.kucoin.api_key
@@ -171,3 +188,66 @@ class KucoinClient:
       body=payload,
     )
     return KucoinOrderResponse(**data)
+
+
+class KucoinFuturesClient:
+  def __init__(self, cfg: AppConfig) -> None:
+    self.api_key = cfg.kucoin_futures.api_key or ""
+    self.api_secret = (cfg.kucoin_futures.secret or "").encode("utf-8")
+    self.api_passphrase = (cfg.kucoin_futures.passphrase or "").encode("utf-8")
+    self.base_url = cfg.kucoin_futures.base_url.rstrip("/")
+
+  def _sign_headers(self, method: RestMethod, path: str, body: Any | None) -> Dict[str, str]:
+    timestamp = str(int(time.time() * 1000))
+    body_str = json.dumps(body) if body is not None else ""
+    prehash = f"{timestamp}{method}{path}{body_str}"
+
+    signature = hmac.new(self.api_secret, prehash.encode("utf-8"), hashlib.sha256).digest()
+    passphrase = hmac.new(self.api_secret, self.api_passphrase, hashlib.sha256).digest()
+
+    return {
+      "KC-API-KEY": self.api_key,
+      "KC-API-SIGN": base64.b64encode(signature).decode("utf-8"),
+      "KC-API-TIMESTAMP": timestamp,
+      "KC-API-PASSPHRASE": base64.b64encode(passphrase).decode("utf-8"),
+      "KC-API-KEY-VERSION": "2",
+    }
+
+  def _request(
+    self,
+    method: RestMethod,
+    path: str,
+    *,
+    auth: bool = False,
+    query: Optional[Dict[str, str | int | float]] = None,
+    body: Any | None = None,
+  ) -> Any:
+    qs = f"?{requests.compat.urlencode(query)}" if query else ""
+    full_path = f"{path}{qs}"
+    url = f"{self.base_url}{full_path}"
+
+    headers = {"Content-Type": "application/json"}
+    if auth:
+      headers.update(self._sign_headers(method, full_path, body))
+
+    response = requests.request(method, url, headers=headers, json=body, timeout=15)
+    if not response.ok:
+      raise RuntimeError(f"Kucoin Futures HTTP {response.status_code}: {response.text}")
+
+    payload = response.json()
+    if payload.get("code") not in ("200000", "200"):  # futures may return 200
+      raise RuntimeError(f"Kucoin Futures API error: {payload.get('code')} {payload.get('msg','')}")
+
+    return payload.get("data")
+
+  def place_order(self, order: KucoinFuturesOrderRequest) -> KucoinFuturesOrderResponse:
+    payload = {k: v for k, v in order.__dict__.items() if v is not None}
+    data = self._request(
+      "POST",
+      "/api/v1/orders",
+      auth=True,
+      body=payload,
+    )
+    order_id = data.get("orderId") if isinstance(data, dict) else None
+    client_oid = data.get("clientOid") if isinstance(data, dict) else None
+    return KucoinFuturesOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid", ""))

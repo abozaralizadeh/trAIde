@@ -13,7 +13,15 @@ from agents.tool import WebSearchTool, function_tool
 from openai import AsyncAzureOpenAI
 
 from .config import AppConfig
-from .kucoin import KucoinAccount, KucoinClient, KucoinOrderRequest, KucoinTicker
+from .kucoin import (
+  KucoinAccount,
+  KucoinClient,
+  KucoinFuturesClient,
+  KucoinFuturesOrderRequest,
+  KucoinOrderRequest,
+  KucoinTicker,
+)
+from .memory import MemoryStore
 
 
 @dataclass
@@ -23,6 +31,8 @@ class TradingSnapshot:
   paper_trading: bool
   max_position_usd: float
   min_confidence: float
+  max_leverage: float
+  futures_enabled: bool
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -41,6 +51,8 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "paperTrading": snapshot.paper_trading,
     "maxPositionUsd": snapshot.max_position_usd,
     "minConfidence": snapshot.min_confidence,
+    "maxLeverage": snapshot.max_leverage,
+    "futuresEnabled": snapshot.futures_enabled,
     "guidance": "If you place an order, prefer market orders sized in USDT funds.",
   }
   return json.dumps(user_content)
@@ -50,6 +62,7 @@ async def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
   kucoin: KucoinClient,
+  kucoin_futures: KucoinFuturesClient | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   openai_client = _build_openai_client(cfg)
@@ -67,10 +80,11 @@ async def run_trading_agent(
     )
 
   allowed_symbols = set(snapshot.tickers.keys())
+  memory = MemoryStore(cfg.memory_file)
 
   @function_tool
   async def place_market_order(symbol: str, side: str, funds: float) -> Dict[str, Any]:
-    """Place a market order on Kucoin using quote funds in USDT. Respects maxPositionUsd and paper_trading flag."""
+    """Place a spot market order on Kucoin using quote funds in USDT. Respects maxPositionUsd and paper_trading flag."""
     try:
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
@@ -79,6 +93,11 @@ async def run_trading_agent(
       return {"error": "Invalid funds or symbol"}
     if funds_val > snapshot.max_position_usd:
       return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
+    usdt_balance = balances_by_currency.get("USDT", 0.0)
+    reserve = usdt_balance * 0.10
+    max_spend = max(0.0, usdt_balance - reserve)
+    if funds_val > max_spend:
+      return {"rejected": True, "reason": "Exceeds spendable USDT after 10% reserve", "maxSpend": max_spend}
 
     order_req = KucoinOrderRequest(
       symbol=symbol,
@@ -146,16 +165,102 @@ async def run_trading_agent(
     ob["asks"] = ob.get("asks", [])[:depth_safe]
     return {"symbol": symbol, "depth": depth_safe, "orderbook": ob}
 
+  @function_tool
+  async def place_futures_market_order(
+    symbol: str,
+    side: str,
+    notional_usd: float,
+    leverage: float = 1.0,
+    size_override: float | None = None,
+  ) -> Dict[str, Any]:
+    """Place a linear futures market order using notional and leverage. Falls back to paper if futures disabled."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"paper": True, "reason": "Futures disabled in config"}
+    try:
+      notional = float(notional_usd or 0)
+      lev = float(leverage or 0)
+    except (TypeError, ValueError):
+      return {"error": "Invalid notional or leverage"}
+    if notional <= 0 or lev <= 0:
+      return {"error": "Invalid notional or leverage"}
+    if lev > snapshot.max_leverage:
+      return {"rejected": True, "reason": "Exceeds max_leverage", "max_leverage": snapshot.max_leverage}
+    if notional > snapshot.max_position_usd * snapshot.max_leverage:
+      return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd * snapshot.max_leverage}
+
+    price = float(snapshot.tickers[symbol].price)
+    est_size = notional / price if price else 0
+    size = size_override if size_override is not None else est_size
+    if size <= 0:
+      return {"error": "Computed size is zero"}
+
+    order_req = KucoinFuturesOrderRequest(
+      symbol=symbol,
+      side="buy" if side == "buy" else "sell",
+      type="market",
+      leverage=f"{lev}",
+      size=f"{size}",
+      clientOid=str(uuid.uuid4()),
+    )
+
+    if snapshot.paper_trading:
+      return {"paper": True, "orderRequest": order_req.__dict__}
+    return kucoin_futures.place_order(order_req).__dict__
+
+  @function_tool
+  async def save_trade_plan(title: str, summary: str, actions: List[str]) -> Dict[str, Any]:
+    """Persist a trading plan (title, summary, actions) for recall."""
+    return memory.save_plan(title=title, summary=summary, actions=actions)
+
+  @function_tool
+  async def latest_plan() -> Dict[str, Any]:
+    """Get the latest stored trading plan."""
+    return {"latest_plan": memory.latest_plan()}
+
+  @function_tool
+  async def clear_plans() -> Dict[str, Any]:
+    """Clear all stored plans and triggers."""
+    return memory.clear_plans()
+
+  @function_tool
+  async def set_auto_trigger(
+    symbol: str,
+    direction: str,
+    rationale: str,
+    target_price: float | None = None,
+    stop_price: float | None = None,
+  ) -> Dict[str, Any]:
+    """Store an auto-buy/sell trigger idea (persists to disk for follow-up by future runs)."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    return memory.save_trigger(
+      symbol=symbol,
+      direction=direction,
+      rationale=rationale,
+      target_price=target_price,
+      stop_price=stop_price,
+    )
+
+  @function_tool
+  async def list_triggers() -> Dict[str, Any]:
+    """List stored auto triggers (buy/sell ideas) for follow-up."""
+    return {"triggers": memory.latest_triggers()}
+
   instructions = (
     "You are a disciplined quantitative crypto trader using Azure OpenAI gpt-5.2.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
     "- First, run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
+    "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
+    "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
     f"- Consider only the provided symbols and market snapshot.\n"
     f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
+    f"- Futures leverage must stay <= {snapshot.max_leverage}x. Keep sizing realistic; if unsure, prefer spot.\n"
     f"- Only place a trade if your confidence >= {snapshot.min_confidence}; otherwise decline.\n"
     "- Keep at least 10% of USDT balance untouched for safety.\n"
     "- Be explicit about your reasoning in the final narrative.\n"
@@ -169,7 +274,13 @@ async def run_trading_agent(
       WebSearchTool(search_context_size="high"),
       fetch_recent_candles,
       fetch_orderbook,
+      place_futures_market_order,
       place_market_order,
+      save_trade_plan,
+      latest_plan,
+      set_auto_trigger,
+      list_triggers,
+      clear_plans,
       decline_trade,
     ],
     model=model,
