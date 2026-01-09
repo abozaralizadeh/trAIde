@@ -371,7 +371,7 @@ async def run_trading_agent(
     return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   instructions = (
-    "You are a disciplined quantitative crypto trader using Azure OpenAI gpt-5.2.\n"
+    "You are a disciplined quantitative crypto trader.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
     "- First, run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
