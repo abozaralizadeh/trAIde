@@ -120,9 +120,21 @@ async def run_trading_agent(
       set_tracing_export_api_key(cfg.openai_trace_api_key)
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
+      from langsmith import Client as LangsmithClient
       from langsmith.wrappers import OpenAIAgentsTracingProcessor
 
-      set_trace_processors([OpenAIAgentsTracingProcessor()])
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+        project_name=cfg.langsmith.project or None,
+      )
+      processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
+      )
+      set_trace_processors([processor])
     except Exception as exc:
       print("LangSmith tracing processor failed to initialize:", exc)
 
