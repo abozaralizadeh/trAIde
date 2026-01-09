@@ -88,9 +88,23 @@ async def run_trading_agent(
   openai_client = _build_openai_client(cfg)
   set_default_openai_client(openai_client, use_for_tracing=cfg.tracing_enabled)
 
+  class _RedactingConsoleExporter(ConsoleSpanExporter):
+    """Redact bulky outputs (candles/orderbooks) before console export."""
+
+    def export(self, spans):
+      for s in spans:
+        sd = getattr(s, "span_data", None)
+        if getattr(sd, "type", "") == "function" and getattr(sd, "name", "") in (
+          "fetch_recent_candles",
+          "fetch_orderbook",
+        ):
+          if hasattr(sd, "output"):
+            sd.output = "(redacted: large payload)"
+      return super().export(spans)
+
   if cfg.tracing_enabled:
     if cfg.console_tracing:
-      add_trace_processor(BatchTraceProcessor(exporter=ConsoleSpanExporter()))
+      add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
 
@@ -420,11 +434,11 @@ async def run_trading_agent(
       return f"decline: {output.get('reason','unspecified')} (conf={output.get('confidence')})"
     if output.get("paper") and output.get("orderRequest"):
       req = output.get("orderRequest", {})
-      return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')}"
+      return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')} (pnl=n/a)"
     if output.get("orderId") or output.get("orderRequest"):
       side = output.get("side") or output.get("orderRequest", {}).get("side")
       sym = output.get("symbol") or output.get("orderRequest", {}).get("symbol")
-      return f"live order: {side} {sym} (orderId={output.get('orderId')})"
+      return f"live order: {side} {sym} (orderId={output.get('orderId')}) (pnl=n/a)"
     if output.get("transfer"):
       t = output.get("transfer", {})
       return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"
