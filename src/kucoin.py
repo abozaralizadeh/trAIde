@@ -51,7 +51,7 @@ class KucoinOrderRequest:
 @dataclass
 class KucoinOrderResponse:
   orderId: str
-  clientOid: str
+  clientOid: Optional[str] = None
 
 
 @dataclass
@@ -68,7 +68,7 @@ class KucoinFuturesOrderRequest:
 @dataclass
 class KucoinFuturesOrderResponse:
   orderId: str
-  clientOid: str
+  clientOid: Optional[str] = None
 
 
 class KucoinClient:
@@ -187,7 +187,9 @@ class KucoinClient:
       auth=True,
       body=payload,
     )
-    return KucoinOrderResponse(**data)
+    order_id = data.get("orderId") if isinstance(data, dict) else None
+    client_oid = data.get("clientOid") if isinstance(data, dict) else None
+    return KucoinOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid"))
 
 
 class KucoinFuturesClient:

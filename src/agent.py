@@ -117,7 +117,13 @@ async def run_trading_agent(
       return {"error": "Invalid funds or symbol"}
     if funds_val > snapshot.max_position_usd:
       return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
-    usdt_balance = balances_by_currency.get("USDT", 0.0)
+    # Refresh balances to reduce stale balance failures.
+    fresh_balances = kucoin.get_trade_accounts()
+    fresh_by_currency: Dict[str, float] = {}
+    for bal in fresh_balances:
+      fresh_by_currency[bal.currency] = fresh_by_currency.get(bal.currency, 0.0) + float(bal.available or 0)
+
+    usdt_balance = fresh_by_currency.get("USDT", 0.0)
     reserve = usdt_balance * 0.10
     max_spend = max(0.0, usdt_balance - reserve)
     if funds_val > max_spend:
@@ -132,7 +138,10 @@ async def run_trading_agent(
     )
     if snapshot.paper_trading:
       return {"paper": True, "orderRequest": order_req.__dict__}
-    return kucoin.place_order(order_req).__dict__
+    try:
+      return kucoin.place_order(order_req).__dict__
+    except Exception as exc:
+      return {"error": str(exc), "orderRequest": order_req.__dict__}
 
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:

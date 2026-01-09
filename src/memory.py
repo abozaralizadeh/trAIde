@@ -13,6 +13,8 @@ class MemoryStore:
   def __init__(self, path: str) -> None:
     self.path = Path(path)
     self._lock = threading.Lock()
+    # Sanitize on init.
+    self._read()
 
   def _read(self) -> Dict[str, Any]:
     if not self.path.exists():
@@ -22,6 +24,17 @@ class MemoryStore:
       if isinstance(data, dict):
         data.setdefault("plans", [])
         data.setdefault("triggers", [])
+        # prune invalid entries while keeping timestamp
+        data["plans"] = [
+          p
+          for p in data.get("plans", [])
+          if isinstance(p, dict) and p.get("title") and p.get("summary") and isinstance(p.get("actions"), list)
+        ]
+        data["triggers"] = [
+          t
+          for t in data.get("triggers", [])
+          if isinstance(t, dict) and t.get("symbol") and t.get("direction")
+        ]
         return data
     except Exception:
       return {"plans": [], "triggers": []}
