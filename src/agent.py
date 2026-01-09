@@ -135,8 +135,16 @@ async def run_trading_agent(
         name="trAIde-agent",
       )
       set_trace_processors([processor])
+      print(
+        "LangSmith tracing enabled",
+        "project=" + str(cfg.langsmith.project or "default"),
+        "url=" + str(cfg.langsmith.api_url or "https://api.smith.langchain.com"),
+      )
     except Exception as exc:
       print("LangSmith tracing processor failed to initialize:", exc)
+  else:
+    if cfg.langsmith.enabled and cfg.langsmith.tracing and not cfg.langsmith.api_key:
+      print("LangSmith tracing requested but LANGSMITH_API_KEY is missing.")
 
   model = OpenAIResponsesModel(
     model=cfg.azure.deployment,
