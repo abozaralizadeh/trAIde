@@ -32,9 +32,6 @@ class KucoinConfig:
 @dataclass
 class KucoinFuturesConfig:
   enabled: bool
-  api_key: Optional[str]
-  secret: Optional[str]
-  passphrase: Optional[str]
   base_url: str
 
 
@@ -62,6 +59,7 @@ class AppConfig:
 def load_config() -> AppConfig:
   coins_env = os.getenv("COINS", "")
   coins = [c.strip() for c in coins_env.split(",") if c.strip()]
+  kucoin_base_url = os.getenv("KUCOIN_BASE_URL", "https://api.kucoin.com")
 
   config = AppConfig(
     azure=AzureConfig(
@@ -74,14 +72,11 @@ def load_config() -> AppConfig:
       api_key=os.getenv("KUCOIN_API_KEY", ""),
       secret=os.getenv("KUCOIN_API_SECRET", ""),
       passphrase=os.getenv("KUCOIN_API_PASSPHRASE", ""),
-      base_url=os.getenv("KUCOIN_BASE_URL", "https://api.kucoin.com"),
+      base_url=kucoin_base_url,
     ),
     kucoin_futures=KucoinFuturesConfig(
-      enabled=_as_bool(os.getenv("KUCOIN_FUTURES_ENABLED"), False),
-      api_key=os.getenv("KUCOIN_FUTURES_API_KEY"),
-      secret=os.getenv("KUCOIN_FUTURES_API_SECRET"),
-      passphrase=os.getenv("KUCOIN_FUTURES_API_PASSPHRASE"),
-      base_url=os.getenv("KUCOIN_FUTURES_BASE_URL", "https://api-futures.kucoin.com"),
+      enabled=_as_bool(os.getenv("KUCOIN_FUTURES_ENABLED"), True),
+      base_url=kucoin_base_url,
     ),
     trading=TradingConfig(
       coins=coins,
@@ -116,13 +111,6 @@ def validate_config(cfg: AppConfig) -> None:
     missing.append("KUCOIN_API_PASSPHRASE")
   if not cfg.trading.coins:
     missing.append("COINS (e.g., BTC-USDT)")
-  if cfg.kucoin_futures.enabled:
-    if not cfg.kucoin_futures.api_key:
-      missing.append("KUCOIN_FUTURES_API_KEY")
-    if not cfg.kucoin_futures.secret:
-      missing.append("KUCOIN_FUTURES_API_SECRET")
-    if not cfg.kucoin_futures.passphrase:
-      missing.append("KUCOIN_FUTURES_API_PASSPHRASE")
 
   if missing:
     raise ValueError(

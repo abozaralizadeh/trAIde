@@ -8,6 +8,7 @@ Automatic AI Agent crypto trader powered by Azure OpenAI (gpt-5.2) and Kucoin AP
 - `PAPER_TRADING=true` by default to avoid real orders; set to `false` to trade live.
 - `MAX_POSITION_USD` caps spend per trade; `MIN_CONFIDENCE` controls when the agent trades.
 - Loop controls: `POLL_INTERVAL_SEC` (poll cadence), `PRICE_CHANGE_TRIGGER_PCT` (price move trigger), `MAX_IDLE_POLLS` (force-run after N idle polls).
+- Futures uses the same KuCoin API keys and base URL; toggle via `KUCOIN_FUTURES_ENABLED` (default true).
 
 ## Install & Run
 ```bash

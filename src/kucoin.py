@@ -192,9 +192,10 @@ class KucoinClient:
 
 class KucoinFuturesClient:
   def __init__(self, cfg: AppConfig) -> None:
-    self.api_key = cfg.kucoin_futures.api_key or ""
-    self.api_secret = (cfg.kucoin_futures.secret or "").encode("utf-8")
-    self.api_passphrase = (cfg.kucoin_futures.passphrase or "").encode("utf-8")
+    # Futures use the same credentials as spot; only the base URL and enable flag differ.
+    self.api_key = cfg.kucoin.api_key
+    self.api_secret = cfg.kucoin.secret.encode("utf-8")
+    self.api_passphrase = cfg.kucoin.passphrase.encode("utf-8")
     self.base_url = cfg.kucoin_futures.base_url.rstrip("/")
 
   def _sign_headers(self, method: RestMethod, path: str, body: Any | None) -> Dict[str, str]:
