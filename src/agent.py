@@ -36,6 +36,7 @@ from .memory import MemoryStore
 
 @dataclass
 class TradingSnapshot:
+  coins: List[str]
   tickers: Dict[str, KucoinTicker]
   balances: List[KucoinAccount]
   paper_trading: bool
@@ -64,6 +65,7 @@ def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
 
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   user_content = {
+    "coins": snapshot.coins,
     "tickers": {k: vars(v) for k, v in snapshot.tickers.items()},
     "balances": balances_by_currency,
     "paperTrading": snapshot.paper_trading,
@@ -331,6 +333,29 @@ async def run_trading_agent(
     """List stored auto triggers (buy/sell ideas) for follow-up."""
     return {"triggers": memory.latest_triggers()}
 
+  @function_tool
+  async def list_coins() -> Dict[str, Any]:
+    """List the current active coin universe (dynamic if enabled)."""
+    return {"coins": memory.get_coins(default=list(allowed_symbols))}
+
+  @function_tool
+  async def add_coin(symbol: str, reason: str) -> Dict[str, Any]:
+    """Add a coin to the active universe (requires reason)."""
+    if not symbol:
+      return {"error": "symbol required"}
+    entry = memory.add_coin(symbol, reason)
+    return {"added": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
+
+  @function_tool
+  async def remove_coin(symbol: str, reason: str, exit_plan: str) -> Dict[str, Any]:
+    """Remove a coin from the active universe with an exit plan noted."""
+    if not symbol:
+      return {"error": "symbol required"}
+    if not exit_plan:
+      return {"error": "exit_plan required to remove coin"}
+    entry = memory.remove_coin(symbol, reason, exit_plan)
+    return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
+
   instructions = (
     "You are a disciplined quantitative crypto trader using Azure OpenAI gpt-5.2.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
@@ -339,6 +364,7 @@ async def run_trading_agent(
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
+    "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
@@ -365,6 +391,9 @@ async def run_trading_agent(
       latest_plan,
       set_auto_trigger,
       list_triggers,
+      list_coins,
+      add_coin,
+      remove_coin,
       clear_plans,
       decline_trade,
     ],

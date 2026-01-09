@@ -7,16 +7,29 @@ from typing import Dict
 from .agent import TradingSnapshot, run_trading_agent
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient
+from .memory import MemoryStore
 
 
-def build_snapshot(cfg, kucoin: KucoinClient) -> TradingSnapshot:
+def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
+  if cfg.trading.flexible_coins_enabled:
+    coins = memory.get_coins(default=cfg.trading.coins)
+    if not coins:
+      memory.set_coins(cfg.trading.coins, reason="seed-from-config")
+      return cfg.trading.coins
+    return coins
+  return cfg.trading.coins
+
+
+def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSnapshot:
+  coins = _load_active_coins(cfg, memory)
   tickers = {}
-  for symbol in cfg.trading.coins:
+  for symbol in coins:
     tickers[symbol] = kucoin.get_ticker(symbol)
 
   balances = kucoin.get_trade_accounts()
 
   return TradingSnapshot(
+    coins=coins,
     tickers=tickers,
     balances=balances,
     paper_trading=cfg.trading.paper_trading,
@@ -33,11 +46,12 @@ async def trading_loop() -> None:
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
   idle_polls = 0
+  memory = MemoryStore(cfg.memory_file)
 
   print("Starting trading loop...")
   while True:
     try:
-      snapshot = build_snapshot(cfg, kucoin)
+      snapshot = build_snapshot(cfg, kucoin, memory)
     except Exception as exc:
       print("Snapshot failed, retrying after delay:", exc, file=sys.stderr)
       await asyncio.sleep(cfg.trading.poll_interval_sec)

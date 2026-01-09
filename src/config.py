@@ -46,6 +46,7 @@ class KucoinFuturesConfig:
 @dataclass
 class TradingConfig:
   coins: List[str]
+  flexible_coins_enabled: bool
   paper_trading: bool
   max_position_usd: float
   min_confidence: float
@@ -98,6 +99,7 @@ def load_config() -> AppConfig:
     ),
     trading=TradingConfig(
       coins=coins,
+      flexible_coins_enabled=_as_bool(os.getenv("FLEXIBLE_COINS_ENABLED"), True),
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
       max_position_usd=float(os.getenv("MAX_POSITION_USD", "100")),
       min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.6")),

@@ -18,12 +18,13 @@ class MemoryStore:
 
   def _read(self) -> Dict[str, Any]:
     if not self.path.exists():
-      return {"plans": [], "triggers": []}
+      return {"plans": [], "triggers": [], "coins": []}
     try:
       data = json.loads(self.path.read_text())
       if isinstance(data, dict):
         data.setdefault("plans", [])
         data.setdefault("triggers", [])
+        data.setdefault("coins", [])
         # prune invalid entries while keeping timestamp
         data["plans"] = [
           p
@@ -35,10 +36,21 @@ class MemoryStore:
           for t in data.get("triggers", [])
           if isinstance(t, dict) and t.get("symbol") and t.get("direction")
         ]
+        data["coins"] = [
+          {
+            "symbol": c.get("symbol", "").upper(),
+            "status": c.get("status", "active"),
+            "reason": c.get("reason"),
+            "exitPlan": c.get("exitPlan"),
+            "ts": c.get("ts"),
+          }
+          for c in data.get("coins", [])
+          if isinstance(c, dict) and c.get("symbol")
+        ]
         return data
     except Exception:
-      return {"plans": [], "triggers": []}
-    return {"plans": [], "triggers": []}
+      return {"plans": [], "triggers": [], "coins": []}
+    return {"plans": [], "triggers": [], "coins": []}
 
   def _write(self, data: Dict[str, Any]) -> None:
     self.path.write_text(json.dumps(data, indent=2))
@@ -65,7 +77,7 @@ class MemoryStore:
 
   def clear_plans(self) -> Dict[str, Any]:
     with self._lock:
-      data = {"plans": [], "triggers": []}
+      data = {"plans": [], "triggers": [], "coins": self._read().get("coins", [])}
       self._write(data)
       return data
 
@@ -96,3 +108,54 @@ class MemoryStore:
     with self._lock:
       data = self._read()
       return data.get("triggers", []) or []
+
+  def get_coins(self, default: list[str] | None = None) -> list[str]:
+    with self._lock:
+      data = self._read()
+      coins = data.get("coins", []) or []
+      if coins:
+        return [c["symbol"] for c in coins if c.get("status", "active") == "active"]
+      return default or []
+
+  def set_coins(self, coins: list[str], reason: str = "update") -> list[Dict[str, Any]]:
+    with self._lock:
+      entries = []
+      now = int(time.time())
+      for sym in coins:
+        entries.append({"symbol": sym.upper(), "status": "active", "reason": reason, "ts": now})
+      data = self._read()
+      data["coins"] = entries
+      self._write(data)
+      return entries
+
+  def add_coin(self, symbol: str, reason: str) -> Dict[str, Any]:
+    with self._lock:
+      data = self._read()
+      coins = data.get("coins", [])
+      now = int(time.time())
+      symbol_up = symbol.upper()
+      # avoid duplicates; replace existing with latest reason
+      coins = [c for c in coins if c.get("symbol") != symbol_up]
+      coins.append({"symbol": symbol_up, "status": "active", "reason": reason, "ts": now})
+      data["coins"] = coins
+      self._write(data)
+      return {"symbol": symbol_up, "status": "active", "reason": reason, "ts": now}
+
+  def remove_coin(self, symbol: str, reason: str, exit_plan: str) -> Dict[str, Any]:
+    with self._lock:
+      data = self._read()
+      coins = data.get("coins", [])
+      symbol_up = symbol.upper()
+      now = int(time.time())
+      coins = [c for c in coins if c.get("symbol") != symbol_up]
+      entry = {
+        "symbol": symbol_up,
+        "status": "removed",
+        "reason": reason,
+        "exitPlan": exit_plan,
+        "ts": now,
+      }
+      coins.append(entry)
+      data["coins"] = coins
+      self._write(data)
+      return entry
