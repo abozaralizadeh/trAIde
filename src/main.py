@@ -60,11 +60,15 @@ async def trading_loop() -> None:
     if should_run:
       idle_polls = 0
       print(f"Running agent. Triggers: {triggers or ['idle_threshold']}")
-      result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures)
-      print("\n--- Agent Decision Narrative ---")
-      print(result["narrative"])
-      print("\n--- Tool Results ---")
-      print(result["tool_results"])
+      try:
+        result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures)
+        print("\n--- Agent Decision Narrative ---")
+        print(result["narrative"])
+        print("\n--- Tool Results ---")
+        print(result["tool_results"])
+      except Exception as exc:
+        # Keep the loop alive across restarts and transient errors.
+        print("Agent run failed:", exc, file=sys.stderr)
     else:
       idle_polls += 1
       print(f"No triggers. Idle polls: {idle_polls}/{cfg.trading.max_idle_polls}")
