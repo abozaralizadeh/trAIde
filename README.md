@@ -18,3 +18,59 @@ python -m src.main
 ```
 
 The agent runs in a loop: polls Kucoin, tracks price changes, performs a web search for fresh market context, and invokes the Azure OpenAI tool agent when triggers fire (initial run, price move threshold, or idle threshold). It then submits (or simulates) Kucoin market orders with a safety-first narrative. Keep PAPER_TRADING=true while testing.
+
+## Running under Gunicorn (service-style on Linux)
+Gunicorn can supervise the long-running loop via a small WSGI shim.
+```bash
+pip install -r requirements.txt  # includes gunicorn
+gunicorn -w 1 -b 0.0.0.0:8000 'src.wsgi:application'
+```
+- Keep `-w 1` to avoid multiple loops starting; bump only if you intentionally want multiple independent agents.
+- Hitting `http://localhost:8000/` returns a simple health message while the background trading thread runs.
+- Manage with systemd: use the above gunicorn command as the ExecStart in a unit file and set `Restart=always`.
+
+### systemd unit example
+Create `/etc/systemd/system/traide.service` (adjust paths and user):
+```
+[Unit]
+Description=trAIde Trading Agent (Gunicorn)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=traide
+Group=traide
+WorkingDirectory=/opt/traide
+Environment="PATH=/opt/traide/.venv/bin"
+ExecStart=/opt/traide/.venv/bin/gunicorn -w 1 -b 0.0.0.0:8000 'src.wsgi:application'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### Manage the service
+- Reload systemd after creating/updating the unit: `sudo systemctl daemon-reload`
+- Enable at boot: `sudo systemctl enable traide.service`
+- Start: `sudo systemctl start traide.service`
+- Stop: `sudo systemctl stop traide.service`
+- Restart: `sudo systemctl restart traide.service`
+- Status: `sudo systemctl status traide.service`
+
+### Logs
+- Stream logs: `journalctl -u traide.service -f`
+- View recent logs: `journalctl -u traide.service -n 200`
+
+### Quick setup script
+Run from the repo root (requires sudo to write the unit and control systemd):
+```bash
+sudo SERVICE_USER=$(whoami) ./setup_service.sh
+```
+Environment overrides:
+- `SERVICE_NAME` (default: `traide`)
+- `SERVICE_USER` / `SERVICE_GROUP` (default: `traide`)
+- `WORKDIR` (default: repo root)
+- `VENV_PATH` (default: `./.venv`)
+- `BIND_ADDR` (default: `0.0.0.0:8000`)
