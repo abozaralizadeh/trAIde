@@ -118,33 +118,19 @@ async def run_trading_agent(
       add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
-  if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
+  if cfg.langsmith.enabled and cfg.langsmith.tracing:
     try:
-      from langsmith import Client as LangsmithClient
-      from langsmith.wrappers import OpenAIAgentsTracingProcessor
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
 
-      ls_client = LangsmithClient(
-        api_key=cfg.langsmith.api_key,
-        api_url=cfg.langsmith.api_url or None,
-        project_name=cfg.langsmith.project or None,
-      )
       processor = OpenAIAgentsTracingProcessor(
-        client=ls_client,
         project_name=cfg.langsmith.project or None,
         tags=["trAIde", "openai-agents"],
         name="trAIde-agent",
       )
       set_trace_processors([processor])
-      print(
-        "LangSmith tracing enabled",
-        "project=" + str(cfg.langsmith.project or "default"),
-        "url=" + str(cfg.langsmith.api_url or "https://api.smith.langchain.com"),
-      )
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor")
     except Exception as exc:
       print("LangSmith tracing processor failed to initialize:", exc)
-  else:
-    if cfg.langsmith.enabled and cfg.langsmith.tracing and not cfg.langsmith.api_key:
-      print("LangSmith tracing requested but LANGSMITH_API_KEY is missing.")
 
   model = OpenAIResponsesModel(
     model=cfg.azure.deployment,
