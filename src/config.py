@@ -22,6 +22,14 @@ class AzureConfig:
 
 
 @dataclass
+class ApimConfig:
+  endpoint: str
+  deployment: str
+  api_version: str
+  subscription_key: Optional[str]
+
+
+@dataclass
 class KucoinConfig:
   api_key: str
   secret: str
@@ -50,9 +58,13 @@ class TradingConfig:
 @dataclass
 class AppConfig:
   azure: AzureConfig
+  apim: ApimConfig
   kucoin: KucoinConfig
   kucoin_futures: KucoinFuturesConfig
   trading: TradingConfig
+  tracing_enabled: bool
+  console_tracing: bool
+  openai_trace_api_key: Optional[str]
   memory_file: str
 
 
@@ -67,6 +79,12 @@ def load_config() -> AppConfig:
       deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.2"),
       api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-10-01-preview"),
       api_key=os.getenv("AZURE_OPENAI_API_KEY", ""),
+    ),
+    apim=ApimConfig(
+      endpoint=os.getenv("AZURE_APIM_OPENAI_ENDPOINT", ""),
+      deployment=os.getenv("AZURE_APIM_OPENAI_DEPLOYMENT", ""),
+      api_version=os.getenv("AZURE_APIM_OPENAI_API_VERSION", "2024-08-01-preview"),
+      subscription_key=os.getenv("AZURE_APIM_OPENAI_SUBSCRIPTION_KEY"),
     ),
     kucoin=KucoinConfig(
       api_key=os.getenv("KUCOIN_API_KEY", ""),
@@ -88,6 +106,9 @@ def load_config() -> AppConfig:
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
     ),
+    tracing_enabled=_as_bool(os.getenv("ENABLE_TRACING"), False),
+    console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),
+    openai_trace_api_key=os.getenv("OPENAI_TRACE_API_KEY"),
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
   )
 
@@ -103,6 +124,11 @@ def validate_config(cfg: AppConfig) -> None:
     missing.append("AZURE_OPENAI_DEPLOYMENT")
   if not cfg.azure.api_key:
     missing.append("AZURE_OPENAI_API_KEY")
+  if cfg.apim.subscription_key:
+    if not cfg.apim.endpoint:
+      missing.append("AZURE_APIM_OPENAI_ENDPOINT")
+    if not cfg.apim.deployment:
+      missing.append("AZURE_APIM_OPENAI_DEPLOYMENT")
   if not cfg.kucoin.api_key:
     missing.append("KUCOIN_API_KEY")
   if not cfg.kucoin.secret:

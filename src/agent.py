@@ -6,10 +6,20 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from agents import Agent, InputGuardrail, GuardrailFunctionOutput, Runner, OpenAIChatCompletionsModel, OpenAIResponsesModel
-from agents import set_default_openai_client
+from agents import (
+  Agent,
+  InputGuardrail,
+  GuardrailFunctionOutput,
+  Runner,
+  OpenAIChatCompletionsModel,
+  OpenAIResponsesModel,
+  add_trace_processor,
+  set_default_openai_client,
+  set_tracing_export_api_key,
+)
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
+from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
 from openai import AsyncAzureOpenAI
 
 from .config import AppConfig
@@ -36,6 +46,14 @@ class TradingSnapshot:
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
+  # Prefer APIM when subscription key is provided; else use direct Azure OpenAI.
+  if cfg.apim.subscription_key:
+    return AsyncAzureOpenAI(
+      api_key=cfg.apim.subscription_key,
+      api_version=cfg.apim.api_version,
+      azure_endpoint=cfg.apim.endpoint,
+      azure_deployment=cfg.apim.deployment,
+    )
   return AsyncAzureOpenAI(
     api_key=cfg.azure.api_key,
     api_version=cfg.azure.api_version,
@@ -66,7 +84,13 @@ async def run_trading_agent(
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   openai_client = _build_openai_client(cfg)
-  set_default_openai_client(openai_client, use_for_tracing=False)
+  set_default_openai_client(openai_client, use_for_tracing=cfg.tracing_enabled)
+
+  if cfg.tracing_enabled:
+    if cfg.console_tracing:
+      add_trace_processor(BatchTraceProcessor(exporter=ConsoleSpanExporter()))
+    if cfg.openai_trace_api_key:
+      set_tracing_export_api_key(cfg.openai_trace_api_key)
 
   model = OpenAIResponsesModel(
     model=cfg.azure.deployment,
