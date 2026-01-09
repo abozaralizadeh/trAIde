@@ -75,3 +75,8 @@ Environment overrides:
 - `WORKDIR` (default: repo root)
 - `VENV_PATH` (default: `./.venv`)
 - `BIND_ADDR` (default: `0.0.0.0:8000`)
+
+Logs (stdout/stderr captured by gunicorn):
+- Live: `journalctl -u traide.service -f`
+- Tail last 200 lines: `journalctl -u traide.service -n 200`
+- Health check (should return `trAIde trading loop running`): `curl -s http://localhost:8000/`

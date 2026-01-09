@@ -41,7 +41,8 @@ User=${SERVICE_USER}
 Group=${SERVICE_GROUP}
 WorkingDirectory=${WORKDIR}
 Environment="PATH=${VENV_PATH}/bin"
-ExecStart=${GUNICORN_BIN} -w 1 -b ${BIND_ADDR} 'src.wsgi:application'
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=${GUNICORN_BIN} --capture-output --log-level info -w 1 -b ${BIND_ADDR} 'src.wsgi:application'
 Restart=always
 RestartSec=5
 
