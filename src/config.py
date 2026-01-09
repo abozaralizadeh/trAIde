@@ -62,12 +62,22 @@ class TradingConfig:
 
 
 @dataclass
+class LangsmithConfig:
+  enabled: bool
+  api_key: Optional[str]
+  project: Optional[str]
+  api_url: Optional[str]
+  tracing: bool
+
+
+@dataclass
 class AppConfig:
   azure: AzureConfig
   apim: ApimConfig
   kucoin: KucoinConfig
   kucoin_futures: KucoinFuturesConfig
   trading: TradingConfig
+  langsmith: LangsmithConfig
   tracing_enabled: bool
   console_tracing: bool
   openai_trace_api_key: Optional[str]
@@ -118,6 +128,13 @@ def load_config() -> AppConfig:
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
       max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3")),
       max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
+    ),
+    langsmith=LangsmithConfig(
+      enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),
+      api_key=os.getenv("LANGSMITH_API_KEY"),
+      project=os.getenv("LANGSMITH_PROJECT"),
+      api_url=os.getenv("LANGSMITH_API_URL"),
+      tracing=_as_bool(os.getenv("LANGSMITH_TRACING"), False),
     ),
     tracing_enabled=_as_bool(os.getenv("ENABLE_TRACING"), False),
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),

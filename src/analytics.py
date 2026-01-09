@@ -27,6 +27,8 @@ def candles_to_dataframe(candles: Sequence[Sequence[Any]]) -> pd.DataFrame:
     candles,
     columns=["time", "open", "close", "high", "low", "volume", "turnover"],
   )
+  # Normalize numeric columns before timestamp conversion to avoid pandas future warnings.
+  df["time"] = pd.to_numeric(df["time"], errors="coerce")
   df["timestamp"] = pd.to_datetime(df["time"], unit="s", errors="coerce")
   for col in ["open", "close", "high", "low", "volume", "turnover"]:
     df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -58,7 +60,9 @@ def compute_indicators(df: pd.DataFrame, settings: IndicatorSettings | None = No
   gain = delta.clip(lower=0)
   loss = (-delta).clip(lower=0)
   avg_gain = gain.ewm(alpha=1 / settings.rsi_length, adjust=False).mean()
-  avg_loss = loss.ewm(alpha=1 / settings.rsi_length, adjust=False).mean().replace(0, pd.NA).ffill()
+  avg_loss = loss.ewm(alpha=1 / settings.rsi_length, adjust=False).mean()
+  # Avoid silent downcasting warning by using mask instead of replace -> ffill.
+  avg_loss = avg_loss.mask(avg_loss == 0).ffill()
   rs = avg_gain / avg_loss
   out["rsi"] = 100 - (100 / (1 + rs))
 

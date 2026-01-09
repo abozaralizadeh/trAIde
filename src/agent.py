@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import requests
+from datetime import datetime
 
 from agents import (
   Agent,
@@ -16,6 +17,7 @@ from agents import (
   OpenAIChatCompletionsModel,
   OpenAIResponsesModel,
   add_trace_processor,
+  set_trace_processors,
   set_default_openai_client,
   set_tracing_export_api_key,
 )
@@ -116,6 +118,13 @@ async def run_trading_agent(
       add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
+  if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
+    try:
+      from langsmith.wrappers import OpenAIAgentsTracingProcessor
+
+      set_trace_processors([OpenAIAgentsTracingProcessor()])
+    except Exception as exc:
+      print("LangSmith tracing processor failed to initialize:", exc)
 
   model = OpenAIResponsesModel(
     model=cfg.azure.deployment,
@@ -130,6 +139,30 @@ async def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
+
+  def _log_langsmith_run(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
+    if not cfg.langsmith.enabled or not cfg.langsmith.api_key:
+      return
+    try:
+      from langsmith import Client as LangsmithClient
+
+      client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+        project_name=cfg.langsmith.project or None,
+      )
+      now = datetime.utcnow()
+      client.create_run(
+        name="trAIde-agent",
+        run_type="chain",
+        inputs=inputs,
+        outputs=outputs,
+        start_time=now,
+        end_time=now,
+        tags=["trAIde"],
+      )
+    except Exception as exc:
+      print("LangSmith logging failed:", exc)
 
   @function_tool
   async def place_market_order(
@@ -752,5 +785,13 @@ async def run_trading_agent(
     summary = _summarize(out)
     if summary:
       decisions.append(summary)
+
+  try:
+    _log_langsmith_run(
+      inputs={"snapshot": json.loads(input_payload)},
+      outputs={"narrative": narrative, "decisions": decisions, "tool_results": tool_outputs},
+    )
+  except Exception:
+    pass
 
   return {"narrative": narrative, "tool_results": tool_outputs, "decisions": decisions}
