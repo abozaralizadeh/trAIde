@@ -5,3 +5,4 @@ requests>=2.32.3
 gunicorn>=22.0.0
 pandas>=2.2.3
 langsmith[openai-agents]>=0.1.37
+langsmith
