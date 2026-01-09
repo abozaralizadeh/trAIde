@@ -411,4 +411,32 @@ async def run_trading_agent(
     if isinstance(item, ToolCallOutputItem):
       tool_outputs.append(item.output)
 
-  return {"narrative": narrative, "tool_results": tool_outputs}
+  decisions: list[str] = []
+
+  def _summarize(output: Any) -> str | None:
+    if not isinstance(output, dict):
+      return None
+    if output.get("skipped"):
+      return f"decline: {output.get('reason','unspecified')} (conf={output.get('confidence')})"
+    if output.get("paper") and output.get("orderRequest"):
+      req = output.get("orderRequest", {})
+      return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')}"
+    if output.get("orderId") or output.get("orderRequest"):
+      side = output.get("side") or output.get("orderRequest", {}).get("side")
+      sym = output.get("symbol") or output.get("orderRequest", {}).get("symbol")
+      return f"live order: {side} {sym} (orderId={output.get('orderId')})"
+    if output.get("transfer"):
+      t = output.get("transfer", {})
+      return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"
+    if output.get("rejected"):
+      return f"rejected: {output.get('reason','unspecified')}"
+    if output.get("error"):
+      return f"error: {output.get('error')}"
+    return None
+
+  for out in tool_outputs:
+    summary = _summarize(out)
+    if summary:
+      decisions.append(summary)
+
+  return {"narrative": narrative, "tool_results": tool_outputs, "decisions": decisions}

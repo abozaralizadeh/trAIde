@@ -78,8 +78,10 @@ async def trading_loop() -> None:
         result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures)
         print("\n--- Agent Decision Narrative ---")
         print(result["narrative"])
-        print("\n--- Tool Results ---")
-        print(result["tool_results"])
+        if result.get("decisions"):
+          print("\n--- Decisions ---")
+          for d in result["decisions"]:
+            print("-", d)
       except Exception as exc:
         # Keep the loop alive across restarts and transient errors.
         print("Agent run failed:", exc, file=sys.stderr)
