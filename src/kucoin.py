@@ -179,6 +179,30 @@ class KucoinClient:
       query={"symbol": symbol},
     )
 
+  def transfer_funds(
+    self,
+    *,
+    currency: str,
+    amount: float,
+    from_account: Literal["trade", "contract"],
+    to_account: Literal["trade", "contract"],
+    client_oid: Optional[str] = None,
+  ) -> Dict[str, Any]:
+    """Transfer funds between spot (trade) and futures (contract) accounts."""
+    body = {
+      "clientOid": client_oid or str(int(time.time() * 1000)),
+      "currency": currency,
+      "from": from_account,
+      "to": to_account,
+      "amount": f"{amount}",
+    }
+    return self._request(
+      "POST",
+      "/api/v1/accounts/inner-transfer",
+      auth=True,
+      body=body,
+    )
+
   def place_order(self, order: KucoinOrderRequest) -> KucoinOrderResponse:
     payload = {k: v for k, v in order.__dict__.items() if v is not None}
     data = self._request(

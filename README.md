@@ -11,6 +11,7 @@ Automatic AI Agent crypto trader powered by Azure OpenAI (gpt-5.2) and Kucoin AP
 - Futures uses the same KuCoin API keys and base URL; toggle via `KUCOIN_FUTURES_ENABLED` (default true).
 - Azure OpenAI vs APIM: defaults to direct Azure OpenAI. If `AZURE_APIM_OPENAI_SUBSCRIPTION_KEY` is set, the client uses APIM endpoint/version/deployment instead (subscription key auth).
 - Tracing: set `ENABLE_TRACING=true` to enable Agents SDK spans. Optional: `ENABLE_CONSOLE_TRACING=true` for console span export; `OPENAI_TRACE_API_KEY` to export to the OpenAI traces endpoint; and OTLP envs (`OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_EXPORTER_OTLP_HEADERS`) for Azure Monitor/APIM ingestion per the tutorial.
+- Transfers: Flex transfers are supported via the agent tool to move funds between spot (trade) and futures (contract) when enabled.
 
 ## Install & Run
 ```bash

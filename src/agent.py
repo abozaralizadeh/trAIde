@@ -243,6 +243,56 @@ async def run_trading_agent(
     return kucoin_futures.place_order(order_req).__dict__
 
   @function_tool
+  async def transfer_funds(
+    direction: str,
+    currency: str = "USDT",
+    amount: float = 0.0,
+  ) -> Dict[str, Any]:
+    """Transfer funds between spot (trade) and futures (contract). Direction: spot_to_futures or futures_to_spot."""
+    dir_norm = (direction or "").lower()
+    if dir_norm not in {"spot_to_futures", "futures_to_spot"}:
+      return {"error": "Invalid direction", "allowed": ["spot_to_futures", "futures_to_spot"]}
+    try:
+      amt = float(amount or 0)
+    except (TypeError, ValueError):
+      return {"error": "Invalid amount"}
+    if amt <= 0:
+      return {"error": "Amount must be positive"}
+
+    # Pull fresh balances to avoid stale state.
+    fresh_balances = kucoin.get_trade_accounts()
+    balance_map: Dict[str, float] = {}
+    for bal in fresh_balances:
+      balance_map[bal.currency] = balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
+
+    from_acct = "trade" if dir_norm == "spot_to_futures" else "contract"
+    to_acct = "contract" if dir_norm == "spot_to_futures" else "trade"
+    available = balance_map.get(currency.upper(), 0.0)
+    if amt > available:
+      return {"rejected": True, "reason": "Insufficient balance", "available": available}
+
+    if snapshot.paper_trading:
+      return {
+        "paper": True,
+        "direction": dir_norm,
+        "currency": currency.upper(),
+        "amount": amt,
+        "from": from_acct,
+        "to": to_acct,
+      }
+
+    try:
+      res = kucoin.transfer_funds(
+        currency=currency.upper(),
+        amount=amt,
+        from_account=from_acct,  # type: ignore[arg-type]
+        to_account=to_acct,  # type: ignore[arg-type]
+      )
+      return {"transfer": res, "direction": dir_norm, "currency": currency.upper(), "amount": amt}
+    except Exception as exc:
+      return {"error": str(exc), "direction": dir_norm, "currency": currency.upper(), "amount": amt}
+
+  @function_tool
   async def save_trade_plan(title: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Persist a trading plan (title, summary, actions) for recall."""
     return memory.save_plan(title=title, summary=summary, actions=actions)
@@ -288,6 +338,7 @@ async def run_trading_agent(
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
+    "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
@@ -307,6 +358,7 @@ async def run_trading_agent(
       WebSearchTool(search_context_size="high"),
       fetch_recent_candles,
       fetch_orderbook,
+      transfer_funds,
       place_futures_market_order,
       place_market_order,
       save_trade_plan,
