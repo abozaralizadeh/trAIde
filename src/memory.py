@@ -10,9 +10,10 @@ from typing import Any, Dict, Optional
 class MemoryStore:
   """Lightweight JSON-backed store for agent plans/notes."""
 
-  def __init__(self, path: str) -> None:
+  def __init__(self, path: str, retention_days: int = 7) -> None:
     self.path = Path(path)
     self._lock = threading.Lock()
+    self.retention_days = retention_days
     # Sanitize on init.
     self._read()
 
@@ -47,17 +48,26 @@ class MemoryStore:
           for c in data.get("coins", [])
           if isinstance(c, dict) and c.get("symbol")
         ]
-        return data
+        return self._prune(data)
     except Exception:
       return {"plans": [], "triggers": [], "coins": []}
     return {"plans": [], "triggers": [], "coins": []}
+
+  def _prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop entries older than retention_days."""
+    now = int(time.time())
+    cutoff = now - self.retention_days * 86400
+    data["plans"] = [p for p in data.get("plans", []) if (p.get("ts") or now) >= cutoff]
+    data["triggers"] = [t for t in data.get("triggers", []) if (t.get("ts") or now) >= cutoff]
+    data["coins"] = [c for c in data.get("coins", []) if (c.get("ts") or now) >= cutoff]
+    return data
 
   def _write(self, data: Dict[str, Any]) -> None:
     self.path.write_text(json.dumps(data, indent=2))
 
   def save_plan(self, title: str, summary: str, actions: list[str]) -> Dict[str, Any]:
     with self._lock:
-      data = self._read()
+      data = self._prune(self._read())
       entry = {
         "title": title,
         "summary": summary,
@@ -71,7 +81,7 @@ class MemoryStore:
 
   def latest_plan(self) -> Optional[Dict[str, Any]]:
     with self._lock:
-      data = self._read()
+      data = self._prune(self._read())
       plans = data.get("plans") or []
       return plans[-1] if plans else None
 
@@ -106,16 +116,22 @@ class MemoryStore:
 
   def latest_triggers(self) -> list[Dict[str, Any]]:
     with self._lock:
-      data = self._read()
+      data = self._prune(self._read())
       return data.get("triggers", []) or []
 
   def get_coins(self, default: list[str] | None = None) -> list[str]:
     with self._lock:
-      data = self._read()
+      data = self._prune(self._read())
       coins = data.get("coins", []) or []
       if coins:
         return [c["symbol"] for c in coins if c.get("status", "active") == "active"]
       return default or []
+
+  def has_coins(self) -> bool:
+    with self._lock:
+      data = self._prune(self._read())
+      coins = data.get("coins", []) or []
+      return bool(coins)
 
   def set_coins(self, coins: list[str], reason: str = "update") -> list[Dict[str, Any]]:
     with self._lock:
@@ -130,7 +146,7 @@ class MemoryStore:
 
   def add_coin(self, symbol: str, reason: str) -> Dict[str, Any]:
     with self._lock:
-      data = self._read()
+      data = self._prune(self._read())
       coins = data.get("coins", [])
       now = int(time.time())
       symbol_up = symbol.upper()
@@ -143,7 +159,7 @@ class MemoryStore:
 
   def remove_coin(self, symbol: str, reason: str, exit_plan: str) -> Dict[str, Any]:
     with self._lock:
-      data = self._read()
+      data = self._prune(self._read())
       coins = data.get("coins", [])
       symbol_up = symbol.upper()
       now = int(time.time())

@@ -11,13 +11,18 @@ from .memory import MemoryStore
 
 
 def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
-  if cfg.trading.flexible_coins_enabled:
-    coins = memory.get_coins(default=cfg.trading.coins)
-    if not coins:
-      memory.set_coins(cfg.trading.coins, reason="seed-from-config")
-      return cfg.trading.coins
-    return coins
-  return cfg.trading.coins
+  if not cfg.trading.flexible_coins_enabled:
+    return cfg.trading.coins
+
+  if not memory.has_coins():
+    memory.set_coins(cfg.trading.coins, reason="seed-from-config")
+    return cfg.trading.coins
+
+  coins = memory.get_coins(default=cfg.trading.coins)
+  if not coins:
+    memory.set_coins(cfg.trading.coins, reason="seed-from-config")
+    return cfg.trading.coins
+  return coins
 
 
 def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSnapshot:
@@ -46,7 +51,7 @@ async def trading_loop() -> None:
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
   idle_polls = 0
-  memory = MemoryStore(cfg.memory_file)
+  memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
 
   print("Starting trading loop...")
   while True:

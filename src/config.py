@@ -67,6 +67,7 @@ class AppConfig:
   console_tracing: bool
   openai_trace_api_key: Optional[str]
   memory_file: str
+  retention_days: int
 
 
 def load_config() -> AppConfig:
@@ -112,6 +113,7 @@ def load_config() -> AppConfig:
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),
     openai_trace_api_key=os.getenv("OPENAI_TRACE_API_KEY"),
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
+    retention_days=int(os.getenv("RETENTION_DAYS", "7")),
   )
 
   validate_config(config)
