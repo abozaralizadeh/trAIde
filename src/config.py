@@ -49,11 +49,16 @@ class TradingConfig:
   flexible_coins_enabled: bool
   paper_trading: bool
   max_position_usd: float
+  risk_per_trade_pct: float
   min_confidence: float
+  sentiment_filter_enabled: bool
+  sentiment_min_score: float
   poll_interval_sec: float
   price_change_trigger_pct: float
   max_idle_polls: int
   max_leverage: float
+  max_trades_per_symbol_per_day: int
+  max_daily_drawdown_pct: float
 
 
 @dataclass
@@ -103,11 +108,16 @@ def load_config() -> AppConfig:
       flexible_coins_enabled=_as_bool(os.getenv("FLEXIBLE_COINS_ENABLED"), True),
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
       max_position_usd=float(os.getenv("MAX_POSITION_USD", "100")),
+      risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.01")),
       min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.6")),
+      sentiment_filter_enabled=_as_bool(os.getenv("SENTIMENT_FILTER_ENABLED"), False),
+      sentiment_min_score=float(os.getenv("SENTIMENT_MIN_SCORE", "0.55")),
       poll_interval_sec=float(os.getenv("POLL_INTERVAL_SEC", "30")),
       price_change_trigger_pct=float(os.getenv("PRICE_CHANGE_TRIGGER_PCT", "0.5")),
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
+      max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3")),
+      max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
     ),
     tracing_enabled=_as_bool(os.getenv("ENABLE_TRACING"), False),
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),

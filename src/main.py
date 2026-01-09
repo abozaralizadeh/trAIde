@@ -62,6 +62,21 @@ async def trading_loop() -> None:
       await asyncio.sleep(cfg.trading.poll_interval_sec)
       continue
 
+    usdt_balance = 0.0
+    for acct in snapshot.balances:
+      if acct.currency == "USDT":
+        try:
+          usdt_balance += float(acct.available or 0)
+        except Exception:
+          continue
+
+    limits = memory.update_limits(usdt_balance, cfg.trading.max_daily_drawdown_pct)
+    if limits.get("kill"):
+      reason = limits.get("reason") or "Kill switch active (drawdown limit reached)."
+      print(reason)
+      await asyncio.sleep(cfg.trading.poll_interval_sec)
+      continue
+
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
       price = float(ticker.price)

@@ -6,6 +6,8 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
+import requests
+
 from agents import (
   Agent,
   InputGuardrail,
@@ -22,6 +24,13 @@ from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
 from openai import AsyncAzureOpenAI
 
+from .analytics import (
+  INTERVAL_SECONDS,
+  candles_to_dataframe,
+  compute_indicators,
+  summarize_interval,
+  summarize_multi_timeframe,
+)
 from .config import AppConfig
 from .kucoin import (
   KucoinAccount,
@@ -123,7 +132,13 @@ async def run_trading_agent(
   memory = MemoryStore(cfg.memory_file)
 
   @function_tool
-  async def place_market_order(symbol: str, side: str, funds: float) -> Dict[str, Any]:
+  async def place_market_order(
+    symbol: str,
+    side: str,
+    funds: float,
+    confidence: float | None = None,
+    rationale: str | None = None,
+  ) -> Dict[str, Any]:
     """Place a spot market order on Kucoin using quote funds in USDT. Respects maxPositionUsd and paper_trading flag."""
     try:
       funds_val = float(funds or 0)
@@ -133,6 +148,26 @@ async def run_trading_agent(
       return {"error": "Invalid funds or symbol"}
     if funds_val > snapshot.max_position_usd:
       return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
+    trades_today = memory.trades_today(symbol)
+    if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
+      return {
+        "rejected": True,
+        "reason": "Daily trade cap reached",
+        "tradesToday": trades_today,
+        "limit": cfg.trading.max_trades_per_symbol_per_day,
+      }
+    if cfg.trading.sentiment_filter_enabled:
+      latest_sent = memory.latest_sentiment(symbol)
+      day_key = int(time.time() // 86400)
+      if not latest_sent or latest_sent.get("day") != day_key:
+        return {"rejected": True, "reason": "Sentiment missing for today", "minScore": cfg.trading.sentiment_min_score}
+      if latest_sent.get("score", 0) < cfg.trading.sentiment_min_score:
+        return {
+          "rejected": True,
+          "reason": "Sentiment below threshold",
+          "score": latest_sent.get("score"),
+          "minScore": cfg.trading.sentiment_min_score,
+        }
     # Refresh balances to reduce stale balance failures.
     fresh_balances = kucoin.get_trade_accounts()
     fresh_by_currency: Dict[str, float] = {}
@@ -153,15 +188,39 @@ async def run_trading_agent(
       clientOid=str(uuid.uuid4()),
     )
     if snapshot.paper_trading:
-      return {"paper": True, "orderRequest": order_req.__dict__}
+      record = memory.record_trade(symbol, side, funds_val, paper=True)
+      decision = None
+      if confidence is not None:
+        decision = memory.log_decision(
+          symbol,
+          f"spot_{side}",
+          float(confidence),
+          rationale or "paper trade",
+          pnl=None,
+          paper=True,
+        )
+      return {"paper": True, "orderRequest": order_req.__dict__, "tradeRecord": record, "decisionLog": decision}
     try:
-      return kucoin.place_order(order_req).__dict__
+      res = kucoin.place_order(order_req).__dict__
+      record = memory.record_trade(symbol, side, funds_val, paper=False)
+      res["tradeRecord"] = record
+      if confidence is not None:
+        res["decisionLog"] = memory.log_decision(
+          symbol,
+          f"spot_{side}",
+          float(confidence),
+          rationale or "live trade",
+          pnl=None,
+          paper=False,
+        )
+      return res
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__}
 
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
     """Decline trading due to low confidence or risk."""
+    memory.log_decision("ALL", "decline", confidence, reason, paper=True)
     return {"skipped": True, "reason": reason, "confidence": confidence}
 
   @function_tool
@@ -215,12 +274,137 @@ async def run_trading_agent(
     return {"symbol": symbol, "depth": depth_safe, "orderbook": ob}
 
   @function_tool
+  async def analyze_market_context(
+    symbol: str,
+    fast_interval: str = "15min",
+    slow_interval: str = "1hour",
+    lookback_minutes: int = 360,
+  ) -> Dict[str, Any]:
+    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP across two intervals and summarize bias."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+
+    interval_order: list[str] = []
+    for iv in [fast_interval, slow_interval]:
+      if iv not in INTERVAL_SECONDS:
+        return {"error": "Invalid interval", "allowed": list(INTERVAL_SECONDS.keys())}
+      if iv not in interval_order:
+        interval_order.append(iv)
+
+    snapshots: list[Dict[str, Any]] = []
+    end_at = int(time.time())
+    for iv in interval_order:
+      interval_sec = INTERVAL_SECONDS[iv]
+      lookback_min = max(120, min(int(lookback_minutes or 0), 720))
+      points = min(500, max(50, int(lookback_min * 60 / interval_sec)))
+      start_at = end_at - points * interval_sec
+      candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
+      if not candles:
+        return {"error": "No candles returned", "interval": iv}
+      try:
+        df = candles_to_dataframe(candles)
+        snapshot = summarize_interval(df, iv)
+        snapshot["rows"] = len(df)
+        snapshots.append(snapshot)
+      except Exception as exc:
+        return {"error": str(exc), "interval": iv}
+
+    summary = summarize_multi_timeframe(snapshots)
+    return {"symbol": symbol, "snapshots": snapshots, "summary": summary}
+
+  @function_tool
+  async def plan_spot_position(
+    symbol: str,
+    risk_pct: float | None = None,
+    atr_multiple: float = 1.5,
+    target_rr: float = 2.0,
+    entry_price: float | None = None,
+  ) -> Dict[str, Any]:
+    """Size a spot trade using risk-per-trade % with ATR-based stop/target."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+
+    balance_usdt = balances_by_currency.get("USDT", 0.0)
+    if balance_usdt <= 0:
+      return {"error": "No USDT balance available"}
+    risk_fraction = risk_pct if risk_pct is not None else cfg.trading.risk_per_trade_pct
+    risk_fraction = max(0.0, float(risk_fraction))
+    risk_dollars = balance_usdt * risk_fraction
+    if risk_dollars <= 0:
+      return {"error": "Risk dollars computed to zero", "riskPct": risk_fraction}
+
+    spendable = max(0.0, balance_usdt * 0.90)
+    price = float(entry_price) if entry_price else float(snapshot.tickers[symbol].price)
+
+    lookback_min = 180
+    end_at = int(time.time())
+    interval = "15min"
+    interval_sec = INTERVAL_SECONDS[interval]
+    points = min(500, max(50, int(lookback_min * 60 / interval_sec)))
+    start_at = end_at - points * interval_sec
+    candles = kucoin.get_candles(symbol, interval=interval, start_at=start_at, end_at=end_at)
+    if not candles:
+      return {"error": "No candles returned for ATR sizing", "interval": interval}
+    df = candles_to_dataframe(candles)
+    enriched = compute_indicators(df)
+    atr_raw = enriched["atr"].iloc[-1]
+    try:
+      atr_val = float(atr_raw)
+    except Exception:
+      atr_val = None
+    if atr_val != atr_val:  # NaN check
+      atr_val = None
+    stop_distance = atr_val * atr_multiple if atr_val else price * 0.005  # fallback 0.5%
+    if stop_distance <= 0:
+      return {"error": "Stop distance invalid", "atr": atr_val}
+
+    raw_size = risk_dollars / stop_distance
+    notional_unclipped = raw_size * price
+    cap_notional = min(snapshot.max_position_usd, spendable)
+    notional = min(notional_unclipped, cap_notional)
+    size = notional / price if price else 0
+    stop_price = max(0.0, price - stop_distance)
+    target_price = price + stop_distance * target_rr
+
+    trades_today = memory.trades_today(symbol)
+
+    warnings: list[str] = []
+    if atr_val and atr_val / price * 100 >= 5:
+      warnings.append("Volatility elevated (ATR% >=5); consider smaller size or skip.")
+    if notional_unclipped > cap_notional:
+      warnings.append("Size clipped by maxPositionUsd or 10% reserve.")
+    if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
+      warnings.append("Trade cap reached; do not enter without manual override.")
+
+    return {
+      "symbol": symbol,
+      "price": price,
+      "riskPct": risk_fraction,
+      "riskDollars": risk_dollars,
+      "spendableAfterReserve": spendable,
+      "atr": atr_val,
+      "atrMultiple": atr_multiple,
+      "stopDistance": stop_distance,
+      "stopPrice": stop_price,
+      "targetPrice": target_price,
+      "rr": target_rr,
+      "size": size,
+      "notionalUsd": notional,
+      "rawNotionalUsd": notional_unclipped,
+      "tradesToday": trades_today,
+      "maxTradesPerDay": cfg.trading.max_trades_per_symbol_per_day,
+      "warnings": warnings,
+    }
+
+  @function_tool
   async def place_futures_market_order(
     symbol: str,
     side: str,
     notional_usd: float,
     leverage: float = 1.0,
     size_override: float | None = None,
+    confidence: float | None = None,
+    rationale: str | None = None,
   ) -> Dict[str, Any]:
     """Place a linear futures market order using notional and leverage. Falls back to paper if futures disabled."""
     if symbol not in allowed_symbols:
@@ -238,6 +422,26 @@ async def run_trading_agent(
       return {"rejected": True, "reason": "Exceeds max_leverage", "max_leverage": snapshot.max_leverage}
     if notional > snapshot.max_position_usd * snapshot.max_leverage:
       return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd * snapshot.max_leverage}
+    trades_today = memory.trades_today(symbol)
+    if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
+      return {
+        "rejected": True,
+        "reason": "Daily trade cap reached",
+        "tradesToday": trades_today,
+        "limit": cfg.trading.max_trades_per_symbol_per_day,
+      }
+    if cfg.trading.sentiment_filter_enabled:
+      latest_sent = memory.latest_sentiment(symbol)
+      day_key = int(time.time() // 86400)
+      if not latest_sent or latest_sent.get("day") != day_key:
+        return {"rejected": True, "reason": "Sentiment missing for today", "minScore": cfg.trading.sentiment_min_score}
+      if latest_sent.get("score", 0) < cfg.trading.sentiment_min_score:
+        return {
+          "rejected": True,
+          "reason": "Sentiment below threshold",
+          "score": latest_sent.get("score"),
+          "minScore": cfg.trading.sentiment_min_score,
+        }
 
     price = float(snapshot.tickers[symbol].price)
     est_size = notional / price if price else 0
@@ -255,8 +459,31 @@ async def run_trading_agent(
     )
 
     if snapshot.paper_trading:
-      return {"paper": True, "orderRequest": order_req.__dict__}
-    return kucoin_futures.place_order(order_req).__dict__
+      record = memory.record_trade(symbol, side, notional, paper=True)
+      decision = None
+      if confidence is not None:
+        decision = memory.log_decision(
+          symbol,
+          f"futures_{side}",
+          float(confidence),
+          rationale or "paper trade",
+          pnl=None,
+          paper=True,
+        )
+      return {"paper": True, "orderRequest": order_req.__dict__, "tradeRecord": record, "decisionLog": decision}
+    res = kucoin_futures.place_order(order_req).__dict__
+    record = memory.record_trade(symbol, side, notional, paper=False)
+    res["tradeRecord"] = record
+    if confidence is not None:
+      res["decisionLog"] = memory.log_decision(
+        symbol,
+        f"futures_{side}",
+        float(confidence),
+        rationale or "live trade",
+        pnl=None,
+        paper=False,
+      )
+    return res
 
   @function_tool
   async def transfer_funds(
@@ -370,11 +597,76 @@ async def run_trading_agent(
     entry = memory.remove_coin(symbol, reason, exit_plan)
     return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
+  @function_tool
+  async def log_sentiment(symbol: str, score: float, rationale: str, source: str = "") -> Dict[str, Any]:
+    """Store a sentiment score (0-1) with rationale and source for gating trades."""
+    try:
+      score_val = float(score)
+    except (TypeError, ValueError):
+      return {"error": "Invalid score"}
+    if not symbol:
+      return {"error": "symbol required"}
+    entry = memory.log_sentiment(symbol, score_val, rationale, source)
+    return {"sentiment": entry}
+
+  @function_tool
+  async def log_decision(
+    symbol: str,
+    action: str,
+    confidence: float,
+    reason: str,
+    pnl: float | None = None,
+    paper: bool = False,
+  ) -> Dict[str, Any]:
+    """Record decision/confidence for calibration."""
+    if not symbol:
+      return {"error": "symbol required"}
+    try:
+      conf = float(confidence)
+    except (TypeError, ValueError):
+      return {"error": "Invalid confidence"}
+    entry = memory.log_decision(symbol, action, conf, reason, pnl=pnl, paper=paper)
+    return {"decision": entry}
+
+  @function_tool
+  async def fetch_kucoin_news(limit: int = 10) -> Dict[str, Any]:
+    """Fetch latest Kucoin news RSS (lang=en). Returns list of {title, link, pubDate}."""
+    url = "https://www.kucoin.com/rss/news?lang=en"
+    try:
+      resp = requests.get(url, timeout=10)
+      resp.raise_for_status()
+    except Exception as exc:
+      return {"error": f"fetch_failed: {exc}"}
+
+    try:
+      import xml.etree.ElementTree as ET
+
+      root = ET.fromstring(resp.content)
+      items: List[Dict[str, Any]] = []
+      for item in root.findall(".//item")[: max(1, min(int(limit or 0), 20))]:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        date_el = item.find("pubDate")
+        items.append(
+          {
+            "title": (title_el.text or "").strip() if title_el is not None else "",
+            "link": (link_el.text or "").strip() if link_el is not None else "",
+            "pubDate": (date_el.text or "").strip() if date_el is not None else "",
+          }
+        )
+      return {"items": items}
+    except Exception as exc:
+      return {"error": f"parse_failed: {exc}"}
+
   instructions = (
     "You are a disciplined quantitative crypto trader.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
     "- First, run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
+    "- Use analyze_market_context (15m + 1h default) to get EMA/RSI/MACD/ATR/Bollinger/VWAP; only trade when both intervals align and ATR% is reasonable (<5% if conviction is low).\n"
+    "- If analyze_market_context shows mixed bias or elevated volatility without a high-conviction catalyst, prefer decline_trade.\n"
+    "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
+    "- Before placing a spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if size is clipped or volatility is high.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
@@ -384,9 +676,12 @@ async def run_trading_agent(
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
     f"- Consider only the provided symbols and market snapshot.\n"
     f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
+    f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades.\n"
     f"- Futures leverage must stay <= {snapshot.max_leverage}x. Keep sizing realistic; if unsure, prefer spot.\n"
     f"- Only place a trade if your confidence >= {snapshot.min_confidence}; otherwise decline.\n"
+    f"- Sentiment filter enabled: {cfg.trading.sentiment_filter_enabled}. Min score: {cfg.trading.sentiment_min_score}.\n"
     "- Keep at least 10% of USDT balance untouched for safety.\n"
+    "- Log every decision with confidence using log_decision for calibration; include reason and whether paper/live.\n"
     "- Be explicit about your reasoning in the final narrative.\n"
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, just simulate orders via the tool."
   )
@@ -398,6 +693,8 @@ async def run_trading_agent(
       WebSearchTool(search_context_size="high"),
       fetch_recent_candles,
       fetch_orderbook,
+      analyze_market_context,
+      plan_spot_position,
       transfer_funds,
       place_futures_market_order,
       place_market_order,
@@ -410,6 +707,9 @@ async def run_trading_agent(
       remove_coin,
       clear_plans,
       decline_trade,
+      fetch_kucoin_news,
+      log_sentiment,
+      log_decision,
     ],
     model=model,
   )
