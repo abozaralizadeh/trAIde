@@ -20,6 +20,10 @@ VENV_PATH="${VENV_PATH:-$PROJECT_ROOT/.venv}"
 GUNICORN_BIN="${GUNICORN_BIN:-$VENV_PATH/bin/gunicorn}"
 BIND_ADDR="${BIND_ADDR:-0.0.0.0:8000}"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+SERVICE_EXISTS=false
+if systemctl list-unit-files | grep -q "^${SERVICE_NAME}.service"; then
+  SERVICE_EXISTS=true
+fi
 
 if [[ ! -x "$GUNICORN_BIN" ]]; then
   echo "Warning: $GUNICORN_BIN not found or not executable. Install deps first: python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt" >&2
@@ -47,7 +51,17 @@ EOF
 
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
-systemctl restart "${SERVICE_NAME}.service"
+
+if systemctl is-active --quiet "${SERVICE_NAME}.service"; then
+  systemctl restart "${SERVICE_NAME}.service"
+else
+  systemctl start "${SERVICE_NAME}.service"
+fi
 
 echo "Service ${SERVICE_NAME}.service installed and started."
+if $SERVICE_EXISTS; then
+  echo "Service existed; unit updated and restarted to pick up latest code."
+else
+  echo "Service created and started."
+fi
 echo "Logs: journalctl -u ${SERVICE_NAME}.service -f"
