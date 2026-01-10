@@ -561,7 +561,13 @@ async def run_trading_agent(
           pnl=None,
           paper=True,
         )
-      return {"paper": True, "orderRequest": order_req.__dict__, "tradeRecord": record, "decisionLog": decision}
+      return {
+        "paper": True,
+        "orderRequest": order_req.__dict__,
+        "tradeRecord": record,
+        "decisionLog": decision,
+        "rationale": rationale,
+      }
     res = kucoin_futures.place_order(order_req).__dict__
     record = memory.record_trade(symbol, side, notional, paper=False)
     res["tradeRecord"] = record
@@ -574,6 +580,7 @@ async def run_trading_agent(
         pnl=None,
         paper=False,
       )
+    res["rationale"] = rationale
     return res
 
   @function_tool
@@ -832,6 +839,7 @@ async def run_trading_agent(
       log_decision,
     ],
     model=model,
+    tracing=True,
   )
 
   trading_agent = Agent(
@@ -896,11 +904,15 @@ async def run_trading_agent(
       return f"decline: {output.get('reason','unspecified')} (conf={output.get('confidence')})"
     if output.get("paper") and output.get("orderRequest"):
       req = output.get("orderRequest", {})
-      return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')} (pnl=n/a)"
+      rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
+      suffix = f" rationale={rationale}" if rationale else ""
+      return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')} (pnl=n/a){suffix}"
     if output.get("orderId") or output.get("orderRequest"):
       side = output.get("side") or output.get("orderRequest", {}).get("side")
       sym = output.get("symbol") or output.get("orderRequest", {}).get("symbol")
-      return f"live order: {side} {sym} (orderId={output.get('orderId')}) (pnl=n/a)"
+      rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
+      suffix = f" rationale={rationale}" if rationale else ""
+      return f"live order: {side} {sym} (orderId={output.get('orderId')}) (pnl=n/a){suffix}"
     if output.get("transfer"):
       t = output.get("transfer", {})
       return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"
