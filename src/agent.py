@@ -21,6 +21,7 @@ from agents import (
   set_tracing_export_api_key,
   set_trace_processors,
   trace,
+  get_trace_provider,
 )
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
@@ -760,6 +761,12 @@ async def run_trading_agent(
   # Ensure a fresh trace per agent loop using the official processor setup.
   with trace("Trading Agent Run"):
     result = await Runner.run(trading_agent, input_payload)
+  try:
+    current_trace = get_trace_provider().get_current_trace()
+    if current_trace:
+      current_trace.finish(reset_current=True)
+  except Exception as exc:
+    print("Trace cleanup failed:", exc)
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []
