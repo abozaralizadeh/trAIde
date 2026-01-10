@@ -126,6 +126,7 @@ async def run_trading_agent(
         get_run_name,
         get_run_type,
       )
+      from datetime import timezone
 
       class _LangsmithExporter:
         """Send each agent run as a fresh trace to LangSmith."""
@@ -137,17 +138,35 @@ async def run_trading_agent(
             api_url=cfg.langsmith.api_url or None,
           )
 
+        def _normalize_dt(self, val):
+          if hasattr(val, "tzinfo") and val.tzinfo:
+            return val
+          try:
+            # try parse iso string
+            return datetime.fromisoformat(val)
+          except Exception:
+            return datetime.utcnow().replace(tzinfo=timezone.utc)
+
         def export(self, spans) -> None:
           try:
             runs: Dict[str, RunTree] = {}
             parents: Dict[str, str | None] = {}
+            flat_spans = []
             for span in spans:
+              if hasattr(span, "span_data"):
+                flat_spans.append(span)
+              elif hasattr(span, "spans"):
+                try:
+                  flat_spans.extend(list(span.spans))
+                except Exception:
+                  continue
+            for span in flat_spans:
               data = extract_span_data(span)
               run = RunTree(
                 name=get_run_name(span),
                 run_type=get_run_type(span),
-                start_time=span.started_at,
-                end_time=span.ended_at,
+                start_time=self._normalize_dt(getattr(span, "started_at", datetime.utcnow())),
+                end_time=self._normalize_dt(getattr(span, "ended_at", datetime.utcnow())),
                 inputs=data.get("inputs") or {},
                 outputs=data.get("outputs") or {},
                 error=str(span.error) if span.error else None,
