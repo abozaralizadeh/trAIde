@@ -222,11 +222,48 @@ async def run_trading_agent(
     for bal in fresh_balances:
       fresh_by_currency[bal.currency] = fresh_by_currency.get(bal.currency, 0.0) + float(bal.available or 0)
 
-    usdt_balance = fresh_by_currency.get("USDT", 0.0)
-    reserve = usdt_balance * 0.10
-    max_spend = max(0.0, usdt_balance - reserve)
+    spot_usdt = fresh_by_currency.get("USDT", 0.0)
+    futures_available = 0.0
+    if cfg.kucoin_futures.enabled and kucoin_futures:
+      try:
+        overview = kucoin_futures.get_account_overview()
+        futures_available = float(overview.get("availableBalance") or 0.0)
+      except Exception as exc:
+        print("Warning: futures overview unavailable:", exc)
+
+    total_available = spot_usdt + futures_available
+    reserve_total = total_available * 0.10
+    max_spend = max(0.0, total_available - reserve_total)
     if funds_val > max_spend:
-      return {"rejected": True, "reason": "Exceeds spendable USDT after 10% reserve", "maxSpend": max_spend}
+      return {
+        "rejected": True,
+        "reason": "Exceeds spendable USDT after 10% reserve",
+        "maxSpend": max_spend,
+        "spotAvailable": spot_usdt,
+        "futuresAvailable": futures_available,
+      }
+
+    # If spot alone is insufficient but futures has free balance, auto-transfer the shortfall (respecting futures 10% reserve).
+    spot_reserve = spot_usdt * 0.10
+    spot_spendable = max(0.0, spot_usdt - spot_reserve)
+    transfer_used: dict[str, Any] | None = None
+    if funds_val > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
+      futures_reserve = futures_available * 0.10
+      futures_spendable = max(0.0, futures_available - futures_reserve)
+      need = funds_val - spot_spendable
+      transfer_amt = min(need, futures_spendable)
+      if transfer_amt > 0:
+        try:
+          transfer_used = kucoin.transfer_funds(
+            currency="USDT",
+            amount=transfer_amt,
+            from_account="contract",
+            to_account="trade",
+          )
+          spot_usdt += transfer_amt
+          spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
+        except Exception as exc:
+          print("Warning: futures->spot transfer failed:", exc)
 
     order_req = KucoinOrderRequest(
       symbol=symbol,
@@ -263,7 +300,7 @@ async def run_trading_agent(
         )
       return res
     except Exception as exc:
-      return {"error": str(exc), "orderRequest": order_req.__dict__}
+      return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
 
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
@@ -742,6 +779,7 @@ async def run_trading_agent(
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
     "- When riskOff=true or no trade is viable: research. Use web_search + fetch_kucoin_news to study new strategies, log findings via log_research (topic, summary, actions), and consider backtests for promising setups.\n"
+    "- Avoid putting all eggs in one basket: keep USDT split across spot and futures where practical so both venues remain tradable; rebalance with transfer_funds instead of concentrating all capital in one account.\n"
     "- Continually improve data sources: when idle, search for useful feeds/APIs; add them via add_source(name, url, reason). If a source proves low-value, remove_source(name, reason).\n"
     "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
