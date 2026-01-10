@@ -32,19 +32,20 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
     tickers[symbol] = kucoin.get_ticker(symbol)
 
   balances = kucoin.get_trade_accounts()
+  futures_overview = None
   if cfg.kucoin_futures.enabled:
     try:
       fut = KucoinFuturesClient(cfg)
-      overview = fut.get_account_overview()
-      if overview:
+      futures_overview = fut.get_account_overview()
+      if futures_overview:
         balances.append(
           KucoinAccount(
             id="futures",
-            currency=str(overview.get("currency", "USDT")),
+            currency=str(futures_overview.get("currency", "USDT")),
             type="contract",
-            balance=str(overview.get("accountEquity") or overview.get("marginBalance") or overview.get("availableBalance") or "0"),
-            available=str(overview.get("availableBalance") or "0"),
-            holds=str(overview.get("frozenBalance") or "0"),
+            balance=str(futures_overview.get("accountEquity") or futures_overview.get("marginBalance") or futures_overview.get("availableBalance") or "0"),
+            available=str(futures_overview.get("availableBalance") or "0"),
+            holds=str(futures_overview.get("frozenBalance") or "0"),
           )
         )
     except Exception as exc:
@@ -59,6 +60,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
     min_confidence=cfg.trading.min_confidence,
     max_leverage=cfg.trading.max_leverage,
     futures_enabled=cfg.kucoin_futures.enabled,
+    risk_off=False,  # default; may be set in loop
   )
 
 
@@ -91,11 +93,10 @@ async def trading_loop() -> None:
           continue
 
     limits = memory.update_limits(usdt_balance, cfg.trading.max_daily_drawdown_pct)
-    if limits.get("kill"):
-      reason = limits.get("reason") or "Kill switch active (drawdown limit reached)."
+    risk_off = bool(limits.get("kill"))
+    if risk_off:
+      reason = limits.get("reason") or "Kill switch active (drawdown limit reached). Running in risk-off mode."
       print(reason)
-      await asyncio.sleep(cfg.trading.poll_interval_sec)
-      continue
 
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
@@ -115,6 +116,8 @@ async def trading_loop() -> None:
       idle_polls = 0
       print(f"Running agent. Triggers: {triggers or ['idle_threshold']}")
       try:
+        # Propagate risk_off into snapshot so the agent can act defensively (hedge/exit) but skip new risk-on entries.
+        snapshot.risk_off = risk_off
         result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures)
         print("\n--- Agent Decision Narrative ---")
         print(result["narrative"])

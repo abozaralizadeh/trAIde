@@ -58,6 +58,7 @@ class TradingSnapshot:
   min_confidence: float
   max_leverage: float
   futures_enabled: bool
+  risk_off: bool = False
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -87,6 +88,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "minConfidence": snapshot.min_confidence,
     "maxLeverage": snapshot.max_leverage,
     "futuresEnabled": snapshot.futures_enabled,
+    "riskOff": snapshot.risk_off,
     "guidance": "If you place an order, prefer market orders sized in USDT funds.",
   }
   return json.dumps(user_content)
@@ -716,6 +718,10 @@ async def run_trading_agent(
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
+    "- If riskOff=true in the snapshot, do NOT open new long/short risk-on positions. You may:\n"
+    "  - Close/trim existing exposure if it reduces risk.\n"
+    "  - Hedge or transfer funds between spot/futures to reduce net risk.\n"
+    "  - Set or adjust protective triggers. Avoid new speculative entries.\n"
     f"- Consider only the provided symbols and market snapshot.\n"
     f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
     f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades.\n"
