@@ -17,6 +17,7 @@ from agents import (
   OpenAIChatCompletionsModel,
   OpenAIResponsesModel,
   add_trace_processor,
+  default_processor,
   set_default_openai_client,
   set_tracing_export_api_key,
   set_trace_processors,
@@ -25,6 +26,7 @@ from agents import (
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
+from agents.tracing import trace
 from agents.tracing.setup import get_trace_provider
 from agents.tracing import trace
 from openai import AsyncAzureOpenAI
@@ -129,15 +131,22 @@ async def run_trading_agent(
       set_tracing_export_api_key(cfg.openai_trace_api_key)
   if cfg.langsmith.enabled and cfg.langsmith.tracing:
     try:
+      from langsmith import Client as LangsmithClient
       from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
 
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+        project_name=cfg.langsmith.project or None,
+      )
       processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
         project_name=cfg.langsmith.project or None,
         tags=["trAIde", "openai-agents"],
         name="trAIde-agent",
       )
-      set_trace_processors([processor])
-      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run)")
+      set_trace_processors([default_processor(), processor])
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
     except Exception as exc:
       print("LangSmith tracing processor failed to initialize:", exc)
 
