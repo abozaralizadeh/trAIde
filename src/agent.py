@@ -162,6 +162,7 @@ async def run_trading_agent(
   langsmith_processor = None
   processor_registered = False
   multi_processor = getattr(provider, "_multi_processor", None)
+  original_processors = list(getattr(multi_processor, "_processors", ())) if multi_processor else []
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
       from langsmith import Client as LangsmithClient
@@ -896,9 +897,7 @@ async def run_trading_agent(
         print("Trace cleanup failed:", exc)
       if processor_registered and multi_processor and hasattr(multi_processor, "set_processors"):
         try:
-          current = list(getattr(multi_processor, "_processors", ()))
-          filtered = [p for p in current if p is not langsmith_processor]
-          multi_processor.set_processors(filtered)
+          multi_processor.set_processors(original_processors)
         except Exception as exc:
           print("Trace processor reset failed:", exc)
   narrative = str(result.final_output)
