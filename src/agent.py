@@ -19,6 +19,7 @@ from agents import (
   OpenAIResponsesModel,
   add_trace_processor,
   set_default_openai_client,
+  set_trace_processors,
   set_tracing_export_api_key,
   gen_trace_id,
 )
@@ -29,6 +30,7 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
+_BASE_TRACE_PROCESSORS: tuple = ()
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -66,7 +68,7 @@ class _RedactingConsoleExporter(ConsoleSpanExporter):
 
 def setup_tracing(cfg: AppConfig) -> None:
   """Register tracing processors once at startup."""
-  global _TRACING_INITIALIZED
+  global _TRACING_INITIALIZED, _BASE_TRACE_PROCESSORS
   if _TRACING_INITIALIZED:
     return
   try:
@@ -77,22 +79,8 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
-    if cfg.langsmith.enabled and cfg.langsmith.tracing:
-      from langsmith import Client as LangsmithClient
-      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
-
-      ls_client = LangsmithClient(
-        api_key=cfg.langsmith.api_key,
-        api_url=cfg.langsmith.api_url or None,
-      )
-      processor = OpenAIAgentsTracingProcessor(
-        client=ls_client,
-        project_name=cfg.langsmith.project or None,
-        tags=["trAIde", "openai-agents"],
-        name="trAIde-agent",
-      )
-      add_trace_processor(processor)
-      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
+    provider = get_trace_provider()
+    _BASE_TRACE_PROCESSORS = getattr(getattr(provider, "_multi_processor", None), "_processors", ())
   except Exception as exc:
     print("Tracing setup failed:", exc)
   else:
@@ -171,15 +159,25 @@ async def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
+  provider = get_trace_provider()
 
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
+  langsmith_processor = None
+  base_processors = getattr(getattr(provider, "_multi_processor", None), "_processors", ()) or _BASE_TRACE_PROCESSORS
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
       from langsmith import Client as LangsmithClient
       from langsmith.run_helpers import get_run_tree_context
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
 
       ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
+      langsmith_processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
+      )
       langsmith_ctx = get_run_tree_context(
         run_id=str(uuid.uuid4()),
         name="Trading Agent Run",
@@ -882,7 +880,16 @@ async def run_trading_agent(
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
-  provider = get_trace_provider()
+  processors_applied = False
+  if langsmith_processor:
+    try:
+      processor_list = list(base_processors)
+      processor_list.append(langsmith_processor)
+      set_trace_processors(processor_list)
+      processors_applied = True
+    except Exception as exc:
+      print("LangSmith processor attach failed:", exc)
+
   with langsmith_ctx:
     tr = provider.create_trace("Trading Agent Run", trace_id=gen_trace_id())
     tr.start(mark_as_current=True)
@@ -893,6 +900,11 @@ async def run_trading_agent(
         tr.finish(reset_current=True)
       except Exception as exc:
         print("Trace cleanup failed:", exc)
+      if processors_applied:
+        try:
+          set_trace_processors(list(base_processors))
+        except Exception as exc:
+          print("Trace processor reset failed:", exc)
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []
