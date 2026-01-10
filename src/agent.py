@@ -17,7 +17,6 @@ from agents import (
   OpenAIChatCompletionsModel,
   OpenAIResponsesModel,
   add_trace_processor,
-  default_processor,
   set_default_openai_client,
   set_tracing_export_api_key,
   set_trace_processors,
@@ -145,7 +144,7 @@ async def run_trading_agent(
         tags=["trAIde", "openai-agents"],
         name="trAIde-agent",
       )
-      set_trace_processors([default_processor(), processor])
+      add_trace_processor(processor)
       print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
     except Exception as exc:
       print("LangSmith tracing processor failed to initialize:", exc)
