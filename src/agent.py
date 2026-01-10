@@ -192,6 +192,30 @@ async def run_trading_agent(
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
 
+  def _log_langsmith_run_simple(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
+    if not (cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key):
+      return
+    try:
+      from langsmith import Client as LangsmithClient
+
+      client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+      )
+      start = datetime.utcnow()
+      client.create_run(
+        name="trAIde-agent-loop",
+        run_type="chain",
+        inputs=inputs,
+        outputs=outputs,
+        start_time=start,
+        end_time=start,
+        tags=["trAIde", "openai-agents"],
+        project_name=cfg.langsmith.project or None,
+      )
+    except Exception as exc:
+      print("LangSmith simple run log failed:", exc)
+
   def _log_langsmith_run(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
     if not cfg.langsmith.enabled or not cfg.langsmith.api_key:
       return
@@ -837,5 +861,10 @@ async def run_trading_agent(
     summary = _summarize(out)
     if summary:
       decisions.append(summary)
+
+  _log_langsmith_run_simple(
+    inputs={"snapshot": json.loads(input_payload)},
+    outputs={"narrative": narrative, "decisions": decisions, "tool_results": tool_outputs},
+  )
 
   return {"narrative": narrative, "tool_results": tool_outputs, "decisions": decisions}
