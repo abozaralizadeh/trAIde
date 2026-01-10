@@ -121,13 +121,14 @@ class MemoryStore:
   def _write(self, data: Dict[str, Any]) -> None:
     self.path.write_text(json.dumps(data, indent=2))
 
-  def save_plan(self, title: str, summary: str, actions: list[str]) -> Dict[str, Any]:
+  def save_plan(self, title: str, summary: str, actions: list[str], author: str | None = None) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
       entry = {
         "title": title,
         "summary": summary,
         "actions": actions,
+        "author": author,
         "ts": int(time.time()),
       }
       data.setdefault("plans", [])

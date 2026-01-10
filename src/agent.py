@@ -152,11 +152,23 @@ async def run_trading_agent(
       "You are a research scout for alternative crypto opportunities.\n"
       "- Goal: find high-confidence setups on coins beyond the current universe.\n"
       "- Use web_search and KuCoin news to identify catalysts, liquidity, and momentum on other symbols.\n"
+      "- When idle, also discover new high-quality data/news sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
       "- NEVER place orders or change the coin list yourself; instead propose candidates with evidence.\n"
       "- Log findings via log_research (topic, summary, actions) and recommend adds for the main agent to decide.\n"
       "- Prioritize liquid, tradable pairs; avoid illiquid/obscure tokens. Return concise recommendations with confidence and why they beat current options."
     ),
-    tools=[WebSearchTool(search_context_size="high"), log_research, add_source, remove_source, fetch_kucoin_news],
+    tools=[
+      WebSearchTool(search_context_size="high"),
+      fetch_recent_candles,
+      analyze_market_context,
+      fetch_orderbook,
+      fetch_kucoin_news,
+      log_research,
+      add_source,
+      remove_source,
+      log_sentiment,
+      log_decision,
+    ],
     model=model,
   )
 
@@ -637,7 +649,7 @@ async def run_trading_agent(
   @function_tool
   async def save_trade_plan(title: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Persist a trading plan (title, summary, actions) for recall."""
-    return memory.save_plan(title=title, summary=summary, actions=actions)
+    return memory.save_plan(title=title, summary=summary, actions=actions, author="Trading Agent")
 
   @function_tool
   async def latest_plan() -> Dict[str, Any]:
@@ -762,14 +774,14 @@ async def run_trading_agent(
     """Record a research note/strategy idea (persists in memory)."""
     if not topic or not summary:
       return {"error": "topic and summary required"}
-    return memory.save_plan(title=f"Research: {topic}", summary=summary, actions=actions)
+    return memory.save_plan(title=f"Research: {topic}", summary=summary, actions=actions, author="Research Agent")
 
   @function_tool
   async def add_source(name: str, url: str, reason: str) -> Dict[str, Any]:
     """Add a data/research source to memory."""
     if not name or not url:
       return {"error": "name and url required"}
-    entry = memory.save_plan(title=f"Source: {name}", summary=url, actions=[reason or ""])
+    entry = memory.save_plan(title=f"Source: {name}", summary=url, actions=[reason or ""], author="Research Agent")
     return {"source": entry}
 
   @function_tool
@@ -777,7 +789,7 @@ async def run_trading_agent(
     """Mark a data/research source as removed."""
     if not name or not reason:
       return {"error": "name and reason required"}
-    entry = memory.save_plan(title=f"Removed Source: {name}", summary=reason, actions=[])
+    entry = memory.save_plan(title=f"Removed Source: {name}", summary=reason, actions=[], author="Research Agent")
     return {"removed": entry}
 
   instructions = (
@@ -792,10 +804,8 @@ async def run_trading_agent(
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
-    "- When riskOff=true or no trade is viable: research. Use web_search + fetch_kucoin_news to study new strategies, log findings via log_research (topic, summary, actions), and consider backtests for promising setups.\n"
-    "- When idle/riskOff and no clean setups on current coins, you may handoff to the Research Agent to scout other high-confidence coins; only adopt new coins after clear evidence and explicit decision.\n"
+    "- When idle/riskOff and no clean setups on current coins, handoff to the Research Agent to scout other high-confidence coins or better data sources; only adopt new coins/sources after clear evidence and explicit decision. Use research outputs (log_research, backtests) before committing capital.\n"
     "- Avoid putting all eggs in one basket: keep USDT split across spot and futures where practical so both venues remain tradable; rebalance with transfer_funds instead of concentrating all capital in one account.\n"
-    "- Continually improve data sources: when idle, search for useful feeds/APIs; add them via add_source(name, url, reason). If a source proves low-value, remove_source(name, reason).\n"
     "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
