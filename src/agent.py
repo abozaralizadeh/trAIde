@@ -25,9 +25,7 @@ from agents import (
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
-from agents.tracing import trace
 from agents.tracing.setup import get_trace_provider
-from agents.tracing import trace
 from openai import AsyncAzureOpenAI
 
 from .analytics import (
@@ -47,6 +45,50 @@ from .kucoin import (
   KucoinTicker,
 )
 from .memory import MemoryStore
+
+
+class _RedactingConsoleExporter(ConsoleSpanExporter):
+  """Redact bulky outputs (candles/orderbooks) before console export."""
+
+  def export(self, spans):
+    for s in spans:
+      sd = getattr(s, "span_data", None)
+      if getattr(sd, "type", "") == "function" and getattr(sd, "name", "") in (
+        "fetch_recent_candles",
+        "fetch_orderbook",
+      ):
+        if hasattr(sd, "output"):
+          sd.output = "(redacted: large payload)"
+    return super().export(spans)
+
+
+def setup_tracing(cfg: AppConfig) -> None:
+  """Register tracing processors once at startup."""
+  try:
+    if not cfg.tracing_enabled:
+      return
+    if cfg.console_tracing:
+      add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
+    if cfg.openai_trace_api_key:
+      set_tracing_export_api_key(cfg.openai_trace_api_key)
+    if cfg.langsmith.enabled and cfg.langsmith.tracing:
+      from langsmith import Client as LangsmithClient
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+      )
+      processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
+      )
+      add_trace_processor(processor)
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
+  except Exception as exc:
+    print("Tracing setup failed:", exc)
 
 
 @dataclass
@@ -109,45 +151,6 @@ async def run_trading_agent(
   openai_client = _build_openai_client(cfg)
   set_default_openai_client(openai_client, use_for_tracing=cfg.tracing_enabled)
 
-  class _RedactingConsoleExporter(ConsoleSpanExporter):
-    """Redact bulky outputs (candles/orderbooks) before console export."""
-
-    def export(self, spans):
-      for s in spans:
-        sd = getattr(s, "span_data", None)
-        if getattr(sd, "type", "") == "function" and getattr(sd, "name", "") in (
-          "fetch_recent_candles",
-          "fetch_orderbook",
-        ):
-          if hasattr(sd, "output"):
-            sd.output = "(redacted: large payload)"
-      return super().export(spans)
-
-  if cfg.tracing_enabled:
-    if cfg.console_tracing:
-      add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
-    if cfg.openai_trace_api_key:
-      set_tracing_export_api_key(cfg.openai_trace_api_key)
-  if cfg.langsmith.enabled and cfg.langsmith.tracing:
-    try:
-      from langsmith import Client as LangsmithClient
-      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
-
-      ls_client = LangsmithClient(
-        api_key=cfg.langsmith.api_key,
-        api_url=cfg.langsmith.api_url or None,
-      )
-      processor = OpenAIAgentsTracingProcessor(
-        client=ls_client,
-        project_name=cfg.langsmith.project or None,
-        tags=["trAIde", "openai-agents"],
-        name="trAIde-agent",
-      )
-      add_trace_processor(processor)
-      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
-    except Exception as exc:
-      print("LangSmith tracing processor failed to initialize:", exc)
-
   model = OpenAIResponsesModel(
     model=cfg.azure.deployment,
     openai_client=openai_client,
@@ -170,7 +173,6 @@ async def run_trading_agent(
       client = LangsmithClient(
         api_key=cfg.langsmith.api_key,
         api_url=cfg.langsmith.api_url or None,
-        project_name=cfg.langsmith.project or None,
       )
       now = datetime.utcnow()
       client.create_run(

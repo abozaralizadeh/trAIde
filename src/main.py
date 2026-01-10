@@ -4,7 +4,7 @@ import asyncio
 import sys
 from typing import Dict
 
-from .agent import TradingSnapshot, run_trading_agent
+from .agent import TradingSnapshot, run_trading_agent, setup_tracing
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
@@ -68,6 +68,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
 
 async def trading_loop() -> None:
   cfg = load_config()
+  setup_tracing(cfg)
   kucoin = KucoinClient(cfg)
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
