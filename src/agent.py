@@ -19,6 +19,7 @@ from agents import (
   OpenAIResponsesModel,
   add_trace_processor,
   set_default_openai_client,
+  set_trace_processors,
   set_tracing_export_api_key,
   gen_trace_id,
 )
@@ -29,6 +30,7 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
+_BASE_TRACE_PROCESSORS: tuple = ()
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -66,7 +68,7 @@ class _RedactingConsoleExporter(ConsoleSpanExporter):
 
 def setup_tracing(cfg: AppConfig) -> None:
   """Register tracing processors once at startup."""
-  global _TRACING_INITIALIZED
+  global _TRACING_INITIALIZED, _BASE_TRACE_PROCESSORS
   if _TRACING_INITIALIZED:
     return
   try:
@@ -77,6 +79,8 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+    provider = get_trace_provider()
+    _BASE_TRACE_PROCESSORS = getattr(getattr(provider, "_multi_processor", None), "_processors", ())
   except Exception as exc:
     print("Tracing setup failed:", exc)
   else:
@@ -160,8 +164,7 @@ async def run_trading_agent(
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
   langsmith_processor = None
-  processor_registered = False
-  multi_processor = getattr(provider, "_multi_processor", None)
+  base_processors = getattr(getattr(provider, "_multi_processor", None), "_processors", ()) or _BASE_TRACE_PROCESSORS
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
       from langsmith import Client as LangsmithClient
@@ -877,10 +880,13 @@ async def run_trading_agent(
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
-  if langsmith_processor and multi_processor and hasattr(multi_processor, "add_tracing_processor"):
+  processors_applied = False
+  if langsmith_processor:
     try:
-      multi_processor.add_tracing_processor(langsmith_processor)
-      processor_registered = True
+      processor_list = list(base_processors)
+      processor_list.append(langsmith_processor)
+      set_trace_processors(processor_list)
+      processors_applied = True
     except Exception as exc:
       print("LangSmith processor attach failed:", exc)
 
@@ -894,11 +900,9 @@ async def run_trading_agent(
         tr.finish(reset_current=True)
       except Exception as exc:
         print("Trace cleanup failed:", exc)
-      if processor_registered and multi_processor and hasattr(multi_processor, "set_processors"):
+      if processors_applied:
         try:
-          current = list(getattr(multi_processor, "_processors", ()))
-          filtered = [p for p in current if p is not langsmith_processor]
-          multi_processor.set_processors(filtered)
+          set_trace_processors(list(base_processors))
         except Exception as exc:
           print("Trace processor reset failed:", exc)
   narrative = str(result.final_output)
