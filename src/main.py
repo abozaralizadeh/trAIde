@@ -83,7 +83,10 @@ async def trading_loop() -> None:
     for acct in snapshot.balances:
       if acct.currency == "USDT":
         try:
-          usdt_balance += float(acct.available or 0)
+          avail = float(acct.available or 0)
+          bal = float(acct.balance or 0)
+          # For futures (contract) use the larger of available/equity so we don't undercount.
+          usdt_balance += max(avail, bal)
         except Exception:
           continue
 
