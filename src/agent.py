@@ -19,12 +19,13 @@ from agents import (
   add_trace_processor,
   set_default_openai_client,
   set_tracing_export_api_key,
+  set_trace_processors,
+  trace,
 )
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
 from openai import AsyncAzureOpenAI
-from langsmith.run_trees import RunTree
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -120,80 +121,15 @@ async def run_trading_agent(
       set_tracing_export_api_key(cfg.openai_trace_api_key)
   if cfg.langsmith.enabled and cfg.langsmith.tracing:
     try:
-      from langsmith import Client as LangsmithClient
-      from langsmith.integrations.openai_agents_sdk._openai_agent_utils import (
-        extract_span_data,
-        get_run_name,
-        get_run_type,
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+
+      processor = OpenAIAgentsTracingProcessor(
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
       )
-      from datetime import timezone
-
-      class _LangsmithExporter:
-        """Send each agent run as a fresh trace to LangSmith."""
-
-        def __init__(self) -> None:
-          self.project = cfg.langsmith.project or None
-          self.client = LangsmithClient(
-            api_key=cfg.langsmith.api_key,
-            api_url=cfg.langsmith.api_url or None,
-          )
-
-        def _normalize_dt(self, val):
-          if hasattr(val, "tzinfo") and val.tzinfo:
-            return val
-          try:
-            # try parse iso string
-            return datetime.fromisoformat(val)
-          except Exception:
-            return datetime.utcnow().replace(tzinfo=timezone.utc)
-
-        def export(self, spans) -> None:
-          try:
-            runs: Dict[str, RunTree] = {}
-            parents: Dict[str, str | None] = {}
-            flat_spans = []
-            for span in spans:
-              if hasattr(span, "span_data"):
-                flat_spans.append(span)
-              elif hasattr(span, "spans"):
-                try:
-                  flat_spans.extend(list(span.spans))
-                except Exception:
-                  continue
-            for span in flat_spans:
-              data = extract_span_data(span)
-              run = RunTree(
-                name=get_run_name(span),
-                run_type=get_run_type(span),
-                start_time=self._normalize_dt(getattr(span, "started_at", datetime.utcnow())),
-                end_time=self._normalize_dt(getattr(span, "ended_at", datetime.utcnow())),
-                inputs=data.get("inputs") or {},
-                outputs=data.get("outputs") or {},
-                error=str(span.error) if span.error else None,
-                extra={"metadata": data.get("metadata", {})},
-                tags=["trAIde", "openai-agents"],
-                client=self.client,
-                project_name=self.project,
-              )
-              runs[span.span_id] = run
-              parents[span.span_id] = span.parent_id
-
-            # Attach children to parents.
-            for span_id, run in runs.items():
-              parent_id = parents.get(span_id)
-              if parent_id and parent_id in runs:
-                runs[parent_id].child_runs.append(run)
-
-            # Post roots only (new trace per agent run).
-            for span_id, run in runs.items():
-              parent_id = parents.get(span_id)
-              if not parent_id or parent_id not in runs:
-                run.post(exclude_child_runs=False)
-          except Exception as exc:
-            print("LangSmith export failed:", exc)
-
-      add_trace_processor(BatchTraceProcessor(exporter=_LangsmithExporter()))
-      print("LangSmith tracing enabled via custom exporter")
+      set_trace_processors([processor])
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run)")
     except Exception as exc:
       print("LangSmith tracing processor failed to initialize:", exc)
 
@@ -210,30 +146,6 @@ async def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
-
-  def _log_langsmith_run_simple(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
-    if not (cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key):
-      return
-    try:
-      from langsmith import Client as LangsmithClient
-
-      client = LangsmithClient(
-        api_key=cfg.langsmith.api_key,
-        api_url=cfg.langsmith.api_url or None,
-      )
-      start = datetime.utcnow()
-      client.create_run(
-        name="trAIde-agent-loop",
-        run_type="chain",
-        inputs=inputs,
-        outputs=outputs,
-        start_time=start,
-        end_time=start,
-        tags=["trAIde", "openai-agents"],
-        project_name=cfg.langsmith.project or None,
-      )
-    except Exception as exc:
-      print("LangSmith simple run log failed:", exc)
 
   def _log_langsmith_run(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
     if not cfg.langsmith.enabled or not cfg.langsmith.api_key:
@@ -845,7 +757,9 @@ async def run_trading_agent(
   # Provide snapshot as serialized context input.
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
-  result = await Runner.run(trading_agent, input_payload)
+  # Ensure a fresh trace per agent loop using the official processor setup.
+  with trace("Trading Agent Run"):
+    result = await Runner.run(trading_agent, input_payload)
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []
