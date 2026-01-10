@@ -747,7 +747,7 @@ async def run_trading_agent(
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
-    "- If riskOff=true in the snapshot, avoid new speculative entries. You may:\n"
+    "- If riskOff=true in the snapshot (set by daily drawdown guard when drawdownPct > MAX_DAILY_DRAWDOWN_PCT), avoid new speculative entries. You may:\n"
     "  - Close/trim existing exposure if it reduces risk.\n"
     "  - Hedge (including futures shorts) or transfer funds between spot/futures to reduce net risk.\n"
     "  - Set or adjust protective triggers. Avoid adding net long risk unless explicitly justified as a hedge.\n"
