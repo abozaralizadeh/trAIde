@@ -59,6 +59,8 @@ class TradingSnapshot:
   max_leverage: float
   futures_enabled: bool
   risk_off: bool = False
+  drawdown_pct: float = 0.0
+  total_usdt: float = 0.0
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -89,6 +91,8 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "maxLeverage": snapshot.max_leverage,
     "futuresEnabled": snapshot.futures_enabled,
     "riskOff": snapshot.risk_off,
+    "drawdownPct": snapshot.drawdown_pct,
+    "totalUsdt": snapshot.total_usdt,
     "guidance": "If you place an order, prefer market orders sized in USDT funds.",
   }
   return json.dumps(user_content)
@@ -702,6 +706,29 @@ async def run_trading_agent(
     except Exception as exc:
       return {"error": f"parse_failed: {exc}"}
 
+  @function_tool
+  async def log_research(topic: str, summary: str, actions: List[str]) -> Dict[str, Any]:
+    """Record a research note/strategy idea (persists in memory)."""
+    if not topic or not summary:
+      return {"error": "topic and summary required"}
+    return memory.save_plan(title=f"Research: {topic}", summary=summary, actions=actions)
+
+  @function_tool
+  async def add_source(name: str, url: str, reason: str) -> Dict[str, Any]:
+    """Add a data/research source to memory."""
+    if not name or not url:
+      return {"error": "name and url required"}
+    entry = memory.save_plan(title=f"Source: {name}", summary=url, actions=[reason or ""])
+    return {"source": entry}
+
+  @function_tool
+  async def remove_source(name: str, reason: str) -> Dict[str, Any]:
+    """Mark a data/research source as removed."""
+    if not name or not reason:
+      return {"error": "name and reason required"}
+    entry = memory.save_plan(title=f"Removed Source: {name}", summary=reason, actions=[])
+    return {"removed": entry}
+
   instructions = (
     "You are a disciplined quantitative crypto trader.\n"
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
@@ -714,14 +741,17 @@ async def run_trading_agent(
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
+    "- When riskOff=true or no trade is viable: research. Use web_search + fetch_kucoin_news to study new strategies, log findings via log_research (topic, summary, actions), and consider backtests for promising setups.\n"
+    "- Continually improve data sources: when idle, search for useful feeds/APIs; add them via add_source(name, url, reason). If a source proves low-value, remove_source(name, reason).\n"
     "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; default to low/no leverage.\n"
-    "- If riskOff=true in the snapshot, do NOT open new long/short risk-on positions. You may:\n"
+    "- If riskOff=true in the snapshot, avoid new speculative entries. You may:\n"
     "  - Close/trim existing exposure if it reduces risk.\n"
-    "  - Hedge or transfer funds between spot/futures to reduce net risk.\n"
-    "  - Set or adjust protective triggers. Avoid new speculative entries.\n"
+    "  - Hedge (including futures shorts) or transfer funds between spot/futures to reduce net risk.\n"
+    "  - Set or adjust protective triggers. Avoid adding net long risk unless explicitly justified as a hedge.\n"
+    "- When riskOff and drawdownPct is high, analyze causes and propose steps to recover safely (e.g., hedges, rebalance, pause trades, tighten stops). If rules block entries, log a plan to exit riskOff when conditions improve.\n"
     f"- Consider only the provided symbols and market snapshot.\n"
     f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
     f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades.\n"
@@ -756,6 +786,9 @@ async def run_trading_agent(
       clear_plans,
       decline_trade,
       fetch_kucoin_news,
+      log_research,
+      add_source,
+      remove_source,
       log_sentiment,
       log_decision,
     ],

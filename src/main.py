@@ -60,7 +60,9 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
     min_confidence=cfg.trading.min_confidence,
     max_leverage=cfg.trading.max_leverage,
     futures_enabled=cfg.kucoin_futures.enabled,
-    risk_off=False,  # default; may be set in loop
+    risk_off=False,  # will be set in loop
+    drawdown_pct=0.0,
+    total_usdt=0.0,
   )
 
 
@@ -94,6 +96,9 @@ async def trading_loop() -> None:
 
     limits = memory.update_limits(usdt_balance, cfg.trading.max_daily_drawdown_pct)
     risk_off = bool(limits.get("kill"))
+    snapshot.risk_off = risk_off
+    snapshot.drawdown_pct = float(limits.get("drawdownPct") or 0.0)
+    snapshot.total_usdt = usdt_balance
     if risk_off:
       reason = limits.get("reason") or "Kill switch active (drawdown limit reached). Running in risk-off mode."
       print(reason)
