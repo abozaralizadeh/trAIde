@@ -131,10 +131,10 @@ async def run_trading_agent(
         """Send each agent run as a fresh trace to LangSmith."""
 
         def __init__(self) -> None:
+          self.project = cfg.langsmith.project or None
           self.client = LangsmithClient(
             api_key=cfg.langsmith.api_key,
             api_url=cfg.langsmith.api_url or None,
-            project_name=cfg.langsmith.project or None,
           )
 
         def export(self, spans) -> None:
@@ -154,7 +154,7 @@ async def run_trading_agent(
                 extra={"metadata": data.get("metadata", {})},
                 tags=["trAIde", "openai-agents"],
                 client=self.client,
-                project_name=cfg.langsmith.project or None,
+                project_name=self.project,
               )
               runs[span.span_id] = run
               parents[span.span_id] = span.parent_id
