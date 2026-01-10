@@ -20,12 +20,13 @@ from agents import (
   set_default_openai_client,
   set_tracing_export_api_key,
   set_trace_processors,
-  trace,
   gen_trace_id,
 )
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
+from agents.tracing.setup import get_trace_provider
+from agents.tracing import trace
 from openai import AsyncAzureOpenAI
 
 from .analytics import (
@@ -759,8 +760,16 @@ async def run_trading_agent(
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
-  with trace("Trading Agent Run", trace_id=gen_trace_id()):
+  provider = get_trace_provider()
+  tr = provider.create_trace("Trading Agent Run", trace_id=gen_trace_id())
+  tr.start(mark_as_current=True)
+  try:
     result = await Runner.run(trading_agent, input_payload)
+  finally:
+    try:
+      tr.finish(reset_current=True)
+    except Exception as exc:
+      print("Trace cleanup failed:", exc)
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []
