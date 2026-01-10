@@ -6,7 +6,7 @@ from typing import Dict
 
 from .agent import TradingSnapshot, run_trading_agent
 from .config import load_config
-from .kucoin import KucoinClient, KucoinFuturesClient
+from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
 
 
