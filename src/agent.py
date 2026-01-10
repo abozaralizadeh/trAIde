@@ -839,7 +839,6 @@ async def run_trading_agent(
       log_decision,
     ],
     model=model,
-    tracing=True,
   )
 
   trading_agent = Agent(
