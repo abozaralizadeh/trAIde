@@ -77,6 +77,22 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+    if cfg.langsmith.enabled and cfg.langsmith.tracing:
+      from langsmith import Client as LangsmithClient
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+      )
+      processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
+      )
+      add_trace_processor(processor)
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
   except Exception as exc:
     print("Tracing setup failed:", exc)
   else:
@@ -153,7 +169,6 @@ async def run_trading_agent(
       bal.available or 0
     )
 
-  unique_run_id = uuid.uuid4()
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
 
@@ -170,7 +185,6 @@ async def run_trading_agent(
       langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
         run_name=run_name,
-        run_id=str(unique_run_id),
         tags=["trAIde", "openai-agents"],
         client=ls_client,
       )
@@ -871,8 +885,8 @@ async def run_trading_agent(
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
+  provider = get_trace_provider()
   with langsmith_ctx:
-    provider = get_trace_provider()
     tr = provider.create_trace(run_name, trace_id=gen_trace_id())
     tr.start(mark_as_current=True)
     try:
