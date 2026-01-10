@@ -70,7 +70,18 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.console_tracing:
       add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
     if cfg.openai_trace_api_key:
-      set_tracing_export_api_key(cfg.openai_trace_api_key)
+      # The OpenAI exporter expects a platform API key (sk-...). Skip if not.
+      if str(cfg.openai_trace_api_key).startswith("sk-"):
+        # Ensure exporter sees the platform key even if Azure key is set in env.
+        try:
+          import os
+          os.environ["OPENAI_API_KEY"] = cfg.openai_trace_api_key
+        except Exception:
+          pass
+        set_tracing_export_api_key(cfg.openai_trace_api_key)
+        print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+      else:
+        print("Skipping OpenAI trace exporter: OPENAI_TRACE_API_KEY does not look like an OpenAI platform key.")
     if cfg.langsmith.enabled and cfg.langsmith.tracing:
       from langsmith import Client as LangsmithClient
       from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
