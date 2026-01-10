@@ -278,3 +278,13 @@ class KucoinFuturesClient:
     order_id = data.get("orderId") if isinstance(data, dict) else None
     client_oid = data.get("clientOid") if isinstance(data, dict) else None
     return KucoinFuturesOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid", ""))
+
+  def get_account_overview(self, currency: str = "USDT") -> Dict[str, Any]:
+    """Fetch futures account overview for a given currency (default USDT)."""
+    data = self._request(
+      "GET",
+      "/api/v1/account-overview",
+      auth=True,
+      query={"currency": currency},
+    )
+    return data or {}

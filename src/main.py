@@ -32,6 +32,23 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
     tickers[symbol] = kucoin.get_ticker(symbol)
 
   balances = kucoin.get_trade_accounts()
+  if cfg.kucoin_futures.enabled:
+    try:
+      fut = KucoinFuturesClient(cfg)
+      overview = fut.get_account_overview()
+      if overview:
+        balances.append(
+          KucoinAccount(
+            id="futures",
+            currency=str(overview.get("currency", "USDT")),
+            type="contract",
+            balance=str(overview.get("accountEquity") or overview.get("marginBalance") or overview.get("availableBalance") or "0"),
+            available=str(overview.get("availableBalance") or "0"),
+            holds=str(overview.get("frozenBalance") or "0"),
+          )
+        )
+    except Exception as exc:
+      print("Warning: unable to fetch futures account overview:", exc, file=sys.stderr)
 
   return TradingSnapshot(
     coins=coins,
