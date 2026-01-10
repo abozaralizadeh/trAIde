@@ -19,7 +19,6 @@ from agents import (
   add_trace_processor,
   set_default_openai_client,
   set_tracing_export_api_key,
-  set_trace_processors,
   gen_trace_id,
 )
 from agents.items import ToolCallOutputItem
@@ -27,6 +26,8 @@ from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
 from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
+
+_TRACING_INITIALIZED = False
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -64,21 +65,17 @@ class _RedactingConsoleExporter(ConsoleSpanExporter):
 
 def setup_tracing(cfg: AppConfig) -> None:
   """Register tracing processors once at startup."""
+  global _TRACING_INITIALIZED
+  if _TRACING_INITIALIZED:
+    return
   try:
     if not cfg.tracing_enabled:
       return
     if cfg.console_tracing:
       add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
     if cfg.openai_trace_api_key:
-      # Force the platform key into the exporter environment (overrides Azure key).
-      try:
-        import os
-        os.environ["OPENAI_API_KEY"] = cfg.openai_trace_api_key
-        os.environ["OPENAI_TRACE_API_KEY"] = cfg.openai_trace_api_key
-      except Exception:
-        pass
       set_tracing_export_api_key(cfg.openai_trace_api_key)
-      print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY (forcing exporter to use it).")
+      print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
     if cfg.langsmith.enabled and cfg.langsmith.tracing:
       from langsmith import Client as LangsmithClient
       from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
@@ -97,6 +94,8 @@ def setup_tracing(cfg: AppConfig) -> None:
       print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
   except Exception as exc:
     print("Tracing setup failed:", exc)
+  else:
+    _TRACING_INITIALIZED = True
 
 
 @dataclass
@@ -154,11 +153,11 @@ async def run_trading_agent(
   snapshot: TradingSnapshot,
   kucoin: KucoinClient,
   kucoin_futures: KucoinFuturesClient | None = None,
+  openai_client: AsyncAzureOpenAI | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
-  openai_client = _build_openai_client(cfg)
-  set_default_openai_client(openai_client, use_for_tracing=cfg.tracing_enabled)
-
+  if openai_client is None:
+    openai_client = _build_openai_client(cfg)
   model = OpenAIResponsesModel(
     model=cfg.azure.deployment,
     openai_client=openai_client,
@@ -171,29 +170,6 @@ async def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
-
-  def _log_langsmith_run(inputs: Dict[str, Any], outputs: Dict[str, Any]) -> None:
-    if not cfg.langsmith.enabled or not cfg.langsmith.api_key:
-      return
-    try:
-      from langsmith import Client as LangsmithClient
-
-      client = LangsmithClient(
-        api_key=cfg.langsmith.api_key,
-        api_url=cfg.langsmith.api_url or None,
-      )
-      now = datetime.utcnow()
-      client.create_run(
-        name="trAIde-agent",
-        run_type="chain",
-        inputs=inputs,
-        outputs=outputs,
-        start_time=now,
-        end_time=now,
-        tags=["trAIde"],
-      )
-    except Exception as exc:
-      print("LangSmith logging failed:", exc)
 
   @function_tool
   async def place_market_order(
@@ -935,10 +911,5 @@ async def run_trading_agent(
     summary = _summarize(out)
     if summary:
       decisions.append(summary)
-
-  _log_langsmith_run(
-    inputs={"snapshot": json.loads(input_payload)},
-    outputs={"narrative": narrative, "decisions": decisions, "tool_results": tool_outputs},
-  )
 
   return {"narrative": narrative, "tool_results": tool_outputs, "decisions": decisions}

@@ -4,7 +4,7 @@ import asyncio
 import sys
 from typing import Dict
 
-from .agent import TradingSnapshot, run_trading_agent, setup_tracing
+from .agent import TradingSnapshot, run_trading_agent, setup_tracing, _build_openai_client
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
@@ -69,6 +69,9 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
 async def trading_loop() -> None:
   cfg = load_config()
   setup_tracing(cfg)
+  azure_client = _build_openai_client(cfg)
+  # Azure client is for inference only; tracing uses platform key via set_tracing_export_api_key in setup_tracing.
+  set_default_openai_client(azure_client, use_for_tracing=False)
   kucoin = KucoinClient(cfg)
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
@@ -128,7 +131,7 @@ async def trading_loop() -> None:
       try:
         # Propagate risk_off into snapshot so the agent can act defensively (hedge/exit) but skip new risk-on entries.
         snapshot.risk_off = risk_off
-        result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures)
+        result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures, azure_client)
         print("\n--- Agent Decision Narrative ---")
         print(result["narrative"])
         if result.get("decisions"):
