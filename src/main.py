@@ -94,7 +94,11 @@ async def trading_loop() -> None:
         except Exception:
           continue
 
+    # Update drawdown and auto-clear risk_off when recovered.
     limits = memory.update_limits(usdt_balance, cfg.trading.max_daily_drawdown_pct)
+    if limits.get("kill") and (limits.get("drawdownPct") or 0) < cfg.trading.max_daily_drawdown_pct * 0.5:
+      limits = memory.reset_limits(usdt_balance)
+
     risk_off = bool(limits.get("kill"))
     snapshot.risk_off = risk_off
     snapshot.drawdown_pct = float(limits.get("drawdownPct") or 0.0)

@@ -59,6 +59,7 @@ class TradingConfig:
   max_leverage: float
   max_trades_per_symbol_per_day: int
   max_daily_drawdown_pct: float
+  reset_drawdown_on_start: bool
 
 
 @dataclass
@@ -129,6 +130,7 @@ def load_config() -> AppConfig:
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
       max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3")),
       max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
+      reset_drawdown_on_start=_as_bool(os.getenv("RESET_DRAWDOWN_ON_START"), False),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

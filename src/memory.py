@@ -375,3 +375,22 @@ class MemoryStore:
       data = self._read()
       limits = data.get("limits") or {}
       return bool(limits.get("kill"))
+
+  def reset_limits(self, current_usdt: float) -> Dict[str, Any]:
+    """Reset daily limits baseline to current_usdt and clear kill flag."""
+    with self._lock:
+      data = self._read()
+      now = int(time.time())
+      day_key = int(now // 86400)
+      limits = {
+        "day": day_key,
+        "baselineUsdt": float(current_usdt or 0.0),
+        "currentUsdt": float(current_usdt or 0.0),
+        "drawdownPct": 0.0,
+        "kill": False,
+        "reason": "manual reset",
+        "updated": now,
+      }
+      data["limits"] = limits
+      self._write(data)
+      return limits
