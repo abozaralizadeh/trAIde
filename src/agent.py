@@ -136,7 +136,6 @@ async def run_trading_agent(
       ls_client = LangsmithClient(
         api_key=cfg.langsmith.api_key,
         api_url=cfg.langsmith.api_url or None,
-        project_name=cfg.langsmith.project or None,
       )
       processor = OpenAIAgentsTracingProcessor(
         client=ls_client,
