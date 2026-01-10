@@ -795,7 +795,7 @@ async def run_trading_agent(
     if summary:
       decisions.append(summary)
 
-  _log_langsmith_run_simple(
+  _log_langsmith_run(
     inputs={"snapshot": json.loads(input_payload)},
     outputs={"narrative": narrative, "decisions": decisions, "tool_results": tool_outputs},
   )
