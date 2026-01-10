@@ -145,6 +145,20 @@ async def run_trading_agent(
     model=cfg.azure.deployment,
     openai_client=openai_client,
   )
+  # Secondary research agent to scout new coins while idle/riskOff.
+  research_agent = Agent(
+    name="Research Agent",
+    instructions=(
+      "You are a research scout for alternative crypto opportunities.\n"
+      "- Goal: find high-confidence setups on coins beyond the current universe.\n"
+      "- Use web_search and KuCoin news to identify catalysts, liquidity, and momentum on other symbols.\n"
+      "- NEVER place orders or change the coin list yourself; instead propose candidates with evidence.\n"
+      "- Log findings via log_research (topic, summary, actions) and recommend adds for the main agent to decide.\n"
+      "- Prioritize liquid, tradable pairs; avoid illiquid/obscure tokens. Return concise recommendations with confidence and why they beat current options."
+    ),
+    tools=[WebSearchTool(search_context_size="high"), log_research, add_source, remove_source, fetch_kucoin_news],
+    model=model,
+  )
 
   balances_by_currency: Dict[str, float] = {}
   for bal in snapshot.balances:
@@ -779,6 +793,7 @@ async def run_trading_agent(
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
     "- When riskOff=true or no trade is viable: research. Use web_search + fetch_kucoin_news to study new strategies, log findings via log_research (topic, summary, actions), and consider backtests for promising setups.\n"
+    "- When idle/riskOff and no clean setups on current coins, you may handoff to the Research Agent to scout other high-confidence coins; only adopt new coins after clear evidence and explicit decision.\n"
     "- Avoid putting all eggs in one basket: keep USDT split across spot and futures where practical so both venues remain tradable; rebalance with transfer_funds instead of concentrating all capital in one account.\n"
     "- Continually improve data sources: when idle, search for useful feeds/APIs; add them via add_source(name, url, reason). If a source proves low-value, remove_source(name, reason).\n"
     "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
@@ -830,6 +845,7 @@ async def run_trading_agent(
       log_sentiment,
       log_decision,
     ],
+    handoffs=[research_agent],
     model=model,
   )
 
