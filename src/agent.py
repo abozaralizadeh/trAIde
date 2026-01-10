@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List
 
 import requests
-from datetime import datetime
+from datetime import datetime, timezone
 import contextlib
 
 from agents import (
@@ -174,19 +174,22 @@ async def run_trading_agent(
 
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
+  run_name = "Trading Agent Run"
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
       from langsmith import Client as LangsmithClient
-      from langsmith.run_helpers import get_run_tree_context
+      from langsmith.run_helpers import tracing_context
 
+      run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
       ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
-      langsmith_ctx = get_run_tree_context(
-        run_id=str(uuid.uuid4()),
-        name="Trading Agent Run",
+      langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
+        run_name=run_name,
         tags=["trAIde", "openai-agents"],
         client=ls_client,
       )
+    except ImportError:
+      print("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
     except Exception as exc:
       print("LangSmith run context init failed:", exc)
 
@@ -884,7 +887,7 @@ async def run_trading_agent(
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
   provider = get_trace_provider()
   with langsmith_ctx:
-    tr = provider.create_trace("Trading Agent Run", trace_id=gen_trace_id())
+    tr = provider.create_trace(run_name, trace_id=gen_trace_id())
     tr.start(mark_as_current=True)
     try:
       result = await Runner.run(trading_agent, input_payload)
