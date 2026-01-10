@@ -8,6 +8,7 @@ from typing import Any, Dict, List
 
 import requests
 from datetime import datetime
+import contextlib
 
 from agents import (
   Agent,
@@ -170,6 +171,24 @@ async def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
+
+  # Create a LangSmith run context per loop to isolate traces.
+  langsmith_ctx = contextlib.nullcontext()
+  if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
+    try:
+      from langsmith import Client as LangsmithClient
+      from langsmith.run_helpers import get_run_tree_context
+
+      ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
+      langsmith_ctx = get_run_tree_context(
+        run_id=str(uuid.uuid4()),
+        name="Trading Agent Run",
+        project_name=cfg.langsmith.project,
+        tags=["trAIde", "openai-agents"],
+        client=ls_client,
+      )
+    except Exception as exc:
+      print("LangSmith run context init failed:", exc)
 
   @function_tool
   async def place_market_order(
@@ -864,15 +883,16 @@ async def run_trading_agent(
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
   provider = get_trace_provider()
-  tr = provider.create_trace("Trading Agent Run", trace_id=gen_trace_id())
-  tr.start(mark_as_current=True)
-  try:
-    result = await Runner.run(trading_agent, input_payload)
-  finally:
+  with langsmith_ctx:
+    tr = provider.create_trace("Trading Agent Run", trace_id=gen_trace_id())
+    tr.start(mark_as_current=True)
     try:
-      tr.finish(reset_current=True)
-    except Exception as exc:
-      print("Trace cleanup failed:", exc)
+      result = await Runner.run(trading_agent, input_payload)
+    finally:
+      try:
+        tr.finish(reset_current=True)
+      except Exception as exc:
+        print("Trace cleanup failed:", exc)
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []
