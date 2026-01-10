@@ -145,33 +145,6 @@ async def run_trading_agent(
     model=cfg.azure.deployment,
     openai_client=openai_client,
   )
-  # Secondary research agent to scout new coins while idle/riskOff.
-  research_agent = Agent(
-    name="Research Agent",
-    instructions=(
-      "You are a research scout for alternative crypto opportunities.\n"
-      "- Goal: find high-confidence setups on coins beyond the current universe.\n"
-      "- Use web_search and KuCoin news to identify catalysts, liquidity, and momentum on other symbols.\n"
-      "- When idle, also discover new high-quality data/news sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
-      "- NEVER place orders or change the coin list yourself; instead propose candidates with evidence.\n"
-      "- Log findings via log_research (topic, summary, actions) and recommend adds for the main agent to decide.\n"
-      "- Prioritize liquid, tradable pairs; avoid illiquid/obscure tokens. Return concise recommendations with confidence and why they beat current options."
-    ),
-    tools=[
-      WebSearchTool(search_context_size="high"),
-      fetch_recent_candles,
-      analyze_market_context,
-      fetch_orderbook,
-      fetch_kucoin_news,
-      log_research,
-      add_source,
-      remove_source,
-      log_sentiment,
-      log_decision,
-    ],
-    model=model,
-  )
-
   balances_by_currency: Dict[str, float] = {}
   for bal in snapshot.balances:
     balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
@@ -825,6 +798,33 @@ async def run_trading_agent(
     "- Log every decision with confidence using log_decision for calibration; include reason and whether paper/live.\n"
     "- Be explicit about your reasoning in the final narrative.\n"
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, just simulate orders via the tool."
+  )
+
+  # Secondary research agent to scout new coins while idle/riskOff.
+  research_agent = Agent(
+    name="Research Agent",
+    instructions=(
+      "You are a research scout for alternative crypto opportunities.\n"
+      "- Goal: find high-confidence setups on coins beyond the current universe.\n"
+      "- Use web_search and KuCoin news to identify catalysts, liquidity, and momentum on other symbols.\n"
+      "- When idle, also discover new high-quality data/news sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
+      "- NEVER place orders or change the coin list yourself; instead propose candidates with evidence.\n"
+      "- Log findings via log_research (topic, summary, actions) and recommend adds for the main agent to decide.\n"
+      "- Prioritize liquid, tradable pairs; avoid illiquid/obscure tokens. Return concise recommendations with confidence and why they beat current options."
+    ),
+    tools=[
+      WebSearchTool(search_context_size="high"),
+      fetch_recent_candles,
+      analyze_market_context,
+      fetch_orderbook,
+      fetch_kucoin_news,
+      log_research,
+      add_source,
+      remove_source,
+      log_sentiment,
+      log_decision,
+    ],
+    model=model,
   )
 
   trading_agent = Agent(
