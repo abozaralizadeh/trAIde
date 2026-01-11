@@ -168,6 +168,7 @@ async def run_trading_agent(
     balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
       bal.available or 0
     )
+  unique_trace_id = gen_trace_id()
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
@@ -185,6 +186,7 @@ async def run_trading_agent(
       langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
         run_name=run_name,
+        run_id=unique_trace_id,
         tags=["trAIde", "openai-agents"],
         client=ls_client,
       )
@@ -885,9 +887,9 @@ async def run_trading_agent(
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
-  provider = get_trace_provider()
   with langsmith_ctx:
-    tr = provider.create_trace(run_name, trace_id=gen_trace_id())
+    provider = get_trace_provider()
+    tr = provider.create_trace(run_name, trace_id=unique_trace_id)
     tr.start(mark_as_current=True)
     try:
       result = await Runner.run(trading_agent, input_payload)
