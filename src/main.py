@@ -147,6 +147,7 @@ async def trading_loop() -> None:
       idle_polls += 1
       print(f"No triggers. Idle polls: {idle_polls}/{cfg.trading.max_idle_polls}")
 
+    get_trace_provider().shutdown()
     await asyncio.sleep(cfg.trading.poll_interval_sec)
 
 
