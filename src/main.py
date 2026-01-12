@@ -4,7 +4,8 @@ import asyncio
 import sys
 from typing import Dict
 
-from agents import set_default_openai_client, get_trace_provider
+from agents import set_default_openai_client
+from agents.tracing import (get_trace_provider)
 from .agent import TradingSnapshot, run_trading_agent, setup_tracing, _build_openai_client
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
