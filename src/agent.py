@@ -66,9 +66,6 @@ class _RedactingConsoleExporter(ConsoleSpanExporter):
 
 def setup_tracing(cfg: AppConfig) -> None:
   """Register tracing processors once at startup."""
-  global _TRACING_INITIALIZED
-  if _TRACING_INITIALIZED:
-    return
   try:
     if not cfg.tracing_enabled:
       return
@@ -95,9 +92,6 @@ def setup_tracing(cfg: AppConfig) -> None:
       print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
   except Exception as exc:
     print("Tracing setup failed:", exc)
-  else:
-    _TRACING_INITIALIZED = True
-
 
 @dataclass
 class TradingSnapshot:
@@ -131,22 +125,11 @@ def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
   )
 
 
-def _format_snapshot(
-  snapshot: TradingSnapshot,
-  spot_balances_by_currency: Dict[str, float],
-  futures_balances_by_currency: Dict[str, float],
-) -> str:
-  combined_balances: Dict[str, float] = {}
-  for cur in set(spot_balances_by_currency) | set(futures_balances_by_currency):
-    combined_balances[cur] = spot_balances_by_currency.get(cur, 0.0) + futures_balances_by_currency.get(cur, 0.0)
+def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   user_content = {
     "coins": snapshot.coins,
     "tickers": {k: vars(v) for k, v in snapshot.tickers.items()},
-    "balances": {
-      "spot": spot_balances_by_currency,
-      "futures": futures_balances_by_currency,
-      "combined": combined_balances,
-    },
+    "balances": balances_by_currency,
     "paperTrading": snapshot.paper_trading,
     "maxPositionUsd": snapshot.max_position_usd,
     "minConfidence": snapshot.min_confidence,
@@ -174,18 +157,11 @@ async def run_trading_agent(
     model=cfg.azure.deployment,
     openai_client=openai_client,
   )
-  spot_balances_by_currency: Dict[str, float] = {}
-  futures_balances_by_currency: Dict[str, float] = {}
-  for bal in snapshot.balances:
-    try:
-      amt = float(bal.available or 0)
-    except Exception:
-      amt = 0.0
-    target = futures_balances_by_currency if bal.type == "contract" else spot_balances_by_currency
-    target[bal.currency] = target.get(bal.currency, 0.0) + amt
   balances_by_currency: Dict[str, float] = {}
-  for cur in set(spot_balances_by_currency) | set(futures_balances_by_currency):
-    balances_by_currency[cur] = spot_balances_by_currency.get(cur, 0.0) + futures_balances_by_currency.get(cur, 0.0)
+  for bal in snapshot.balances:
+    balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
+      bal.available or 0
+    )
   unique_trace_id = gen_trace_id()
   unique_span_id = gen_span_id()
 
@@ -268,17 +244,39 @@ async def run_trading_agent(
       except Exception as exc:
         print("Warning: futures overview unavailable:", exc)
 
-    spot_reserve = spot_usdt * 0.10
-    spot_spendable = max(0.0, spot_usdt - spot_reserve)
-    if funds_val > spot_spendable:
+    total_available = spot_usdt + futures_available
+    reserve_total = total_available * 0.10
+    max_spend = max(0.0, total_available - reserve_total)
+    if funds_val > max_spend:
       return {
         "rejected": True,
-        "reason": "Insufficient spot balance after 10% reserve",
+        "reason": "Exceeds spendable USDT after 10% reserve",
+        "maxSpend": max_spend,
         "spotAvailable": spot_usdt,
-        "spotSpendable": spot_spendable,
         "futuresAvailable": futures_available,
-        "hint": "Use transfer_funds to rebalance or place a futures order instead of forcing a spot buy.",
       }
+
+    # If spot alone is insufficient but futures has free balance, auto-transfer the shortfall (respecting futures 10% reserve).
+    spot_reserve = spot_usdt * 0.10
+    spot_spendable = max(0.0, spot_usdt - spot_reserve)
+    transfer_used: dict[str, Any] | None = None
+    if funds_val > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
+      futures_reserve = futures_available * 0.10
+      futures_spendable = max(0.0, futures_available - futures_reserve)
+      need = funds_val - spot_spendable
+      transfer_amt = min(need, futures_spendable)
+      if transfer_amt > 0:
+        try:
+          transfer_used = kucoin.transfer_funds(
+            currency="USDT",
+            amount=transfer_amt,
+            from_account="contract",
+            to_account="trade",
+          )
+          spot_usdt += transfer_amt
+          spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
+        except Exception as exc:
+          print("Warning: futures->spot transfer failed:", exc)
 
     order_req = KucoinOrderRequest(
       symbol=symbol,
@@ -315,7 +313,7 @@ async def run_trading_agent(
         )
       return res
     except Exception as exc:
-      return {"error": str(exc), "orderRequest": order_req.__dict__}
+      return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
 
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
@@ -424,7 +422,7 @@ async def run_trading_agent(
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
 
-    balance_usdt = spot_balances_by_currency.get("USDT", 0.0)
+    balance_usdt = balances_by_currency.get("USDT", 0.0)
     if balance_usdt <= 0:
       return {"error": "No USDT balance available"}
     risk_fraction = risk_pct if risk_pct is not None else cfg.trading.risk_per_trade_pct
@@ -799,7 +797,6 @@ async def run_trading_agent(
     "- Before placing a spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if size is clipped or volatility is high.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
-    "- Balances are split by venue: balances.spot vs balances.futures. Only spend spot funds on spot orders; keep futures funds for futures trades/hedges unless you explicitly rebalance with transfer_funds.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
     "- When idle/riskOff and no clean setups on current coins, handoff to the Research Agent to scout other high-confidence coins or better data sources; only adopt new coins/sources after clear evidence and explicit decision. Use research outputs (log_research, backtests) before committing capital.\n"
     "- Avoid putting all eggs in one basket: keep USDT split across spot and futures where practical so both venues remain tradable; rebalance with transfer_funds instead of concentrating all capital in one account.\n"
@@ -884,7 +881,7 @@ async def run_trading_agent(
   )
 
   # Provide snapshot as serialized context input.
-  input_payload = _format_snapshot(snapshot, spot_balances_by_currency, futures_balances_by_currency)
+  input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
   with langsmith_ctx:
