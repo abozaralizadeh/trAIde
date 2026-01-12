@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import requests
+from datetime import datetime, timezone
+import contextlib
 
 from agents import (
   Agent,
@@ -64,19 +64,6 @@ class _RedactingConsoleExporter(ConsoleSpanExporter):
     return super().export(spans)
 
 
-def _remove_trace_processor(proc: Any) -> None:
-  """Best-effort removal of a tracing processor from the provider."""
-  try:
-    provider = get_trace_provider()
-    multi = getattr(provider, "_multi_processor", None)
-    current = list(getattr(multi, "_processors", ())) if multi else []
-    if proc in current:
-      current.remove(proc)
-      provider.set_processors(current)
-  except Exception as exc:
-    print("Warning: failed to remove trace processor:", exc)
-
-
 def setup_tracing(cfg: AppConfig) -> None:
   """Register tracing processors once at startup."""
   global _TRACING_INITIALIZED
@@ -90,6 +77,22 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+    if cfg.langsmith.enabled and cfg.langsmith.tracing:
+      from langsmith import Client as LangsmithClient
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+      )
+      processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
+      )
+      add_trace_processor(processor)
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
   except Exception as exc:
     print("Tracing setup failed:", exc)
   else:
@@ -170,34 +173,25 @@ async def run_trading_agent(
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
 
-  # Create a LangSmith run context per loop and register a per-run processor.
+  # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
   run_name = "Trading Agent Run"
-  ls_processor = None
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
       from langsmith import Client as LangsmithClient
-      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
-      from langsmith.run_helpers import get_run_tree_context
+      from langsmith.run_helpers import tracing_context
 
       run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
       ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
-      langsmith_ctx = get_run_tree_context(
-        client=ls_client,
-        run_id=str(uuid.uuid4()),
-        name=run_name,
+      langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
+        run_name=run_name,
+        run_id=unique_trace_id,
         tags=["trAIde", "openai-agents"],
-      )
-      ls_processor = OpenAIAgentsTracingProcessor(
         client=ls_client,
-        project_name=cfg.langsmith.project or None,
-        tags=["trAIde", "openai-agents"],
-        name="trAIde-agent",
       )
-      add_trace_processor(ls_processor)
     except ImportError:
-      print("LangSmith tracing modules unavailable; skipping per-run LangSmith context.")
+      print("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
     except Exception as exc:
       print("LangSmith run context init failed:", exc)
 
@@ -893,21 +887,17 @@ async def run_trading_agent(
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
-  try:
-    with langsmith_ctx:
-      provider = get_trace_provider()
-      tr = provider.create_trace(run_name, trace_id=unique_trace_id)
-      tr.start(mark_as_current=True)
+  with langsmith_ctx:
+    provider = get_trace_provider()
+    tr = provider.create_trace(run_name, trace_id=unique_trace_id)
+    tr.start(mark_as_current=True)
+    try:
+      result = await Runner.run(trading_agent, input_payload)
+    finally:
       try:
-        result = await Runner.run(trading_agent, input_payload)
-      finally:
-        try:
-          tr.finish(reset_current=True)
-        except Exception as exc:
-          print("Trace cleanup failed:", exc)
-  finally:
-    if ls_processor:
-      _remove_trace_processor(ls_processor)
+        tr.finish(reset_current=True)
+      except Exception as exc:
+        print("Trace cleanup failed:", exc)
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []
