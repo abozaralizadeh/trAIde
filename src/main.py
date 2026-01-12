@@ -147,7 +147,7 @@ async def trading_loop() -> None:
       idle_polls += 1
       print(f"No triggers. Idle polls: {idle_polls}/{cfg.trading.max_idle_polls}")
 
-    get_trace_provider().gen_trace_id()
+    get_trace_provider().set_processors([])  # Flush and close any trace processors
     await asyncio.sleep(cfg.trading.poll_interval_sec)
 
 
@@ -159,9 +159,6 @@ def main() -> None:
   except Exception as exc:
     print("Fatal error:", exc, file=sys.stderr)
     sys.exit(1)
-  finally:
-    #get_trace_provider().set_processors([])  # Flush and close any trace processors
-    get_trace_provider().gen_trace_id()
 
 
 if __name__ == "__main__":
