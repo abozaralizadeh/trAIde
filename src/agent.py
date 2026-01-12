@@ -15,7 +15,6 @@ from agents import (
   Runner,
   OpenAIResponsesModel,
   add_trace_processor,
-  set_trace_processors,
   set_tracing_export_api_key,
   gen_trace_id,
 )
@@ -26,7 +25,6 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
-_LANGSMITH_PROCESSOR_SET = False
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -75,6 +73,23 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+    if cfg.langsmith.enabled and cfg.langsmith.api_key:
+      from langsmith import Client as LangsmithClient
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+      )
+      add_trace_processor(
+        OpenAIAgentsTracingProcessor(
+          client=ls_client,
+          project_name=cfg.langsmith.project,
+          tags=["trAIde", "openai-agents"],
+          name="trAIde-agent",
+        )
+      )
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor")
   except Exception as exc:
     print("Tracing setup failed:", exc)
   else:
@@ -161,7 +176,6 @@ async def run_trading_agent(
     try:
       from langsmith import Client as LangsmithClient
       from langsmith.run_helpers import get_run_tree_context
-      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
 
       run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
       ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
@@ -172,19 +186,6 @@ async def run_trading_agent(
         project_name=cfg.langsmith.project,
         tags=["trAIde", "openai-agents"],
       )
-      global _LANGSMITH_PROCESSOR_SET
-      if not _LANGSMITH_PROCESSOR_SET:
-        set_trace_processors(
-          [
-            OpenAIAgentsTracingProcessor(
-              client=ls_client,
-              project_name=cfg.langsmith.project,
-              tags=["trAIde", "openai-agents"],
-              name="trAIde-agent",
-            )
-          ]
-        )
-        _LANGSMITH_PROCESSOR_SET = True
     except ImportError:
       print("LangSmith tracing modules unavailable; skipping per-run LangSmith context.")
     except Exception as exc:
