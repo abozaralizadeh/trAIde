@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import requests
+from datetime import datetime, timezone
+import contextlib
 
 from agents import (
   Agent,
+  InputGuardrail,
+  GuardrailFunctionOutput,
   Runner,
+  OpenAIChatCompletionsModel,
   OpenAIResponsesModel,
   add_trace_processor,
+  set_default_openai_client,
   set_tracing_export_api_key,
+  gen_trace_id,
 )
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
@@ -24,7 +29,6 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
-_LANGSMITH_PROCESSOR_ATTACHED = False
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -73,6 +77,22 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+    if cfg.langsmith.enabled and cfg.langsmith.tracing:
+      from langsmith import Client as LangsmithClient
+      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
+
+      ls_client = LangsmithClient(
+        api_key=cfg.langsmith.api_key,
+        api_url=cfg.langsmith.api_url or None,
+      )
+      processor = OpenAIAgentsTracingProcessor(
+        client=ls_client,
+        project_name=cfg.langsmith.project or None,
+        tags=["trAIde", "openai-agents"],
+        name="trAIde-agent",
+      )
+      add_trace_processor(processor)
+      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
   except Exception as exc:
     print("Tracing setup failed:", exc)
   else:
@@ -148,8 +168,7 @@ async def run_trading_agent(
     balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
       bal.available or 0
     )
-  unique_run_id = uuid.uuid4()
-  trace_id = unique_run_id.hex
+  unique_trace_id = gen_trace_id()
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
@@ -160,7 +179,6 @@ async def run_trading_agent(
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
       from langsmith import Client as LangsmithClient
-      from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
       from langsmith.run_helpers import tracing_context
 
       run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
@@ -168,21 +186,10 @@ async def run_trading_agent(
       langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
         run_name=run_name,
-        run_id=unique_run_id,
+        run_id=unique_trace_id,
         tags=["trAIde", "openai-agents"],
         client=ls_client,
       )
-      global _LANGSMITH_PROCESSOR_ATTACHED
-      if not _LANGSMITH_PROCESSOR_ATTACHED:
-        add_trace_processor(
-          OpenAIAgentsTracingProcessor(
-            client=ls_client,
-            project_name=cfg.langsmith.project or None,
-            tags=["trAIde", "openai-agents"],
-            name="trAIde-agent",
-          )
-        )
-        _LANGSMITH_PROCESSOR_ATTACHED = True
     except ImportError:
       print("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
     except Exception as exc:
@@ -882,7 +889,7 @@ async def run_trading_agent(
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
   with langsmith_ctx:
     provider = get_trace_provider()
-    tr = provider.create_trace(run_name, trace_id=trace_id)
+    tr = provider.create_trace(run_name, trace_id=unique_trace_id)
     tr.start(mark_as_current=True)
     try:
       result = await Runner.run(trading_agent, input_payload)
