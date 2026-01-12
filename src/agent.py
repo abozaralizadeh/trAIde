@@ -148,8 +148,8 @@ async def run_trading_agent(
     balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
       bal.available or 0
     )
-  unique_run_id = uuid.uuid4()
-  trace_id = unique_run_id.hex
+  unique_run_id = uuid.uuid4().hex
+  trace_id = f"trace_{unique_run_id}"
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
@@ -168,7 +168,7 @@ async def run_trading_agent(
       langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
         run_name=run_name,
-        run_id=unique_run_id,
+        run_id=trace_id,
         tags=["trAIde", "openai-agents"],
         client=ls_client,
       )
