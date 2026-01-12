@@ -159,7 +159,8 @@ def main() -> None:
     print("Fatal error:", exc, file=sys.stderr)
     sys.exit(1)
   finally:
-    get_trace_provider().shutdown()
+    #get_trace_provider().set_processors([])  # Flush and close any trace processors
+    get_trace_provider().gen_trace_id()
 
 
 if __name__ == "__main__":
