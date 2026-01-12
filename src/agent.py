@@ -1,21 +1,26 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Any, Dict, List
 
 import requests
+from datetime import datetime, timezone
+import contextlib
 
 from agents import (
   Agent,
+  InputGuardrail,
+  GuardrailFunctionOutput,
   Runner,
+  OpenAIChatCompletionsModel,
   OpenAIResponsesModel,
   add_trace_processor,
+  set_default_openai_client,
   set_tracing_export_api_key,
+  gen_trace_id,
 )
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
@@ -24,7 +29,6 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
-_OTEL_TRACER = None
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -145,35 +149,6 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
   return json.dumps(user_content)
 
 
-def _get_otel_tracer(cfg: AppConfig):
-  """Initialize a LangSmith OTLP exporter once and reuse its tracer."""
-  global _OTEL_TRACER
-  if _OTEL_TRACER is not None:
-    return _OTEL_TRACER
-  if not (cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key):
-    return None
-  try:
-    from opentelemetry import trace as ot_trace
-    from opentelemetry.sdk.resources import Resource
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-  except ImportError:
-    print("OpenTelemetry not installed; skipping LangSmith OTLP export.")
-    return None
-
-  resource = Resource.create({"service.name": "traide-agent"})
-  provider = TracerProvider(resource=resource)
-  otlp_exporter = OTLPSpanExporter(
-    endpoint="https://api.smith.langchain.com/otel/v1/traces",
-    headers={"x-api-key": cfg.langsmith.api_key},
-  )
-  provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-  ot_trace.set_tracer_provider(provider)
-  _OTEL_TRACER = ot_trace.get_tracer("traide.agent")
-  return _OTEL_TRACER
-
-
 async def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
@@ -193,16 +168,32 @@ async def run_trading_agent(
     balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
       bal.available or 0
     )
+  unique_trace_id = gen_trace_id()
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
 
+  # Create a LangSmith run context per loop to isolate traces.
+  langsmith_ctx = contextlib.nullcontext()
   run_name = "Trading Agent Run"
-  if cfg.langsmith.enabled and cfg.langsmith.tracing:
-    run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
+  if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
+    try:
+      from langsmith import Client as LangsmithClient
+      from langsmith.run_helpers import tracing_context
 
-  otel_tracer = _get_otel_tracer(cfg)
-  otel_ctx = otel_tracer.start_as_current_span(run_name) if otel_tracer else contextlib.nullcontext()
+      run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
+      ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
+      langsmith_ctx = tracing_context(
+        project_name=cfg.langsmith.project,
+        run_name=run_name,
+        run_id=unique_trace_id,
+        tags=["trAIde", "openai-agents"],
+        client=ls_client,
+      )
+    except ImportError:
+      print("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
+    except Exception as exc:
+      print("LangSmith run context init failed:", exc)
 
   @function_tool
   async def place_market_order(
@@ -895,16 +886,10 @@ async def run_trading_agent(
   # Provide snapshot as serialized context input.
   input_payload = _format_snapshot(snapshot, balances_by_currency)
 
-  trace_id = f"trace_{uuid.uuid4().hex}"
-
-  # Ensure a fresh trace per agent loop using a unique trace_id, and optionally mirror it to OTLP.
-  with otel_ctx as otel_span:
-    if otel_span:
-      ctx = otel_span.get_span_context()
-      if ctx and ctx.trace_id:
-        trace_id = f"trace_{ctx.trace_id:032x}"
+  # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
+  with langsmith_ctx:
     provider = get_trace_provider()
-    tr = provider.create_trace(run_name, trace_id=trace_id)
+    tr = provider.create_trace(run_name, trace_id=unique_trace_id)
     tr.start(mark_as_current=True)
     try:
       result = await Runner.run(trading_agent, input_payload)
