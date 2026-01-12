@@ -21,7 +21,7 @@ from agents import (
   set_default_openai_client,
   set_tracing_export_api_key,
   gen_trace_id,
-)
+  gen_span_id)
 from agents.items import ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
@@ -169,6 +169,7 @@ async def run_trading_agent(
       bal.available or 0
     )
   unique_trace_id = gen_trace_id()
+  unique_span_id = gen_span_id()
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
@@ -187,6 +188,8 @@ async def run_trading_agent(
         project_name=cfg.langsmith.project,
         run_name=run_name,
         run_id=unique_trace_id,
+        trace_id=unique_trace_id,
+        span_id=unique_span_id,
         tags=["trAIde", "openai-agents"],
         client=ls_client,
       )
