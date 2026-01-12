@@ -82,6 +82,7 @@ async def trading_loop() -> None:
 
   print("Starting trading loop...")
   while True:
+    setup_tracing(cfg)
     try:
       snapshot = build_snapshot(cfg, kucoin, memory)
     except Exception as exc:
