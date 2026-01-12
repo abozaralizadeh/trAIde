@@ -4,7 +4,7 @@ import asyncio
 import sys
 from typing import Dict
 
-from agents import set_default_openai_client
+from agents import set_default_openai_client, get_trace_provider
 from .agent import TradingSnapshot, run_trading_agent, setup_tracing, _build_openai_client
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
@@ -157,6 +157,8 @@ def main() -> None:
   except Exception as exc:
     print("Fatal error:", exc, file=sys.stderr)
     sys.exit(1)
+  finally:
+    get_trace_provider().shutdown()
 
 
 if __name__ == "__main__":
