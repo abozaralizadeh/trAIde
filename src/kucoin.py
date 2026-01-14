@@ -189,25 +189,59 @@ class KucoinClient:
     *,
     currency: str,
     amount: float,
-    from_account: Literal["trade", "contract"],
-    to_account: Literal["trade", "contract"],
+    from_account: str,
+    to_account: str,
     client_oid: Optional[str] = None,
   ) -> Dict[str, Any]:
-    """Transfer funds between spot (trade) and futures (contract) accounts using universal transfer."""
-    body = {
+    """Transfer funds between internal accounts (spot/futures/unified) with universal transfer, falling back if needed."""
+    def _normalize(account: str) -> str:
+      acct = (account or "").lower()
+      mapping = {
+        "trade": "TRADE",
+        "spot": "TRADE",
+        "main": "MAIN",
+        "funding": "MAIN",
+        "margin": "MARGIN",
+        "contract": "CONTRACT",
+        "futures": "CONTRACT",
+        "unified": "UNIFIED",
+      }
+      return mapping.get(acct, acct.upper())
+
+    payload = {
       "clientOid": client_oid or str(int(time.time() * 1000)),
       "currency": currency.upper(),
       "amount": f"{amount}",
       "type": "INTERNAL",
-      "fromAccountType": from_account.upper(),
-      "toAccountType": to_account.upper(),
+      "fromAccountType": _normalize(from_account),
+      "toAccountType": _normalize(to_account),
     }
-    return self._request(
-      "POST",
-      "/api/v3/accounts/universal-transfer",
-      auth=True,
-      body=body,
-    )
+    try:
+      return self._request(
+        "POST",
+        "/api/v3/accounts/universal-transfer",
+        auth=True,
+        body=payload,
+      )
+    except Exception as exc:
+      # Some account types (esp. legacy accounts) may reject universal transfer; fallback to inner-transfer.
+      legacy_body = {
+        "clientOid": payload["clientOid"],
+        "currency": payload["currency"],
+        "from": from_account.lower(),
+        "to": to_account.lower(),
+        "amount": f"{amount}",
+      }
+      try:
+        return self._request(
+          "POST",
+          "/api/v2/accounts/inner-transfer",
+          auth=True,
+          body=legacy_body,
+        )
+      except Exception:
+        # Re-raise original failure for easier debugging if fallback also fails.
+        raise exc
 
   def place_order(self, order: KucoinOrderRequest) -> KucoinOrderResponse:
     payload = {k: v for k, v in order.__dict__.items() if v is not None}
