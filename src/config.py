@@ -84,6 +84,7 @@ class AppConfig:
   openai_trace_api_key: Optional[str]
   memory_file: str
   retention_days: int
+  agent_max_turns: int
 
 
 def load_config() -> AppConfig:
@@ -144,6 +145,7 @@ def load_config() -> AppConfig:
     openai_trace_api_key=os.getenv("OPENAI_TRACE_API_KEY"),
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
     retention_days=int(os.getenv("RETENTION_DAYS", "7")),
+    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "50")),
   )
 
   validate_config(config)

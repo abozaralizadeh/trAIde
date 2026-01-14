@@ -8,6 +8,7 @@ autonomous AI Agent crypto trader powered by Azure OpenAI and Kucoin APIs in Pyt
 - `PAPER_TRADING=true` by default to avoid real orders; set to `false` to trade live.
 - `MAX_POSITION_USD` caps spend per trade; `MIN_CONFIDENCE` controls when the agent trades.
 - Loop controls: `POLL_INTERVAL_SEC` (poll cadence), `PRICE_CHANGE_TRIGGER_PCT` (price move trigger), `MAX_IDLE_POLLS` (force-run after N idle polls).
+- Agent turn cap: `AGENT_MAX_TURNS` (default 50) raises the per-run loop limit for complex toolplans; bump if you see `Max turns (...) exceeded`.
 - Futures uses the same KuCoin API keys and base URL; toggle via `KUCOIN_FUTURES_ENABLED` (default true).
 - Azure OpenAI vs APIM: defaults to direct Azure OpenAI. If `AZURE_APIM_OPENAI_SUBSCRIPTION_KEY` is set, the client uses APIM endpoint/version/deployment instead (subscription key auth).
 - Coin universe: seed with `COINS`; if `FLEXIBLE_COINS_ENABLED=true` (default), the agent can add/remove coins with reasons and stored exit plans via memory.

@@ -896,7 +896,7 @@ async def run_trading_agent(
     tr = provider.create_trace(run_name, trace_id=unique_trace_id)
     tr.start(mark_as_current=True)
     try:
-      result = await Runner.run(trading_agent, input_payload)
+      result = await Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns)
     finally:
       try:
         tr.finish(reset_current=True)
