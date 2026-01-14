@@ -64,7 +64,7 @@ class _RedactingConsoleExporter(ConsoleSpanExporter):
     return super().export(spans)
 
 
-def setup_tracing(cfg: AppConfig) -> None:
+def setup_tracing(cfg: AppConfig):
   """Register tracing processors once at startup."""
   try:
     if not cfg.tracing_enabled:
@@ -74,6 +74,12 @@ def setup_tracing(cfg: AppConfig) -> None:
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
       print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+  except Exception as exc:
+    print("Tracing setup failed:", exc)
+
+def setup_lstracing(cfg: AppConfig):
+  """Register tracing processors once at startup."""
+  try:
     if cfg.langsmith.enabled and cfg.langsmith.tracing:
       from langsmith import Client as LangsmithClient
       from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
@@ -86,10 +92,11 @@ def setup_tracing(cfg: AppConfig) -> None:
         client=ls_client,
         project_name=cfg.langsmith.project or None,
         tags=["trAIde", "openai-agents"],
-        name="trAIde-agent",
+        name=f"trAIde-agent-{gen_trace_id()}",
       )
       add_trace_processor(processor)
       print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
+    return processor
   except Exception as exc:
     print("Tracing setup failed:", exc)
 

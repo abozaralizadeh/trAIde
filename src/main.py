@@ -6,7 +6,7 @@ from typing import Dict
 
 from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
-from .agent import TradingSnapshot, run_trading_agent, setup_tracing, _build_openai_client
+from .agent import TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
@@ -82,7 +82,7 @@ async def trading_loop() -> None:
 
   print("Starting trading loop...")
   while True:
-    setup_tracing(cfg)
+    setup_lstracing(cfg)
     try:
       snapshot = build_snapshot(cfg, kucoin, memory)
     except Exception as exc:
@@ -148,7 +148,6 @@ async def trading_loop() -> None:
       idle_polls += 1
       print(f"No triggers. Idle polls: {idle_polls}/{cfg.trading.max_idle_polls}")
 
-    get_trace_provider().set_processors([])  # Flush and close any trace processors
     await asyncio.sleep(cfg.trading.poll_interval_sec)
 
 
