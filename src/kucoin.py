@@ -193,17 +193,18 @@ class KucoinClient:
     to_account: Literal["trade", "contract"],
     client_oid: Optional[str] = None,
   ) -> Dict[str, Any]:
-    """Transfer funds between spot (trade) and futures (contract) accounts."""
+    """Transfer funds between spot (trade) and futures (contract) accounts using universal transfer."""
     body = {
       "clientOid": client_oid or str(int(time.time() * 1000)),
-      "currency": currency,
-      "from": from_account,
-      "to": to_account,
+      "currency": currency.upper(),
       "amount": f"{amount}",
+      "type": "INTERNAL",
+      "fromAccountType": from_account.upper(),
+      "toAccountType": to_account.upper(),
     }
     return self._request(
       "POST",
-      "/api/v2/accounts/inner-transfer",
+      "/api/v3/accounts/universal-transfer",
       auth=True,
       body=body,
     )
