@@ -27,7 +27,7 @@ def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
   return coins
 
 
-def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSnapshot:
+def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
   coins = _load_active_coins(cfg, memory)
   tickers = {}
   for symbol in coins:
@@ -37,10 +37,10 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
   all_accounts = kucoin.get_accounts()
   balances = list(spot_accounts)
   futures_overview = None
-  if cfg.kucoin_futures.enabled:
+  futures_stops: list[dict] = []
+  if cfg.kucoin_futures.enabled and kucoin_futures:
     try:
-      fut = KucoinFuturesClient(cfg)
-      futures_overview = fut.get_account_overview()
+      futures_overview = kucoin_futures.get_account_overview()
       if futures_overview:
         balances.append(
           KucoinAccount(
@@ -52,8 +52,15 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
             holds=str(futures_overview.get("frozenBalance") or "0"),
           )
         )
+      futures_stops = kucoin_futures.list_stop_orders(status="active") or []
     except Exception as exc:
       print("Warning: unable to fetch futures account overview:", exc, file=sys.stderr)
+
+  spot_stops: list[dict] = []
+  try:
+    spot_stops = kucoin.list_stop_orders(status="active")
+  except Exception as exc:
+    print("Warning: unable to fetch spot stop orders:", exc, file=sys.stderr)
 
   return TradingSnapshot(
     coins=coins,
@@ -70,6 +77,8 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
     spot_accounts=spot_accounts,
     futures_account=futures_overview or {},
     all_accounts=all_accounts,
+    spot_stop_orders=spot_stops,
+    futures_stop_orders=futures_stops,
   )
 
 
@@ -89,7 +98,7 @@ async def trading_loop() -> None:
   print("Starting trading loop...")
   while True:
     try:
-      snapshot = build_snapshot(cfg, kucoin, memory)
+      snapshot = build_snapshot(cfg, kucoin, kucoin_futures, memory)
     except Exception as exc:
       print("Snapshot failed, retrying after delay:", exc, file=sys.stderr)
       await asyncio.sleep(cfg.trading.poll_interval_sec)

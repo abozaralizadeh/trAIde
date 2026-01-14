@@ -46,6 +46,8 @@ class KucoinOrderRequest:
   funds: Optional[str] = None
   price: Optional[str] = None
   clientOid: Optional[str] = None
+  stopPrice: Optional[str] = None
+  stopPriceType: Optional[Literal["TP", "MP"]] = None  # TP=trigger when price rises, MP=trigger when price falls
 
 
 @dataclass
@@ -63,6 +65,17 @@ class KucoinFuturesOrderRequest:
   size: str
   price: Optional[str] = None
   clientOid: Optional[str] = None
+  stop: Optional[Literal["up", "down"]] = None
+  stopPriceType: Optional[Literal["TP", "MP", "IP"]] = None  # TP=last price, MP=mark, IP=index (per API)
+  stopPrice: Optional[str] = None
+  reduceOnly: Optional[bool] = None
+  closeOrder: Optional[bool] = None
+  takeProfitPrice: Optional[str] = None
+  stopLossPrice: Optional[str] = None
+  postOnly: Optional[bool] = None
+  hidden: Optional[bool] = None
+  iceberg: Optional[bool] = None
+  visibleSize: Optional[str] = None
 
 
 @dataclass
@@ -255,6 +268,49 @@ class KucoinClient:
     client_oid = data.get("clientOid") if isinstance(data, dict) else None
     return KucoinOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid"))
 
+  def place_stop_order(self, order: KucoinOrderRequest) -> KucoinOrderResponse:
+    """Place a spot stop order (KuCoin stop-order endpoint)."""
+    payload = {k: v for k, v in order.__dict__.items() if v is not None}
+    data = self._request(
+      "POST",
+      "/api/v1/stop-order",
+      auth=True,
+      body=payload,
+    )
+    order_id = data.get("orderId") if isinstance(data, dict) else None
+    client_oid = data.get("clientOid") if isinstance(data, dict) else None
+    return KucoinOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid"))
+
+  def cancel_stop_order(self, order_id: Optional[str] = None, client_oid: Optional[str] = None) -> Dict[str, Any]:
+    """Cancel a spot stop order by orderId or clientOid."""
+    body: Dict[str, str] = {}
+    if order_id:
+      body["orderId"] = order_id
+    if client_oid:
+      body["clientOid"] = client_oid
+    return self._request(
+      "DELETE",
+      "/api/v1/stop-order",
+      auth=True,
+      body=body or None,
+    )
+
+  def list_stop_orders(self, status: str = "active", symbol: Optional[str] = None) -> list[Dict[str, Any]]:
+    """List spot stop orders (default: active)."""
+    query: Dict[str, str] = {"status": status}
+    if symbol:
+      query["symbol"] = symbol
+    data = self._request(
+      "GET",
+      "/api/v1/stop-order",
+      auth=True,
+      query=query,
+    )
+    # API may return {"items":[...]} or list; normalize
+    if isinstance(data, dict) and "items" in data:
+      return data.get("items") or []
+    return data or []
+
 
 class KucoinFuturesClient:
   def __init__(self, cfg: AppConfig) -> None:
@@ -318,6 +374,48 @@ class KucoinFuturesClient:
     order_id = data.get("orderId") if isinstance(data, dict) else None
     client_oid = data.get("clientOid") if isinstance(data, dict) else None
     return KucoinFuturesOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid", ""))
+
+  def cancel_order(self, order_id: str, symbol: Optional[str] = None) -> Dict[str, Any]:
+    """Cancel a futures order (works for stop orders too)."""
+    query = {"symbol": symbol} if symbol else None
+    return self._request(
+      "DELETE",
+      f"/api/v1/orders/{order_id}",
+      auth=True,
+      query=query,
+    )
+
+  def list_orders(self, status: str = "open", symbol: Optional[str] = None, side: Optional[str] = None) -> list[Dict[str, Any]]:
+    """List futures orders; status may include 'open', 'done', 'active' etc."""
+    query: Dict[str, str] = {"status": status}
+    if symbol:
+      query["symbol"] = symbol
+    if side:
+      query["side"] = side
+    data = self._request(
+      "GET",
+      "/api/v1/orders",
+      auth=True,
+      query=query,
+    )
+    if isinstance(data, dict) and "items" in data:
+      return data.get("items") or []
+    return data or []
+
+  def list_stop_orders(self, status: str = "active", symbol: Optional[str] = None) -> list[Dict[str, Any]]:
+    """List futures stop orders (active or done)."""
+    query: Dict[str, str] = {"status": status}
+    if symbol:
+      query["symbol"] = symbol
+    data = self._request(
+      "GET",
+      "/api/v1/stopOrders",
+      auth=True,
+      query=query,
+    )
+    if isinstance(data, dict) and "items" in data:
+      return data.get("items") or []
+    return data or []
 
   def get_account_overview(self, currency: str = "USDT") -> Dict[str, Any]:
     """Fetch futures account overview for a given currency (default USDT)."""

@@ -116,6 +116,8 @@ class TradingSnapshot:
   spot_accounts: List[KucoinAccount] = field(default_factory=list)
   futures_account: Dict[str, Any] | None = None
   all_accounts: List[KucoinAccount] = field(default_factory=list)
+  spot_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
+  futures_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -220,6 +222,10 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "drawdownPct": snapshot.drawdown_pct,
     "totalUsdt": snapshot.total_usdt,
     "guidance": "If you place an order, prefer market orders sized in USDT funds.",
+    "stops": {
+      "spot": snapshot.spot_stop_orders,
+      "futures": snapshot.futures_stop_orders,
+    },
   }
   return json.dumps(user_content)
 
@@ -406,6 +412,67 @@ async def run_trading_agent(
       return res
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
+
+  @function_tool
+  async def place_spot_stop_order(
+    symbol: str,
+    side: str,
+    stop_price: float,
+    stop_price_type: str = "MP",
+    order_type: str = "limit",
+    size: float | None = None,
+    funds: float | None = None,
+    limit_price: float | None = None,
+    client_oid: str | None = None,
+  ) -> Dict[str, Any]:
+    """Place a spot stop order (stop-loss or take-profit). stop_price_type: TP(trigger when price rises) or MP(falls)."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    try:
+      stop_price_f = float(stop_price or 0)
+    except Exception:
+      return {"error": "Invalid stop price"}
+    if stop_price_f <= 0:
+      return {"error": "Stop price must be positive"}
+    order_req = KucoinOrderRequest(
+      symbol=symbol,
+      side="buy" if side == "buy" else "sell",
+      type="limit" if order_type == "limit" else "market",
+      size=f"{size}" if size is not None else None,
+      funds=f"{funds:.2f}" if funds is not None else None,
+      price=f"{limit_price:.6f}" if limit_price is not None else None,
+      clientOid=client_oid or str(uuid.uuid4()),
+      stopPrice=f"{stop_price_f}",
+      stopPriceType="TP" if stop_price_type.upper() == "TP" else "MP",
+    )
+    if snapshot.paper_trading:
+      return {"paper": True, "orderRequest": order_req.__dict__}
+    try:
+      res = kucoin.place_stop_order(order_req).__dict__
+      res["orderRequest"] = order_req.__dict__
+      return res
+    except Exception as exc:
+      return {"error": str(exc), "orderRequest": order_req.__dict__}
+
+  @function_tool
+  async def cancel_spot_stop_order(order_id: str | None = None, client_oid: str | None = None) -> Dict[str, Any]:
+    """Cancel a spot stop order by orderId or clientOid."""
+    if snapshot.paper_trading:
+      return {"paper": True, "cancelled": {"orderId": order_id, "clientOid": client_oid}}
+    try:
+      res = kucoin.cancel_stop_order(order_id=order_id, client_oid=client_oid)
+      return {"cancelled": res, "orderId": order_id, "clientOid": client_oid}
+    except Exception as exc:
+      return {"error": str(exc), "orderId": order_id, "clientOid": client_oid}
+
+  @function_tool
+  async def list_spot_stop_orders(status: str = "active", symbol: str | None = None) -> Dict[str, Any]:
+    """List spot stop orders; status usually 'active' or 'done'."""
+    try:
+      orders = kucoin.list_stop_orders(status=status, symbol=symbol)
+      return {"orders": orders, "status": status, "symbol": symbol}
+    except Exception as exc:
+      return {"error": str(exc), "status": status, "symbol": symbol}
 
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
@@ -703,6 +770,88 @@ async def run_trading_agent(
     return res
 
   @function_tool
+  async def place_futures_stop_order(
+    symbol: str,
+    side: str,
+    leverage: float,
+    size: float | None = None,
+    stop_price: float | None = None,
+    stop: str | None = None,
+    stop_price_type: str | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    reduce_only: bool | None = None,
+    close_order: bool | None = None,
+    order_type: str = "limit",
+    limit_price: float | None = None,
+    client_oid: str | None = None,
+  ) -> Dict[str, Any]:
+    """Place a futures stop/TP/SL order (works for reduce-only hedges)."""
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    try:
+      lev = float(leverage or 0)
+    except Exception:
+      return {"error": "Invalid leverage"}
+    if lev <= 0 or lev > snapshot.max_leverage:
+      return {"error": "Invalid leverage", "max": snapshot.max_leverage}
+    if size is None or size <= 0:
+      return {"error": "size required and >0"}
+    stop_price_str = f"{stop_price}" if stop_price is not None else None
+    tp_str = f"{take_profit_price}" if take_profit_price is not None else None
+    sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
+    order_req = KucoinFuturesOrderRequest(
+      symbol=symbol,
+      side="buy" if side == "buy" else "sell",
+      type="limit" if order_type == "limit" else "market",
+      leverage=f"{lev}",
+      size=f"{size}",
+      price=f"{limit_price}" if limit_price is not None else None,
+      clientOid=client_oid or str(uuid.uuid4()),
+      stop=stop,
+      stopPriceType=stop_price_type,
+      stopPrice=stop_price_str,
+      reduceOnly=reduce_only,
+      closeOrder=close_order,
+      takeProfitPrice=tp_str,
+      stopLossPrice=sl_str,
+    )
+    if snapshot.paper_trading:
+      return {"paper": True, "orderRequest": order_req.__dict__}
+    try:
+      res = kucoin_futures.place_order(order_req).__dict__
+      res["orderRequest"] = order_req.__dict__
+      return res
+    except Exception as exc:
+      return {"error": str(exc), "orderRequest": order_req.__dict__}
+
+  @function_tool
+  async def cancel_futures_order(order_id: str, symbol: str | None = None) -> Dict[str, Any]:
+    """Cancel a futures order (stop or regular) by orderId."""
+    if snapshot.paper_trading:
+      return {"paper": True, "cancelled": {"orderId": order_id, "symbol": symbol}}
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    try:
+      res = kucoin_futures.cancel_order(order_id, symbol=symbol)
+      return {"cancelled": res, "orderId": order_id, "symbol": symbol}
+    except Exception as exc:
+      return {"error": str(exc), "orderId": order_id, "symbol": symbol}
+
+  @function_tool
+  async def list_futures_stop_orders(status: str = "active", symbol: str | None = None) -> Dict[str, Any]:
+    """List futures stop orders; status: active/done."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    try:
+      orders = kucoin_futures.list_stop_orders(status=status, symbol=symbol)
+      return {"orders": orders, "status": status, "symbol": symbol}
+    except Exception as exc:
+      return {"error": str(exc), "status": status, "symbol": symbol}
+
+  @function_tool
   async def transfer_funds(
     direction: str,
     currency: str = "USDT",
@@ -985,6 +1134,7 @@ async def run_trading_agent(
     "- If analyze_market_context shows mixed bias or elevated volatility without a high-conviction catalyst, prefer decline_trade.\n"
     "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
     "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
+    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TP, cancel/replace them when thesis changes; keep stops in sync with position size.\n"
     "- Evaluate every account each run: make a decision for spot balances, then separately for futures balances (if enabled). Consider transfers to free capital instead of skipping because one venue is low on USDT.\n"
     "- Before placing a spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if size is clipped or volatility is high.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
@@ -1055,6 +1205,12 @@ async def run_trading_agent(
       fetch_account_state,
       place_futures_market_order,
       place_market_order,
+      place_spot_stop_order,
+      cancel_spot_stop_order,
+      list_spot_stop_orders,
+      place_futures_stop_order,
+      cancel_futures_order,
+      list_futures_stop_orders,
       save_trade_plan,
       latest_plan,
       set_auto_trigger,
