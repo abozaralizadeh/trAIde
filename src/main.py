@@ -71,6 +71,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
 async def trading_loop() -> None:
   cfg = load_config()
   setup_tracing(cfg)
+  ls_client = setup_lstracing(cfg)
   azure_client = _build_openai_client(cfg)
   # Azure client is for inference only; tracing uses platform key via set_tracing_export_api_key in setup_tracing.
   set_default_openai_client(azure_client, use_for_tracing=False)
@@ -82,7 +83,7 @@ async def trading_loop() -> None:
 
   print("Starting trading loop...")
   while True:
-    setup_lstracing(cfg)
+    
     try:
       snapshot = build_snapshot(cfg, kucoin, memory)
     except Exception as exc:
@@ -134,7 +135,7 @@ async def trading_loop() -> None:
       try:
         # Propagate risk_off into snapshot so the agent can act defensively (hedge/exit) but skip new risk-on entries.
         snapshot.risk_off = risk_off
-        result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures, azure_client)
+        result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client)
         print("\n--- Agent Decision Narrative ---")
         print(result["narrative"])
         if result.get("decisions"):

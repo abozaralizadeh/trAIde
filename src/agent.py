@@ -92,11 +92,11 @@ def setup_lstracing(cfg: AppConfig):
         client=ls_client,
         project_name=cfg.langsmith.project or None,
         tags=["trAIde", "openai-agents"],
-        name=f"trAIde-agent-{gen_trace_id()}",
+        name=f"trAIde-agent",
       )
       add_trace_processor(processor)
       print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
-    return processor
+    return ls_client
   except Exception as exc:
     print("Tracing setup failed:", exc)
 
@@ -149,6 +149,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
   }
   return json.dumps(user_content)
 
+from langsmith import Client as LangsmithClient
 
 async def run_trading_agent(
   cfg: AppConfig,
@@ -156,6 +157,7 @@ async def run_trading_agent(
   kucoin: KucoinClient,
   kucoin_futures: KucoinFuturesClient | None = None,
   openai_client: AsyncAzureOpenAI | None = None,
+  langsmith_client: LangsmithClient | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   if openai_client is None:
@@ -180,11 +182,9 @@ async def run_trading_agent(
   run_name = "Trading Agent Run"
   if cfg.langsmith.enabled and cfg.langsmith.tracing and cfg.langsmith.api_key:
     try:
-      from langsmith import Client as LangsmithClient
       from langsmith.run_helpers import tracing_context
 
       run_name = f"Trading Loop {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z')}"
-      ls_client = LangsmithClient(api_key=cfg.langsmith.api_key, api_url=cfg.langsmith.api_url or None)
       langsmith_ctx = tracing_context(
         project_name=cfg.langsmith.project,
         run_name=run_name,
@@ -192,7 +192,7 @@ async def run_trading_agent(
         trace_id=unique_trace_id,
         span_id=unique_span_id,
         tags=["trAIde", "openai-agents"],
-        client=ls_client,
+        client=langsmith_client,
       )
     except ImportError:
       print("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
