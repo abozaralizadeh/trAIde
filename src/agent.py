@@ -694,17 +694,41 @@ async def run_trading_agent(
     if amt <= 0:
       return {"error": "Amount must be positive"}
 
-    # Pull fresh balances to avoid stale state.
-    fresh_balances = kucoin.get_trade_accounts()
-    balance_map: Dict[str, float] = {}
-    for bal in fresh_balances:
-      balance_map[bal.currency] = balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
+    # Pull fresh balances to avoid stale state; include main/trade so deposits are counted.
+    spot_accounts = kucoin.get_accounts()
+    spot_balance_map: Dict[str, float] = {}
+    for bal in spot_accounts:
+      spot_balance_map[bal.currency] = spot_balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
+
+    futures_available = 0.0
+    futures_overview: Dict[str, Any] | None = None
+    if cfg.kucoin_futures.enabled and kucoin_futures:
+      try:
+        futures_overview = kucoin_futures.get_account_overview()
+        futures_available = _to_float(futures_overview.get("availableBalance"))
+      except Exception as exc:
+        # Record but continue to avoid hard failure.
+        futures_overview = {"error": str(exc)}
 
     from_acct = "trade" if dir_norm == "spot_to_futures" else "contract"
     to_acct = "contract" if dir_norm == "spot_to_futures" else "trade"
-    available = balance_map.get(currency.upper(), 0.0)
-    if amt > available:
-      return {"rejected": True, "reason": "Insufficient balance", "available": available}
+    cur = currency.upper()
+
+    if dir_norm == "spot_to_futures":
+      available = spot_balance_map.get(cur, 0.0)
+      if amt > available:
+        return {"rejected": True, "reason": "Insufficient spot balance", "available": available}
+    else:
+      if not cfg.kucoin_futures.enabled or not kucoin_futures:
+        return {"error": "Futures disabled or client unavailable"}
+      available = futures_available
+      if amt > available:
+        return {
+          "rejected": True,
+          "reason": "Insufficient futures balance",
+          "available": available,
+          "futuresOverview": futures_overview,
+        }
 
     if snapshot.paper_trading:
       return {
@@ -714,6 +738,8 @@ async def run_trading_agent(
         "amount": amt,
         "from": from_acct,
         "to": to_acct,
+        "spotAvailable": spot_balance_map.get(cur, 0.0),
+        "futuresAvailable": futures_available,
       }
 
     try:
@@ -723,7 +749,15 @@ async def run_trading_agent(
         from_account=from_acct,  # type: ignore[arg-type]
         to_account=to_acct,  # type: ignore[arg-type]
       )
-      return {"transfer": res, "direction": dir_norm, "currency": currency.upper(), "amount": amt}
+      return {
+        "transfer": res,
+        "direction": dir_norm,
+        "currency": currency.upper(),
+        "amount": amt,
+        "spotAvailable": spot_balance_map.get(cur, 0.0),
+        "futuresAvailable": futures_available,
+        "futuresOverview": futures_overview,
+      }
     except Exception as exc:
       return {"error": str(exc), "direction": dir_norm, "currency": currency.upper(), "amount": amt}
 

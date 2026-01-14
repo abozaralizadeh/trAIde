@@ -203,7 +203,7 @@ class KucoinClient:
     }
     return self._request(
       "POST",
-      "/api/v1/accounts/inner-transfer",
+      "/api/v2/accounts/inner-transfer",
       auth=True,
       body=body,
     )
