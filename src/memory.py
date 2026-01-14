@@ -57,6 +57,8 @@ class MemoryStore:
             "symbol": t.get("symbol", "").upper(),
             "side": t.get("side"),
             "notionalUsd": t.get("notionalUsd"),
+            "price": t.get("price"),
+            "size": t.get("size"),
             "paper": t.get("paper", False),
             "ts": t.get("ts") or int(time.time()),
             "day": t.get("day"),
@@ -254,7 +256,15 @@ class MemoryStore:
         ]
       )
 
-  def record_trade(self, symbol: str, side: str, notional_usd: float, paper: bool = False) -> Dict[str, Any]:
+  def record_trade(
+    self,
+    symbol: str,
+    side: str,
+    notional_usd: float,
+    paper: bool = False,
+    price: float | None = None,
+    size: float | None = None,
+  ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
       now = int(time.time())
@@ -263,6 +273,8 @@ class MemoryStore:
         "symbol": symbol.upper(),
         "side": side,
         "notionalUsd": notional_usd,
+        "price": price,
+        "size": size,
         "paper": paper,
         "ts": now,
         "day": day_key,
@@ -370,6 +382,74 @@ class MemoryStore:
       data["limits"] = limits
       self._write(data)
       return limits
+
+  def positions(self, prices: Dict[str, float] | None = None) -> Dict[str, Any]:
+    """Derive positions (avg entry, unrealized/realized PnL) from recorded trades."""
+    with self._lock:
+      data = self._prune(self._read())
+      trades = sorted(data.get("trades", []), key=lambda t: t.get("ts", 0))
+
+    positions: Dict[str, Dict[str, float]] = {}
+
+    def _avg(cost: float, qty: float) -> float:
+      return cost / qty if qty else 0.0
+
+    for t in trades:
+      sym = t.get("symbol")
+      side = (t.get("side") or "").lower()
+      try:
+        qty = float(t.get("size") or 0)
+        price = float(t.get("price") or 0)
+      except Exception:
+        continue
+      if not sym or qty <= 0 or price <= 0 or side not in {"buy", "sell"}:
+        continue
+      pos = positions.setdefault(sym, {"netSize": 0.0, "cost": 0.0, "realizedPnl": 0.0, "lastTs": t.get("ts", 0)})
+      net = pos["netSize"]
+      cost = pos["cost"]
+      realized = pos["realizedPnl"]
+      ts = t.get("ts", 0)
+      if side == "buy":
+        if net < 0:
+          close_amt = min(qty, -net)
+          avg_entry = _avg(cost, net) if net != 0 else 0.0
+          realized += (avg_entry - price) * close_amt
+          net += close_amt
+          cost += avg_entry * close_amt
+          qty -= close_amt
+        if qty > 0:
+          net += qty
+          cost += price * qty
+      else:  # sell
+        if net > 0:
+          close_amt = min(qty, net)
+          avg_entry = _avg(cost, net) if net != 0 else 0.0
+          realized += (price - avg_entry) * close_amt
+          net -= close_amt
+          cost -= avg_entry * close_amt
+          qty -= close_amt
+        if qty > 0:
+          net -= qty
+          cost -= price * qty
+      pos["netSize"] = net
+      pos["cost"] = cost
+      pos["realizedPnl"] = realized
+      pos["lastTs"] = max(pos.get("lastTs", 0), ts)
+
+    # Attach derived values and unrealized PnL when prices are supplied.
+    prices = prices or {}
+    for sym, pos in positions.items():
+      net = pos.get("netSize", 0.0)
+      cost = pos.get("cost", 0.0)
+      cur_price = float(prices.get(sym) or 0.0)
+      avg_entry = _avg(cost, net) if net else None
+      unrealized = None
+      if net and cur_price > 0:
+        unrealized = (cur_price - avg_entry) * net
+      pos["avgEntry"] = avg_entry
+      pos["unrealizedPnl"] = unrealized
+      pos["currentPrice"] = cur_price or None
+    return positions
 
   def kill_active(self) -> bool:
     with self._lock:

@@ -256,6 +256,8 @@ async def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
+  current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
+  positions = memory.positions(current_prices)
 
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
@@ -365,6 +367,9 @@ async def run_trading_agent(
         except Exception as exc:
           print("Warning: futures->spot transfer failed:", exc)
 
+    price = float(snapshot.tickers[symbol].price)
+    size_est = funds_val / price if price else 0.0
+
     order_req = KucoinOrderRequest(
       symbol=symbol,
       side="buy" if side == "buy" else "sell",  # enforce allowed values
@@ -373,7 +378,7 @@ async def run_trading_agent(
       clientOid=str(uuid.uuid4()),
     )
     if snapshot.paper_trading:
-      record = memory.record_trade(symbol, side, funds_val, paper=True)
+      record = memory.record_trade(symbol, side, funds_val, paper=True, price=price, size=size_est)
       decision = None
       if confidence is not None:
         decision = memory.log_decision(
@@ -387,7 +392,7 @@ async def run_trading_agent(
       return {"paper": True, "orderRequest": order_req.__dict__, "tradeRecord": record, "decisionLog": decision}
     try:
       res = kucoin.place_order(order_req).__dict__
-      record = memory.record_trade(symbol, side, funds_val, paper=False)
+      record = memory.record_trade(symbol, side, funds_val, paper=False, price=price, size=size_est)
       res["tradeRecord"] = record
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(
@@ -644,7 +649,7 @@ async def run_trading_agent(
     )
 
     if snapshot.paper_trading:
-      record = memory.record_trade(symbol, side, notional, paper=True)
+      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=size)
       decision = None
       if confidence is not None:
         decision = memory.log_decision(
@@ -663,7 +668,7 @@ async def run_trading_agent(
         "rationale": rationale,
       }
     res = kucoin_futures.place_order(order_req).__dict__
-    record = memory.record_trade(symbol, side, notional, paper=False)
+    record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=size)
     res["tradeRecord"] = record
     if confidence is not None:
       res["decisionLog"] = memory.log_decision(
@@ -959,6 +964,7 @@ async def run_trading_agent(
     "- Use analyze_market_context (15m + 1h default) to get EMA/RSI/MACD/ATR/Bollinger/VWAP; only trade when both intervals align and ATR% is reasonable (<5% if conviction is low).\n"
     "- If analyze_market_context shows mixed bias or elevated volatility without a high-conviction catalyst, prefer decline_trade.\n"
     "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
+    "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
     "- Evaluate every account each run: make a decision for spot balances, then separately for futures balances (if enabled). Consider transfers to free capital instead of skipping because one venue is low on USDT.\n"
     "- Before placing a spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if size is clipped or volatility is high.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
@@ -1050,7 +1056,11 @@ async def run_trading_agent(
   )
 
   # Provide snapshot as serialized context input.
-  input_payload = _format_snapshot(snapshot, balances_by_currency)
+  user_state = _format_snapshot(snapshot, balances_by_currency)
+  # Enrich snapshot payload with positions (avgEntry/unrealized/realized) so agent can manage exits.
+  user_state_obj = json.loads(user_state)
+  user_state_obj["positions"] = positions
+  input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
   with langsmith_ctx:
