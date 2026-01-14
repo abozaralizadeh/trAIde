@@ -33,7 +33,9 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
   for symbol in coins:
     tickers[symbol] = kucoin.get_ticker(symbol)
 
-  balances = kucoin.get_trade_accounts()
+  spot_accounts = kucoin.get_trade_accounts()
+  all_accounts = kucoin.get_accounts()
+  balances = list(spot_accounts)
   futures_overview = None
   if cfg.kucoin_futures.enabled:
     try:
@@ -65,6 +67,9 @@ def build_snapshot(cfg, kucoin: KucoinClient, memory: MemoryStore) -> TradingSna
     risk_off=False,  # will be set in loop
     drawdown_pct=0.0,
     total_usdt=0.0,
+    spot_accounts=spot_accounts,
+    futures_account=futures_overview or {},
+    all_accounts=all_accounts,
   )
 
 
@@ -83,7 +88,6 @@ async def trading_loop() -> None:
 
   print("Starting trading loop...")
   while True:
-    
     try:
       snapshot = build_snapshot(cfg, kucoin, memory)
     except Exception as exc:
@@ -92,15 +96,22 @@ async def trading_loop() -> None:
       continue
 
     usdt_balance = 0.0
-    for acct in snapshot.balances:
+    for acct in snapshot.all_accounts or snapshot.spot_accounts:
       if acct.currency == "USDT":
         try:
           avail = float(acct.available or 0)
           bal = float(acct.balance or 0)
-          # For futures (contract) use the larger of available/equity so we don't undercount.
           usdt_balance += max(avail, bal)
         except Exception:
           continue
+
+    if snapshot.futures_account:
+      try:
+        fut_avail = float(snapshot.futures_account.get("availableBalance") or 0)
+        fut_equity = float(snapshot.futures_account.get("accountEquity") or snapshot.futures_account.get("marginBalance") or fut_avail)
+        usdt_balance += max(fut_avail, fut_equity)
+      except Exception:
+        pass
 
     # Update drawdown and auto-clear risk_off when recovered.
     limits = memory.update_limits(usdt_balance, cfg.trading.max_daily_drawdown_pct)

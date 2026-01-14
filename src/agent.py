@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import requests
@@ -113,6 +113,9 @@ class TradingSnapshot:
   risk_off: bool = False
   drawdown_pct: float = 0.0
   total_usdt: float = 0.0
+  spot_accounts: List[KucoinAccount] = field(default_factory=list)
+  futures_account: Dict[str, Any] | None = None
+  all_accounts: List[KucoinAccount] = field(default_factory=list)
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -131,12 +134,83 @@ def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
     azure_deployment=cfg.azure.deployment,
   )
 
+def _to_float(val: Any, default: float = 0.0) -> float:
+  try:
+    return float(val)
+  except (TypeError, ValueError):
+    return default
+
+
+def _maybe_number(val: Any) -> Any:
+  if isinstance(val, (int, float)):
+    return float(val)
+  if isinstance(val, str):
+    try:
+      return float(val)
+    except ValueError:
+      return val
+  return val
+
+
+def _serialize_accounts(accounts: List[KucoinAccount]) -> List[Dict[str, Any]]:
+  return [
+    {
+      "id": acct.id,
+      "currency": acct.currency,
+      "type": acct.type,
+      "balance": _to_float(acct.balance),
+      "available": _to_float(acct.available),
+      "holds": _to_float(acct.holds),
+    }
+    for acct in accounts
+  ]
+
+
+def _aggregate_account_totals(accounts: List[KucoinAccount]) -> Dict[str, Dict[str, float]]:
+  totals: Dict[str, Dict[str, float]] = {}
+  for acct in accounts:
+    cur = acct.currency
+    bucket = totals.setdefault(cur, {"available": 0.0, "holds": 0.0, "balance": 0.0})
+    bucket["available"] += _to_float(acct.available)
+    bucket["holds"] += _to_float(acct.holds)
+    bucket["balance"] += _to_float(acct.balance)
+  return totals
+
+
+def _summarize_futures_account(overview: Dict[str, Any] | None) -> Dict[str, Any]:
+  if not overview:
+    return {}
+  normalized = {k: _maybe_number(v) for k, v in overview.items()}
+  currency = str(overview.get("currency", "USDT"))
+  normalized["summary"] = {
+    "currency": currency,
+    "availableBalance": _to_float(overview.get("availableBalance")),
+    "marginBalance": _to_float(overview.get("marginBalance")),
+    "accountEquity": _to_float(overview.get("accountEquity") or overview.get("marginBalance")),
+    "frozenBalance": _to_float(overview.get("frozenBalance")),
+    "unrealisedPnl": _to_float(overview.get("unrealisedPnl") or overview.get("unrealisedPNL")),
+  }
+  return normalized
+
 
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
+  spot_accounts = snapshot.spot_accounts or snapshot.balances
+  all_accounts = snapshot.all_accounts or spot_accounts
+  spot_serialized = _serialize_accounts(spot_accounts)
+  all_serialized = _serialize_accounts(all_accounts)
+  spot_totals = _aggregate_account_totals(spot_accounts)
+  all_totals = _aggregate_account_totals(all_accounts)
+  futures_info = _summarize_futures_account(snapshot.futures_account)
+
   user_content = {
     "coins": snapshot.coins,
     "tickers": {k: vars(v) for k, v in snapshot.tickers.items()},
     "balances": balances_by_currency,
+    "accountDetails": {
+      "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
+      "futures": futures_info,
+      "allAccounts": {"accounts": all_serialized, "byCurrency": all_totals},
+    },
     "paperTrading": snapshot.paper_trading,
     "maxPositionUsd": snapshot.max_position_usd,
     "minConfidence": snapshot.min_confidence,
@@ -167,10 +241,16 @@ async def run_trading_agent(
     openai_client=openai_client,
   )
   balances_by_currency: Dict[str, float] = {}
-  for bal in snapshot.balances:
-    balances_by_currency[bal.currency] = balances_by_currency.get(bal.currency, 0.0) + float(
-      bal.available or 0
-    )
+  spot_accounts = snapshot.spot_accounts or snapshot.balances
+  spot_totals = _aggregate_account_totals(spot_accounts)
+  for cur, totals in spot_totals.items():
+    balances_by_currency[cur] = balances_by_currency.get(cur, 0.0) + totals.get("available", 0.0)
+
+  if snapshot.futures_account:
+    fut_currency = str(snapshot.futures_account.get("currency", "USDT"))
+    fut_available = _to_float(snapshot.futures_account.get("availableBalance"))
+    if fut_available:
+      balances_by_currency[fut_currency] = balances_by_currency.get(fut_currency, 0.0) + fut_available
   unique_trace_id = gen_trace_id()
   unique_span_id = gen_span_id()
 
@@ -648,6 +728,49 @@ async def run_trading_agent(
       return {"error": str(exc), "direction": dir_norm, "currency": currency.upper(), "amount": amt}
 
   @function_tool
+  async def fetch_account_state() -> Dict[str, Any]:
+    """Get up-to-date balances for all spot accounts and futures (including non-trade funds)."""
+    try:
+      spot_accounts_fresh = kucoin.get_trade_accounts()
+      all_accounts_fresh = kucoin.get_accounts()
+    except Exception as exc:
+      return {"error": f"spot_fetch_failed: {exc}"}
+
+    futures_overview = None
+    futures_error = None
+    if cfg.kucoin_futures.enabled and kucoin_futures:
+      try:
+        futures_overview = kucoin_futures.get_account_overview()
+      except Exception as exc:
+        futures_error = f"futures_fetch_failed: {exc}"
+
+    spot_serialized = _serialize_accounts(spot_accounts_fresh)
+    spot_totals = _aggregate_account_totals(spot_accounts_fresh)
+    all_serialized = _serialize_accounts(all_accounts_fresh)
+    all_totals = _aggregate_account_totals(all_accounts_fresh)
+    balances_map = {cur: vals.get("available", 0.0) for cur, vals in all_totals.items()}
+
+    futures_serialized: Dict[str, Any] = {}
+    if futures_overview:
+      futures_serialized = _summarize_futures_account(futures_overview)
+      fut_cur = str(futures_overview.get("currency", "USDT"))
+      balances_map[fut_cur] = balances_map.get(fut_cur, 0.0) + _to_float(futures_overview.get("availableBalance"))
+
+    result: Dict[str, Any] = {
+      "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
+      "allAccounts": {"accounts": all_serialized, "byCurrency": all_totals},
+      "balancesAvailable": balances_map,
+      "futuresEnabled": bool(cfg.kucoin_futures.enabled),
+    }
+    if futures_overview:
+      result["futures"] = futures_serialized or {"enabled": True}
+    else:
+      result["futures"] = {"enabled": bool(cfg.kucoin_futures.enabled)}
+    if futures_error:
+      result["futuresError"] = futures_error
+    return result
+
+  @function_tool
   async def save_trade_plan(title: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Persist a trading plan (title, summary, actions) for recall."""
     return memory.save_plan(title=title, summary=summary, actions=actions, author="Trading Agent")
@@ -865,6 +988,7 @@ async def run_trading_agent(
       analyze_market_context,
       plan_spot_position,
       transfer_funds,
+      fetch_account_state,
       place_futures_market_order,
       place_market_order,
       save_trade_plan,

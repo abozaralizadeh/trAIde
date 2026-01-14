@@ -130,11 +130,16 @@ class KucoinClient:
     return payload.get("data")
 
   def get_trade_accounts(self) -> list[KucoinAccount]:
+    return self.get_accounts("trade")
+
+  def get_accounts(self, account_type: Optional[str] = None) -> list[KucoinAccount]:
+    """Fetch accounts; when account_type is None, returns all (main/trade/margin)."""
+    query = {"type": account_type} if account_type else None
     data = self._request(
       "GET",
       "/api/v1/accounts",
       auth=True,
-      query={"type": "trade"},
+      query=query,
     )
     return [KucoinAccount(**item) for item in data]
 
