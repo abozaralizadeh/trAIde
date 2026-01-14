@@ -602,16 +602,12 @@ async def run_trading_agent(
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
-      notional = float(notional_usd or 0)
+      notional_input = float(notional_usd or 0)
       lev = float(leverage or 0)
     except (TypeError, ValueError):
       return {"error": "Invalid notional or leverage"}
-    if notional <= 0 or lev <= 0:
+    if notional_input <= 0 or lev <= 0:
       return {"error": "Invalid notional or leverage"}
-    if lev > snapshot.max_leverage:
-      return {"rejected": True, "reason": "Exceeds max_leverage", "max_leverage": snapshot.max_leverage}
-    if notional > snapshot.max_position_usd * snapshot.max_leverage:
-      return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd * snapshot.max_leverage}
     trades_today = memory.trades_today(symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
       return {
@@ -634,22 +630,46 @@ async def run_trading_agent(
         }
 
     price = float(snapshot.tickers[symbol].price)
-    est_size = notional / price if price else 0
-    size = size_override if size_override is not None else est_size
-    if size <= 0:
+    if price <= 0:
+      return {"error": "Invalid or missing price"}
+
+    try:
+      base_size = float(size_override) if size_override is not None else notional_input / price
+    except (TypeError, ValueError):
+      return {"error": "Invalid size_override"}
+    if base_size <= 0:
       return {"error": "Computed size is zero"}
+
+    notional = base_size * price  # effective notional based on size override (if any)
+    if lev > snapshot.max_leverage:
+      return {"rejected": True, "reason": "Exceeds max_leverage", "max_leverage": snapshot.max_leverage}
+    if notional > snapshot.max_position_usd * snapshot.max_leverage:
+      return {
+        "rejected": True,
+        "reason": "Exceeds max notional cap",
+        "cap": snapshot.max_position_usd * snapshot.max_leverage,
+        "notional": notional,
+      }
+    contracts = int(round(notional))
+    if contracts < 1:
+      return {
+        "rejected": True,
+        "reason": "Notional too small for 1 contract",
+        "minContractsUsd": 1.0,
+        "notional": notional,
+      }
 
     order_req = KucoinFuturesOrderRequest(
       symbol=symbol,
       side="buy" if side == "buy" else "sell",
       type="market",
       leverage=f"{lev}",
-      size=f"{size}",
+      size=str(contracts),  # Kucoin futures expects integer contract size
       clientOid=str(uuid.uuid4()),
     )
 
     if snapshot.paper_trading:
-      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=size)
+      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=base_size)
       decision = None
       if confidence is not None:
         decision = memory.log_decision(
@@ -668,7 +688,7 @@ async def run_trading_agent(
         "rationale": rationale,
       }
     res = kucoin_futures.place_order(order_req).__dict__
-    record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=size)
+    record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=base_size)
     res["tradeRecord"] = record
     if confidence is not None:
       res["decisionLog"] = memory.log_decision(
