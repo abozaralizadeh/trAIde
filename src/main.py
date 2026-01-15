@@ -62,6 +62,18 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
   except Exception as exc:
     print("Warning: unable to fetch spot stop orders:", exc, file=sys.stderr)
 
+  fees: dict[str, float] = {}
+  try:
+    fee_info = kucoin.get_base_fee()
+    if fee_info:
+      fees = {
+        "spot_taker": float(fee_info.get("takerFeeRate") or 0.001),
+        "spot_maker": float(fee_info.get("makerFeeRate") or 0.001),
+      }
+      # futures fee endpoints differ; not available here, but keep structure
+  except Exception as exc:
+    print("Warning: unable to fetch base fee:", exc, file=sys.stderr)
+
   return TradingSnapshot(
     coins=coins,
     tickers=tickers,
@@ -79,6 +91,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     all_accounts=all_accounts,
     spot_stop_orders=spot_stops,
     futures_stop_orders=futures_stops,
+    fees=fees,
   )
 
 

@@ -19,7 +19,7 @@ class MemoryStore:
 
   def _read(self) -> Dict[str, Any]:
     if not self.path.exists():
-      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": []}
+      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
     try:
       data = json.loads(self.path.read_text())
       if isinstance(data, dict):
@@ -30,6 +30,7 @@ class MemoryStore:
         data.setdefault("limits", {})
         data.setdefault("sentiments", [])
         data.setdefault("decisions", [])
+        data.setdefault("fees", [])
         # prune invalid entries while keeping timestamp
         data["plans"] = [
           p
@@ -105,7 +106,7 @@ class MemoryStore:
         return self._prune(data)
     except Exception:
       return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}}
-    return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}}
+    return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "fees": []}
 
   def _prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
     """Drop entries older than retention_days."""
@@ -118,6 +119,7 @@ class MemoryStore:
     data.setdefault("limits", {})
     data["sentiments"] = [s for s in data.get("sentiments", []) if (s.get("ts") or now) >= cutoff]
     data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
+    data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
     return data
 
   def _write(self, data: Dict[str, Any]) -> None:
@@ -475,3 +477,25 @@ class MemoryStore:
       data["limits"] = limits
       self._write(data)
       return limits
+
+  def save_fee_info(self, spot_taker: float, spot_maker: float, futures_taker: float | None = None, futures_maker: float | None = None) -> Dict[str, Any]:
+    with self._lock:
+      data = self._prune(self._read())
+      now = int(time.time())
+      entry = {
+        "spot_taker": float(spot_taker),
+        "spot_maker": float(spot_maker),
+        "futures_taker": float(futures_taker) if futures_taker is not None else None,
+        "futures_maker": float(futures_maker) if futures_maker is not None else None,
+        "ts": now,
+      }
+      data.setdefault("fees", [])
+      data["fees"].append(entry)
+      self._write(data)
+      return entry
+
+  def latest_fees(self) -> Optional[Dict[str, Any]]:
+    with self._lock:
+      data = self._prune(self._read())
+      fees = data.get("fees") or []
+      return fees[-1] if fees else None

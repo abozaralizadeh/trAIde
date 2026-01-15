@@ -268,6 +268,14 @@ class KucoinClient:
     client_oid = data.get("clientOid") if isinstance(data, dict) else None
     return KucoinOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid"))
 
+  def get_base_fee(self) -> Dict[str, Any]:
+    """Fetch base fee (maker/taker) for spot."""
+    return self._request(
+      "GET",
+      "/api/v1/base-fee",
+      auth=True,
+    ) or {}
+
   def place_stop_order(self, order: KucoinOrderRequest) -> KucoinOrderResponse:
     """Place a spot stop order (KuCoin stop-order endpoint)."""
     payload = {k: v for k, v in order.__dict__.items() if v is not None}

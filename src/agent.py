@@ -118,6 +118,7 @@ class TradingSnapshot:
   all_accounts: List[KucoinAccount] = field(default_factory=list)
   spot_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
   futures_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
+  fees: Dict[str, Any] = field(default_factory=dict)
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -226,6 +227,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
       "spot": snapshot.spot_stop_orders,
       "futures": snapshot.futures_stop_orders,
     },
+    "fees": snapshot.fees if hasattr(snapshot, "fees") else {},
   }
   return json.dumps(user_content)
 
@@ -264,6 +266,16 @@ async def run_trading_agent(
   memory = MemoryStore(cfg.memory_file)
   current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
   positions = memory.positions(current_prices)
+  # Pull latest stored fees; fallback defaults.
+  fee_defaults = {"spot_taker": 0.001, "spot_maker": 0.001, "futures_taker": 0.0006, "futures_maker": 0.0002}
+  stored_fees = memory.latest_fees() or {}
+  fees = {
+    "spot_taker": float(stored_fees.get("spot_taker") or snapshot.fees.get("spot_taker") or fee_defaults["spot_taker"]),
+    "spot_maker": float(stored_fees.get("spot_maker") or snapshot.fees.get("spot_maker") or fee_defaults["spot_maker"]),
+    "futures_taker": float(stored_fees.get("futures_taker") or snapshot.fees.get("futures_taker") or fee_defaults["futures_taker"]),
+    "futures_maker": float(stored_fees.get("futures_maker") or snapshot.fees.get("futures_maker") or fee_defaults["futures_maker"]),
+    "ts": stored_fees.get("ts") or None,
+  }
 
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
@@ -302,6 +314,8 @@ async def run_trading_agent(
       funds_val = 0.0
     if funds_val <= 0 or not symbol:
       return {"error": "Invalid funds or symbol"}
+    fee_rate = fees.get("spot_taker", 0.001)
+    funds_with_fee = funds_val * (1 + fee_rate)
     if funds_val > snapshot.max_position_usd:
       return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
     trades_today = memory.trades_today(symbol)
@@ -342,20 +356,21 @@ async def run_trading_agent(
     total_available = spot_usdt + futures_available
     reserve_total = total_available * 0.10
     max_spend = max(0.0, total_available - reserve_total)
-    if funds_val > max_spend:
+    if funds_with_fee > max_spend:
       return {
         "rejected": True,
-        "reason": "Exceeds spendable USDT after 10% reserve",
+        "reason": "Exceeds spendable USDT after 10% reserve (incl fee)",
         "maxSpend": max_spend,
         "spotAvailable": spot_usdt,
         "futuresAvailable": futures_available,
+        "feeRate": fee_rate,
       }
 
     # If spot alone is insufficient but futures has free balance, auto-transfer the shortfall (respecting futures 10% reserve).
     spot_reserve = spot_usdt * 0.10
     spot_spendable = max(0.0, spot_usdt - spot_reserve)
     transfer_used: dict[str, Any] | None = None
-    if funds_val > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
+    if funds_with_fee > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
       futures_reserve = futures_available * 0.10
       futures_spendable = max(0.0, futures_available - futures_reserve)
       need = funds_val - spot_spendable
@@ -375,6 +390,12 @@ async def run_trading_agent(
 
     price = float(snapshot.tickers[symbol].price)
     size_est = funds_val / price if price else 0.0
+
+    # Adjust funds down so fee fits in spend cap.
+    if funds_with_fee > max_spend and funds_val > 0:
+      scale = max_spend / funds_with_fee
+      funds_val = max(0.0, funds_val * scale)
+      funds_with_fee = funds_val * (1 + fee_rate)
 
     order_req = KucoinOrderRequest(
       symbol=symbol,
@@ -590,6 +611,7 @@ async def run_trading_agent(
     if risk_dollars <= 0:
       return {"error": "Risk dollars computed to zero", "riskPct": risk_fraction}
 
+    fee_rate = fees.get("spot_taker", 0.001)
     spendable = max(0.0, balance_usdt * 0.90)
     price = float(entry_price) if entry_price else float(snapshot.tickers[symbol].price)
 
@@ -619,6 +641,7 @@ async def run_trading_agent(
     notional_unclipped = raw_size * price
     cap_notional = min(snapshot.max_position_usd, spendable)
     notional = min(notional_unclipped, cap_notional)
+    notional_with_fee = notional * (1 + fee_rate)
     size = notional / price if price else 0
     stop_price = max(0.0, price - stop_distance)
     target_price = price + stop_distance * target_rr
@@ -647,10 +670,12 @@ async def run_trading_agent(
       "rr": target_rr,
       "size": size,
       "notionalUsd": notional,
+      "notionalUsdWithFee": notional_with_fee,
       "rawNotionalUsd": notional_unclipped,
       "tradesToday": trades_today,
       "maxTradesPerDay": cfg.trading.max_trades_per_symbol_per_day,
       "warnings": warnings,
+      "feeRate": fee_rate,
     }
 
   @function_tool
@@ -717,6 +742,8 @@ async def run_trading_agent(
         "cap": snapshot.max_position_usd * snapshot.max_leverage,
         "notional": notional,
       }
+    fee_rate = fees.get("futures_taker", 0.0006)
+    notional_with_fee = notional * (1 + fee_rate)
     contracts = int(round(notional))
     if contracts < 1:
       return {
@@ -753,6 +780,8 @@ async def run_trading_agent(
         "tradeRecord": record,
         "decisionLog": decision,
         "rationale": rationale,
+        "feeRate": fee_rate,
+        "notionalWithFee": notional_with_fee,
       }
     res = kucoin_futures.place_order(order_req).__dict__
     record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=base_size)
@@ -767,6 +796,8 @@ async def run_trading_agent(
         paper=False,
       )
     res["rationale"] = rationale
+    res["feeRate"] = fee_rate
+    res["notionalWithFee"] = notional_with_fee
     return res
 
   @function_tool
@@ -979,6 +1010,23 @@ async def run_trading_agent(
     return result
 
   @function_tool
+  async def refresh_fee_rates() -> Dict[str, Any]:
+    """Fetch latest fee rates (spot base fee). Futures fee not provided by API; keep previous/default."""
+    try:
+      base_fee = kucoin.get_base_fee()
+      spot_taker = float(base_fee.get("takerFeeRate") or 0.001)
+      spot_maker = float(base_fee.get("makerFeeRate") or 0.001)
+    except Exception as exc:
+      return {"error": f"base_fee_failed: {exc}"}
+    entry = memory.save_fee_info(
+      spot_taker=spot_taker,
+      spot_maker=spot_maker,
+      futures_taker=fees.get("futures_taker"),
+      futures_maker=fees.get("futures_maker"),
+    )
+    return {"fee": entry}
+
+  @function_tool
   async def save_trade_plan(title: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Persist a trading plan (title, summary, actions) for recall."""
     return memory.save_plan(title=title, summary=summary, actions=actions, author="Trading Agent")
@@ -1135,6 +1183,7 @@ async def run_trading_agent(
     "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
     "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
     "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TP, cancel/replace them when thesis changes; keep stops in sync with position size.\n"
+    "- Keep sizing fee-aware: use latest fees from state; refresh via refresh_fee_rates when stale; ensure spend caps include taker fees.\n"
     "- Evaluate every account each run: make a decision for spot balances, then separately for futures balances (if enabled). Consider transfers to free capital instead of skipping because one venue is low on USDT.\n"
     "- Before placing a spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if size is clipped or volatility is high.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
@@ -1203,6 +1252,7 @@ async def run_trading_agent(
       plan_spot_position,
       transfer_funds,
       fetch_account_state,
+      refresh_fee_rates,
       place_futures_market_order,
       place_market_order,
       place_spot_stop_order,
@@ -1236,6 +1286,7 @@ async def run_trading_agent(
   # Enrich snapshot payload with positions (avgEntry/unrealized/realized) so agent can manage exits.
   user_state_obj = json.loads(user_state)
   user_state_obj["positions"] = positions
+  user_state_obj["fees"] = fees
   input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
