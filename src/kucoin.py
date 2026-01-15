@@ -291,16 +291,16 @@ class KucoinClient:
 
   def cancel_stop_order(self, order_id: Optional[str] = None, client_oid: Optional[str] = None) -> Dict[str, Any]:
     """Cancel a spot stop order by orderId or clientOid."""
-    body: Dict[str, str] = {}
+    query: Dict[str, str] = {}
     if order_id:
-      body["orderId"] = order_id
+      query["orderId"] = order_id
     if client_oid:
-      body["clientOid"] = client_oid
+      query["clientOid"] = client_oid
     return self._request(
       "DELETE",
       "/api/v1/stop-order",
       auth=True,
-      body=body or None,
+      query=query or None,
     )
 
   def list_stop_orders(self, status: str = "active", symbol: Optional[str] = None) -> list[Dict[str, Any]]:
