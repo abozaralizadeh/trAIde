@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -203,6 +204,19 @@ def _base_currency(symbol: str) -> str:
   return symbol.split("-")[0].upper()
 
 
+def _to_futures_symbol(spot_symbol: str) -> str | None:
+  """Map spot symbol (e.g., BTC-USDT) to KuCoin futures contract symbol (e.g., XBTUSDTM)."""
+  if not spot_symbol or "-" not in spot_symbol:
+    return None
+  base, quote = spot_symbol.split("-", 1)
+  base = base.upper()
+  quote = quote.upper()
+  # KuCoin futures uses XBT for BTC.
+  if base == "BTC":
+    base = "XBT"
+  return f"{base}{quote}M"
+
+
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   spot_accounts = snapshot.spot_accounts or snapshot.balances
   all_accounts = snapshot.all_accounts or spot_accounts
@@ -328,6 +342,31 @@ async def run_trading_agent(
     "futures_maker": float(stored_fees.get("futures_maker") or snapshot.fees.get("futures_maker") or fee_defaults["futures_maker"]),
     "ts": stored_fees.get("ts") or None,
   }
+  contract_cache: Dict[str, Dict[str, Any]] = {}
+
+  def _get_contract_spec(futures_symbol: str) -> Dict[str, Any] | None:
+    """Fetch and cache KuCoin futures contract specs to validate size/mins."""
+    if not futures_symbol:
+      return None
+    if futures_symbol in contract_cache:
+      return contract_cache[futures_symbol]
+    if not kucoin_futures:
+      return None
+    url = f"{kucoin_futures.base_url}/api/v1/contracts/{futures_symbol}"
+    try:
+      resp = requests.get(url, timeout=10)
+      if not resp.ok:
+        return None
+      payload = resp.json()
+      if payload.get("code") not in ("200000", "200"):
+        return None
+      data = payload.get("data")
+      if isinstance(data, dict):
+        contract_cache[futures_symbol] = data
+        return data
+    except Exception as exc:
+      print(f"Warning: unable to fetch futures contract {futures_symbol}:", exc)
+    return None
 
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
@@ -773,9 +812,23 @@ async def run_trading_agent(
           "minScore": cfg.trading.sentiment_min_score,
         }
 
+    futures_symbol = _to_futures_symbol(symbol)
+    if not futures_symbol:
+      return {"error": "Invalid symbol for futures", "symbol": symbol}
+
+    contract = _get_contract_spec(futures_symbol)
+    if not contract:
+      return {"error": "Futures contract spec unavailable", "futuresSymbol": futures_symbol}
+
     price = float(snapshot.tickers[symbol].price)
     if price <= 0:
       return {"error": "Invalid or missing price"}
+
+    multiplier = _to_float(contract.get("multiplier"))
+    lot_size = int(contract.get("lotSize") or 1)
+    max_order_qty = contract.get("maxOrderQty")
+    if multiplier <= 0:
+      return {"error": "Invalid contract multiplier", "contract": contract}
 
     try:
       base_size = float(size_override) if size_override is not None else notional_input / price
@@ -784,7 +837,21 @@ async def run_trading_agent(
     if base_size <= 0:
       return {"error": "Computed size is zero"}
 
-    notional = base_size * price  # effective notional based on size override (if any)
+    contracts_raw = base_size / multiplier
+    lot = max(1, lot_size)
+    contracts = int(math.ceil(contracts_raw / lot) * lot)
+    actual_notional = contracts * multiplier * price
+    min_notional = lot * multiplier * price
+    if actual_notional < min_notional:
+      return {
+        "rejected": True,
+        "reason": "Below contract minimum notional",
+        "minNotionalUsd": min_notional,
+        "requestedNotionalUsd": notional_input,
+      }
+    if max_order_qty and isinstance(max_order_qty, (int, float)) and contracts > max_order_qty:
+      return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty, "contracts": contracts}
+    notional = actual_notional
     if lev > snapshot.max_leverage:
       return {"rejected": True, "reason": "Exceeds max_leverage", "max_leverage": snapshot.max_leverage}
     if notional > snapshot.max_position_usd * snapshot.max_leverage:
@@ -794,28 +861,68 @@ async def run_trading_agent(
         "cap": snapshot.max_position_usd * snapshot.max_leverage,
         "notional": notional,
       }
-    fee_rate = fees.get("futures_taker", 0.0006)
+    # Prefer live contract fee if available.
+    fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
     notional_with_fee = notional * (1 + fee_rate)
-    contracts = int(round(notional))
-    if contracts < 1:
+    # Ensure required margin is funded; auto-transfer from spot if futures are empty.
+    spot_accounts = kucoin.get_accounts()
+    spot_balance_map: Dict[str, float] = {}
+    for bal in spot_accounts:
+      spot_balance_map[bal.currency] = spot_balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
+
+    futures_overview: Dict[str, Any] | None = None
+    futures_available = 0.0
+    if kucoin_futures:
+      try:
+        futures_overview = kucoin_futures.get_account_overview()
+        futures_available = _to_float(futures_overview.get("availableBalance"))
+      except Exception as exc:
+        print("Warning: futures overview unavailable:", exc)
+
+    margin_needed = notional / lev
+    fee_allowance = notional * fee_rate
+    buffer = max(1.0, margin_needed * 0.01)
+    required_futures_balance = margin_needed + fee_allowance + buffer
+
+    transfer_used: dict[str, Any] | None = None
+    if not snapshot.paper_trading and futures_available < required_futures_balance:
+      spot_usdt = spot_balance_map.get("USDT", 0.0)
+      spot_reserve = spot_usdt * 0.10
+      spot_spendable = max(0.0, spot_usdt - spot_reserve)
+      need = required_futures_balance - futures_available
+      transfer_amt = min(spot_spendable, need)
+      if transfer_amt > 0:
+        try:
+          transfer_used = kucoin.transfer_funds(
+            currency="USDT",
+            amount=transfer_amt,
+            from_account="trade",
+            to_account="contract",
+          )
+          futures_available += transfer_amt
+        except Exception as exc:
+          print("Warning: spot->futures transfer failed:", exc)
+    if required_futures_balance > futures_available and not snapshot.paper_trading:
       return {
         "rejected": True,
-        "reason": "Notional too small for 1 contract",
-        "minContractsUsd": 1.0,
-        "notional": notional,
+        "reason": "Insufficient futures margin after transfer attempt",
+        "requiredBalance": required_futures_balance,
+        "available": futures_available,
+        "spotAvailable": spot_balance_map.get("USDT", 0.0),
+        "transferAttempt": transfer_used,
       }
 
     order_req = KucoinFuturesOrderRequest(
-      symbol=symbol,
+      symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",
       type="market",
       leverage=f"{lev}",
-      size=str(contracts),  # Kucoin futures expects integer contract size
+      size=str(contracts),  # Kucoin futures expects integer contract size (contracts)
       clientOid=str(uuid.uuid4()),
     )
 
     if snapshot.paper_trading:
-      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=base_size)
+      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=contracts * multiplier)
       decision = None
       if confidence is not None:
         decision = memory.log_decision(
@@ -834,9 +941,12 @@ async def run_trading_agent(
         "rationale": rationale,
         "feeRate": fee_rate,
         "notionalWithFee": notional_with_fee,
+        "futuresSymbol": futures_symbol,
+        "contracts": contracts,
+        "contractSpec": {"multiplier": multiplier, "lotSize": lot_size},
       }
     res = kucoin_futures.place_order(order_req).__dict__
-    record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=base_size)
+    record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
     res["tradeRecord"] = record
     if confidence is not None:
       res["decisionLog"] = memory.log_decision(
@@ -850,6 +960,10 @@ async def run_trading_agent(
     res["rationale"] = rationale
     res["feeRate"] = fee_rate
     res["notionalWithFee"] = notional_with_fee
+    res["futuresSymbol"] = futures_symbol
+    res["contracts"] = contracts
+    res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
+    res["transferUsed"] = transfer_used
     return res
 
   @function_tool
@@ -874,6 +988,9 @@ async def run_trading_agent(
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"error": "Futures disabled in config"}
+    futures_symbol = _to_futures_symbol(symbol)
+    if not futures_symbol:
+      return {"error": "Invalid symbol for futures", "symbol": symbol}
     try:
       lev = float(leverage or 0)
     except Exception:
@@ -886,7 +1003,7 @@ async def run_trading_agent(
     tp_str = f"{take_profit_price}" if take_profit_price is not None else None
     sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
     order_req = KucoinFuturesOrderRequest(
-      symbol=symbol,
+      symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",
       type="limit" if order_type == "limit" else "market",
       leverage=f"{lev}",
