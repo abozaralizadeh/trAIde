@@ -1184,6 +1184,7 @@ async def run_trading_agent(
     "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
     "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TP, cancel/replace them when thesis changes; keep stops in sync with position size.\n"
     "- Keep sizing fee-aware: use latest fees from state; refresh via refresh_fee_rates when stale; ensure spend caps include taker fees.\n"
+    "- Favor intraday/day-trading profits: when confidence is high and research backs momentum/catalysts, prefer futures with sensible leverage (<= max_leverage) for higher R; size prudently and keep stops tight.\n"
     "- Evaluate every account each run: make a decision for spot balances, then separately for futures balances (if enabled). Consider transfers to free capital instead of skipping because one venue is low on USDT.\n"
     "- Before placing a spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if size is clipped or volatility is high.\n"
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
