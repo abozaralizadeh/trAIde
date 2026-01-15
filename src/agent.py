@@ -1351,7 +1351,7 @@ async def run_trading_agent(
     "- If analyze_market_context shows mixed bias or elevated volatility without a high-conviction catalyst, prefer decline_trade.\n"
     "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
     "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
-    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TP, cancel/replace them when thesis changes; keep stops in sync with position size.\n"
+    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TP, cancel/replace them when thesis changes; keep stops in sync with position size. If spot balance+position size is ~0 but a SELL stop exists, cancel it via cancel_spot_stop_order to avoid stale orders.\n"
     "- Keep sizing fee-aware: use latest fees from state; refresh via refresh_fee_rates when stale; ensure spend caps include taker fees.\n"
     "- Favor intraday/day-trading profits: when confidence is high and research backs momentum/catalysts, prefer futures with sensible leverage (<= max_leverage) for higher R; size prudently and keep stops tight.\n"
     "- Evaluate every account each run: make a decision for spot balances, then separately for futures balances (if enabled). Consider transfers to free capital instead of skipping because one venue is low on USDT.\n"
