@@ -196,6 +196,13 @@ def _summarize_futures_account(overview: Dict[str, Any] | None) -> Dict[str, Any
   return normalized
 
 
+def _base_currency(symbol: str) -> str:
+  """Return the base currency for a trading symbol (e.g., BTC-USDT -> BTC)."""
+  if not symbol or "-" not in symbol:
+    return symbol or ""
+  return symbol.split("-")[0].upper()
+
+
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   spot_accounts = snapshot.spot_accounts or snapshot.balances
   all_accounts = snapshot.all_accounts or spot_accounts
@@ -266,6 +273,51 @@ async def run_trading_agent(
   memory = MemoryStore(cfg.memory_file)
   current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
   positions = memory.positions(current_prices)
+  # Reconcile tracked positions with live spot balances to avoid phantom exposure when trades happen outside the agent.
+  spot_balances_by_currency = {
+    cur.upper(): _to_float(totals.get("balance"))
+    for cur, totals in (spot_totals or {}).items()
+  }
+  reconciled_positions: Dict[str, Dict[str, Any]] = {}
+  zero_tol = 1e-9
+  for sym, pos in positions.items():
+    base = _base_currency(sym)
+    actual_qty = spot_balances_by_currency.get(base, 0.0)
+    net = _to_float(pos.get("netSize"))
+    if actual_qty <= zero_tol:
+      # Drop positions when the wallet no longer holds the asset.
+      continue
+    adj = dict(pos)
+    if abs(actual_qty - net) > zero_tol:
+      avg_entry = adj.get("avgEntry")
+      adj["netSize"] = actual_qty
+      if avg_entry is not None:
+        adj["cost"] = _to_float(avg_entry) * actual_qty
+        cur_price = current_prices.get(sym) or 0.0
+        adj["unrealizedPnl"] = (cur_price - _to_float(avg_entry)) * actual_qty if cur_price else None
+      else:
+        adj["cost"] = None
+        adj["unrealizedPnl"] = None
+    reconciled_positions[sym] = adj
+  # Add any live holdings that are missing from the recorded trade log.
+  for sym in snapshot.tickers.keys():
+    if sym in reconciled_positions:
+      continue
+    base = _base_currency(sym)
+    actual_qty = spot_balances_by_currency.get(base, 0.0)
+    if actual_qty <= zero_tol:
+      continue
+    cur_price = current_prices.get(sym) or None
+    reconciled_positions[sym] = {
+      "netSize": actual_qty,
+      "cost": None,
+      "avgEntry": None,
+      "realizedPnl": None,
+      "unrealizedPnl": None,
+      "lastTs": None,
+      "currentPrice": cur_price,
+    }
+  positions = reconciled_positions
   # Pull latest stored fees; fallback defaults.
   fee_defaults = {"spot_taker": 0.001, "spot_maker": 0.001, "futures_taker": 0.0006, "futures_maker": 0.0002}
   stored_fees = memory.latest_fees() or {}
