@@ -296,12 +296,24 @@ class KucoinClient:
       query["orderId"] = order_id
     if client_oid:
       query["clientOid"] = client_oid
-    return self._request(
-      "DELETE",
-      "/api/v1/stop-order",
-      auth=True,
-      query=query or None,
-    )
+    try:
+      return self._request(
+        "DELETE",
+        "/api/v1/stop-order",
+        auth=True,
+        query=query or None,
+      )
+    except Exception as exc:
+      # Fallback to explicit cancel endpoint (some accounts require this path)
+      try:
+        return self._request(
+          "DELETE",
+          "/api/v1/stop-order/cancel",
+          auth=True,
+          query=query or None,
+        )
+      except Exception:
+        raise exc
 
   def list_stop_orders(self, status: str = "active", symbol: Optional[str] = None) -> list[Dict[str, Any]]:
     """List spot stop orders (default: active)."""
