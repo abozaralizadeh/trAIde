@@ -786,8 +786,14 @@ async def run_trading_agent(
     size_override: float | None = None,
     confidence: float | None = None,
     rationale: str | None = None,
+    stop: str | None = None,
+    stop_price_type: str | None = None,
+    stop_price: float | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    reduce_only: bool | None = None,
   ) -> Dict[str, Any]:
-    """Place a linear futures market order using notional and leverage. Falls back to paper if futures disabled."""
+    """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
@@ -935,6 +941,9 @@ async def run_trading_agent(
         mode_norm = mode.upper()
         if mode_norm == "ISOLATED":
           auto_deposit = False
+      stop_price_str = f"{stop_price}" if stop_price is not None else None
+      tp_str = f"{take_profit_price}" if take_profit_price is not None else None
+      sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
       return KucoinFuturesOrderRequest(
         symbol=futures_symbol,
         side="buy" if side == "buy" else "sell",
@@ -944,6 +953,12 @@ async def run_trading_agent(
         clientOid=str(uuid.uuid4()),
         marginMode=mode_norm,
         autoDeposit=auto_deposit,
+        stop=stop,
+        stopPriceType=stop_price_type,
+        stopPrice=stop_price_str,
+        takeProfitPrice=tp_str,
+        stopLossPrice=sl_str,
+        reduceOnly=reduce_only,
       )
 
     if snapshot.paper_trading:
@@ -1063,6 +1078,16 @@ async def run_trading_agent(
     stop_price_str = f"{stop_price}" if stop_price is not None else None
     tp_str = f"{take_profit_price}" if take_profit_price is not None else None
     sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
+    margin_mode: str | None = None
+    try:
+      position_info = kucoin_futures.get_position(futures_symbol)
+      if isinstance(position_info, dict) and "crossMode" in position_info:
+        margin_mode = "cross" if position_info.get("crossMode") else "isolated"
+    except Exception as exc:
+      print("Warning: futures position lookup failed for stop order; margin mode unknown:", exc)
+
+    margin_mode_norm = margin_mode.upper() if margin_mode else None
+    auto_deposit = False if margin_mode_norm == "ISOLATED" else None
     order_req = KucoinFuturesOrderRequest(
       symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",
@@ -1078,6 +1103,8 @@ async def run_trading_agent(
       closeOrder=close_order,
       takeProfitPrice=tp_str,
       stopLossPrice=sl_str,
+      marginMode=margin_mode_norm,
+      autoDeposit=auto_deposit,
     )
     if snapshot.paper_trading:
       return {"paper": True, "orderRequest": order_req.__dict__}
