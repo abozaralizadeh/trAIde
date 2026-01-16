@@ -186,8 +186,7 @@ async def trading_loop() -> None:
       idle_polls = 0
       print(f"Running agent. Triggers: {triggers or ['idle_threshold']}")
       try:
-        # Propagate risk_off into snapshot so the agent can act defensively (hedge/exit) but skip new risk-on entries.
-        snapshot.risk_off = risk_off
+        # snapshot.risk_off already computed above from per-scope limits.
         result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client)
         print("\n--- Agent Decision Narrative ---")
         print(result["narrative"])
