@@ -76,7 +76,8 @@ class KucoinFuturesOrderRequest:
   hidden: Optional[bool] = None
   iceberg: Optional[bool] = None
   visibleSize: Optional[str] = None
-  marginMode: Optional[Literal["cross", "isolated"]] = None
+  marginMode: Optional[Literal["cross", "isolated", "CROSS", "ISOLATED"]] = None
+  autoDeposit: Optional[bool] = None  # required when using isolated to specify auto margin replenishment
 
 
 @dataclass

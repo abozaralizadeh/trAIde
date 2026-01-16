@@ -920,6 +920,13 @@ async def run_trading_agent(
       }
 
     def _build_order(mode: str | None) -> KucoinFuturesOrderRequest:
+      # KuCoin docs show uppercase margin modes; include autoDeposit for isolated.
+      mode_norm = None
+      auto_deposit = None
+      if mode:
+        mode_norm = mode.upper()
+        if mode_norm == "ISOLATED":
+          auto_deposit = False
       return KucoinFuturesOrderRequest(
         symbol=futures_symbol,
         side="buy" if side == "buy" else "sell",
@@ -927,7 +934,8 @@ async def run_trading_agent(
         leverage=f"{lev}",
         size=str(contracts),  # Kucoin futures expects integer contract size (contracts)
         clientOid=str(uuid.uuid4()),
-        marginMode=mode,
+        marginMode=mode_norm,
+        autoDeposit=auto_deposit,
       )
 
     if snapshot.paper_trading:
@@ -958,11 +966,13 @@ async def run_trading_agent(
 
     attempts: list[Dict[str, Any]] = []
     modes_to_try: list[str | None] = []
-    # Start with letting KuCoin pick (None), then detected, then opposite.
+    # Start with letting KuCoin pick (None), then detected, then opposite; finally uppercase variants if needed.
     modes_to_try.append(None)
     if margin_mode is not None:
       modes_to_try.append(margin_mode)
       modes_to_try.append("isolated" if margin_mode == "cross" else "cross")
+    modes_to_try.append("ISOLATED")
+    modes_to_try.append("CROSS")
 
     for mode in modes_to_try:
       if mode is None and any(a.get("marginMode") is None for a in attempts):
