@@ -872,14 +872,13 @@ async def run_trading_agent(
 
     futures_overview: Dict[str, Any] | None = None
     futures_available = 0.0
-    margin_mode = "cross"
+    margin_mode: str | None = None
     try:
       position_info = kucoin_futures.get_position(futures_symbol)
-      if isinstance(position_info, dict):
-        if position_info.get("crossMode") is False:
-          margin_mode = "isolated"
+      if isinstance(position_info, dict) and "crossMode" in position_info:
+        margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception as exc:
-      print("Warning: futures position lookup failed; defaulting to cross margin:", exc)
+      print("Warning: futures position lookup failed; margin mode unknown:", exc)
     if kucoin_futures:
       try:
         futures_overview = kucoin_futures.get_account_overview()
@@ -920,17 +919,19 @@ async def run_trading_agent(
         "transferAttempt": transfer_used,
       }
 
-    order_req = KucoinFuturesOrderRequest(
-      symbol=futures_symbol,
-      side="buy" if side == "buy" else "sell",
-      type="market",
-      leverage=f"{lev}",
-      size=str(contracts),  # Kucoin futures expects integer contract size (contracts)
-      clientOid=str(uuid.uuid4()),
-      marginMode=margin_mode,
-    )
+    def _build_order(mode: str | None) -> KucoinFuturesOrderRequest:
+      return KucoinFuturesOrderRequest(
+        symbol=futures_symbol,
+        side="buy" if side == "buy" else "sell",
+        type="market",
+        leverage=f"{lev}",
+        size=str(contracts),  # Kucoin futures expects integer contract size (contracts)
+        clientOid=str(uuid.uuid4()),
+        marginMode=mode,
+      )
 
     if snapshot.paper_trading:
+      order_req = _build_order(margin_mode)
       record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=contracts * multiplier)
       decision = None
       if confidence is not None:
@@ -954,26 +955,59 @@ async def run_trading_agent(
         "contracts": contracts,
         "contractSpec": {"multiplier": multiplier, "lotSize": lot_size},
       }
-    res = kucoin_futures.place_order(order_req).__dict__
-    record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
-    res["tradeRecord"] = record
-    if confidence is not None:
-      res["decisionLog"] = memory.log_decision(
-        symbol,
-        f"futures_{side}",
-        float(confidence),
-        rationale or "live trade",
-        pnl=None,
-        paper=False,
-      )
-    res["rationale"] = rationale
-    res["feeRate"] = fee_rate
-    res["notionalWithFee"] = notional_with_fee
-    res["futuresSymbol"] = futures_symbol
-    res["contracts"] = contracts
-    res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
-    res["transferUsed"] = transfer_used
-    return res
+
+    attempts: list[Dict[str, Any]] = []
+    modes_to_try: list[str | None] = []
+    # Start with letting KuCoin pick (None), then detected, then opposite.
+    modes_to_try.append(None)
+    if margin_mode is not None:
+      modes_to_try.append(margin_mode)
+      modes_to_try.append("isolated" if margin_mode == "cross" else "cross")
+
+    for mode in modes_to_try:
+      if mode is None and any(a.get("marginMode") is None for a in attempts):
+        continue
+      order_req = _build_order(mode)
+      try:
+        res = kucoin_futures.place_order(order_req).__dict__
+        record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
+        res["tradeRecord"] = record
+        if confidence is not None:
+          res["decisionLog"] = memory.log_decision(
+            symbol,
+            f"futures_{side}",
+            float(confidence),
+            rationale or "live trade",
+            pnl=None,
+            paper=False,
+          )
+        res["rationale"] = rationale
+        res["feeRate"] = fee_rate
+        res["notionalWithFee"] = notional_with_fee
+        res["futuresSymbol"] = futures_symbol
+        res["contracts"] = contracts
+        res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
+        res["transferUsed"] = transfer_used
+        res["marginModeUsed"] = mode
+        if attempts:
+          res["previousAttempts"] = attempts
+        return res
+      except Exception as exc:
+        attempts.append({"marginMode": mode, "error": str(exc)})
+        # If we already tried fallback or error doesn't mention margin mode, break.
+        msg = str(exc).lower()
+        if "margin mode" not in msg:
+          break
+        continue
+
+    return {
+      "error": "Futures order failed",
+      "attempts": attempts,
+      "futuresSymbol": futures_symbol,
+      "contracts": contracts,
+      "marginModeDetected": margin_mode,
+      "transferUsed": transfer_used,
+    }
 
   @function_tool
   async def place_futures_stop_order(
