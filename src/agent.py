@@ -800,10 +800,10 @@ async def run_trading_agent(
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
       notional_input = float(notional_usd or 0)
-      lev = float(leverage or 0)
+      lev_requested = float(leverage or 0)
     except (TypeError, ValueError):
       return {"error": "Invalid notional or leverage"}
-    if notional_input <= 0 or lev <= 0:
+    if notional_input <= 0 or lev_requested <= 0:
       return {"error": "Invalid notional or leverage"}
     trades_today = memory.trades_today(symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
@@ -841,8 +841,15 @@ async def run_trading_agent(
     multiplier = _to_float(contract.get("multiplier"))
     lot_size = int(contract.get("lotSize") or 1)
     max_order_qty = contract.get("maxOrderQty")
+    contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
     if multiplier <= 0:
       return {"error": "Invalid contract multiplier", "contract": contract}
+    lev = lev_requested
+    if contract_max_leverage:
+      lev = min(lev, contract_max_leverage)
+    if snapshot.max_leverage:
+      lev = min(lev, snapshot.max_leverage)
+    lev = max(1.0, lev)
 
     try:
       base_size = float(size_override) if size_override is not None else notional_input / price
@@ -968,12 +975,12 @@ async def run_trading_agent(
       if confidence is not None:
         decision = memory.log_decision(
           symbol,
-          f"futures_{side}",
-          float(confidence),
-          rationale or "paper trade",
-          pnl=None,
-          paper=True,
-        )
+        f"futures_{side}",
+        float(confidence),
+        rationale or "paper trade",
+        pnl=None,
+        paper=True,
+      )
       return {
         "paper": True,
         "orderRequest": order_req.__dict__,
@@ -985,6 +992,7 @@ async def run_trading_agent(
         "futuresSymbol": futures_symbol,
         "contracts": contracts,
         "contractSpec": {"multiplier": multiplier, "lotSize": lot_size},
+        "appliedLeverage": lev,
       }
 
     attempts: list[Dict[str, Any]] = []
@@ -1022,6 +1030,7 @@ async def run_trading_agent(
         res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
         res["transferUsed"] = transfer_used
         res["marginModeUsed"] = mode
+        res["appliedLeverage"] = lev
         if attempts:
           res["previousAttempts"] = attempts
         return res
@@ -1072,12 +1081,17 @@ async def run_trading_agent(
     except Exception:
       return {"error": "Invalid leverage"}
     if lev <= 0 or lev > snapshot.max_leverage:
-      return {"error": "Invalid leverage", "max": snapshot.max_leverage}
+      lev = min(max(1.0, lev), snapshot.max_leverage)
     if size is None or size <= 0:
       return {"error": "size required and >0"}
     stop_price_str = f"{stop_price}" if stop_price is not None else None
     tp_str = f"{take_profit_price}" if take_profit_price is not None else None
     sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
+    contract = _get_contract_spec(futures_symbol)
+    contract_max_leverage = _to_float(contract.get("maxLeverage")) if contract else None
+    if contract_max_leverage:
+      lev = min(lev, contract_max_leverage)
+
     margin_mode: str | None = None
     try:
       position_info = kucoin_futures.get_position(futures_symbol)
