@@ -38,6 +38,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
   balances = list(spot_accounts)
   futures_overview = None
   futures_stops: list[dict] = []
+  futures_positions: list[dict] = []
   if cfg.kucoin_futures.enabled and kucoin_futures:
     try:
       futures_overview = kucoin_futures.get_account_overview()
@@ -53,6 +54,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
           )
         )
       futures_stops = kucoin_futures.list_stop_orders(status="active") or []
+      futures_positions = kucoin_futures.list_positions() or []
     except Exception as exc:
       print("Warning: unable to fetch futures account overview:", exc, file=sys.stderr)
 
@@ -92,6 +94,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     total_usdt=0.0,
     spot_accounts=spot_accounts,
     futures_account=futures_overview or {},
+    futures_positions=futures_positions,
     all_accounts=all_accounts,
     spot_stop_orders=spot_stops,
     futures_stop_orders=futures_stops,

@@ -457,3 +457,18 @@ class KucoinFuturesClient:
       auth=True,
       query={"symbol": symbol},
     ) or {}
+
+  def list_positions(self, status: Optional[str] = None) -> list[Dict[str, Any]]:
+    """List all futures positions (optionally by status)."""
+    query: Dict[str, str] = {}
+    if status:
+      query["status"] = status
+    data = self._request(
+      "GET",
+      "/api/v1/positions",
+      auth=True,
+      query=query or None,
+    )
+    if isinstance(data, dict) and "items" in data:
+      return data.get("items") or []
+    return data or []

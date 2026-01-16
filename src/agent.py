@@ -118,6 +118,7 @@ class TradingSnapshot:
   drawdown_pct_spot: float = 0.0
   drawdown_pct_futures: float = 0.0
   total_usdt: float = 0.0
+  futures_positions: list[dict[str, Any]] = field(default_factory=list)
   spot_accounts: List[KucoinAccount] = field(default_factory=list)
   futures_account: Dict[str, Any] | None = None
   all_accounts: List[KucoinAccount] = field(default_factory=list)
@@ -251,6 +252,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "drawdownPctSpot": snapshot.drawdown_pct_spot,
     "drawdownPctFutures": snapshot.drawdown_pct_futures,
     "totalUsdt": snapshot.total_usdt,
+    "futuresPositions": snapshot.futures_positions,
     "guidance": "If you place an order, prefer market orders sized in USDT funds.",
     "stops": {
       "spot": snapshot.spot_stop_orders,
@@ -1154,6 +1156,17 @@ async def run_trading_agent(
       return {"error": str(exc), "status": status, "symbol": symbol}
 
   @function_tool
+  async def list_futures_positions(status: str | None = None) -> Dict[str, Any]:
+    """List current futures positions (live fetch; falls back to snapshot)."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    try:
+      positions = kucoin_futures.list_positions(status=status)
+      return {"positions": positions, "status": status}
+    except Exception as exc:
+      return {"error": str(exc), "status": status, "snapshotPositions": snapshot.futures_positions}
+
+  @function_tool
   async def transfer_funds(
     direction: str,
     currency: str = "USDT",
@@ -1530,6 +1543,7 @@ async def run_trading_agent(
       place_futures_stop_order,
       cancel_futures_order,
       list_futures_stop_orders,
+      list_futures_positions,
       save_trade_plan,
       latest_plan,
       set_auto_trigger,
