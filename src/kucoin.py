@@ -76,6 +76,7 @@ class KucoinFuturesOrderRequest:
   hidden: Optional[bool] = None
   iceberg: Optional[bool] = None
   visibleSize: Optional[str] = None
+  marginMode: Optional[Literal["cross", "isolated"]] = None
 
 
 @dataclass
@@ -446,3 +447,12 @@ class KucoinFuturesClient:
       query={"currency": currency},
     )
     return data or {}
+
+  def get_position(self, symbol: str) -> Dict[str, Any]:
+    """Fetch futures position for a symbol to detect margin mode (cross/isolated)."""
+    return self._request(
+      "GET",
+      "/api/v1/position",
+      auth=True,
+      query={"symbol": symbol},
+    ) or {}

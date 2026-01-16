@@ -872,6 +872,14 @@ async def run_trading_agent(
 
     futures_overview: Dict[str, Any] | None = None
     futures_available = 0.0
+    margin_mode = "cross"
+    try:
+      position_info = kucoin_futures.get_position(futures_symbol)
+      if isinstance(position_info, dict):
+        if position_info.get("crossMode") is False:
+          margin_mode = "isolated"
+    except Exception as exc:
+      print("Warning: futures position lookup failed; defaulting to cross margin:", exc)
     if kucoin_futures:
       try:
         futures_overview = kucoin_futures.get_account_overview()
@@ -919,6 +927,7 @@ async def run_trading_agent(
       leverage=f"{lev}",
       size=str(contracts),  # Kucoin futures expects integer contract size (contracts)
       clientOid=str(uuid.uuid4()),
+      marginMode=margin_mode,
     )
 
     if snapshot.paper_trading:
