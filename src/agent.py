@@ -112,7 +112,11 @@ class TradingSnapshot:
   max_leverage: float
   futures_enabled: bool
   risk_off: bool = False
+  risk_off_spot: bool = False
+  risk_off_futures: bool = False
   drawdown_pct: float = 0.0
+  drawdown_pct_spot: float = 0.0
+  drawdown_pct_futures: float = 0.0
   total_usdt: float = 0.0
   spot_accounts: List[KucoinAccount] = field(default_factory=list)
   futures_account: Dict[str, Any] | None = None
@@ -241,7 +245,11 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "maxLeverage": snapshot.max_leverage,
     "futuresEnabled": snapshot.futures_enabled,
     "riskOff": snapshot.risk_off,
+    "riskOffSpot": snapshot.risk_off_spot,
+    "riskOffFutures": snapshot.risk_off_futures,
     "drawdownPct": snapshot.drawdown_pct,
+    "drawdownPctSpot": snapshot.drawdown_pct_spot,
+    "drawdownPctFutures": snapshot.drawdown_pct_futures,
     "totalUsdt": snapshot.total_usdt,
     "guidance": "If you place an order, prefer market orders sized in USDT funds.",
     "stops": {
@@ -1408,7 +1416,7 @@ async def run_trading_agent(
     "- Maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TPs; update/cancel when thesis changes. Keep stops in sync with size. If spot balance + position size ≈ 0 but a SELL stop exists, cancel via cancel_spot_stop_order.\n"
     "- Keep sizing fee-aware: use current fees; refresh via refresh_fee_rates when stale; include taker fees in spend caps.\n"
     "- Favor intraday/day-trading profits. Use futures with sensible leverage (<= max_leverage) and tight stops only when conviction and research are strong; size prudently.\n"
-    "- Evaluate spot and futures balances separately each run. Use transfer_funds to free capital instead of skipping trades when one venue lacks USDT.\n"
+    "- Evaluate spot and futures balances separately each run (riskOffSpot vs riskOffFutures provided). If only spot is risk-off, you may still trade futures; if only futures is risk-off, avoid futures but spot may be OK. Use transfer_funds to free capital instead of skipping trades when one venue lacks USDT.\n"
     "- Before any spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if clipped or volatility is too high.\n"
     "- Use fetch_orderbook for depth/imbalance checks (top 20/100) when needed.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage limits.\n"

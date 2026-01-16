@@ -84,7 +84,11 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     max_leverage=cfg.trading.max_leverage,
     futures_enabled=cfg.kucoin_futures.enabled,
     risk_off=False,  # will be set in loop
+    risk_off_spot=False,
+    risk_off_futures=False,
     drawdown_pct=0.0,
+    drawdown_pct_spot=0.0,
+    drawdown_pct_futures=0.0,
     total_usdt=0.0,
     spot_accounts=spot_accounts,
     futures_account=futures_overview or {},
@@ -117,35 +121,51 @@ async def trading_loop() -> None:
       await asyncio.sleep(cfg.trading.poll_interval_sec)
       continue
 
-    usdt_balance = 0.0
-    for acct in snapshot.all_accounts or snapshot.spot_accounts:
+    spot_usdt = 0.0
+    for acct in snapshot.spot_accounts:
       if acct.currency == "USDT":
         try:
           avail = float(acct.available or 0)
           bal = float(acct.balance or 0)
-          usdt_balance += max(avail, bal)
+          spot_usdt += max(avail, bal)
         except Exception:
           continue
 
+    futures_usdt = 0.0
     if snapshot.futures_account:
       try:
         fut_avail = float(snapshot.futures_account.get("availableBalance") or 0)
         fut_equity = float(snapshot.futures_account.get("accountEquity") or snapshot.futures_account.get("marginBalance") or fut_avail)
-        usdt_balance += max(fut_avail, fut_equity)
+        futures_usdt += max(fut_avail, fut_equity)
       except Exception:
         pass
 
-    # Update drawdown and auto-clear risk_off when recovered.
-    limits = memory.update_limits(usdt_balance, cfg.trading.max_daily_drawdown_pct)
-    if limits.get("kill") and (limits.get("drawdownPct") or 0) < cfg.trading.max_daily_drawdown_pct * 0.5:
-      limits = memory.reset_limits(usdt_balance)
+    total_usdt = spot_usdt + futures_usdt
 
-    risk_off = bool(limits.get("kill"))
-    snapshot.risk_off = risk_off
-    snapshot.drawdown_pct = float(limits.get("drawdownPct") or 0.0)
-    snapshot.total_usdt = usdt_balance
-    if risk_off:
-      reason = limits.get("reason") or "Kill switch active (drawdown limit reached). Running in risk-off mode."
+    # Update drawdown per venue and overall; auto-clear when recovered.
+    limits_total = memory.update_limits(total_usdt, cfg.trading.max_daily_drawdown_pct, scope="total")
+    limits_spot = memory.update_limits(spot_usdt, cfg.trading.max_daily_drawdown_pct, scope="spot")
+    limits_futures = memory.update_limits(futures_usdt, cfg.trading.max_daily_drawdown_pct, scope="futures")
+
+    def _maybe_reset(limits_obj, current_usdt, scope):
+      if limits_obj.get("kill") and (limits_obj.get("drawdownPct") or 0) < cfg.trading.max_daily_drawdown_pct * 0.5:
+        return memory.reset_limits(current_usdt, scope=scope)
+      return limits_obj
+
+    limits_total = _maybe_reset(limits_total, total_usdt, "total")
+    limits_spot = _maybe_reset(limits_spot, spot_usdt, "spot")
+    limits_futures = _maybe_reset(limits_futures, futures_usdt, "futures")
+
+    snapshot.total_usdt = total_usdt
+    snapshot.drawdown_pct = float(limits_total.get("drawdownPct") or 0.0)
+    snapshot.drawdown_pct_spot = float(limits_spot.get("drawdownPct") or 0.0)
+    snapshot.drawdown_pct_futures = float(limits_futures.get("drawdownPct") or 0.0)
+    snapshot.risk_off_spot = bool(limits_spot.get("kill"))
+    snapshot.risk_off_futures = bool(limits_futures.get("kill"))
+    snapshot.risk_off = bool(limits_total.get("kill") and snapshot.risk_off_spot and snapshot.risk_off_futures)
+
+    if snapshot.risk_off or snapshot.risk_off_spot or snapshot.risk_off_futures:
+      reason = limits_total.get("reason") or limits_spot.get("reason") or limits_futures.get("reason") or "Kill switch active (drawdown limit reached)."
       print(reason)
 
     triggers: list[str] = []

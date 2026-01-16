@@ -94,15 +94,24 @@ class MemoryStore:
           if isinstance(d, dict) and d.get("symbol") and d.get("ts") is not None
         ]
         limits = data.get("limits") or {}
-        data["limits"] = {
-          "day": limits.get("day"),
-          "baselineUsdt": limits.get("baselineUsdt"),
-          "currentUsdt": limits.get("currentUsdt"),
-          "drawdownPct": limits.get("drawdownPct"),
-          "kill": limits.get("kill", False),
-          "reason": limits.get("reason", ""),
-          "updated": limits.get("updated"),
-        }
+        # Normalize legacy limits (single dict) into per-scope dict keyed by "total".
+        if isinstance(limits, dict) and any(
+          k in limits for k in ("baselineUsdt", "currentUsdt", "drawdownPct", "kill")
+        ) and "total" not in limits:
+          limits = {
+            "total": {
+              "day": limits.get("day"),
+              "baselineUsdt": limits.get("baselineUsdt"),
+              "currentUsdt": limits.get("currentUsdt"),
+              "drawdownPct": limits.get("drawdownPct"),
+              "kill": limits.get("kill", False),
+              "reason": limits.get("reason", ""),
+              "updated": limits.get("updated"),
+            }
+          }
+        if not isinstance(limits, dict):
+          limits = {}
+        data["limits"] = limits
         return self._prune(data)
     except Exception:
       return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}}
@@ -117,6 +126,13 @@ class MemoryStore:
     data["coins"] = [c for c in data.get("coins", []) if (c.get("ts") or now) >= cutoff]
     data["trades"] = [t for t in data.get("trades", []) if (t.get("ts") or now) >= cutoff]
     data.setdefault("limits", {})
+    if isinstance(data["limits"], dict):
+      for scope, lim in list(data["limits"].items()):
+        if not isinstance(lim, dict):
+          data["limits"].pop(scope, None)
+          continue
+        if (lim.get("updated") or now) < cutoff:
+          data["limits"].pop(scope, None)
     data["sentiments"] = [s for s in data.get("sentiments", []) if (s.get("ts") or now) >= cutoff]
     data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
     data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
@@ -345,12 +361,13 @@ class MemoryStore:
       day_key = int(time.time() // 86400)
       return len([t for t in data.get("trades", []) or [] if (t.get("day") or 0) == day_key])
 
-  def update_limits(self, current_usdt: float, drawdown_limit_pct: float) -> Dict[str, Any]:
+  def update_limits(self, current_usdt: float, drawdown_limit_pct: float, scope: str = "total") -> Dict[str, Any]:
     with self._lock:
       data = self._read()
       now = int(time.time())
       day_key = int(now // 86400)
-      limits = data.get("limits") or {}
+      limits_all = data.get("limits") if isinstance(data.get("limits"), dict) else {}
+      limits = limits_all.get(scope) or {}
       if limits.get("day") != day_key:
         limits = {
           "day": day_key,
@@ -381,7 +398,8 @@ class MemoryStore:
           "updated": now,
         }
       )
-      data["limits"] = limits
+      limits_all[scope] = limits
+      data["limits"] = limits_all
       self._write(data)
       return limits
 
@@ -453,18 +471,20 @@ class MemoryStore:
       pos["currentPrice"] = cur_price or None
     return positions
 
-  def kill_active(self) -> bool:
+  def kill_active(self, scope: str = "total") -> bool:
     with self._lock:
       data = self._read()
-      limits = data.get("limits") or {}
+      limits_all = data.get("limits") or {}
+      limits = limits_all.get(scope) or {}
       return bool(limits.get("kill"))
 
-  def reset_limits(self, current_usdt: float) -> Dict[str, Any]:
+  def reset_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:
     """Reset daily limits baseline to current_usdt and clear kill flag."""
     with self._lock:
       data = self._read()
       now = int(time.time())
       day_key = int(now // 86400)
+      limits_all = data.get("limits") if isinstance(data.get("limits"), dict) else {}
       limits = {
         "day": day_key,
         "baselineUsdt": float(current_usdt or 0.0),
@@ -474,7 +494,8 @@ class MemoryStore:
         "reason": "manual reset",
         "updated": now,
       }
-      data["limits"] = limits
+      limits_all[scope] = limits
+      data["limits"] = limits_all
       self._write(data)
       return limits
 
