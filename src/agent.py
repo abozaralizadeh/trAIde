@@ -1013,8 +1013,12 @@ async def run_trading_agent(
         continue
       order_req = _build_order(mode)
       try:
-        # Align exchange leverage setting before placing order to prevent defaulting to high leverage.
+        # Align exchange margin mode and leverage before placing order (KuCoin ignores leverage in order payload).
         cross = True if (mode or "").lower() != "isolated" else False
+        try:
+          kucoin_futures.set_margin_mode(futures_symbol, (mode or "cross"), auto_deposit=(mode or "").upper() == "ISOLATED" and False)
+        except Exception as exc:
+          print("Warning: set_margin_mode failed (continuing):", exc)
         try:
           kucoin_futures.set_leverage(futures_symbol, lev, cross=cross)
         except Exception as exc:
@@ -1111,6 +1115,10 @@ async def run_trading_agent(
 
     margin_mode_norm = margin_mode.upper() if margin_mode else None
     auto_deposit = False if margin_mode_norm == "ISOLATED" else None
+    try:
+      kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS", auto_deposit=auto_deposit)
+    except Exception as exc:
+      print("Warning: set_margin_mode failed for stop order (continuing):", exc)
     try:
       kucoin_futures.set_leverage(futures_symbol, lev, cross=margin_mode_norm != "ISOLATED")
     except Exception as exc:

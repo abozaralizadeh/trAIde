@@ -519,22 +519,24 @@ class KucoinFuturesClient:
     return data or []
 
   def set_leverage(self, symbol: str, leverage: float, cross: bool = True) -> Dict[str, Any]:
-    """Set leverage for a futures symbol; tries common payload variants for cross/isolated."""
-    payloads = [
-      {"symbol": symbol, "leverage": leverage, "crossMode": cross},
-      {"symbol": symbol, "leverage": leverage, "marginMode": "cross" if cross else "isolated"},
-      {"symbol": symbol, "leverage": leverage},
-    ]
-    errors: list[str] = []
-    for body in payloads:
-      try:
-        return self._request(
-          "POST",
-          "/api/v1/position/change-leverage",
-          auth=True,
-          body=body,
-        )
-      except Exception as exc:
-        errors.append(str(exc))
-        continue
-    raise RuntimeError(f"Kucoin Futures set_leverage failed: {errors}")
+    """Set leverage for a futures symbol using the official leverage endpoint."""
+    body = {"symbol": symbol, "leverage": str(int(leverage))}
+    return self._request(
+      "POST",
+      "/api/v1/position/margin/leverage",
+      auth=True,
+      body=body,
+    )
+
+  def set_margin_mode(self, symbol: str, margin_mode: str, auto_deposit: Optional[bool] = None) -> Dict[str, Any]:
+    """Set margin mode (CROSS/ISOLATED) for a futures symbol."""
+    mode_norm = margin_mode.upper()
+    body: Dict[str, Any] = {"symbol": symbol, "marginMode": mode_norm}
+    if auto_deposit is not None:
+      body["autoDeposit"] = auto_deposit
+    return self._request(
+      "POST",
+      "/api/v1/position/margin/mode",
+      auth=True,
+      body=body,
+    )
