@@ -172,6 +172,13 @@ async def trading_loop() -> None:
     snapshot.risk_off_futures = bool(limits_futures.get("kill"))
     snapshot.risk_off = bool(limits_total.get("kill") and snapshot.risk_off_spot and snapshot.risk_off_futures)
 
+    # If futures are effectively empty (no positions and tiny balance), clear futures kill switch to avoid blocking.
+    empty_futures = (futures_usdt <= 1e-3) and not snapshot.futures_positions
+    if empty_futures and snapshot.risk_off_futures:
+      limits_futures = memory.reset_limits(futures_usdt, scope="futures")
+      snapshot.drawdown_pct_futures = float(limits_futures.get("drawdownPct") or 0.0)
+      snapshot.risk_off_futures = False
+
     if snapshot.risk_off or snapshot.risk_off_spot or snapshot.risk_off_futures:
       reason = limits_total.get("reason") or limits_spot.get("reason") or limits_futures.get("reason") or "Kill switch active (drawdown limit reached)."
       print(reason)
