@@ -6,6 +6,15 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+# Hard caps to keep the memory file small and readable (agent only needs recent history).
+MAX_PLANS = 20
+MAX_TRIGGERS = 50
+MAX_COINS = 50
+MAX_TRADES = 150
+MAX_SENTIMENTS = 150
+MAX_DECISIONS = 150
+MAX_FEES = 50
+
 
 class MemoryStore:
   """Lightweight JSON-backed store for agent plans/notes."""
@@ -136,6 +145,25 @@ class MemoryStore:
     data["sentiments"] = [s for s in data.get("sentiments", []) if (s.get("ts") or now) >= cutoff]
     data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
     data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
+
+    def _cap_list(key: str, max_items: int) -> None:
+      items = data.get(key) or []
+      if len(items) > max_items:
+        # keep most recent by ts if available, else last items
+        try:
+          items = sorted(items, key=lambda x: x.get("ts", 0))[-max_items:]
+        except Exception:
+          items = items[-max_items:]
+      data[key] = items
+
+    _cap_list("plans", MAX_PLANS)
+    _cap_list("triggers", MAX_TRIGGERS)
+    _cap_list("coins", MAX_COINS)
+    _cap_list("trades", MAX_TRADES)
+    _cap_list("sentiments", MAX_SENTIMENTS)
+    _cap_list("decisions", MAX_DECISIONS)
+    _cap_list("fees", MAX_FEES)
+
     return data
 
   def _write(self, data: Dict[str, Any]) -> None:
@@ -174,8 +202,8 @@ class MemoryStore:
         "sentiments": existing.get("sentiments", []),
         "decisions": existing.get("decisions", []),
       }
-      self._write(data)
-      return data
+      self._write(self._prune(data))
+      return self._prune(data)
 
   def save_trigger(
     self,
