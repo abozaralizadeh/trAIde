@@ -174,7 +174,14 @@ async def trading_loop() -> None:
 
     # If futures are effectively empty (no positions and tiny balance), clear futures kill switch to avoid blocking.
     empty_futures = (futures_usdt <= 1e-3) and not snapshot.futures_positions
-    if empty_futures and snapshot.risk_off_futures:
+    # If no futures positions and no margin in use, reset futures drawdown/kill to avoid blocking when idle.
+    no_futures_pos = not snapshot.futures_positions
+    fut_margin = 0.0
+    try:
+      fut_margin = float(snapshot.futures_account.get("positionMargin") or 0.0)
+    except Exception:
+      pass
+    if (empty_futures or (no_futures_pos and fut_margin <= 1e-6)) and snapshot.risk_off_futures:
       limits_futures = memory.reset_limits(futures_usdt, scope="futures")
       snapshot.drawdown_pct_futures = float(limits_futures.get("drawdownPct") or 0.0)
       snapshot.risk_off_futures = False
