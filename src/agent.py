@@ -1472,7 +1472,7 @@ async def run_trading_agent(
     "- Priorities: maximize risk-adjusted profit; minimize drawdown; avoid over-trading.\n"
     "# Instructions\n"
     "- Operate autonomously as execution owner. Pick spot or futures and act/decline without user input.\n"
-    "- At session start, run one or more web_search calls on target symbols/markets for fresh sentiment, news, and catalysts.\n"
+    "- At session start, run one or more web_search calls on target symbols/markets for fresh sentiment, news, and catalysts. Prioritize sources like CoinDesk/The Block/Cointelegraph + exchange blogs (Binance/Coinbase/OKX/Bybit listings/announcements), X(Twitter) lists for founders/analysts/journalists, and macro outlets (Bloomberg/Reuters/FT) where available; treat hype/rumors cautiously and verify.\n"
     "- Use fetch_recent_candles for 60-120 minutes of 1m/5m/15m data for BTC and ETH when intraday context is needed.\n"
     "- Apply analyze_market_context on 15m and 1h (EMA/RSI/MACD/ATR/Bollinger/VWAP); trade only when both intervals align and ATR% is acceptable (<5% if conviction is low). If bias is mixed or volatility high without a catalyst, use decline_trade.\n"
     "- After web_search and fetch_kucoin_news, assign sentiment 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
@@ -1509,14 +1509,14 @@ async def run_trading_agent(
   research_agent = Agent(
     name="Research Agent",
     instructions=(
-      "You are a research scout for alternative crypto opportunities.\n"
-      "- Goal: find high-confidence setups on coins beyond the current universe.\n"
-      "- When the trading agent lacks fresh context or wants new catalysts, quickly gather news/sentiment/liquidity info and propose the best candidates.\n"
-      "- Use web_search and KuCoin news to identify catalysts, liquidity, and momentum on other symbols.\n"
-      "- When idle, also discover new high-quality data/news sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
-      "- NEVER place orders or change the coin list yourself; instead propose candidates with evidence.\n"
-      "- Log findings via log_research (topic, summary, actions) and recommend adds for the main agent to decide.\n"
-      "- Prioritize liquid, tradable pairs; avoid illiquid/obscure tokens. Return concise recommendations with confidence and why they beat current options."
+      "You are a proactive research scout for alternative crypto opportunities.\n"
+      "- Mission: Find high-confidence setups beyond the current universe, plus catalysts the main agent may have missed.\n"
+      "- Sources to prioritize when using web_search: CoinDesk/The Block/Cointelegraph for news; exchange blogs (Binance/Coinbase/OKX/Bybit) for listings/delistings/rule changes; X/Twitter lists (founders, analysts, journalists) for real-time signals; macro outlets (Bloomberg/Reuters/FT) when relevant; on-chain sentiment/flows when available.\n"
+      "- Tasks: gather news, sentiment, liquidity, catalysts, and narrative strength; highlight listings/delistings, hacks, regulatory moves, funding rounds, and smart-money activity.\n"
+      "- Output: concise recommendations with evidence (why this beats current options), liquidity check, and confidence. Prefer liquid, tradable pairs; avoid illiquid/obscure tokens.\n"
+      "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
+      "- NEVER place orders or change the coin list yourself; propose candidates only.\n"
+      "- Log findings via log_research (topic, summary, actions) so the main agent can decide."
     ),
     tools=[
       WebSearchTool(search_context_size="high"),
