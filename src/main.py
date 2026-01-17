@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import time
 from typing import Dict
 
 from agents import set_default_openai_client
@@ -135,7 +136,7 @@ async def trading_loop() -> None:
           continue
 
     futures_usdt = 0.0
-    if snapshot.futures_account:
+    if cfg.kucoin_futures.enabled and snapshot.futures_account:
       try:
         fut_avail = float(snapshot.futures_account.get("availableBalance") or 0)
         fut_equity = float(snapshot.futures_account.get("accountEquity") or snapshot.futures_account.get("marginBalance") or fut_avail)
@@ -148,7 +149,11 @@ async def trading_loop() -> None:
     # Update drawdown per venue and overall; auto-clear when recovered.
     limits_total = memory.update_limits(total_usdt, cfg.trading.max_daily_drawdown_pct, scope="total")
     limits_spot = memory.update_limits(spot_usdt, cfg.trading.max_daily_drawdown_pct, scope="spot")
-    limits_futures = memory.update_limits(futures_usdt, cfg.trading.max_daily_drawdown_pct, scope="futures")
+    if cfg.kucoin_futures.enabled and snapshot.futures_account:
+      limits_futures = memory.update_limits(futures_usdt, cfg.trading.max_daily_drawdown_pct, scope="futures")
+    else:
+      # If futures are empty/unavailable, clear futures risk-off so it does not block trading.
+      limits_futures = memory.reset_limits(futures_usdt, scope="futures")
 
     def _maybe_reset(limits_obj, current_usdt, scope):
       if limits_obj.get("kill") and (limits_obj.get("drawdownPct") or 0) < cfg.trading.max_daily_drawdown_pct * 0.5:

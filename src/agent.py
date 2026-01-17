@@ -1012,6 +1012,12 @@ async def run_trading_agent(
         continue
       order_req = _build_order(mode)
       try:
+        # Align exchange leverage setting before placing order to prevent defaulting to high leverage.
+        cross = True if (mode or "").lower() != "isolated" else False
+        try:
+          kucoin_futures.set_leverage(futures_symbol, lev, cross=cross)
+        except Exception as exc:
+          print("Warning: set_leverage failed (continuing):", exc)
         res = kucoin_futures.place_order(order_req).__dict__
         record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
         res["tradeRecord"] = record
@@ -1104,6 +1110,10 @@ async def run_trading_agent(
 
     margin_mode_norm = margin_mode.upper() if margin_mode else None
     auto_deposit = False if margin_mode_norm == "ISOLATED" else None
+    try:
+      kucoin_futures.set_leverage(futures_symbol, lev, cross=margin_mode_norm != "ISOLATED")
+    except Exception as exc:
+      print("Warning: set_leverage failed for stop order (continuing):", exc)
     order_req = KucoinFuturesOrderRequest(
       symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",

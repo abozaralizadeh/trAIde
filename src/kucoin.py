@@ -519,3 +519,24 @@ class KucoinFuturesClient:
     if isinstance(data, dict) and "items" in data:
       return data.get("items") or []
     return data or []
+
+  def set_leverage(self, symbol: str, leverage: float, cross: bool = True) -> Dict[str, Any]:
+    """Set leverage for a futures symbol; tries common payload variants for cross/isolated."""
+    payloads = [
+      {"symbol": symbol, "leverage": leverage, "crossMargin": cross},
+      {"symbol": symbol, "leverage": leverage, "marginMode": "cross" if cross else "isolated"},
+      {"symbol": symbol, "leverage": leverage},
+    ]
+    errors: list[str] = []
+    for body in payloads:
+      try:
+        return self._request(
+          "POST",
+          "/api/v1/position/change-leverage",
+          auth=True,
+          body=body,
+        )
+      except Exception as exc:
+        errors.append(str(exc))
+        continue
+    raise RuntimeError(f"Kucoin Futures set_leverage failed: {errors}")
