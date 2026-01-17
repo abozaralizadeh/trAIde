@@ -366,10 +366,8 @@ class KucoinFuturesClient:
     self.base_url = cfg.kucoin_futures.base_url.rstrip("/")
     self._time_offset_ms = 0
 
-    def _timestamp_ms(self) -> int:
-      return int(time.time() * 1000 + self._time_offset_ms)
-
-    self._timestamp_ms = _timestamp_ms
+  def _timestamp_ms(self) -> int:
+    return int(time.time() * 1000 + self._time_offset_ms)
 
   def _sign_headers(self, method: RestMethod, path: str, body: Any | None) -> Dict[str, str]:
     timestamp = str(self._timestamp_ms())
