@@ -120,7 +120,7 @@ def load_config() -> AppConfig:
       coins=coins,
       flexible_coins_enabled=_as_bool(os.getenv("FLEXIBLE_COINS_ENABLED"), True),
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
-      max_position_usd=float(os.getenv("MAX_POSITION_USD", "100")),
+      max_position_usd=float(os.getenv("MAX_POSITION_USD", "1000")),
       risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.01")),
       min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.6")),
       sentiment_filter_enabled=_as_bool(os.getenv("SENTIMENT_FILTER_ENABLED"), False),
@@ -129,7 +129,7 @@ def load_config() -> AppConfig:
       price_change_trigger_pct=float(os.getenv("PRICE_CHANGE_TRIGGER_PCT", "0.5")),
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
-      max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "3")),
+      max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "100")),
       max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
       reset_drawdown_on_start=_as_bool(os.getenv("RESET_DRAWDOWN_ON_START"), False),
     ),
@@ -145,7 +145,7 @@ def load_config() -> AppConfig:
     openai_trace_api_key=os.getenv("OPENAI_TRACE_API_KEY"),
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
     retention_days=int(os.getenv("RETENTION_DAYS", "7")),
-    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "50")),
+    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "100")),
   )
 
   validate_config(config)
