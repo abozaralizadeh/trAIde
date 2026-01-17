@@ -7,13 +7,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 # Hard caps to keep the memory file small and readable (agent only needs recent history).
-MAX_PLANS = 20
-MAX_TRIGGERS = 50
+MAX_PLANS = 3
+MAX_TRIGGERS = 5
 MAX_COINS = 50
-MAX_TRADES = 150
-MAX_SENTIMENTS = 150
-MAX_DECISIONS = 150
-MAX_FEES = 50
+MAX_TRADES = 10
+MAX_SENTIMENTS = 10
+MAX_DECISIONS = 10
+MAX_FEES = 3
 
 
 class MemoryStore:
