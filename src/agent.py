@@ -797,8 +797,17 @@ async def run_trading_agent(
     reduce_only: bool | None = None,
   ) -> Dict[str, Any]:
     """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
+    spot_symbol = symbol
     if symbol not in allowed_symbols:
-      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+      # Accept futures contract symbols directly (e.g., XBTUSDTM -> BTC-USDT)
+      if "-" not in symbol and symbol.upper().endswith("M"):
+        base_quote = symbol[:-1]
+        if base_quote.upper().startswith("XBT"):
+          base_quote = "BTC" + base_quote[3:]
+        if len(base_quote) > 4:
+          spot_symbol = base_quote[:-4] + "-" + base_quote[-4:]
+      if spot_symbol not in allowed_symbols:
+        return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
@@ -808,7 +817,7 @@ async def run_trading_agent(
       return {"error": "Invalid notional or leverage"}
     if notional_input <= 0 or lev_requested <= 0:
       return {"error": "Invalid notional or leverage"}
-    trades_today = memory.trades_today(symbol)
+    trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
       return {
         "rejected": True,
@@ -829,15 +838,15 @@ async def run_trading_agent(
           "minScore": cfg.trading.sentiment_min_score,
         }
 
-    futures_symbol = _to_futures_symbol(symbol)
+    futures_symbol = _to_futures_symbol(spot_symbol)
     if not futures_symbol:
-      return {"error": "Invalid symbol for futures", "symbol": symbol}
+      return {"error": "Invalid symbol for futures", "symbol": spot_symbol}
 
     contract = _get_contract_spec(futures_symbol)
     if not contract:
       return {"error": "Futures contract spec unavailable", "futuresSymbol": futures_symbol}
 
-    price = float(snapshot.tickers[symbol].price)
+    price = float(snapshot.tickers[spot_symbol].price)
     if price <= 0:
       return {"error": "Invalid or missing price"}
 
@@ -912,7 +921,7 @@ async def run_trading_agent(
       except Exception as exc:
         print("Warning: futures overview unavailable:", exc)
 
-    margin_needed = notional / lev
+    margin_needed = 0.0 if reduce_only else notional / lev
     fee_allowance = notional * fee_rate
     buffer = max(1.0, margin_needed * 0.01)
     required_futures_balance = margin_needed + fee_allowance + buffer
@@ -953,7 +962,12 @@ async def run_trading_agent(
         mode_norm = mode.upper()
         if mode_norm == "ISOLATED":
           auto_deposit = False
-      stop_price_str = f"{stop_price}" if stop_price is not None else None
+      # If only stop_loss_price is provided, use it as stopPrice to avoid KuCoin stop-price missing errors.
+      effective_stop_price = stop_price if stop_price is not None else stop_loss_price
+      effective_stop_type = stop_price_type
+      if effective_stop_price is not None and not effective_stop_type:
+        effective_stop_type = "MP"
+      stop_price_str = f"{effective_stop_price}" if effective_stop_price is not None else None
       tp_str = f"{take_profit_price}" if take_profit_price is not None else None
       sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
       return KucoinFuturesOrderRequest(
@@ -966,7 +980,7 @@ async def run_trading_agent(
         marginMode=mode_norm,
         autoDeposit=auto_deposit,
         stop=stop,
-        stopPriceType=stop_price_type,
+        stopPriceType=effective_stop_type,
         stopPrice=stop_price_str,
         takeProfitPrice=tp_str,
         stopLossPrice=sl_str,
@@ -1002,8 +1016,7 @@ async def run_trading_agent(
 
     attempts: list[Dict[str, Any]] = []
     modes_to_try: list[str | None] = []
-    # Start with letting KuCoin pick (None), then detected, then opposite; finally uppercase variants if needed.
-    modes_to_try.append(None)
+    # Start with detected mode, then opposite; finally uppercase variants if needed.
     modes_to_try.append(margin_mode)
     modes_to_try.append("isolated" if margin_mode == "cross" else "cross")
     modes_to_try.append("ISOLATED")
