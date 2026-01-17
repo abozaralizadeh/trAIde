@@ -92,9 +92,24 @@ class KucoinClient:
     self.api_secret = cfg.kucoin.secret
     self.api_passphrase = cfg.kucoin.passphrase
     self.base_url = cfg.kucoin.base_url.rstrip("/")
+    self._time_offset_ms = 0
+
+  def _timestamp_ms(self) -> int:
+    return int(time.time() * 1000 + self._time_offset_ms)
+
+  def _sync_time(self) -> None:
+    try:
+      resp = requests.get(f"{self.base_url}/api/v1/timestamp", timeout=5)
+      if resp.ok:
+        server_ms = resp.json().get("data")
+        if isinstance(server_ms, (int, float)):
+          local_ms = int(time.time() * 1000)
+          self._time_offset_ms = int(server_ms) - local_ms
+    except Exception:
+      pass
 
   def _sign_headers(self, method: RestMethod, path: str, body: Any | None) -> Dict[str, str]:
-    timestamp = str(int(time.time() * 1000))
+    timestamp = str(self._timestamp_ms())
     body_str = json.dumps(body) if body is not None else ""
     prehash = f"{timestamp}{method}{path}{body_str}"
 
@@ -136,7 +151,15 @@ class KucoinClient:
 
     response = requests.request(method, url, headers=headers, json=body, timeout=15)
     if not response.ok:
-      raise RuntimeError(f"Kucoin HTTP {response.status_code}: {response.text}")
+      # Retry once on timestamp errors after syncing time.
+      if response.status_code == 400 and "Invalid KC-API-TIMESTAMP" in response.text:
+        self._sync_time()
+        headers = {"Content-Type": "application/json"}
+        if auth:
+          headers.update(self._sign_headers(method, full_path, body))
+        response = requests.request(method, url, headers=headers, json=body, timeout=15)
+      if not response.ok:
+        raise RuntimeError(f"Kucoin HTTP {response.status_code}: {response.text}")
 
     payload = response.json()
     if payload.get("code") != "200000":
@@ -341,9 +364,15 @@ class KucoinFuturesClient:
     self.api_secret = cfg.kucoin.secret.encode("utf-8")
     self.api_passphrase = cfg.kucoin.passphrase.encode("utf-8")
     self.base_url = cfg.kucoin_futures.base_url.rstrip("/")
+    self._time_offset_ms = 0
+
+    def _timestamp_ms(self) -> int:
+      return int(time.time() * 1000 + self._time_offset_ms)
+
+    self._timestamp_ms = _timestamp_ms
 
   def _sign_headers(self, method: RestMethod, path: str, body: Any | None) -> Dict[str, str]:
-    timestamp = str(int(time.time() * 1000))
+    timestamp = str(self._timestamp_ms())
     body_str = json.dumps(body) if body is not None else ""
     prehash = f"{timestamp}{method}{path}{body_str}"
 
@@ -377,13 +406,31 @@ class KucoinFuturesClient:
 
     response = requests.request(method, url, headers=headers, json=body, timeout=15)
     if not response.ok:
-      raise RuntimeError(f"Kucoin Futures HTTP {response.status_code}: {response.text}")
+      if response.status_code == 400 and "Invalid KC-API-TIMESTAMP" in response.text:
+        self._sync_time()
+        headers = {"Content-Type": "application/json"}
+        if auth:
+          headers.update(self._sign_headers(method, full_path, body))
+        response = requests.request(method, url, headers=headers, json=body, timeout=15)
+      if not response.ok:
+        raise RuntimeError(f"Kucoin Futures HTTP {response.status_code}: {response.text}")
 
     payload = response.json()
     if payload.get("code") not in ("200000", "200"):  # futures may return 200
       raise RuntimeError(f"Kucoin Futures API error: {payload.get('code')} {payload.get('msg','')}")
 
     return payload.get("data")
+
+  def _sync_time(self) -> None:
+    try:
+      resp = requests.get(f"{self.base_url}/api/v1/timestamp", timeout=5)
+      if resp.ok:
+        server_ms = resp.json().get("data")
+        if isinstance(server_ms, (int, float)):
+          local_ms = int(time.time() * 1000)
+          self._time_offset_ms = int(server_ms) - local_ms
+    except Exception:
+      pass
 
   def place_order(self, order: KucoinFuturesOrderRequest) -> KucoinFuturesOrderResponse:
     payload = {k: v for k, v in order.__dict__.items() if v is not None}
