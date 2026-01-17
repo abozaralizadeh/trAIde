@@ -342,6 +342,7 @@ async def run_trading_agent(
       "currentPrice": cur_price,
     }
   positions = reconciled_positions
+  triggers = memory.latest_triggers()
   # Pull latest stored fees; fallback defaults.
   fee_defaults = {"spot_taker": 0.001, "spot_maker": 0.001, "futures_taker": 0.0006, "futures_maker": 0.0002}
   stored_fees = memory.latest_fees() or {}
@@ -1490,6 +1491,7 @@ async def run_trading_agent(
     "- Keep sizing fee-aware: use current fees; refresh via refresh_fee_rates when stale; include taker fees in spend caps.\n"
     "- Favor intraday/day-trading profits. Use futures with sensible leverage (<= max_leverage) and tight stops only when conviction and research are strong; size prudently.\n"
     "- Evaluate spot and futures balances separately each run (riskOffSpot vs riskOffFutures provided). If only spot is risk-off, you may still trade futures; if only futures is risk-off, avoid futures but spot may be OK. Use transfer_funds to free capital instead of skipping trades when one venue lacks USDT.\n"
+    "- At run start, fetch pending triggers via list_triggers (or use provided triggers in context); act on valid ones (place/cancel orders) and clear stale triggers.\n"
     "- Before any spot trade, call plan_spot_position to size with risk_per_trade_pct and ATR-based stop/target; reject/skip if clipped or volatility is too high.\n"
     "- Use fetch_orderbook for depth/imbalance checks (top 20/100) when needed.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage limits.\n"
@@ -1589,6 +1591,7 @@ async def run_trading_agent(
   user_state_obj = json.loads(user_state)
   user_state_obj["positions"] = positions
   user_state_obj["fees"] = fees
+  user_state_obj["triggers"] = triggers
   input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
