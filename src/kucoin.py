@@ -521,7 +521,7 @@ class KucoinFuturesClient:
   def set_leverage(self, symbol: str, leverage: float, cross: bool = True) -> Dict[str, Any]:
     """Set leverage for a futures symbol; tries common payload variants for cross/isolated."""
     payloads = [
-      {"symbol": symbol, "leverage": leverage, "crossMargin": cross},
+      {"symbol": symbol, "leverage": leverage, "crossMode": cross},
       {"symbol": symbol, "leverage": leverage, "marginMode": "cross" if cross else "isolated"},
       {"symbol": symbol, "leverage": leverage},
     ]

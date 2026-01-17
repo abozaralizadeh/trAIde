@@ -902,6 +902,8 @@ async def run_trading_agent(
         margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception as exc:
       print("Warning: futures position lookup failed; margin mode unknown:", exc)
+    if margin_mode is None:
+      margin_mode = "cross"
     if kucoin_futures:
       try:
         futures_overview = kucoin_futures.get_account_overview()
@@ -1001,9 +1003,8 @@ async def run_trading_agent(
     modes_to_try: list[str | None] = []
     # Start with letting KuCoin pick (None), then detected, then opposite; finally uppercase variants if needed.
     modes_to_try.append(None)
-    if margin_mode is not None:
-      modes_to_try.append(margin_mode)
-      modes_to_try.append("isolated" if margin_mode == "cross" else "cross")
+    modes_to_try.append(margin_mode)
+    modes_to_try.append("isolated" if margin_mode == "cross" else "cross")
     modes_to_try.append("ISOLATED")
     modes_to_try.append("CROSS")
 
