@@ -1098,13 +1098,22 @@ async def run_trading_agent(
       lev = min(max(1.0, lev), snapshot.max_leverage)
     if size is None or size <= 0:
       return {"error": "size required and >0"}
-    stop_price_str = f"{stop_price}" if stop_price is not None else None
-    tp_str = f"{take_profit_price}" if take_profit_price is not None else None
-    sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
     contract = _get_contract_spec(futures_symbol)
     contract_max_leverage = _to_float(contract.get("maxLeverage")) if contract else None
     if contract_max_leverage:
       lev = min(lev, contract_max_leverage)
+    multiplier = _to_float(contract.get("multiplier")) if contract else None
+    lot_size = int(contract.get("lotSize") or 1) if contract else 1
+    if multiplier is None or multiplier <= 0:
+      return {"error": "Invalid contract multiplier for stops", "contract": contract}
+    contracts_raw = float(size) / multiplier
+    lot = max(1, lot_size)
+    contracts = int(math.ceil(contracts_raw / lot) * lot)
+    if contracts <= 0:
+      return {"error": "Computed contract size <=0", "contracts": contracts, "baseSize": size, "multiplier": multiplier}
+    stop_price_str = f"{stop_price}" if stop_price is not None else None
+    tp_str = f"{take_profit_price}" if take_profit_price is not None else None
+    sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
 
     margin_mode: str | None = None
     try:
@@ -1129,7 +1138,7 @@ async def run_trading_agent(
       side="buy" if side == "buy" else "sell",
       type="limit" if order_type == "limit" else "market",
       leverage=f"{lev}",
-      size=f"{size}",
+      size=f"{contracts}",
       price=f"{limit_price}" if limit_price is not None else None,
       clientOid=client_oid or str(uuid.uuid4()),
       stop=stop,
