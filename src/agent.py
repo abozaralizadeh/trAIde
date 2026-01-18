@@ -1015,59 +1015,79 @@ async def run_trading_agent(
       }
 
     attempts: list[Dict[str, Any]] = []
-    modes_to_try: list[str | None] = []
-    # Start with detected mode, then opposite; finally uppercase variants if needed.
-    modes_to_try.append(margin_mode)
-    modes_to_try.append("isolated" if margin_mode == "cross" else "cross")
-    modes_to_try.append("ISOLATED")
-    modes_to_try.append("CROSS")
+    order_req = _build_order(margin_mode)
+    try:
+      kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"), auto_deposit=(margin_mode or "").upper() == "ISOLATED" and False)
+    except Exception as exc:
+      print("Warning: set_margin_mode failed (continuing):", exc)
+    try:
+      kucoin_futures.set_leverage(futures_symbol, lev)
+    except Exception as exc:
+      print("Warning: set_leverage failed (continuing):", exc)
+    try:
+      res = kucoin_futures.place_order(order_req).__dict__
+      record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
+      res["tradeRecord"] = record
+      if confidence is not None:
+        res["decisionLog"] = memory.log_decision(
+          spot_symbol,
+          f"futures_{side}",
+          float(confidence),
+          rationale or "live trade",
+          pnl=None,
+          paper=False,
+        )
+      res["rationale"] = rationale
+      res["feeRate"] = fee_rate
+      res["notionalWithFee"] = notional_with_fee
+      res["futuresSymbol"] = futures_symbol
+      res["contracts"] = contracts
+      res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
+      res["transferUsed"] = transfer_used
+      res["marginModeUsed"] = margin_mode
+      res["appliedLeverage"] = lev
+      res["previousAttempts"] = attempts
+      return res
+    except Exception as exc:
+      attempts.append({"marginMode": margin_mode, "error": str(exc)})
 
-    for mode in modes_to_try:
-      if mode is None and any(a.get("marginMode") is None for a in attempts):
-        continue
-      order_req = _build_order(mode)
-      try:
-        # Align exchange margin mode and leverage before placing order (KuCoin ignores leverage in order payload).
-        cross = True if (mode or "").lower() != "isolated" else False
-        try:
-          kucoin_futures.set_margin_mode(futures_symbol, (mode or "cross"), auto_deposit=(mode or "").upper() == "ISOLATED" and False)
-        except Exception as exc:
-          print("Warning: set_margin_mode failed (continuing):", exc)
-        try:
-          kucoin_futures.set_leverage(futures_symbol, lev, cross=cross)
-        except Exception as exc:
-          print("Warning: set_leverage failed (continuing):", exc)
-        res = kucoin_futures.place_order(order_req).__dict__
-        record = memory.record_trade(symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
-        res["tradeRecord"] = record
-        if confidence is not None:
-          res["decisionLog"] = memory.log_decision(
-            symbol,
-            f"futures_{side}",
-            float(confidence),
-            rationale or "live trade",
-            pnl=None,
-            paper=False,
-          )
-        res["rationale"] = rationale
-        res["feeRate"] = fee_rate
-        res["notionalWithFee"] = notional_with_fee
-        res["futuresSymbol"] = futures_symbol
-        res["contracts"] = contracts
-        res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
-        res["transferUsed"] = transfer_used
-        res["marginModeUsed"] = mode
-        res["appliedLeverage"] = lev
-        if attempts:
-          res["previousAttempts"] = attempts
-        return res
-      except Exception as exc:
-        attempts.append({"marginMode": mode, "error": str(exc)})
-        # If we already tried fallback or error doesn't mention margin mode, break.
-        msg = str(exc).lower()
-        if "margin mode" not in msg:
-          break
-        continue
+    # If we reach here, try the opposite mode as a fallback.
+    opposite_mode = "isolated" if margin_mode == "cross" else "cross"
+    order_req = _build_order(opposite_mode)
+    try:
+      kucoin_futures.set_margin_mode(futures_symbol, opposite_mode, auto_deposit=opposite_mode.upper() == "ISOLATED" and False)
+    except Exception as exc:
+      print("Warning: set_margin_mode fallback failed (continuing):", exc)
+    try:
+      kucoin_futures.set_leverage(futures_symbol, lev)
+    except Exception as exc:
+      print("Warning: set_leverage fallback failed (continuing):", exc)
+    try:
+      res = kucoin_futures.place_order(order_req).__dict__
+      record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
+      res["tradeRecord"] = record
+      if confidence is not None:
+        res["decisionLog"] = memory.log_decision(
+          spot_symbol,
+          f"futures_{side}",
+          float(confidence),
+          rationale or "live trade",
+          pnl=None,
+          paper=False,
+        )
+      res["rationale"] = rationale
+      res["feeRate"] = fee_rate
+      res["notionalWithFee"] = notional_with_fee
+      res["futuresSymbol"] = futures_symbol
+      res["contracts"] = contracts
+      res["contractSpec"] = {"multiplier": multiplier, "lotSize": lot_size}
+      res["transferUsed"] = transfer_used
+      res["marginModeUsed"] = opposite_mode
+      res["appliedLeverage"] = lev
+      res["previousAttempts"] = attempts
+      return res
+    except Exception as exc:
+      attempts.append({"marginMode": opposite_mode, "error": str(exc)})
 
     return {
       "error": "Futures order failed",
