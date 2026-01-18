@@ -379,6 +379,36 @@ async def run_trading_agent(
       print(f"Warning: unable to fetch futures contract {futures_symbol}:", exc)
     return None
 
+  def _spot_position_info(symbol: str) -> Dict[str, float] | None:
+    """Return current net size and avg entry for a spot position."""
+    pos = positions.get(symbol)
+    if not pos:
+      return None
+    try:
+      net = float(pos.get("netSize") or 0.0)
+    except Exception:
+      return None
+    if net <= 0:
+      return None
+    avg_entry = pos.get("avgEntry")
+    if avg_entry is None:
+      cost = _to_float(pos.get("cost"))
+      if net and cost:
+        avg_entry = cost / net
+    try:
+      avg_entry_f = float(avg_entry or 0.0)
+    except Exception:
+      return None
+    if avg_entry_f <= 0:
+      return None
+    return {"net": net, "avg_entry": avg_entry_f}
+
+  def _fee_adjusted_breakeven(avg_entry: float, fee_rate: float) -> float:
+    """Breakeven price that covers taker fees on both entry and exit."""
+    fee_rate = max(0.0, float(fee_rate))
+    exit_factor = max(1e-9, 1.0 - fee_rate)
+    return avg_entry * (1.0 + fee_rate) / exit_factor
+
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
   run_name = "Trading Agent Run"
@@ -455,40 +485,44 @@ async def run_trading_agent(
       except Exception as exc:
         print("Warning: futures overview unavailable:", exc)
 
-    total_available = spot_usdt + futures_available
-    reserve_total = total_available * 0.10
-    max_spend = max(0.0, total_available - reserve_total)
-    if funds_with_fee > max_spend:
-      return {
-        "rejected": True,
-        "reason": "Exceeds spendable USDT after 10% reserve (incl fee)",
-        "maxSpend": max_spend,
-        "spotAvailable": spot_usdt,
-        "futuresAvailable": futures_available,
-        "feeRate": fee_rate,
-      }
-
-    # If spot alone is insufficient but futures has free balance, auto-transfer the shortfall (respecting futures 10% reserve).
-    spot_reserve = spot_usdt * 0.10
-    spot_spendable = max(0.0, spot_usdt - spot_reserve)
     transfer_used: dict[str, Any] | None = None
-    if funds_with_fee > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
-      futures_reserve = futures_available * 0.10
-      futures_spendable = max(0.0, futures_available - futures_reserve)
-      need = funds_val - spot_spendable
-      transfer_amt = min(need, futures_spendable)
-      if transfer_amt > 0:
-        try:
-          transfer_used = kucoin.transfer_funds(
-            currency="USDT",
-            amount=transfer_amt,
-            from_account="contract",
-            to_account="trade",
-          )
-          spot_usdt += transfer_amt
-          spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
-        except Exception as exc:
-          print("Warning: futures->spot transfer failed:", exc)
+    if side != "sell":
+      total_available = spot_usdt + futures_available
+      reserve_total = total_available * 0.10
+      max_spend = max(0.0, total_available - reserve_total)
+      if funds_with_fee > max_spend:
+        return {
+          "rejected": True,
+          "reason": "Exceeds spendable USDT after 10% reserve (incl fee)",
+          "maxSpend": max_spend,
+          "spotAvailable": spot_usdt,
+          "futuresAvailable": futures_available,
+          "feeRate": fee_rate,
+        }
+
+      # If spot alone is insufficient but futures has free balance, auto-transfer the shortfall (respecting futures 10% reserve).
+      spot_reserve = spot_usdt * 0.10
+      spot_spendable = max(0.0, spot_usdt - spot_reserve)
+      if funds_with_fee > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
+        futures_reserve = futures_available * 0.10
+        futures_spendable = max(0.0, futures_available - futures_reserve)
+        need = funds_val - spot_spendable
+        transfer_amt = min(need, futures_spendable)
+        if transfer_amt > 0:
+          try:
+            transfer_used = kucoin.transfer_funds(
+              currency="USDT",
+              amount=transfer_amt,
+              from_account="contract",
+              to_account="trade",
+            )
+            spot_usdt += transfer_amt
+            spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
+          except Exception as exc:
+            print("Warning: futures->spot transfer failed:", exc)
+    else:
+      # No spend limits/transfers are needed for sells; they're bounded by position size below.
+      max_spend = float("inf")
 
     price = float(snapshot.tickers[symbol].price)
     size_est = funds_val / price if price else 0.0
@@ -498,14 +532,49 @@ async def run_trading_agent(
       scale = max_spend / funds_with_fee
       funds_val = max(0.0, funds_val * scale)
       funds_with_fee = funds_val * (1 + fee_rate)
+      size_est = funds_val / price if price else 0.0
 
     order_req = KucoinOrderRequest(
       symbol=symbol,
       side="buy" if side == "buy" else "sell",  # enforce allowed values
       type="market",
-      funds=f"{funds_val:.2f}",
+      size=None,
+      funds=f"{funds_val:.2f}" if side == "buy" else None,
       clientOid=str(uuid.uuid4()),
     )
+
+    if side == "sell":
+      pos_info = _spot_position_info(symbol)
+      net_size = pos_info["net"] if pos_info else 0.0
+      if net_size <= 0:
+        return {"rejected": True, "reason": "No spot position available to sell"}
+      if size_est <= 0:
+        size_est = net_size
+        funds_val = size_est * price
+      if size_est > net_size:
+        size_est = net_size
+        funds_val = size_est * price
+      breakeven_px = _fee_adjusted_breakeven(pos_info["avg_entry"], fee_rate) if pos_info else None
+      expected_proceeds = price * size_est * (1 - fee_rate)
+      entry_cost = pos_info["avg_entry"] * size_est * (1 + fee_rate) if pos_info else 0.0
+      expected_pnl = expected_proceeds - entry_cost
+      rationale_norm = (rationale or "").lower() if rationale else ""
+      allow_loss = any(term in rationale_norm for term in ("stop", "cut", "hedge", "risk"))
+      if expected_pnl <= 0 and not allow_loss:
+        return {
+          "rejected": True,
+          "reason": "Sell below fee-adjusted breakeven",
+          "breakevenPrice": breakeven_px,
+          "expectedPnl": expected_pnl,
+          "positionSize": net_size,
+          "requestedSize": size_est,
+          "feeRate": fee_rate,
+        }
+      order_req.size = f"{size_est:.8f}"
+      order_req.funds = None
+    else:
+      if size_est <= 0:
+        return {"error": "Computed size is zero", "price": price}
     if snapshot.paper_trading:
       record = memory.record_trade(symbol, side, funds_val, paper=True, price=price, size=size_est)
       decision = None
@@ -1530,6 +1599,7 @@ async def run_trading_agent(
     "- After web_search and fetch_kucoin_news, assign sentiment 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
     "- Use position data (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with mean-reversion risk, consider trims/stops, not only new entries.\n"
     "- Maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TPs; update/cancel when thesis changes. By default, attach both stop-loss and take-profit to every position (can override/replace if thesis changes). Keep stops in sync with size. If spot balance + position size ≈ 0 but a SELL stop exists, cancel via cancel_spot_stop_order.\n"
+    "- For spot sells, compute fee-adjusted breakeven (avgEntry*(1+fee)/(1-fee)); do not sell below breakeven unless explicitly cutting risk/stop/hedge. Aim for positive net PnL after fees on exits.\n"
     "- Keep sizing fee-aware: use current fees; refresh via refresh_fee_rates when stale; include taker fees in spend caps.\n"
     "- Favor intraday/day-trading profits. Use futures with sensible leverage (<= max_leverage) and tight stops only when conviction and research are strong; size prudently.\n"
     "- Evaluate spot and futures balances separately each run (riskOffSpot vs riskOffFutures provided). If only spot is risk-off, you may still trade futures; if only futures is risk-off, avoid futures but spot may be OK. Use transfer_funds to free capital instead of skipping trades when one venue lacks USDT.\n"
