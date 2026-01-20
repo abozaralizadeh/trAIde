@@ -1606,7 +1606,7 @@ async def run_trading_agent(
     "- Use fetch_orderbook to inspect depth/imbalances (top 20/100 levels) when you need microstructure context.\n"
     "- Choose mode per idea: spot (place_market_order) vs futures (place_futures_market_order) within leverage<=max_leverage.\n"
     "- Use transfer_funds when you need to rebalance USDT between spot(trade) and futures(contract) before/after a plan.\n"
-    "- When idle/riskOff and no clean setups on current coins, handoff to the Research Agent to scout other high-confidence coins or better data sources; only adopt new coins/sources after clear evidence and explicit decision. Use research outputs (log_research, backtests) before committing capital.\n"
+    "- When no active trades or nothing to do, handoff to the Research Agent to scout other high-confidence coins or better data sources; only adopt new coins/sources after clear evidence and explicit decision. Use research outputs (log_research, backtests) before committing capital.\n"
     "- If you lack recent context on a coin, sector, or macro driver, trigger a research handoff to refresh yourself (news, catalysts, new coins) before deciding; do not defer to the user for guidance.\n"
     "- Avoid putting all eggs in one basket: keep USDT split across spot and futures where practical so both venues remain tradable; rebalance with transfer_funds instead of concentrating all capital in one account.\n"
     "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
