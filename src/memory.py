@@ -190,6 +190,44 @@ class MemoryStore:
       plans = data.get("plans") or []
       return plans[-1] if plans else None
 
+  def latest_items(self, kind: str, limit: int = 5) -> Dict[str, Any]:
+    """Fetch the latest N entries for a given kind (plans/sentiments/decisions/trades/triggers/coins/fees)."""
+    alias_map = {
+      "plan": "plans",
+      "plans": "plans",
+      "research": "plans",
+      "note": "plans",
+      "notes": "plans",
+      "sentiment": "sentiments",
+      "sentiments": "sentiments",
+      "decision": "decisions",
+      "decisions": "decisions",
+      "trade": "trades",
+      "trades": "trades",
+      "trigger": "triggers",
+      "triggers": "triggers",
+      "coin": "coins",
+      "coins": "coins",
+      "fee": "fees",
+      "fees": "fees",
+    }
+    key = alias_map.get((kind or "").strip().lower())
+    if not key:
+      return {"error": f"unsupported kind '{kind}'", "allowed": sorted(set(alias_map.keys()))}
+    try:
+      lim = int(limit)
+    except (TypeError, ValueError):
+      lim = 5
+    lim = min(max(lim, 1), 50)
+
+    with self._lock:
+      data = self._prune(self._read())
+      items = data.get(key) or []
+      if not isinstance(items, list):
+        return {"error": f"kind '{kind}' unavailable"}
+      latest = sorted(items, key=lambda x: x.get("ts", 0))[-lim:]
+    return {"kind": key, "requested": lim, "items": list(reversed(latest))}
+
   def clear_plans(self) -> Dict[str, Any]:
     with self._lock:
       existing = self._read()

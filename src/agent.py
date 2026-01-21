@@ -1452,6 +1452,13 @@ async def run_trading_agent(
     return {"latest_plan": memory.latest_plan()}
 
   @function_tool
+  async def latest_items(kind: str, limit: int = 5) -> Dict[str, Any]:
+    """Fetch latest N memory entries (plans/research/sentiments/decisions/trades/triggers/coins/fees)."""
+    if not kind:
+      return {"error": "kind required"}
+    return memory.latest_items(kind, limit)
+
+  @function_tool
   async def clear_plans() -> Dict[str, Any]:
     """Clear all stored plans and triggers."""
     return memory.clear_plans()
@@ -1641,6 +1648,7 @@ async def run_trading_agent(
       "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
       "- NEVER place orders or change the coin list yourself; propose candidates only.\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide."
+      "- always return to the main Trading Agent after your research is done."
     ),
     tools=[
       WebSearchTool(search_context_size="high"),
@@ -1649,6 +1657,7 @@ async def run_trading_agent(
       fetch_orderbook,
       fetch_kucoin_news,
       log_research,
+      latest_items,
       add_source,
       remove_source,
       log_sentiment,
@@ -1680,6 +1689,7 @@ async def run_trading_agent(
       list_futures_positions,
       save_trade_plan,
       latest_plan,
+      latest_items,
       set_auto_trigger,
       list_triggers,
       list_coins,
