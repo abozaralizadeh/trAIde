@@ -1698,6 +1698,8 @@ async def run_trading_agent(
     model=model,
   )
 
+  research_agent.handoffs = [trading_agent]
+
   # Provide snapshot as serialized context input.
   user_state = _format_snapshot(snapshot, balances_by_currency)
   # Enrich snapshot payload with positions (avgEntry/unrealized/realized) so agent can manage exits.
