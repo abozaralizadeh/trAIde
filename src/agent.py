@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import time
@@ -264,7 +265,29 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
 
 from langsmith import Client as LangsmithClient
 
-async def run_trading_agent(
+async def _run_agent_with_tracing(
+  trading_agent: Agent,
+  input_payload: str,
+  cfg: AppConfig,
+  langsmith_ctx: Any,
+  run_name: str,
+  unique_trace_id: str,
+) -> Any:
+  """Execute the agent run inside a tracing context."""
+  with langsmith_ctx:
+    provider = get_trace_provider()
+    tr = provider.create_trace(run_name, trace_id=unique_trace_id)
+    tr.start(mark_as_current=True)
+    try:
+      return await Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns)
+    finally:
+      try:
+        tr.finish(reset_current=True)
+      except Exception as exc:
+        print("Trace cleanup failed:", exc)
+
+
+def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
   kucoin: KucoinClient,
@@ -1857,17 +1880,16 @@ def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: floa
   input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
-  with langsmith_ctx:
-    provider = get_trace_provider()
-    tr = provider.create_trace(run_name, trace_id=unique_trace_id)
-    tr.start(mark_as_current=True)
-    try:
-      result = await Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns)
-    finally:
-      try:
-        tr.finish(reset_current=True)
-      except Exception as exc:
-        print("Trace cleanup failed:", exc)
+  result = asyncio.run(
+    _run_agent_with_tracing(
+      trading_agent,
+      input_payload,
+      cfg,
+      langsmith_ctx,
+      run_name,
+      unique_trace_id,
+    )
+  )
   narrative = str(result.final_output)
 
   tool_outputs: List[Any] = []

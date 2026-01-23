@@ -209,7 +209,9 @@ async def trading_loop() -> None:
       print(f"Running agent. Triggers: {triggers or ['idle_threshold']}")
       try:
         # snapshot.risk_off already computed above from per-scope limits.
-        result = await run_trading_agent(cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client)
+        result = await asyncio.to_thread(
+          run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client
+        )
         print("\n--- Agent Decision Narrative ---")
         print(result["narrative"])
         if result.get("decisions"):
