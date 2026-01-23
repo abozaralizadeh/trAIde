@@ -343,6 +343,17 @@ async def run_trading_agent(
     }
   positions = reconciled_positions
   triggers = memory.latest_triggers()
+  latest_plan_entry = memory.latest_plan()
+  research_plans = memory.latest_items("research", limit=5)
+  research_notes: list[Dict[str, Any]] = []
+  if isinstance(research_plans, dict) and not research_plans.get("error"):
+    for item in research_plans.get("items", []):
+      if not item:
+        continue
+      author = item.get("author")
+      if author and author != "Research Agent":
+        continue
+      research_notes.append(item)
   # Pull latest stored fees; fallback defaults.
   fee_defaults = {"spot_taker": 0.001, "spot_maker": 0.001, "futures_taker": 0.0006, "futures_maker": 0.0002}
   stored_fees = memory.latest_fees() or {}
@@ -1735,6 +1746,7 @@ def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: floa
     "- Avoid putting all eggs in one basket: keep USDT split across spot and futures where practical so both venues remain tradable; rebalance with transfer_funds instead of concentrating all capital in one account.\n"
     "- Curate the coin universe with list_coins/add_coin/remove_coin (requires reason and exit plan before removal); persist choices in memory.\n"
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
+    "- When resuming from a Research Agent handoff, first read researchContext (latestPlan/recentResearch) or call latest_items('research',3)/latest_plan so the research output guides your trade decision.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
     "- Consider leverage only when conviction is high and risk is controlled; \n"
     "- If riskOff=true in the snapshot (set by daily drawdown guard when drawdownPct > MAX_DAILY_DRAWDOWN_PCT), avoid new speculative entries. You may:\n"
@@ -1764,8 +1776,9 @@ def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: floa
       "- Output: concise recommendations with evidence (why this beats current options), liquidity check, and confidence. Prefer liquid, tradable pairs; avoid illiquid/obscure tokens.\n"
       "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
       "- NEVER place orders or change the coin list yourself; propose candidates only.\n"
-      "- Log findings via log_research (topic, summary, actions) so the main agent can decide."
-      "- always return to the main Trading Agent after your research is done."
+      "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
+      "- When handing off, remind the Trading Agent to read the saved note via latest_plan/latest_items so your research is used.\n"
+      "- Always return to the main Trading Agent after your research is done."
     ),
     tools=[
       WebSearchTool(search_context_size="high"),
@@ -1834,6 +1847,13 @@ def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: floa
   user_state_obj["positions"] = positions
   user_state_obj["fees"] = fees
   user_state_obj["triggers"] = triggers
+  research_context: Dict[str, Any] = {}
+  if latest_plan_entry:
+    research_context["latestPlan"] = latest_plan_entry
+  if research_notes:
+    research_context["recentResearch"] = research_notes
+  if research_context:
+    user_state_obj["researchContext"] = research_context
   input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.
