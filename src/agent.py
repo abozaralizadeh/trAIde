@@ -437,30 +437,30 @@ def run_trading_agent(
       return None
     return {"net": net, "avg_entry": avg_entry_f}
 
-def _fee_adjusted_breakeven(avg_entry: float, fee_rate: float) -> float:
-  """Breakeven price that covers taker fees on both entry and exit."""
-  fee_rate = max(0.0, float(fee_rate))
-  exit_factor = max(1e-9, 1.0 - fee_rate)
-  return avg_entry * (1.0 + fee_rate) / exit_factor
-
-def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: float, fee_rate: float) -> tuple[bool, str | None]:
-  """Validate stop distance to avoid churn; ensures correct side and a minimum % away."""
-  if stop_price <= 0 or ref_price <= 0:
-    return False, "Invalid price for stop validation"
-  min_pct = max(0.003, 3 * fee_rate)  # at least 0.3% or 3x fee to clear costs
-  side_norm = (side or "").lower()
-  if side_norm == "sell":
-    if stop_price >= ref_price:
-      return False, "Stop for sell must be below entry/mark"
-    if (ref_price - stop_price) / ref_price < min_pct:
-      return False, f"Stop too tight (<{min_pct*100:.2f}% from price)"
-  elif side_norm == "buy":
-    if stop_price <= ref_price:
-      return False, "Stop for buy must be above entry/mark"
-    if (stop_price - ref_price) / ref_price < min_pct:
-      return False, f"Stop too tight (<{min_pct*100:.2f}% from price)"
-  return True, None
-
+  def _fee_adjusted_breakeven(avg_entry: float, fee_rate: float) -> float:
+    """Breakeven price that covers taker fees on both entry and exit."""
+    fee_rate = max(0.0, float(fee_rate))
+    exit_factor = max(1e-9, 1.0 - fee_rate)
+    return avg_entry * (1.0 + fee_rate) / exit_factor
+  
+  def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: float, fee_rate: float) -> tuple[bool, str | None]:
+    """Validate stop distance to avoid churn; ensures correct side and a minimum % away."""
+    if stop_price <= 0 or ref_price <= 0:
+      return False, "Invalid price for stop validation"
+    min_pct = max(0.003, 3 * fee_rate)  # at least 0.3% or 3x fee to clear costs
+    side_norm = (side or "").lower()
+    if side_norm == "sell":
+      if stop_price >= ref_price:
+        return False, "Stop for sell must be below entry/mark"
+      if (ref_price - stop_price) / ref_price < min_pct:
+        return False, f"Stop too tight (<{min_pct*100:.2f}% from price)"
+    elif side_norm == "buy":
+      if stop_price <= ref_price:
+        return False, "Stop for buy must be above entry/mark"
+      if (stop_price - ref_price) / ref_price < min_pct:
+        return False, f"Stop too tight (<{min_pct*100:.2f}% from price)"
+    return True, None
+  
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
   run_name = "Trading Agent Run"
