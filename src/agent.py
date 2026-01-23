@@ -403,11 +403,29 @@ async def run_trading_agent(
       return None
     return {"net": net, "avg_entry": avg_entry_f}
 
-  def _fee_adjusted_breakeven(avg_entry: float, fee_rate: float) -> float:
-    """Breakeven price that covers taker fees on both entry and exit."""
-    fee_rate = max(0.0, float(fee_rate))
-    exit_factor = max(1e-9, 1.0 - fee_rate)
-    return avg_entry * (1.0 + fee_rate) / exit_factor
+def _fee_adjusted_breakeven(avg_entry: float, fee_rate: float) -> float:
+  """Breakeven price that covers taker fees on both entry and exit."""
+  fee_rate = max(0.0, float(fee_rate))
+  exit_factor = max(1e-9, 1.0 - fee_rate)
+  return avg_entry * (1.0 + fee_rate) / exit_factor
+
+def _stop_distance_ok(symbol: str, side: str, stop_price: float, ref_price: float, fee_rate: float) -> tuple[bool, str | None]:
+  """Validate stop distance to avoid churn; ensures correct side and a minimum % away."""
+  if stop_price <= 0 or ref_price <= 0:
+    return False, "Invalid price for stop validation"
+  min_pct = max(0.003, 3 * fee_rate)  # at least 0.3% or 3x fee to clear costs
+  side_norm = (side or "").lower()
+  if side_norm == "sell":
+    if stop_price >= ref_price:
+      return False, "Stop for sell must be below entry/mark"
+    if (ref_price - stop_price) / ref_price < min_pct:
+      return False, f"Stop too tight (<{min_pct*100:.2f}% from price)"
+  elif side_norm == "buy":
+    if stop_price <= ref_price:
+      return False, "Stop for buy must be above entry/mark"
+    if (stop_price - ref_price) / ref_price < min_pct:
+      return False, f"Stop too tight (<{min_pct*100:.2f}% from price)"
+  return True, None
 
   # Create a LangSmith run context per loop to isolate traces.
   langsmith_ctx = contextlib.nullcontext()
@@ -438,8 +456,14 @@ async def run_trading_agent(
     funds: float,
     confidence: float | None = None,
     rationale: str | None = None,
+    stop_price: float | None = None,
+    take_profit_price: float | None = None,
+    risk_pct: float | None = None,
+    atr_multiple: float | None = None,
+    target_rr: float | None = None,
+    auto_protect: bool = True,
   ) -> Dict[str, Any]:
-    """Place a spot market order on Kucoin using quote funds in USDT. Respects maxPositionUsd and paper_trading flag."""
+    """Place a spot market order on Kucoin using quote funds in USDT. Enforces stop/TP for buys to avoid ultra-tight churn."""
     try:
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
@@ -485,6 +509,11 @@ async def run_trading_agent(
       except Exception as exc:
         print("Warning: futures overview unavailable:", exc)
 
+    try:
+      mark_price = float(snapshot.tickers[symbol].price)
+    except Exception:
+      mark_price = 0.0
+
     transfer_used: dict[str, Any] | None = None
     if side != "sell":
       total_available = spot_usdt + futures_available
@@ -524,8 +553,52 @@ async def run_trading_agent(
       # No spend limits/transfers are needed for sells; they're bounded by position size below.
       max_spend = float("inf")
 
-    price = float(snapshot.tickers[symbol].price)
+    price = mark_price
     size_est = funds_val / price if price else 0.0
+
+    planned_stop = None
+    planned_tp = None
+    rr_actual = None
+    if (side or "").lower() == "buy":
+      size_est = funds_val / price if price else None
+      stop_val = None
+      tp_val = None
+      try:
+        stop_val = float(stop_price) if stop_price is not None else None
+      except Exception:
+        stop_val = None
+      try:
+        tp_val = float(take_profit_price) if take_profit_price is not None else None
+      except Exception:
+        tp_val = None
+      atr_mult = 1.5 if atr_multiple is None else float(atr_multiple)
+      target_rr_val = 2.0 if target_rr is None else float(target_rr)
+      if stop_val is None or tp_val is None:
+        plan = await plan_spot_position(
+          symbol=symbol,
+          risk_pct=risk_pct,
+          atr_multiple=atr_mult,
+          target_rr=target_rr_val,
+          entry_price=price if price else None,
+        )
+        if plan.get("error"):
+          return {"rejected": True, "reason": "Plan failed", "plan": plan}
+        stop_val = stop_val or plan.get("stopPrice")
+        tp_val = tp_val or plan.get("targetPrice")
+        size_est = size_est or plan.get("size")
+      if not stop_val or not tp_val:
+        return {"rejected": True, "reason": "Stop/TP required for buy", "stop": stop_val, "tp": tp_val}
+      ok, reason = _stop_distance_ok(symbol, "sell", float(stop_val), price, fee_rate)
+      if not ok:
+        return {"rejected": True, "reason": reason, "minStopPct": max(0.003, 3 * fee_rate)}
+      if tp_val <= price:
+        return {"rejected": True, "reason": "Take-profit must be above entry"}
+      rr_actual = (tp_val - price) / (price - float(stop_val)) if price > float(stop_val) else None
+      if rr_actual is not None and rr_actual < 1.5:
+        return {"rejected": True, "reason": "RR below minimum", "rr": rr_actual, "minRr": 1.5}
+      planned_stop = float(stop_val)
+      planned_tp = float(tp_val)
+      size_est = float(size_est or 0.0)
 
     # Adjust funds down so fee fits in spend cap.
     if funds_with_fee > max_spend and funds_val > 0:
@@ -587,7 +660,20 @@ async def run_trading_agent(
           pnl=None,
           paper=True,
         )
-      return {"paper": True, "orderRequest": order_req.__dict__, "tradeRecord": record, "decisionLog": decision}
+      bracket = {}
+      if (side or "").lower() == "buy" and auto_protect and planned_stop and planned_tp:
+        bracket = {
+          "stop": {"paper": True, "stopPrice": planned_stop},
+          "takeProfit": {"paper": True, "stopPrice": planned_tp},
+        }
+      return {
+        "paper": True,
+        "orderRequest": order_req.__dict__,
+        "tradeRecord": record,
+        "decisionLog": decision,
+        "bracket": bracket,
+        "rr": rr_actual,
+      }
     try:
       res = kucoin.place_order(order_req).__dict__
       record = memory.record_trade(symbol, side, funds_val, paper=False, price=price, size=size_est)
@@ -601,6 +687,30 @@ async def run_trading_agent(
           pnl=None,
           paper=False,
         )
+      if (side or "").lower() == "buy" and auto_protect and planned_stop and planned_tp:
+        size_for_exit = size_est or (funds_val / price if price else None)
+        bracket: Dict[str, Any] = {}
+        stop_res = await place_spot_stop_order(
+          symbol=symbol,
+          side="sell",
+          stop_price=planned_stop,
+          stop_price_type="MP",
+          order_type="market",
+          size=size_for_exit,
+        )
+        bracket["stop"] = stop_res
+        tp_res = await place_spot_stop_order(
+          symbol=symbol,
+          side="sell",
+          stop_price=planned_tp,
+          stop_price_type="TP",
+          order_type="limit",
+          size=size_for_exit,
+          limit_price=planned_tp,
+        )
+        bracket["takeProfit"] = tp_res
+        res["bracket"] = bracket
+        res["rr"] = rr_actual
       return res
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
@@ -626,6 +736,13 @@ async def run_trading_agent(
       return {"error": "Invalid stop price"}
     if stop_price_f <= 0:
       return {"error": "Stop price must be positive"}
+    ref_px = _to_float(snapshot.tickers[symbol].price if symbol in snapshot.tickers else None)
+    validation_side = side
+    if (side or "").lower() == "sell" and stop_price_type.upper() == "TP":
+      validation_side = "buy"  # TP on a long should be above price
+    ok, reason = _stop_distance_ok(symbol, validation_side, stop_price_f, ref_px, fees.get("spot_taker", 0.001))
+    if not ok:
+      return {"rejected": True, "reason": reason, "price": ref_px, "stop": stop_price_f}
     order_req = KucoinOrderRequest(
       symbol=symbol,
       side="buy" if side == "buy" else "sell",
