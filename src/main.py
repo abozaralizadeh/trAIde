@@ -29,7 +29,22 @@ def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
 
 
 def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
-  coins = _load_active_coins(cfg, memory)
+  def _normalize_symbol(sym: str) -> str:
+    s = (sym or "").strip().upper()
+    if not s:
+      return s
+    if "-" not in s and s.endswith("USDT") and len(s) > 4:
+      return f"{s[:-4]}-USDT"
+    return s
+
+  # Normalize symbols to KuCoin format (BTC-USDT) and de-duplicate.
+  coins = []
+  seen = set()
+  for sym in _load_active_coins(cfg, memory):
+    norm = _normalize_symbol(sym)
+    if norm and norm not in seen:
+      coins.append(norm)
+      seen.add(norm)
   tickers = {}
   missing_tickers: list[str] = []
   for symbol in coins:
