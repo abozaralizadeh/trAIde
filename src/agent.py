@@ -31,6 +31,7 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
+MIN_NET_PROFIT_USD = 1.0
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -633,6 +634,18 @@ def run_trading_agent(
       planned_stop = float(stop_val)
       planned_tp = float(tp_val)
       size_est = float(size_est or 0.0)
+      expected_tp_pnl = (planned_tp * (1 - fee_rate) - price * (1 + fee_rate)) * size_est
+      if expected_tp_pnl < MIN_NET_PROFIT_USD:
+        return {
+          "rejected": True,
+          "reason": "Take-profit too close; requires at least $1 net profit",
+          "expectedTpPnl": expected_tp_pnl,
+          "minProfitUsd": MIN_NET_PROFIT_USD,
+          "size": size_est,
+          "price": price,
+          "tp": planned_tp,
+          "feeRate": fee_rate,
+        }
 
     # Adjust funds down so fee fits in spend cap.
     if funds_with_fee > max_spend and funds_val > 0:
@@ -667,12 +680,13 @@ def run_trading_agent(
       expected_pnl = expected_proceeds - entry_cost
       rationale_norm = (rationale or "").lower() if rationale else ""
       allow_loss = any(term in rationale_norm for term in ("stop", "cut", "hedge", "risk"))
-      if expected_pnl <= 0 and not allow_loss:
+      if expected_pnl <= MIN_NET_PROFIT_USD and not allow_loss:
         return {
           "rejected": True,
-          "reason": "Sell below fee-adjusted breakeven",
+          "reason": "Sell below minimum profit threshold",
           "breakevenPrice": breakeven_px,
           "expectedPnl": expected_pnl,
+          "minProfitUsd": MIN_NET_PROFIT_USD,
           "positionSize": net_size,
           "requestedSize": size_est,
           "feeRate": fee_rate,
@@ -1037,6 +1051,7 @@ def run_trading_agent(
       return {"error": "Invalid notional or leverage"}
     if notional_input <= 0 or lev_requested <= 0:
       return {"error": "Invalid notional or leverage"}
+    rationale_norm = (rationale or "").lower() if rationale else ""
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
       return {
@@ -1152,6 +1167,25 @@ def run_trading_agent(
             "stopLoss": sl_val or trigger_stop_val,
             "feeRate": fee_rate,
           }
+    base_size = contracts * multiplier
+    expected_tp_pnl = None
+    if tp_val and base_size > 0:
+      if side == "buy":
+        expected_tp_pnl = (tp_val * (1 - fee_rate) - price * (1 + fee_rate)) * base_size
+      else:
+        expected_tp_pnl = (price * (1 - fee_rate) - tp_val * (1 + fee_rate)) * base_size
+    allow_loss = reduce_only or any(term in rationale_norm for term in ("stop", "cut", "hedge", "risk"))
+    if expected_tp_pnl is not None and expected_tp_pnl < MIN_NET_PROFIT_USD and not allow_loss:
+      return {
+        "rejected": True,
+        "reason": "Take-profit too close; requires at least $1 net profit",
+        "expectedTpPnl": expected_tp_pnl,
+        "minProfitUsd": MIN_NET_PROFIT_USD,
+        "size": base_size,
+        "price": price,
+        "tp": tp_val,
+        "feeRate": fee_rate,
+      }
     # Ensure required margin is funded; auto-transfer from spot if futures are empty.
     spot_accounts = kucoin.get_accounts()
     spot_balance_map: Dict[str, float] = {}
