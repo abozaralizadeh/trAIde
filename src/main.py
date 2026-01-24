@@ -31,8 +31,17 @@ def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
 def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
   coins = _load_active_coins(cfg, memory)
   tickers = {}
+  missing_tickers: list[str] = []
   for symbol in coins:
-    tickers[symbol] = kucoin.get_ticker(symbol)
+    try:
+      tickers[symbol] = kucoin.get_ticker(symbol)
+    except Exception as exc:
+      missing_tickers.append(symbol)
+      print(f"Warning: ticker fetch failed for {symbol}: {exc}", file=sys.stderr)
+      continue
+
+  if not tickers:
+    raise RuntimeError(f"No tickers available; failed symbols: {missing_tickers}")
 
   spot_accounts = kucoin.get_trade_accounts()
   all_accounts = kucoin.get_accounts()
