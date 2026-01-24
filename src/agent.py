@@ -1074,14 +1074,20 @@ def run_trading_agent(
     lot_size = int(contract.get("lotSize") or 1)
     max_order_qty = contract.get("maxOrderQty")
     contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
+    fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
     if multiplier <= 0:
       return {"error": "Invalid contract multiplier", "contract": contract}
-    lev = lev_requested
-    if contract_max_leverage:
-      lev = min(lev, contract_max_leverage)
-    if snapshot.max_leverage:
-      lev = min(lev, snapshot.max_leverage)
-    lev = max(1.0, lev)
+    leverage_caps = [
+      c for c in (
+        snapshot.max_leverage,
+        cfg.trading.max_leverage,
+        contract_max_leverage,
+      )
+      if c and c > 0
+    ]
+    max_leverage_cap = min(leverage_caps) if leverage_caps else 3.0
+    lev = min(max(1.0, lev_requested), max_leverage_cap)
+    leverage_clamped = lev < lev_requested - 1e-9
 
     try:
       base_size = float(size_override) if size_override is not None else notional_input / price
@@ -1105,18 +1111,47 @@ def run_trading_agent(
     if max_order_qty and isinstance(max_order_qty, (int, float)) and contracts > max_order_qty:
       return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty, "contracts": contracts}
     notional = actual_notional
-    if lev > snapshot.max_leverage:
-      return {"rejected": True, "reason": "Exceeds max_leverage", "max_leverage": snapshot.max_leverage}
-    if notional > snapshot.max_position_usd * snapshot.max_leverage:
+    if notional > snapshot.max_position_usd * max_leverage_cap:
       return {
         "rejected": True,
         "reason": "Exceeds max notional cap",
-        "cap": snapshot.max_position_usd * snapshot.max_leverage,
+        "cap": snapshot.max_position_usd * max_leverage_cap,
         "notional": notional,
+        "maxLeverage": max_leverage_cap,
       }
     # Prefer live contract fee if available.
-    fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
     notional_with_fee = notional * (1 + fee_rate)
+    def _as_price(val: Any) -> float | None:
+      try:
+        p = float(val)
+        return p if p > 0 else None
+      except Exception:
+        return None
+
+    tp_val = _as_price(take_profit_price)
+    sl_val = _as_price(stop_loss_price)
+    trigger_stop_val = _as_price(stop_price)
+    min_edge_pct = max(0.003, 5 * fee_rate)  # at least 0.3% or 5x fee to cover costs
+    if not reduce_only:
+      edge_candidates = [
+        abs(tp_val - price) / price if tp_val else None,
+        abs(sl_val - price) / price if sl_val else None,
+        abs(trigger_stop_val - price) / price if trigger_stop_val else None,
+      ]
+      edge_candidates = [c for c in edge_candidates if c is not None]
+      if edge_candidates:
+        min_edge_found = min(edge_candidates)
+        if min_edge_found < min_edge_pct:
+          return {
+            "rejected": True,
+            "reason": "TP/SL distance too tight relative to fees",
+            "minEdgePct": min_edge_pct,
+            "edgePct": min_edge_found,
+            "price": price,
+            "takeProfit": tp_val,
+            "stopLoss": sl_val or trigger_stop_val,
+            "feeRate": fee_rate,
+          }
     # Ensure required margin is funded; auto-transfer from spot if futures are empty.
     spot_accounts = kucoin.get_accounts()
     spot_balance_map: Dict[str, float] = {}
@@ -1232,6 +1267,8 @@ def run_trading_agent(
         "contracts": contracts,
         "contractSpec": {"multiplier": multiplier, "lotSize": lot_size},
         "appliedLeverage": lev,
+        "leverageClampedFrom": lev_requested if leverage_clamped else None,
+        "maxLeverageCap": max_leverage_cap,
       }
 
     attempts: list[Dict[str, Any]] = []
@@ -1267,6 +1304,9 @@ def run_trading_agent(
       res["marginModeUsed"] = margin_mode
       res["appliedLeverage"] = lev
       res["previousAttempts"] = attempts
+      res["maxLeverageCap"] = max_leverage_cap
+      if leverage_clamped:
+        res["leverageClampedFrom"] = lev_requested
       return res
     except Exception as exc:
       attempts.append({"marginMode": margin_mode, "error": str(exc)})
@@ -1305,6 +1345,9 @@ def run_trading_agent(
       res["marginModeUsed"] = opposite_mode
       res["appliedLeverage"] = lev
       res["previousAttempts"] = attempts
+      res["maxLeverageCap"] = max_leverage_cap
+      if leverage_clamped:
+        res["leverageClampedFrom"] = lev_requested
       return res
     except Exception as exc:
       attempts.append({"marginMode": opposite_mode, "error": str(exc)})
