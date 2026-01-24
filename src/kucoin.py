@@ -187,6 +187,8 @@ class KucoinClient:
       "/api/v1/market/orderbook/level1",
       query={"symbol": symbol},
     )
+    if not isinstance(data, dict):
+      raise RuntimeError(f"Kucoin ticker payload missing for {symbol}: {data}")
     return KucoinTicker(**data)
 
   def get_candles(
