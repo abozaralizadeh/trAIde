@@ -224,6 +224,16 @@ def _to_futures_symbol(spot_symbol: str) -> str | None:
   return f"{base}{quote}M"
 
 
+def _normalize_symbol(sym: str) -> str:
+  """Normalize symbols to KuCoin dash format (e.g., MOVAUSDT -> MOVA-USDT)."""
+  s = (sym or "").strip().upper()
+  if not s:
+    return s
+  if "-" not in s and s.endswith("USDT") and len(s) > 4:
+    return f"{s[:-4]}-USDT"
+  return s
+
+
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   spot_accounts = snapshot.spot_accounts or snapshot.balances
   all_accounts = snapshot.all_accounts or spot_accounts
@@ -499,6 +509,9 @@ def run_trading_agent(
     auto_protect: bool = True,
   ) -> Dict[str, Any]:
     """Place a spot market order on Kucoin using quote funds in USDT. Enforces stop/TP for buys to avoid ultra-tight churn."""
+    symbol = _normalize_symbol(symbol)
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
     try:
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
@@ -776,6 +789,7 @@ def run_trading_agent(
     client_oid: str | None = None,
   ) -> Dict[str, Any]:
     """Place a spot stop order (stop-loss or take-profit). stop_price_type: TP(trigger when price rises) or MP(falls)."""
+    symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
     try:
@@ -844,8 +858,7 @@ def run_trading_agent(
     lookback_minutes: int = 120,
   ) -> Dict[str, Any]:
     """Fetch recent candles for symbol. Interval options: 1min, 5min, 15min, 1hour. Caps to 500 rows."""
-    if symbol not in allowed_symbols:
-      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    symbol = _normalize_symbol(symbol)
 
     interval_seconds = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600}
     if interval not in interval_seconds:
@@ -878,8 +891,7 @@ def run_trading_agent(
   @function_tool
   async def fetch_orderbook(symbol: str, depth: int = 20) -> Dict[str, Any]:
     """Fetch level2 orderbook snapshot (depth 20 or 100)."""
-    if symbol not in allowed_symbols:
-      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    symbol = _normalize_symbol(symbol)
     depth_safe = 20 if depth <= 20 else 100
     ob = kucoin.get_orderbook_levels(symbol, depth=depth_safe)
     # trim in case API returns more than requested
@@ -895,8 +907,7 @@ def run_trading_agent(
     lookback_minutes: int = 360,
   ) -> Dict[str, Any]:
     """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP across two intervals and summarize bias."""
-    if symbol not in allowed_symbols:
-      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    symbol = _normalize_symbol(symbol)
 
     interval_order: list[str] = []
     for iv in [fast_interval, slow_interval]:
@@ -935,6 +946,7 @@ def run_trading_agent(
     entry_price: float | None = None,
   ) -> Dict[str, Any]:
     """Size a spot trade using risk-per-trade % with ATR-based stop/target."""
+    symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
 
@@ -1031,7 +1043,7 @@ def run_trading_agent(
     reduce_only: bool | None = None,
   ) -> Dict[str, Any]:
     """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
-    spot_symbol = symbol
+    spot_symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       # Accept futures contract symbols directly (e.g., XBTUSDTM -> BTC-USDT)
       if "-" not in symbol and symbol.upper().endswith("M"):
@@ -1413,6 +1425,7 @@ def run_trading_agent(
     client_oid: str | None = None,
   ) -> Dict[str, Any]:
     """Place a futures stop/TP/SL order (works for reduce-only hedges)."""
+    symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
@@ -1700,6 +1713,7 @@ def run_trading_agent(
     stop_price: float | None = None,
   ) -> Dict[str, Any]:
     """Store an auto-buy/sell trigger idea (persists to disk for follow-up by future runs)."""
+    symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
     return memory.save_trigger(
@@ -1725,7 +1739,7 @@ def run_trading_agent(
     """Add a coin to the active universe (requires reason)."""
     if not symbol:
       return {"error": "symbol required"}
-    entry = memory.add_coin(symbol, reason)
+    entry = memory.add_coin(_normalize_symbol(symbol), reason)
     return {"added": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
@@ -1735,7 +1749,7 @@ def run_trading_agent(
       return {"error": "symbol required"}
     if not exit_plan:
       return {"error": "exit_plan required to remove coin"}
-    entry = memory.remove_coin(symbol, reason, exit_plan)
+    entry = memory.remove_coin(_normalize_symbol(symbol), reason, exit_plan)
     return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
@@ -1747,7 +1761,7 @@ def run_trading_agent(
       return {"error": "Invalid score"}
     if not symbol:
       return {"error": "symbol required"}
-    entry = memory.log_sentiment(symbol, score_val, rationale, source)
+    entry = memory.log_sentiment(_normalize_symbol(symbol), score_val, rationale, source)
     return {"sentiment": entry}
 
   @function_tool
@@ -1766,7 +1780,7 @@ def run_trading_agent(
       conf = float(confidence)
     except (TypeError, ValueError):
       return {"error": "Invalid confidence"}
-    entry = memory.log_decision(symbol, action, conf, reason, pnl=pnl, paper=paper)
+    entry = memory.log_decision(_normalize_symbol(symbol), action, conf, reason, pnl=pnl, paper=paper)
     return {"decision": entry}
 
   @function_tool
