@@ -1263,7 +1263,7 @@ def run_trading_agent(
         symbol=futures_symbol,
         side="buy" if side == "buy" else "sell",
         type="market",
-        leverage=f"{lev}",
+        leverage=str(int(lev)),
         size=str(contracts),  # Kucoin futures expects integer contract size (contracts)
         clientOid=str(uuid.uuid4()),
         marginMode=mode_norm,
@@ -1467,7 +1467,7 @@ def run_trading_agent(
       symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",
       type="limit" if order_type == "limit" else "market",
-      leverage=f"{lev}",
+      leverage=str(int(lev)),
       size=f"{contracts}",
       price=f"{limit_price}" if limit_price is not None else None,
       clientOid=client_oid or str(uuid.uuid4()),
