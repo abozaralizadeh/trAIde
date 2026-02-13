@@ -31,7 +31,6 @@ from agents.tracing.setup import get_trace_provider
 from openai import AsyncAzureOpenAI
 
 _TRACING_INITIALIZED = False
-MIN_NET_PROFIT_USD = 1.0
 
 from .analytics import (
   INTERVAL_SECONDS,
@@ -648,12 +647,13 @@ def run_trading_agent(
       planned_tp = float(tp_val)
       size_est = float(size_est or 0.0)
       expected_tp_pnl = (planned_tp * (1 - fee_rate) - price * (1 + fee_rate)) * size_est
-      if expected_tp_pnl < MIN_NET_PROFIT_USD:
+      min_profit_usd = cfg.trading.min_net_profit_usd
+      if expected_tp_pnl < min_profit_usd:
         return {
           "rejected": True,
-          "reason": "Take-profit too close; requires at least $1 net profit",
+          "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit",
           "expectedTpPnl": expected_tp_pnl,
-          "minProfitUsd": MIN_NET_PROFIT_USD,
+          "minProfitUsd": min_profit_usd,
           "size": size_est,
           "price": price,
           "tp": planned_tp,
@@ -691,19 +691,34 @@ def run_trading_agent(
       expected_proceeds = price * size_est * (1 - fee_rate)
       entry_cost = pos_info["avg_entry"] * size_est * (1 + fee_rate) if pos_info else 0.0
       expected_pnl = expected_proceeds - entry_cost
+      
+      # Calculate ROI if we have entry cost data
+      roi_pct = 0.0
+      if entry_cost > 0:
+        roi_pct = expected_pnl / entry_cost
+
       rationale_norm = (rationale or "").lower() if rationale else ""
-      allow_loss = any(term in rationale_norm for term in ("stop", "cut", "hedge", "risk"))
-      if expected_pnl <= MIN_NET_PROFIT_USD and not allow_loss:
+      # Stricter loss allowance: requires explicit stop/cut/emergency keywords
+      allow_loss = any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate"))
+      
+      min_profit_usd = cfg.trading.min_net_profit_usd
+      min_roi = cfg.trading.min_profit_roi_pct
+
+      if (expected_pnl < min_profit_usd or roi_pct < min_roi) and not allow_loss:
         return {
           "rejected": True,
-          "reason": "Sell below minimum profit threshold",
+          "reason": f"Sell below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI)",
           "breakevenPrice": breakeven_px,
           "expectedPnl": expected_pnl,
-          "minProfitUsd": MIN_NET_PROFIT_USD,
+          "expectedRoi": roi_pct,
+          "minProfitUsd": min_profit_usd,
+          "minRoiPct": min_roi,
           "positionSize": net_size,
           "requestedSize": size_est,
           "feeRate": fee_rate,
+          "advice": "To cut loss, include 'stop loss' or 'cut loss' in rationale.",
         }
+      print(f"Selling {symbol} - Expected PnL: {expected_pnl:.4f} USD (ROI: {roi_pct*100:.2f}%)")
       order_req.size = f"{size_est:.8f}"
       order_req.funds = None
     else:
@@ -739,6 +754,9 @@ def run_trading_agent(
       res = kucoin.place_order(order_req).__dict__
       record = memory.record_trade(symbol, side, funds_val, paper=False, price=price, size=size_est)
       res["tradeRecord"] = record
+      if side == "sell":
+        res["expectedPnl"] = expected_pnl
+        res["expectedRoi"] = roi_pct
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(
           symbol,
@@ -1122,6 +1140,83 @@ def run_trading_agent(
       return {"error": "Invalid size_override"}
     if base_size <= 0:
       return {"error": "Computed size is zero"}
+    
+    # Check if this is a closing/reducing trade and validate profit
+    closing_pnl = None
+    closing_roi = None
+    existing_pos = next((p for p in snapshot.futures_positions if p.get("symbol") == futures_symbol), None)
+    if existing_pos:
+      try:
+        pos_qty = float(existing_pos.get("currentQty") or 0)
+        pos_entry = float(existing_pos.get("avgEntryPrice") or 0)
+        
+        # Determine if we are closing (opposite side or reduceOnly)
+        is_long = pos_qty > 0
+        is_short = pos_qty < 0
+        is_closing = False
+        
+        if reduce_only:
+          is_closing = True
+        elif is_long and side == "sell":
+          is_closing = True
+        elif is_short and side == "buy":
+          is_closing = True
+          
+        if is_closing and pos_entry > 0:
+          # Calculate estimated PnL on the portion being closed
+          # Note: base_size is the amount we are TENTATIVELY sending
+          # We should clip it to position size to be accurate about what's being closed
+          close_size = min(abs(pos_qty), base_size)
+          
+          if close_size > 0:
+            # Entry value = size * entry
+            # Exit value = size * price
+            # Long PnL = (Exit - Entry)
+            # Short PnL = (Entry - Exit)
+            
+            if is_long:
+              raw_pnl = (price - pos_entry) * close_size
+            else:
+              raw_pnl = (pos_entry - price) * close_size
+              
+            # Approximate fees on the close (fees on entry are sunk cost)
+            # But to be safe, let's deduct the exit fee from the PnL
+            exit_fee = price * close_size * fee_rate
+            net_pnl = raw_pnl - exit_fee
+            
+            entry_value = pos_entry * close_size
+            roi_pct = 0.0
+            if entry_value > 0:
+              roi_pct = net_pnl / entry_value
+            
+            closing_pnl = net_pnl
+            closing_roi = roi_pct
+              
+            # Re-check allow_loss rationale
+            rationale_norm = (rationale or "").lower() if rationale else ""
+            allow_loss_keyword = any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate"))
+            
+            min_profit_usd = cfg.trading.min_net_profit_usd
+            min_roi = cfg.trading.min_profit_roi_pct
+            
+            # If PnL is below threshold (and not allowed loss), reject
+            if (net_pnl < min_profit_usd or roi_pct < min_roi) and not allow_loss_keyword:
+               return {
+                "rejected": True,
+                "reason": f"Closing trade below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI)",
+                "expectedPnl": net_pnl,
+                "expectedRoi": roi_pct,
+                "minProfitUsd": min_profit_usd,
+                "minRoiPct": min_roi,
+                "entryPrice": pos_entry,
+                "currentPrice": price,
+                "closeSize": close_size,
+                "advice": "To cut loss, include 'stop loss' or 'cut loss' in rationale.",
+               }
+            print(f"Closing Futures {futures_symbol} - Expected PnL: {net_pnl:.4f} USD (ROI: {roi_pct*100:.2f}%)")
+
+      except Exception as exc:
+        print(f"Warning: failed to calc closing PnL for {futures_symbol}: {exc}")
 
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
@@ -1186,13 +1281,19 @@ def run_trading_agent(
         expected_tp_pnl = (tp_val * (1 - fee_rate) - price * (1 + fee_rate)) * base_size
       else:
         expected_tp_pnl = (price * (1 - fee_rate) - tp_val * (1 + fee_rate)) * base_size
-    allow_loss = reduce_only or any(term in rationale_norm for term in ("stop", "cut", "hedge", "risk"))
-    if expected_tp_pnl is not None and expected_tp_pnl < MIN_NET_PROFIT_USD and not allow_loss:
+    
+    rationale_norm = (rationale or "").lower() if rationale else ""
+    # Stricter loss allowance: requires explicit stop/cut/emergency keywords
+    allow_loss = reduce_only or any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate"))
+    
+    min_profit_usd = cfg.trading.min_net_profit_usd
+    
+    if expected_tp_pnl is not None and expected_tp_pnl < min_profit_usd and not allow_loss:
       return {
         "rejected": True,
-        "reason": "Take-profit too close; requires at least $1 net profit",
+        "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit",
         "expectedTpPnl": expected_tp_pnl,
-        "minProfitUsd": MIN_NET_PROFIT_USD,
+        "minProfitUsd": min_profit_usd,
         "size": base_size,
         "price": price,
         "tp": tp_val,
@@ -1301,7 +1402,7 @@ def run_trading_agent(
         pnl=None,
         paper=True,
       )
-      return {
+      return_val = {
         "paper": True,
         "orderRequest": order_req.__dict__,
         "tradeRecord": record,
@@ -1316,6 +1417,10 @@ def run_trading_agent(
         "leverageClampedFrom": lev_requested if leverage_clamped else None,
         "maxLeverageCap": max_leverage_cap,
       }
+      if closing_pnl is not None:
+        return_val["closingPnl"] = closing_pnl
+        return_val["closingRoi"] = closing_roi
+      return return_val
 
     attempts: list[Dict[str, Any]] = []
     order_req = _build_order(margin_mode)
@@ -1353,6 +1458,9 @@ def run_trading_agent(
       res["maxLeverageCap"] = max_leverage_cap
       if leverage_clamped:
         res["leverageClampedFrom"] = lev_requested
+      if closing_pnl is not None:
+        res["closingPnl"] = closing_pnl
+        res["closingRoi"] = closing_roi
       return res
     except Exception as exc:
       attempts.append({"marginMode": margin_mode, "error": str(exc)})
@@ -1394,6 +1502,9 @@ def run_trading_agent(
       res["maxLeverageCap"] = max_leverage_cap
       if leverage_clamped:
         res["leverageClampedFrom"] = lev_requested
+      if closing_pnl is not None:
+        res["closingPnl"] = closing_pnl
+        res["closingRoi"] = closing_roi
       return res
     except Exception as exc:
       attempts.append({"marginMode": opposite_mode, "error": str(exc)})

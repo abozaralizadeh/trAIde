@@ -60,6 +60,8 @@ class TradingConfig:
   max_trades_per_symbol_per_day: int
   max_daily_drawdown_pct: float
   reset_drawdown_on_start: bool
+  min_net_profit_usd: float
+  min_profit_roi_pct: float
 
 
 @dataclass
@@ -132,6 +134,8 @@ def load_config() -> AppConfig:
       max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "100")),
       max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
       reset_drawdown_on_start=_as_bool(os.getenv("RESET_DRAWDOWN_ON_START"), False),
+      min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "1.5")),
+      min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.005")),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),
