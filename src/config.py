@@ -62,6 +62,7 @@ class TradingConfig:
   reset_drawdown_on_start: bool
   min_net_profit_usd: float
   min_profit_roi_pct: float
+  estimated_slippage_pct: float
 
 
 @dataclass
@@ -135,7 +136,8 @@ def load_config() -> AppConfig:
       max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
       reset_drawdown_on_start=_as_bool(os.getenv("RESET_DRAWDOWN_ON_START"), False),
       min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "1.5")),
-      min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.005")),
+      min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.008")),
+      estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0005")),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

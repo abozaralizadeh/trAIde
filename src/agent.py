@@ -518,7 +518,8 @@ def run_trading_agent(
     if funds_val <= 0 or not symbol:
       return {"error": "Invalid funds or symbol"}
     fee_rate = fees.get("spot_taker", 0.001)
-    funds_with_fee = funds_val * (1 + fee_rate)
+    slippage_rate = cfg.trading.estimated_slippage_pct
+    funds_with_fee = funds_val * (1 + fee_rate + slippage_rate)
     if funds_val > snapshot.max_position_usd:
       return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
     trades_today = memory.trades_today(symbol)
@@ -646,25 +647,27 @@ def run_trading_agent(
       planned_stop = float(stop_val)
       planned_tp = float(tp_val)
       size_est = float(size_est or 0.0)
-      expected_tp_pnl = (planned_tp * (1 - fee_rate) - price * (1 + fee_rate)) * size_est
+      # PnL = (Exit - Entry) - Fees - Slippage
+      expected_tp_pnl = (planned_tp * (1 - fee_rate - slippage_rate) - price * (1 + fee_rate + slippage_rate)) * size_est
       min_profit_usd = cfg.trading.min_net_profit_usd
       if expected_tp_pnl < min_profit_usd:
         return {
           "rejected": True,
-          "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit",
+          "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit (after slippage)",
           "expectedTpPnl": expected_tp_pnl,
           "minProfitUsd": min_profit_usd,
           "size": size_est,
           "price": price,
           "tp": planned_tp,
           "feeRate": fee_rate,
+          "slippageRate": slippage_rate,
         }
 
     # Adjust funds down so fee fits in spend cap.
     if funds_with_fee > max_spend and funds_val > 0:
       scale = max_spend / funds_with_fee
       funds_val = max(0.0, funds_val * scale)
-      funds_with_fee = funds_val * (1 + fee_rate)
+      funds_with_fee = funds_val * (1 + fee_rate + slippage_rate)
       size_est = funds_val / price if price else 0.0
 
     order_req = KucoinOrderRequest(
@@ -687,9 +690,9 @@ def run_trading_agent(
       if size_est > net_size:
         size_est = net_size
         funds_val = size_est * price
-      breakeven_px = _fee_adjusted_breakeven(pos_info["avg_entry"], fee_rate) if pos_info else None
-      expected_proceeds = price * size_est * (1 - fee_rate)
-      entry_cost = pos_info["avg_entry"] * size_est * (1 + fee_rate) if pos_info else 0.0
+      breakeven_px = _fee_adjusted_breakeven(pos_info["avg_entry"], fee_rate + slippage_rate) if pos_info else None
+      expected_proceeds = price * size_est * (1 - fee_rate - slippage_rate)
+      entry_cost = pos_info["avg_entry"] * size_est * (1 + fee_rate + slippage_rate) if pos_info else 0.0
       expected_pnl = expected_proceeds - entry_cost
       
       # Calculate ROI if we have entry cost data
@@ -707,7 +710,8 @@ def run_trading_agent(
       if (expected_pnl < min_profit_usd or roi_pct < min_roi) and not allow_loss:
         return {
           "rejected": True,
-          "reason": f"Sell below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI)",
+          "rejected": True,
+          "reason": f"Sell below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI after slippage)",
           "breakevenPrice": breakeven_px,
           "expectedPnl": expected_pnl,
           "expectedRoi": roi_pct,
@@ -1120,6 +1124,7 @@ def run_trading_agent(
     max_order_qty = contract.get("maxOrderQty")
     contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
     fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
+    slippage_rate = cfg.trading.estimated_slippage_pct
     if multiplier <= 0:
       return {"error": "Invalid contract multiplier", "contract": contract}
     leverage_caps = [
@@ -1181,7 +1186,7 @@ def run_trading_agent(
               
             # Approximate fees on the close (fees on entry are sunk cost)
             # But to be safe, let's deduct the exit fee from the PnL
-            exit_fee = price * close_size * fee_rate
+            exit_fee = price * close_size * (fee_rate + slippage_rate)
             net_pnl = raw_pnl - exit_fee
             
             entry_value = pos_entry * close_size
@@ -1203,7 +1208,7 @@ def run_trading_agent(
             if (net_pnl < min_profit_usd or roi_pct < min_roi) and not allow_loss_keyword:
                return {
                 "rejected": True,
-                "reason": f"Closing trade below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI)",
+                "reason": f"Closing trade below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI after slippage)",
                 "expectedPnl": net_pnl,
                 "expectedRoi": roi_pct,
                 "minProfitUsd": min_profit_usd,
@@ -1242,7 +1247,7 @@ def run_trading_agent(
         "maxLeverage": max_leverage_cap,
       }
     # Prefer live contract fee if available.
-    notional_with_fee = notional * (1 + fee_rate)
+    notional_with_fee = notional * (1 + fee_rate + slippage_rate)
     def _as_price(val: Any) -> float | None:
       try:
         p = float(val)
@@ -1253,7 +1258,7 @@ def run_trading_agent(
     tp_val = _as_price(take_profit_price)
     sl_val = _as_price(stop_loss_price)
     trigger_stop_val = _as_price(stop_price)
-    min_edge_pct = max(0.003, 5 * fee_rate)  # at least 0.3% or 5x fee to cover costs
+    min_edge_pct = max(0.003, 5 * (fee_rate + slippage_rate))  # at least 0.3% or 5x friction cost
     if not reduce_only:
       edge_candidates = [
         abs(tp_val - price) / price if tp_val else None,
@@ -1278,9 +1283,9 @@ def run_trading_agent(
     expected_tp_pnl = None
     if tp_val and base_size > 0:
       if side == "buy":
-        expected_tp_pnl = (tp_val * (1 - fee_rate) - price * (1 + fee_rate)) * base_size
+        expected_tp_pnl = (tp_val * (1 - fee_rate - slippage_rate) - price * (1 + fee_rate + slippage_rate)) * base_size
       else:
-        expected_tp_pnl = (price * (1 - fee_rate) - tp_val * (1 + fee_rate)) * base_size
+        expected_tp_pnl = (price * (1 - fee_rate - slippage_rate) - tp_val * (1 + fee_rate + slippage_rate)) * base_size
     
     rationale_norm = (rationale or "").lower() if rationale else ""
     # Stricter loss allowance: requires explicit stop/cut/emergency keywords
@@ -1291,13 +1296,14 @@ def run_trading_agent(
     if expected_tp_pnl is not None and expected_tp_pnl < min_profit_usd and not allow_loss:
       return {
         "rejected": True,
-        "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit",
+        "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit (after slippage)",
         "expectedTpPnl": expected_tp_pnl,
         "minProfitUsd": min_profit_usd,
         "size": base_size,
         "price": price,
         "tp": tp_val,
         "feeRate": fee_rate,
+        "slippageRate": slippage_rate,
       }
     # Ensure required margin is funded; auto-transfer from spot if futures are empty.
     spot_accounts = kucoin.get_accounts()
@@ -1324,7 +1330,7 @@ def run_trading_agent(
         print("Warning: futures overview unavailable:", exc)
 
     margin_needed = 0.0 if reduce_only else notional / lev
-    fee_allowance = notional * fee_rate
+    fee_allowance = notional * (fee_rate + slippage_rate)
     buffer = max(1.0, margin_needed * 0.01)
     required_futures_balance = margin_needed + fee_allowance + buffer
 
