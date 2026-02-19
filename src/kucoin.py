@@ -171,7 +171,69 @@ class KucoinClient:
     return self.get_accounts("trade")
 
   def get_financial_accounts(self) -> list[KucoinAccount]:
+    # KuCoin Earn (Financial/Pool-X) balances are not returned by /api/v1/accounts.
+    # Try Earn holdings endpoints first, then fall back to the legacy pool account type.
+    for path in ("/api/v1/earn/hold-assets", "/api/v1/earn/holdings", "/api/v1/earn/holding"):
+      try:
+        data = self._request("GET", path, auth=True)
+        accounts = self._map_earn_holdings(data)
+        if accounts:
+          return accounts
+      except Exception:
+        continue
     return self.get_accounts("pool")
+
+  def _map_earn_holdings(self, data: Any) -> list[KucoinAccount]:
+    items: Any = data
+    if isinstance(data, dict):
+      for key in ("items", "data", "list", "holdings"):
+        if isinstance(data.get(key), list):
+          items = data.get(key)
+          break
+    if not isinstance(items, list):
+      return []
+
+    accounts: list[KucoinAccount] = []
+    for idx, item in enumerate(items):
+      if not isinstance(item, dict):
+        continue
+      currency = (
+        item.get("currency")
+        or item.get("coin")
+        or item.get("asset")
+        or item.get("symbol")
+      )
+      if not currency:
+        continue
+
+      balance = (
+        item.get("holdAmount")
+        or item.get("holding")
+        or item.get("amount")
+        or item.get("totalAmount")
+        or item.get("total")
+        or item.get("principal")
+        or item.get("balance")
+      )
+      available = (
+        item.get("redeemableAmount")
+        or item.get("available")
+        or item.get("redeemable")
+        or balance
+      )
+      holds = item.get("locked") or item.get("hold") or "0"
+
+      accounts.append(
+        KucoinAccount(
+          id=str(item.get("id") or f"earn:{currency}:{idx}"),
+          currency=str(currency),
+          type="financial",
+          balance=str(balance or "0"),
+          available=str(available or "0"),
+          holds=str(holds or "0"),
+        )
+      )
+    return accounts
 
   def get_accounts(self, account_type: Optional[str] = None) -> list[KucoinAccount]:
     """Fetch accounts; when account_type is None, returns all (main/trade/margin)."""

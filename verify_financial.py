@@ -18,7 +18,7 @@ def test_accounts():
     trade_accts = client.get_trade_accounts()
     pprint([vars(a) for a in trade_accts if float(a.balance) > 0 or a.currency == "USDT"])
     
-    print("\nFinancial (Pool-X) Accounts:")
+    print("\nFinancial (Earn/Pool-X) Accounts:")
     try:
         fin_accts = client.get_financial_accounts()
         pprint([vars(a) for a in fin_accts if float(a.balance) > 0 or a.currency == "USDT"])
