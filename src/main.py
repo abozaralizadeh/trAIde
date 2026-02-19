@@ -169,6 +169,15 @@ async def trading_loop() -> None:
         except Exception:
           continue
 
+    futures_usdt = 0.0
+    if cfg.kucoin_futures.enabled and snapshot.futures_account:
+      try:
+        fut_avail = float(snapshot.futures_account.get("availableBalance") or 0)
+        fut_equity = float(snapshot.futures_account.get("accountEquity") or snapshot.futures_account.get("marginBalance") or fut_avail)
+        futures_usdt += max(fut_avail, fut_equity)
+      except Exception:
+        pass
+
     financial_usdt = 0.0
     for acct in snapshot.financial_accounts:
       if acct.currency == "USDT":
