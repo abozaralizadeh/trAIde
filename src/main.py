@@ -59,8 +59,17 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     raise RuntimeError(f"No tickers available; failed symbols: {missing_tickers}")
 
   spot_accounts = kucoin.get_trade_accounts()
+  financial_accounts = []
+  try:
+    financial_accounts = kucoin.get_financial_accounts()
+  except Exception as exc:
+    print("Warning: unable to fetch financial accounts:", exc, file=sys.stderr)
+  
   all_accounts = kucoin.get_accounts()
   balances = list(spot_accounts)
+  for fa in financial_accounts:
+    balances.append(fa)
+  
   futures_overview = None
   futures_stops: list[dict] = []
   futures_positions: list[dict] = []
@@ -123,6 +132,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     all_accounts=all_accounts,
     spot_stop_orders=spot_stops,
     futures_stop_orders=futures_stops,
+    financial_accounts=financial_accounts,
     fees=fees,
   )
 
@@ -159,16 +169,17 @@ async def trading_loop() -> None:
         except Exception:
           continue
 
-    futures_usdt = 0.0
-    if cfg.kucoin_futures.enabled and snapshot.futures_account:
-      try:
-        fut_avail = float(snapshot.futures_account.get("availableBalance") or 0)
-        fut_equity = float(snapshot.futures_account.get("accountEquity") or snapshot.futures_account.get("marginBalance") or fut_avail)
-        futures_usdt += max(fut_avail, fut_equity)
-      except Exception:
-        pass
+    financial_usdt = 0.0
+    for acct in snapshot.financial_accounts:
+      if acct.currency == "USDT":
+        try:
+          avail = float(acct.available or 0)
+          bal = float(acct.balance or 0)
+          financial_usdt += max(avail, bal)
+        except Exception:
+          continue
 
-    total_usdt = spot_usdt + futures_usdt
+    total_usdt = spot_usdt + futures_usdt + financial_usdt
 
     # Update drawdown per venue and overall; auto-clear when recovered.
     limits_total = memory.update_limits(total_usdt, cfg.trading.max_daily_drawdown_pct, scope="total")

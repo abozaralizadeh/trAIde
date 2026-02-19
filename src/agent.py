@@ -125,6 +125,7 @@ class TradingSnapshot:
   all_accounts: List[KucoinAccount] = field(default_factory=list)
   spot_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
   futures_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
+  financial_accounts: List[KucoinAccount] = field(default_factory=list)
   fees: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -235,10 +236,13 @@ def _normalize_symbol(sym: str) -> str:
 
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   spot_accounts = snapshot.spot_accounts or snapshot.balances
-  all_accounts = snapshot.all_accounts or spot_accounts
+  financial_accounts = snapshot.financial_accounts
+  all_accounts = snapshot.all_accounts or (spot_accounts + financial_accounts)
   spot_serialized = _serialize_accounts(spot_accounts)
+  financial_serialized = _serialize_accounts(financial_accounts)
   all_serialized = _serialize_accounts(all_accounts)
   spot_totals = _aggregate_account_totals(spot_accounts)
+  financial_totals = _aggregate_account_totals(financial_accounts)
   all_totals = _aggregate_account_totals(all_accounts)
   futures_info = _summarize_futures_account(snapshot.futures_account)
 
@@ -248,6 +252,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "balances": balances_by_currency,
     "accountDetails": {
       "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
+      "financial": {"accounts": financial_serialized, "byCurrency": financial_totals},
       "futures": futures_info,
       "allAccounts": {"accounts": all_serialized, "byCurrency": all_totals},
     },
@@ -323,6 +328,14 @@ def run_trading_agent(
     fut_available = _to_float(snapshot.futures_account.get("availableBalance"))
     if fut_available:
       balances_by_currency[fut_currency] = balances_by_currency.get(fut_currency, 0.0) + fut_available
+
+  # Aggregate financial (Earn/Pool-X) balances as available funds
+  if snapshot.financial_accounts:
+    financial_totals = _aggregate_account_totals(snapshot.financial_accounts)
+    for cur, totals in financial_totals.items():
+      available = totals.get("available", 0.0)
+      if available:
+        balances_by_currency[cur] = balances_by_currency.get(cur, 0.0) + available
   unique_trace_id = gen_trace_id()
   unique_span_id = gen_span_id()
 
@@ -577,26 +590,54 @@ def run_trading_agent(
           "feeRate": fee_rate,
         }
 
-      # If spot alone is insufficient but futures has free balance, auto-transfer the shortfall (respecting futures 10% reserve).
+      # If spot alone is insufficient but futures/financial has free balance, auto-transfer the shortfall.
       spot_reserve = spot_usdt * 0.10
       spot_spendable = max(0.0, spot_usdt - spot_reserve)
-      if funds_with_fee > spot_spendable and futures_available > 0 and not snapshot.paper_trading and kucoin_futures:
-        futures_reserve = futures_available * 0.10
-        futures_spendable = max(0.0, futures_available - futures_reserve)
-        need = funds_val - spot_spendable
-        transfer_amt = min(need, futures_spendable)
-        if transfer_amt > 0:
-          try:
-            transfer_used = kucoin.transfer_funds(
-              currency="USDT",
-              amount=transfer_amt,
-              from_account="contract",
-              to_account="trade",
-            )
-            spot_usdt += transfer_amt
-            spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
-          except Exception as exc:
-            print("Warning: futures->spot transfer failed:", exc)
+      
+      if funds_with_fee > spot_spendable and not snapshot.paper_trading:
+        need = funds_with_fee - spot_spendable
+        
+        # Try pulling from Financial (Earn) account first
+        financial_available = 0.0
+        if snapshot.financial_accounts:
+          financial_totals = _aggregate_account_totals(snapshot.financial_accounts)
+          financial_available = financial_totals.get("USDT", {}).get("available", 0.0)
+        
+        if financial_available > 0:
+          financial_reserve = financial_available * 0.10
+          financial_spendable = max(0.0, financial_available - financial_reserve)
+          transfer_amt = min(need, financial_spendable)
+          if transfer_amt > 0:
+            try:
+              transfer_used = kucoin.transfer_funds(
+                currency="USDT",
+                amount=transfer_amt,
+                from_account="financial",
+                to_account="trade",
+              )
+              spot_usdt += transfer_amt
+              spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
+              need = max(0, funds_with_fee - spot_spendable)
+            except Exception as exc:
+              print("Warning: financial->spot transfer failed:", exc)
+
+        # If still need more, try pulling from Futures account
+        if need > 0 and futures_available > 0 and kucoin_futures:
+          futures_reserve = futures_available * 0.10
+          futures_spendable = max(0.0, futures_available - futures_reserve)
+          transfer_amt = min(need, futures_spendable)
+          if transfer_amt > 0:
+            try:
+              transfer_used = kucoin.transfer_funds(
+                currency="USDT",
+                amount=transfer_amt,
+                from_account="contract",
+                to_account="trade",
+              )
+              spot_usdt += transfer_amt
+              spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
+            except Exception as exc:
+              print("Warning: futures->spot transfer failed:", exc)
     else:
       # No spend limits/transfers are needed for sells; they're bounded by position size below.
       max_spend = float("inf")
@@ -1336,22 +1377,48 @@ def run_trading_agent(
 
     transfer_used: dict[str, Any] | None = None
     if not snapshot.paper_trading and futures_available < required_futures_balance:
-      spot_usdt = spot_balance_map.get("USDT", 0.0)
-      spot_reserve = spot_usdt * 0.10
-      spot_spendable = max(0.0, spot_usdt - spot_reserve)
       need = required_futures_balance - futures_available
-      transfer_amt = min(spot_spendable, need)
-      if transfer_amt > 0:
-        try:
-          transfer_used = kucoin.transfer_funds(
-            currency="USDT",
-            amount=transfer_amt,
-            from_account="trade",
-            to_account="contract",
-          )
-          futures_available += transfer_amt
-        except Exception as exc:
-          print("Warning: spot->futures transfer failed:", exc)
+      
+      # Try pulling from Financial (Earn) account first
+      financial_available = 0.0
+      if snapshot.financial_accounts:
+        financial_totals = _aggregate_account_totals(snapshot.financial_accounts)
+        financial_available = financial_totals.get("USDT", {}).get("available", 0.0)
+      
+      if financial_available > 0:
+        financial_reserve = financial_available * 0.10
+        financial_spendable = max(0.0, financial_available - financial_reserve)
+        transfer_amt = min(need, financial_spendable)
+        if transfer_amt > 0:
+          try:
+            transfer_used = kucoin.transfer_funds(
+              currency="USDT",
+              amount=transfer_amt,
+              from_account="financial",
+              to_account="contract",
+            )
+            futures_available += transfer_amt
+            need = max(0, required_futures_balance - futures_available)
+          except Exception as exc:
+            print("Warning: financial->futures transfer failed:", exc)
+
+      # If still need more, try pulling from Spot (Trade) account
+      if need > 0:
+        spot_usdt = spot_balance_map.get("USDT", 0.0)
+        spot_reserve = spot_usdt * 0.10
+        spot_spendable = max(0.0, spot_usdt - spot_reserve)
+        transfer_amt = min(spot_spendable, need)
+        if transfer_amt > 0:
+          try:
+            transfer_used = kucoin.transfer_funds(
+              currency="USDT",
+              amount=transfer_amt,
+              from_account="trade",
+              to_account="contract",
+            )
+            futures_available += transfer_amt
+          except Exception as exc:
+            print("Warning: spot->futures transfer failed:", exc)
     if required_futures_balance > futures_available and not snapshot.paper_trading:
       return {
         "rejected": True,

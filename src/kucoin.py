@@ -170,6 +170,9 @@ class KucoinClient:
   def get_trade_accounts(self) -> list[KucoinAccount]:
     return self.get_accounts("trade")
 
+  def get_financial_accounts(self) -> list[KucoinAccount]:
+    return self.get_accounts("pool")
+
   def get_accounts(self, account_type: Optional[str] = None) -> list[KucoinAccount]:
     """Fetch accounts; when account_type is None, returns all (main/trade/margin)."""
     query = {"type": account_type} if account_type else None
@@ -244,6 +247,9 @@ class KucoinClient:
         "margin": "MARGIN",
         "contract": "CONTRACT",
         "futures": "CONTRACT",
+        "financial": "POOLED",
+        "pool": "POOLED",
+        "pool-x": "POOLED",
         "unified": "UNIFIED",
       }
       return mapping.get(acct, acct.upper())
