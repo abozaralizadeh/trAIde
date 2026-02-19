@@ -1811,9 +1811,11 @@ def run_trading_agent(
     """Get up-to-date balances for all spot accounts and futures (including non-trade funds)."""
     try:
       spot_accounts_fresh = kucoin.get_trade_accounts()
+      main_accounts_fresh = kucoin.get_accounts("main")
+      fin_accounts_fresh = kucoin.get_financial_accounts()
       all_accounts_fresh = kucoin.get_accounts()
     except Exception as exc:
-      return {"error": f"spot_fetch_failed: {exc}"}
+      return {"error": f"account_fetch_failed: {exc}"}
 
     futures_overview = None
     futures_error = None
@@ -1825,9 +1827,18 @@ def run_trading_agent(
 
     spot_serialized = _serialize_accounts(spot_accounts_fresh)
     spot_totals = _aggregate_account_totals(spot_accounts_fresh)
+    main_serialized = _serialize_accounts(main_accounts_fresh)
+    main_totals = _aggregate_account_totals(main_accounts_fresh)
+    fin_serialized = _serialize_accounts(fin_accounts_fresh)
+    fin_totals = _aggregate_account_totals(fin_accounts_fresh)
     all_serialized = _serialize_accounts(all_accounts_fresh)
     all_totals = _aggregate_account_totals(all_accounts_fresh)
+    
+    # Aggregate available balances across all account types for a quick overview
     balances_map = {cur: vals.get("available", 0.0) for cur, vals in all_totals.items()}
+    # Financial/Pool accounts are not included in 'all' (main/trade/margin) by KuCoin API, so add them explicitly
+    for cur, totals in fin_totals.items():
+      balances_map[cur] = balances_map.get(cur, 0.0) + totals.get("available", 0.0)
 
     futures_serialized: Dict[str, Any] = {}
     if futures_overview:
@@ -1837,6 +1848,8 @@ def run_trading_agent(
 
     result: Dict[str, Any] = {
       "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
+      "funding": {"accounts": main_serialized, "byCurrency": main_totals},
+      "financial": {"accounts": fin_serialized, "byCurrency": fin_totals},
       "allAccounts": {"accounts": all_serialized, "byCurrency": all_totals},
       "balancesAvailable": balances_map,
       "futuresEnabled": bool(cfg.kucoin_futures.enabled),
