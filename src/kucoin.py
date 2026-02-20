@@ -183,6 +183,93 @@ class KucoinClient:
         continue
     return self.get_accounts("pool")
 
+  def get_earn_holdings_raw(self) -> list[dict[str, Any]]:
+    """Fetch raw Earn holdings (best-effort) for redeem operations."""
+    for path in ("/api/v1/earn/hold-assets", "/api/v1/earn/holdings", "/api/v1/earn/holding"):
+      try:
+        data = self._request("GET", path, auth=True)
+        items: Any = data
+        if isinstance(data, dict):
+          for key in ("items", "data", "list", "holdings"):
+            if isinstance(data.get(key), list):
+              items = data.get(key)
+              break
+        if isinstance(items, list):
+          return [item for item in items if isinstance(item, dict)]
+      except Exception:
+        continue
+    return []
+
+  def redeem_earn_for_currency(self, currency: str, amount: float) -> Dict[str, Any]:
+    """Redeem Earn holdings for a currency (best-effort)."""
+    cur = (currency or "").upper()
+    try:
+      amt = float(amount or 0)
+    except (TypeError, ValueError):
+      return {"error": "Invalid amount"}
+    if amt <= 0:
+      return {"error": "Amount must be positive"}
+
+    holdings = self.get_earn_holdings_raw()
+    if not holdings:
+      return {"error": "No earn holdings found"}
+
+    def _get_currency(item: dict[str, Any]) -> str:
+      return str(item.get("currency") or item.get("coin") or item.get("asset") or item.get("symbol") or "").upper()
+
+    def _get_id(item: dict[str, Any]) -> str:
+      return str(item.get("holdingId") or item.get("id") or item.get("orderId") or item.get("holdingID") or "")
+
+    def _get_redeemable(item: dict[str, Any]) -> float:
+      return float(
+        item.get("redeemableAmount")
+        or item.get("available")
+        or item.get("redeemable")
+        or item.get("holdAmount")
+        or item.get("amount")
+        or 0
+      )
+
+    steps: list[dict[str, Any]] = []
+    remaining = amt
+    for item in holdings:
+      if remaining <= 0:
+        break
+      if _get_currency(item) != cur:
+        continue
+      holding_id = _get_id(item)
+      if not holding_id:
+        continue
+      redeemable = _get_redeemable(item)
+      if redeemable <= 0:
+        continue
+      redeem_amt = min(remaining, redeemable)
+      result = self._redeem_earn_holding(holding_id, redeem_amt)
+      steps.append({"holdingId": holding_id, "amount": redeem_amt, "result": result})
+      remaining -= redeem_amt
+
+    if remaining > 0:
+      return {"error": "Insufficient redeemable amount", "requested": amt, "remaining": remaining, "steps": steps}
+    return {"redeemed": amt, "steps": steps}
+
+  def _redeem_earn_holding(self, holding_id: str, amount: float) -> Dict[str, Any]:
+    """Attempt to redeem a specific Earn holding; tries multiple payload shapes."""
+    amt = f"{amount}"
+    payloads = [
+      {"holdingId": holding_id, "amount": amt},
+      {"holdingId": holding_id, "redeemAmount": amt},
+      {"holdingId": holding_id, "size": amt},
+      {"orderId": holding_id, "amount": amt},
+    ]
+    last_exc: Exception | None = None
+    for body in payloads:
+      try:
+        return self._request("POST", "/api/v1/earn/redeem", auth=True, body=body)
+      except Exception as exc:
+        last_exc = exc
+        continue
+    raise last_exc or RuntimeError("Earn redeem failed")
+
   def _map_earn_holdings(self, data: Any) -> list[KucoinAccount]:
     items: Any = data
     if isinstance(data, dict):

@@ -263,13 +263,11 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
       "financialTransferAvailable": True,
       "supportedDirections": [
         "financial_to_spot",
-        "spot_to_financial",
         "financial_to_futures",
-        "futures_to_financial",
         "spot_to_futures",
         "futures_to_spot",
       ],
-      "note": "Financial/Earn funds are transferable via transfer_funds; treat as available unless a transfer attempt fails.",
+      "note": "Financial/Earn funds are transferable out via redeem->transfer; transfers into Earn are not supported by this bot.",
     },
     "accountDetails": {
       "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
@@ -1839,60 +1837,60 @@ def run_trading_agent(
       }
 
     try:
-      # Financial transfers are more reliable via inner-transfer; bridge to futures via trade when needed.
-      if dir_norm in {"financial_to_spot", "spot_to_financial"}:
-        inner_body = {
-          "clientOid": str(int(time.time() * 1000)),
-          "currency": cur,
-          "from": "pool" if from_acct == "financial" else "trade",
-          "to": "pool" if to_acct == "financial" else "trade",
-          "amount": f"{amt}",
-        }
-        res = kucoin._request("POST", "/api/v2/accounts/inner-transfer", auth=True, body=inner_body)  # type: ignore[attr-defined]
-        return {
-          "transfer": res,
-          "method": "inner-transfer",
-          "direction": dir_norm,
-          "currency": currency.upper(),
-          "amount": amt,
-          "spotAvailable": spot_balance_map.get(cur, 0.0),
-          "financialAvailable": financial_balance_map.get(cur, 0.0),
-          "futuresAvailable": futures_available,
-        }
+      # Financial/Earn balances often require redemption before they are transferable.
+      if dir_norm in {"financial_to_spot", "financial_to_futures"}:
+        redeem_res = kucoin.redeem_earn_for_currency(cur, amt)
+        if redeem_res.get("error"):
+          return {
+            "error": redeem_res.get("error"),
+            "detail": redeem_res,
+            "direction": dir_norm,
+            "currency": currency.upper(),
+            "amount": amt,
+          }
 
-      if dir_norm in {"financial_to_futures", "futures_to_financial"}:
-        if dir_norm == "financial_to_futures":
-          inner_body = {
-            "clientOid": f"{int(time.time() * 1000)}-1",
-            "currency": cur,
-            "from": "pool",
-            "to": "trade",
-            "amount": f"{amt}",
+        # After redeem, attempt to ensure funds are in trade (spot) before any futures transfer.
+        main_accounts = kucoin.get_accounts("main")
+        trade_accounts = kucoin.get_trade_accounts()
+        main_available = sum(float(a.available or 0) for a in main_accounts if a.currency == cur)
+        trade_available = sum(float(a.available or 0) for a in trade_accounts if a.currency == cur)
+
+        if trade_available < amt and main_available >= amt:
+          kucoin.transfer_funds(currency=cur, amount=amt, from_account="main", to_account="trade")
+          trade_available = sum(float(a.available or 0) for a in kucoin.get_trade_accounts() if a.currency == cur)
+
+        if dir_norm == "financial_to_spot":
+          return {
+            "transfer": {"redeem": redeem_res, "spotAvailableAfter": trade_available},
+            "method": "redeem->spot",
+            "direction": dir_norm,
+            "currency": currency.upper(),
+            "amount": amt,
+            "spotAvailable": trade_available,
+            "financialAvailable": financial_balance_map.get(cur, 0.0),
+            "futuresAvailable": futures_available,
           }
-          step1 = kucoin._request("POST", "/api/v2/accounts/inner-transfer", auth=True, body=inner_body)  # type: ignore[attr-defined]
-          step2 = kucoin.transfer_funds(currency=cur, amount=amt, from_account="trade", to_account="contract")
-          res = {"bridge": "financial->trade->futures", "steps": [step1, step2]}
-        else:
-          step1 = kucoin.transfer_funds(currency=cur, amount=amt, from_account="contract", to_account="trade")
-          inner_body = {
-            "clientOid": f"{int(time.time() * 1000)}-2",
-            "currency": cur,
-            "from": "trade",
-            "to": "pool",
-            "amount": f"{amt}",
-          }
-          step2 = kucoin._request("POST", "/api/v2/accounts/inner-transfer", auth=True, body=inner_body)  # type: ignore[attr-defined]
-          res = {"bridge": "futures->trade->financial", "steps": [step1, step2]}
+
+        # financial_to_futures: move from trade to futures after redeem.
+        step2 = kucoin.transfer_funds(currency=cur, amount=amt, from_account="trade", to_account="contract")
         return {
-          "transfer": res,
-          "method": "bridge",
+          "transfer": {"redeem": redeem_res, "trade_to_futures": step2},
+          "method": "redeem->spot->futures",
           "direction": dir_norm,
           "currency": currency.upper(),
           "amount": amt,
-          "spotAvailable": spot_balance_map.get(cur, 0.0),
+          "spotAvailable": trade_available,
           "financialAvailable": financial_balance_map.get(cur, 0.0),
           "futuresAvailable": futures_available,
           "futuresOverview": futures_overview,
+        }
+
+      if dir_norm in {"spot_to_financial", "futures_to_financial"}:
+        return {
+          "error": "Transfers into Earn/Financial are not supported via API. Subscribe to Earn products directly.",
+          "direction": dir_norm,
+          "currency": currency.upper(),
+          "amount": amt,
         }
 
       res = kucoin.transfer_funds(
@@ -2148,7 +2146,7 @@ def run_trading_agent(
     "- Act autonomously as the execution owner; do not ask the user what to do. Choose the best venue (spot vs futures) and act or decline yourself.\n"
     "- First, call fetch_account_state to get a clear and up-to-date understanding of your available balances across all venues: spot(trade), funding(main), financial(pool), and futures(contract).\n"
     "- Treat all USDT in these accounts as your available trading capital. Financial/Earn funds are transferable via transfer_funds and are not 'locked' unless a transfer attempt fails.\n"
-    "- If one venue is short, use transfer_funds to move capital where needed before or after planning a trade (supports financial<->spot/futures and spot<->futures).\n"
+    "- If one venue is short, use transfer_funds to move capital where needed before or after planning a trade (supports financial->spot/futures and spot<->futures). Transfers into Earn are not supported.\n"
     "- Run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
     "- Use analyze_market_context (15m + 1h default) to get EMA/RSI/MACD/ATR/Bollinger/VWAP; only trade when both intervals align and ATR% is reasonable (<5% if conviction is low).\n"
