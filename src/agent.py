@@ -1839,6 +1839,62 @@ def run_trading_agent(
       }
 
     try:
+      # Financial transfers are more reliable via inner-transfer; bridge to futures via trade when needed.
+      if dir_norm in {"financial_to_spot", "spot_to_financial"}:
+        inner_body = {
+          "clientOid": str(int(time.time() * 1000)),
+          "currency": cur,
+          "from": "pool" if from_acct == "financial" else "trade",
+          "to": "pool" if to_acct == "financial" else "trade",
+          "amount": f"{amt}",
+        }
+        res = kucoin._request("POST", "/api/v2/accounts/inner-transfer", auth=True, body=inner_body)  # type: ignore[attr-defined]
+        return {
+          "transfer": res,
+          "method": "inner-transfer",
+          "direction": dir_norm,
+          "currency": currency.upper(),
+          "amount": amt,
+          "spotAvailable": spot_balance_map.get(cur, 0.0),
+          "financialAvailable": financial_balance_map.get(cur, 0.0),
+          "futuresAvailable": futures_available,
+        }
+
+      if dir_norm in {"financial_to_futures", "futures_to_financial"}:
+        if dir_norm == "financial_to_futures":
+          inner_body = {
+            "clientOid": f"{int(time.time() * 1000)}-1",
+            "currency": cur,
+            "from": "pool",
+            "to": "trade",
+            "amount": f"{amt}",
+          }
+          step1 = kucoin._request("POST", "/api/v2/accounts/inner-transfer", auth=True, body=inner_body)  # type: ignore[attr-defined]
+          step2 = kucoin.transfer_funds(currency=cur, amount=amt, from_account="trade", to_account="contract")
+          res = {"bridge": "financial->trade->futures", "steps": [step1, step2]}
+        else:
+          step1 = kucoin.transfer_funds(currency=cur, amount=amt, from_account="contract", to_account="trade")
+          inner_body = {
+            "clientOid": f"{int(time.time() * 1000)}-2",
+            "currency": cur,
+            "from": "trade",
+            "to": "pool",
+            "amount": f"{amt}",
+          }
+          step2 = kucoin._request("POST", "/api/v2/accounts/inner-transfer", auth=True, body=inner_body)  # type: ignore[attr-defined]
+          res = {"bridge": "futures->trade->financial", "steps": [step1, step2]}
+        return {
+          "transfer": res,
+          "method": "bridge",
+          "direction": dir_norm,
+          "currency": currency.upper(),
+          "amount": amt,
+          "spotAvailable": spot_balance_map.get(cur, 0.0),
+          "financialAvailable": financial_balance_map.get(cur, 0.0),
+          "futuresAvailable": futures_available,
+          "futuresOverview": futures_overview,
+        }
+
       res = kucoin.transfer_funds(
         currency=currency.upper(),
         amount=amt,
@@ -1847,6 +1903,7 @@ def run_trading_agent(
       )
       return {
         "transfer": res,
+        "method": "universal-transfer",
         "direction": dir_norm,
         "currency": currency.upper(),
         "amount": amt,

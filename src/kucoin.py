@@ -332,42 +332,69 @@ class KucoinClient:
       }
       return mapping.get(acct, acct)
 
-    payload = {
-      "clientOid": client_oid or str(int(time.time() * 1000)),
-      "currency": currency.upper(),
-      "amount": f"{amount}",
-      "type": "INTERNAL",
-      "fromAccountType": _normalize_universal(from_account),
-      "toAccountType": _normalize_universal(to_account),
-    }
-    try:
+    base_oid = client_oid or str(int(time.time() * 1000))
+    cur = currency.upper()
+    amt = f"{amount}"
+    from_u = _normalize_universal(from_account)
+    to_u = _normalize_universal(to_account)
+    from_l = _normalize_legacy(from_account)
+    to_l = _normalize_legacy(to_account)
+
+    def _universal(from_type: str, to_type: str, oid: str) -> Dict[str, Any]:
+      payload = {
+        "clientOid": oid,
+        "currency": cur,
+        "amount": amt,
+        "type": "INTERNAL",
+        "fromAccountType": from_type,
+        "toAccountType": to_type,
+      }
       return self._request(
         "POST",
         "/api/v3/accounts/universal-transfer",
         auth=True,
         body=payload,
       )
+
+    def _inner(from_type: str, to_type: str, oid: str) -> Dict[str, Any]:
+      legacy_body = {
+        "clientOid": oid,
+        "currency": cur,
+        "from": from_type,
+        "to": to_type,
+        "amount": amt,
+      }
+      return self._request(
+        "POST",
+        "/api/v2/accounts/inner-transfer",
+        auth=True,
+        body=legacy_body,
+      )
+
+    # Financial (POOLED/POOL) is not accepted by universal transfer on many keys.
+    if "POOLED" in (from_u, to_u):
+      # Bridge financial <-> futures through spot (trade), since inner-transfer does not support contract.
+      if from_u == "POOLED" and to_u == "CONTRACT":
+        step1 = _inner("pool", "trade", f"{base_oid}-1")
+        step2 = _universal("TRADE", "CONTRACT", f"{base_oid}-2")
+        return {"bridge": "financial->trade->futures", "steps": [step1, step2]}
+      if from_u == "CONTRACT" and to_u == "POOLED":
+        step1 = _universal("CONTRACT", "TRADE", f"{base_oid}-1")
+        step2 = _inner("trade", "pool", f"{base_oid}-2")
+        return {"bridge": "futures->trade->financial", "steps": [step1, step2]}
+
+      # Otherwise prefer inner-transfer for pool/main/trade/margin.
+      return _inner(from_l, to_l, base_oid)
+
+    # Default path: try universal transfer, then fallback to inner-transfer when possible.
+    try:
+      return _universal(from_u, to_u, base_oid)
     except Exception as exc:
-      # Some account types (esp. legacy accounts) may reject universal transfer; fallback to inner-transfer.
-      legacy_from = _normalize_legacy(from_account)
-      legacy_to = _normalize_legacy(to_account)
-      if legacy_from == "contract" or legacy_to == "contract":
+      if from_l == "contract" or to_l == "contract":
         # Inner transfer does not support contract accounts; re-raise original error.
         raise exc
-      legacy_body = {
-        "clientOid": payload["clientOid"],
-        "currency": payload["currency"],
-        "from": legacy_from,
-        "to": legacy_to,
-        "amount": f"{amount}",
-      }
       try:
-        return self._request(
-          "POST",
-          "/api/v2/accounts/inner-transfer",
-          auth=True,
-          body=legacy_body,
-        )
+        return _inner(from_l, to_l, base_oid)
       except Exception:
         # Re-raise original failure for easier debugging if fallback also fails.
         raise exc
