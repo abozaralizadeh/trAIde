@@ -299,7 +299,7 @@ class KucoinClient:
     client_oid: Optional[str] = None,
   ) -> Dict[str, Any]:
     """Transfer funds between internal accounts (spot/futures/unified) with universal transfer, falling back if needed."""
-    def _normalize(account: str) -> str:
+    def _normalize_universal(account: str) -> str:
       acct = (account or "").lower()
       mapping = {
         "trade": "TRADE",
@@ -316,13 +316,29 @@ class KucoinClient:
       }
       return mapping.get(acct, acct.upper())
 
+    def _normalize_legacy(account: str) -> str:
+      acct = (account or "").lower()
+      mapping = {
+        "trade": "trade",
+        "spot": "trade",
+        "main": "main",
+        "funding": "main",
+        "margin": "margin",
+        "financial": "pool",
+        "pool": "pool",
+        "pool-x": "pool",
+        "contract": "contract",
+        "futures": "contract",
+      }
+      return mapping.get(acct, acct)
+
     payload = {
       "clientOid": client_oid or str(int(time.time() * 1000)),
       "currency": currency.upper(),
       "amount": f"{amount}",
       "type": "INTERNAL",
-      "fromAccountType": _normalize(from_account),
-      "toAccountType": _normalize(to_account),
+      "fromAccountType": _normalize_universal(from_account),
+      "toAccountType": _normalize_universal(to_account),
     }
     try:
       return self._request(
@@ -333,11 +349,16 @@ class KucoinClient:
       )
     except Exception as exc:
       # Some account types (esp. legacy accounts) may reject universal transfer; fallback to inner-transfer.
+      legacy_from = _normalize_legacy(from_account)
+      legacy_to = _normalize_legacy(to_account)
+      if legacy_from == "contract" or legacy_to == "contract":
+        # Inner transfer does not support contract accounts; re-raise original error.
+        raise exc
       legacy_body = {
         "clientOid": payload["clientOid"],
         "currency": payload["currency"],
-        "from": from_account.lower(),
-        "to": to_account.lower(),
+        "from": legacy_from,
+        "to": legacy_to,
         "amount": f"{amount}",
       }
       try:
