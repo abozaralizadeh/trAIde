@@ -261,7 +261,15 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     },
     "transferability": {
       "financialTransferAvailable": True,
-      "note": "Financial/Earn funds are transferable via transfer_funds; treat as available unless transfer fails.",
+      "supportedDirections": [
+        "financial_to_spot",
+        "spot_to_financial",
+        "financial_to_futures",
+        "futures_to_financial",
+        "spot_to_futures",
+        "futures_to_spot",
+      ],
+      "note": "Financial/Earn funds are transferable via transfer_funds; treat as available unless a transfer attempt fails.",
     },
     "accountDetails": {
       "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
@@ -1741,10 +1749,18 @@ def run_trading_agent(
     currency: str = "USDT",
     amount: float = 0.0,
   ) -> Dict[str, Any]:
-    """Transfer funds between spot (trade) and futures (contract). Direction: spot_to_futures or futures_to_spot."""
+    """Transfer funds between spot (trade), futures (contract), and financial (earn/pool)."""
     dir_norm = (direction or "").lower()
-    if dir_norm not in {"spot_to_futures", "futures_to_spot"}:
-      return {"error": "Invalid direction", "allowed": ["spot_to_futures", "futures_to_spot"]}
+    allowed_dirs = {
+      "spot_to_futures",
+      "futures_to_spot",
+      "financial_to_spot",
+      "spot_to_financial",
+      "financial_to_futures",
+      "futures_to_financial",
+    }
+    if dir_norm not in allowed_dirs:
+      return {"error": "Invalid direction", "allowed": sorted(allowed_dirs)}
     try:
       amt = float(amount or 0)
     except (TypeError, ValueError):
@@ -1752,11 +1768,21 @@ def run_trading_agent(
     if amt <= 0:
       return {"error": "Amount must be positive"}
 
-    # Pull fresh balances to avoid stale state; include main/trade so deposits are counted.
-    spot_accounts = kucoin.get_accounts()
+    # Pull fresh balances to avoid stale state.
+    spot_accounts = kucoin.get_trade_accounts()
     spot_balance_map: Dict[str, float] = {}
     for bal in spot_accounts:
       spot_balance_map[bal.currency] = spot_balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
+
+    financial_balance_map: Dict[str, float] = {}
+    try:
+      financial_accounts = kucoin.get_financial_accounts()
+      for bal in financial_accounts:
+        financial_balance_map[bal.currency] = financial_balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
+    except Exception as exc:
+      # Keep going; availability checks will fail gracefully if needed.
+      financial_accounts = []
+      financial_balance_map = {}
 
     futures_available = 0.0
     futures_overview: Dict[str, Any] | None = None
@@ -1768,15 +1794,26 @@ def run_trading_agent(
         # Record but continue to avoid hard failure.
         futures_overview = {"error": str(exc)}
 
-    from_acct = "trade" if dir_norm == "spot_to_futures" else "contract"
-    to_acct = "contract" if dir_norm == "spot_to_futures" else "trade"
+    route_map = {
+      "spot_to_futures": ("trade", "contract"),
+      "futures_to_spot": ("contract", "trade"),
+      "financial_to_spot": ("financial", "trade"),
+      "spot_to_financial": ("trade", "financial"),
+      "financial_to_futures": ("financial", "contract"),
+      "futures_to_financial": ("contract", "financial"),
+    }
+    from_acct, to_acct = route_map[dir_norm]
     cur = currency.upper()
 
-    if dir_norm == "spot_to_futures":
+    if from_acct == "trade":
       available = spot_balance_map.get(cur, 0.0)
       if amt > available:
         return {"rejected": True, "reason": "Insufficient spot balance", "available": available}
-    else:
+    elif from_acct == "financial":
+      available = financial_balance_map.get(cur, 0.0)
+      if amt > available:
+        return {"rejected": True, "reason": "Insufficient financial balance", "available": available}
+    elif from_acct == "contract":
       if not cfg.kucoin_futures.enabled or not kucoin_futures:
         return {"error": "Futures disabled or client unavailable"}
       available = futures_available
@@ -1797,6 +1834,7 @@ def run_trading_agent(
         "from": from_acct,
         "to": to_acct,
         "spotAvailable": spot_balance_map.get(cur, 0.0),
+        "financialAvailable": financial_balance_map.get(cur, 0.0),
         "futuresAvailable": futures_available,
       }
 
@@ -1813,6 +1851,7 @@ def run_trading_agent(
         "currency": currency.upper(),
         "amount": amt,
         "spotAvailable": spot_balance_map.get(cur, 0.0),
+        "financialAvailable": financial_balance_map.get(cur, 0.0),
         "futuresAvailable": futures_available,
         "futuresOverview": futures_overview,
       }
@@ -2052,7 +2091,7 @@ def run_trading_agent(
     "- Act autonomously as the execution owner; do not ask the user what to do. Choose the best venue (spot vs futures) and act or decline yourself.\n"
     "- First, call fetch_account_state to get a clear and up-to-date understanding of your available balances across all venues: spot(trade), funding(main), financial(pool), and futures(contract).\n"
     "- Treat all USDT in these accounts as your available trading capital. Financial/Earn funds are transferable via transfer_funds and are not 'locked' unless a transfer attempt fails.\n"
-    "- If one venue is short, use transfer_funds to move capital where needed before or after planning a trade.\n"
+    "- If one venue is short, use transfer_funds to move capital where needed before or after planning a trade (supports financial<->spot/futures and spot<->futures).\n"
     "- Run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
     "- Use analyze_market_context (15m + 1h default) to get EMA/RSI/MACD/ATR/Bollinger/VWAP; only trade when both intervals align and ATR% is reasonable (<5% if conviction is low).\n"
