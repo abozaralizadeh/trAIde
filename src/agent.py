@@ -245,11 +245,24 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
   financial_totals = _aggregate_account_totals(financial_accounts)
   all_totals = _aggregate_account_totals(all_accounts)
   futures_info = _summarize_futures_account(snapshot.futures_account)
+  spot_usdt = spot_totals.get("USDT", {}).get("available", 0.0)
+  financial_usdt = financial_totals.get("USDT", {}).get("available", 0.0)
+  futures_usdt = _to_float(snapshot.futures_account.get("availableBalance")) if snapshot.futures_account else 0.0
 
   user_content = {
     "coins": snapshot.coins,
     "tickers": {k: vars(v) for k, v in snapshot.tickers.items()},
     "balances": balances_by_currency,
+    "availableUsdt": {
+      "spot": spot_usdt,
+      "financial": financial_usdt,
+      "futures": futures_usdt,
+      "total": spot_usdt + financial_usdt + futures_usdt,
+    },
+    "transferability": {
+      "financialTransferAvailable": True,
+      "note": "Financial/Earn funds are transferable via transfer_funds; treat as available unless transfer fails.",
+    },
     "accountDetails": {
       "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
       "financial": {"accounts": financial_serialized, "byCurrency": financial_totals},
@@ -2038,7 +2051,8 @@ def run_trading_agent(
     "Priorities: maximize risk-adjusted profit, minimize drawdown, avoid over-trading.\n"
     "- Act autonomously as the execution owner; do not ask the user what to do. Choose the best venue (spot vs futures) and act or decline yourself.\n"
     "- First, call fetch_account_state to get a clear and up-to-date understanding of your available balances across all venues: spot(trade), funding(main), financial(pool), and futures(contract).\n"
-    "- Treat all USDT in these accounts as your available trading capital. If one venue is short, use transfer_funds to move capital where needed before or after planning a trade.\n"
+    "- Treat all USDT in these accounts as your available trading capital. Financial/Earn funds are transferable via transfer_funds and are not 'locked' unless a transfer attempt fails.\n"
+    "- If one venue is short, use transfer_funds to move capital where needed before or after planning a trade.\n"
     "- Run one or more web_search calls on the symbols/market to gather fresh sentiment, news, and catalysts.\n"
     "- Use fetch_recent_candles to pull 60-120 minutes of 1m/5m/15m data for BTC and ETH when missing intraday context.\n"
     "- Use analyze_market_context (15m + 1h default) to get EMA/RSI/MACD/ATR/Bollinger/VWAP; only trade when both intervals align and ATR% is reasonable (<5% if conviction is low).\n"
