@@ -1911,7 +1911,19 @@ def run_trading_agent(
         "futuresOverview": futures_overview,
       }
     except Exception as exc:
-      return {"error": str(exc), "direction": dir_norm, "currency": currency.upper(), "amount": amt}
+      key_hint = ""
+      try:
+        key_hint = (kucoin.api_key or "")[-6:]
+      except Exception:
+        key_hint = ""
+      return {
+        "error": str(exc),
+        "direction": dir_norm,
+        "currency": currency.upper(),
+        "amount": amt,
+        "apiKeySuffix": key_hint or None,
+        "baseUrl": getattr(kucoin, "base_url", None),
+      }
 
   @function_tool
   async def fetch_account_state() -> Dict[str, Any]:
