@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -229,9 +230,25 @@ def _normalize_symbol(sym: str) -> str:
   s = (sym or "").strip().upper()
   if not s:
     return s
+  if "-" in s:
+    return s
+  if s.endswith("M"):
+    base_quote = s[:-1]
+    if base_quote.startswith("XBT"):
+      base_quote = "BTC" + base_quote[3:]
+    if base_quote.endswith("USDT") and len(base_quote) > 4:
+      return f"{base_quote[:-4]}-USDT"
   if "-" not in s and s.endswith("USDT") and len(s) > 4:
     return f"{s[:-4]}-USDT"
   return s
+
+
+def _resolve_allowed_spot_symbol(symbol: str, allowed_symbols: set[str]) -> str | None:
+  """Resolve user input to an allowed spot symbol, accepting direct futures contract symbols."""
+  spot_symbol = _normalize_symbol(symbol)
+  if spot_symbol in allowed_symbols:
+    return spot_symbol
+  return None
 
 
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
@@ -361,6 +378,39 @@ def run_trading_agent(
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
   current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
+
+  def _repair_allowed_symbol(requested_symbol: str) -> str | None:
+    candidate = _normalize_symbol(requested_symbol)
+    if not candidate:
+      return None
+    if candidate in allowed_symbols:
+      return candidate
+
+    active_source = memory.get_coins(default=cfg.trading.coins) if cfg.trading.flexible_coins_enabled else cfg.trading.coins
+    normalized_active: list[str] = []
+    seen_active: set[str] = set()
+    for sym in active_source:
+      norm = _normalize_symbol(sym)
+      if norm and norm not in seen_active:
+        normalized_active.append(norm)
+        seen_active.add(norm)
+
+    if candidate not in seen_active:
+      return None
+
+    try:
+      ticker = kucoin.get_ticker(candidate)
+    except Exception as exc:
+      print(f"Warning: runtime symbol repair failed for {requested_symbol} -> {candidate}: {exc}", file=sys.stderr)
+      return None
+
+    snapshot.tickers[candidate] = ticker
+    if candidate not in snapshot.coins:
+      snapshot.coins.append(candidate)
+    allowed_symbols.add(candidate)
+    current_prices[candidate] = float(ticker.price)
+    return candidate
+
   positions = memory.positions(current_prices)
   # Reconcile tracked positions with live spot balances to avoid phantom exposure when trades happen outside the agent.
   spot_balances_by_currency = {
@@ -1125,17 +1175,11 @@ def run_trading_agent(
     reduce_only: bool | None = None,
   ) -> Dict[str, Any]:
     """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
-    spot_symbol = _normalize_symbol(symbol)
-    if symbol not in allowed_symbols:
-      # Accept futures contract symbols directly (e.g., XBTUSDTM -> BTC-USDT)
-      if "-" not in symbol and symbol.upper().endswith("M"):
-        base_quote = symbol[:-1]
-        if base_quote.upper().startswith("XBT"):
-          base_quote = "BTC" + base_quote[3:]
-        if len(base_quote) > 4:
-          spot_symbol = base_quote[:-4] + "-" + base_quote[-4:]
-      if spot_symbol not in allowed_symbols:
-        return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
+    spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+    if not spot_symbol:
+      spot_symbol = _repair_allowed_symbol(symbol)
+    if not spot_symbol:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
@@ -1628,9 +1672,12 @@ def run_trading_agent(
     client_oid: str | None = None,
   ) -> Dict[str, Any]:
     """Place a futures stop/TP/SL order (works for reduce-only hedges)."""
-    symbol = _normalize_symbol(symbol)
-    if symbol not in allowed_symbols:
-      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    requested_symbol = symbol
+    symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+    if not symbol:
+      symbol = _repair_allowed_symbol(requested_symbol)
+    if not symbol:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": requested_symbol}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"error": "Futures disabled in config"}
     futures_symbol = _to_futures_symbol(symbol)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import threading
 import time
@@ -16,6 +17,23 @@ MAX_DECISIONS = 10
 MAX_FEES = 3
 
 
+def _normalize_symbol(symbol: str) -> str:
+  s = (symbol or "").strip().upper()
+  if not s:
+    return s
+  if "-" in s:
+    return s
+  if s.endswith("M"):
+    base_quote = s[:-1]
+    if base_quote.startswith("XBT"):
+      base_quote = "BTC" + base_quote[3:]
+    if base_quote.endswith("USDT") and len(base_quote) > 4:
+      return f"{base_quote[:-4]}-USDT"
+  if s.endswith("USDT") and len(s) > 4:
+    return f"{s[:-4]}-USDT"
+  return s
+
+
 class MemoryStore:
   """Lightweight JSON-backed store for agent plans/notes."""
 
@@ -30,7 +48,8 @@ class MemoryStore:
     if not self.path.exists():
       return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
     try:
-      data = json.loads(self.path.read_text())
+      raw = json.loads(self.path.read_text())
+      data = copy.deepcopy(raw)
       if isinstance(data, dict):
         data.setdefault("plans", [])
         data.setdefault("triggers", [])
@@ -47,13 +66,20 @@ class MemoryStore:
           if isinstance(p, dict) and p.get("title") and p.get("summary") and isinstance(p.get("actions"), list)
         ]
         data["triggers"] = [
-          t
+          {
+            "symbol": _normalize_symbol(t.get("symbol", "")),
+            "direction": t.get("direction"),
+            "rationale": t.get("rationale"),
+            "targetPrice": t.get("targetPrice"),
+            "stopPrice": t.get("stopPrice"),
+            "ts": t.get("ts"),
+          }
           for t in data.get("triggers", [])
           if isinstance(t, dict) and t.get("symbol") and t.get("direction")
         ]
         data["coins"] = [
           {
-            "symbol": c.get("symbol", "").upper(),
+            "symbol": _normalize_symbol(c.get("symbol", "")),
             "status": c.get("status", "active"),
             "reason": c.get("reason"),
             "exitPlan": c.get("exitPlan"),
@@ -64,7 +90,7 @@ class MemoryStore:
         ]
         data["trades"] = [
           {
-            "symbol": t.get("symbol", "").upper(),
+            "symbol": _normalize_symbol(t.get("symbol", "")),
             "side": t.get("side"),
             "notionalUsd": t.get("notionalUsd"),
             "price": t.get("price"),
@@ -78,7 +104,7 @@ class MemoryStore:
         ]
         data["sentiments"] = [
           {
-            "symbol": s.get("symbol", "").upper(),
+            "symbol": _normalize_symbol(s.get("symbol", "")),
             "score": s.get("score"),
             "rationale": s.get("rationale", ""),
             "source": s.get("source", ""),
@@ -90,7 +116,7 @@ class MemoryStore:
         ]
         data["decisions"] = [
           {
-            "symbol": d.get("symbol", "").upper(),
+            "symbol": _normalize_symbol(d.get("symbol", "")),
             "action": d.get("action"),
             "confidence": d.get("confidence"),
             "reason": d.get("reason", ""),
@@ -121,10 +147,13 @@ class MemoryStore:
         if not isinstance(limits, dict):
           limits = {}
         data["limits"] = limits
-        return self._prune(data)
+        data = self._prune(data)
+        if data != raw:
+          self._write(data)
+        return data
     except Exception:
-      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}}
-    return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "fees": []}
+      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
+    return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
 
   def _prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
     """Drop entries older than retention_days."""
@@ -254,7 +283,7 @@ class MemoryStore:
     with self._lock:
       data = self._read()
       entry = {
-        "symbol": symbol,
+        "symbol": _normalize_symbol(symbol),
         "direction": direction,
         "rationale": rationale,
         "targetPrice": target_price,
@@ -290,7 +319,7 @@ class MemoryStore:
       entries = []
       now = int(time.time())
       for sym in coins:
-        entries.append({"symbol": sym.upper(), "status": "active", "reason": reason, "ts": now})
+        entries.append({"symbol": _normalize_symbol(sym), "status": "active", "reason": reason, "ts": now})
       data = self._read()
       data["coins"] = entries
       self._write(data)
@@ -301,7 +330,7 @@ class MemoryStore:
       data = self._prune(self._read())
       coins = data.get("coins", [])
       now = int(time.time())
-      symbol_up = symbol.upper()
+      symbol_up = _normalize_symbol(symbol)
       # avoid duplicates; replace existing with latest reason
       coins = [c for c in coins if c.get("symbol") != symbol_up]
       coins.append({"symbol": symbol_up, "status": "active", "reason": reason, "ts": now})
@@ -313,7 +342,7 @@ class MemoryStore:
     with self._lock:
       data = self._prune(self._read())
       coins = data.get("coins", [])
-      symbol_up = symbol.upper()
+      symbol_up = _normalize_symbol(symbol)
       now = int(time.time())
       coins = [c for c in coins if c.get("symbol") != symbol_up]
       entry = {
@@ -336,7 +365,7 @@ class MemoryStore:
         [
           t
           for t in data.get("trades", []) or []
-          if t.get("symbol") == symbol.upper() and (t.get("day") or 0) == day_key
+          if t.get("symbol") == _normalize_symbol(symbol) and (t.get("day") or 0) == day_key
         ]
       )
 
@@ -354,7 +383,7 @@ class MemoryStore:
       now = int(time.time())
       day_key = int(now // 86400)
       entry = {
-        "symbol": symbol.upper(),
+        "symbol": _normalize_symbol(symbol),
         "side": side,
         "notionalUsd": notional_usd,
         "price": price,
@@ -374,7 +403,7 @@ class MemoryStore:
       now = int(time.time())
       day_key = int(now // 86400)
       entry = {
-        "symbol": symbol.upper(),
+        "symbol": _normalize_symbol(symbol),
         "score": float(score),
         "rationale": rationale,
         "source": source,
@@ -389,7 +418,7 @@ class MemoryStore:
   def latest_sentiment(self, symbol: str) -> Optional[Dict[str, Any]]:
     with self._lock:
       data = self._prune(self._read())
-      sym = symbol.upper()
+      sym = _normalize_symbol(symbol)
       sentiments = [s for s in data.get("sentiments", []) if s.get("symbol") == sym]
       return sentiments[-1] if sentiments else None
 
@@ -407,7 +436,7 @@ class MemoryStore:
       now = int(time.time())
       day_key = int(now // 86400)
       entry = {
-        "symbol": symbol.upper(),
+        "symbol": _normalize_symbol(symbol),
         "action": action,
         "confidence": float(confidence),
         "reason": reason,
