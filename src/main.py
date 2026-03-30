@@ -61,6 +61,16 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     except Exception as exc:
       missing_tickers.append(symbol)
       print(f"Warning: ticker fetch failed for {symbol}: {exc}", file=sys.stderr)
+      if cfg.trading.flexible_coins_enabled:
+        try:
+          removal = memory.remove_coin(
+            symbol,
+            reason=f"Ticker unavailable during snapshot build: {exc}",
+            exit_plan="Auto-removed because KuCoin level1 ticker returned no data; re-add only after symbol availability is confirmed.",
+          )
+          print(f"Warning: removed unavailable symbol from active universe: {removal.get('symbol')}", file=sys.stderr)
+        except Exception as remove_exc:
+          print(f"Warning: failed to remove unavailable symbol {symbol}: {remove_exc}", file=sys.stderr)
       continue
 
   if not tickers:

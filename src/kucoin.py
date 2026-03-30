@@ -340,7 +340,10 @@ class KucoinClient:
       query={"symbol": symbol},
     )
     if not isinstance(data, dict):
-      raise RuntimeError(f"Kucoin ticker payload missing for {symbol}: {data}")
+      raise RuntimeError(
+        f"Kucoin ticker unavailable for {symbol}: level1 endpoint returned {data!r}. "
+        "The symbol may be invalid, delisted, suspended, or temporarily unavailable."
+      )
     return KucoinTicker(**data)
 
   def get_candles(
