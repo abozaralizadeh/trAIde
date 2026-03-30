@@ -883,7 +883,7 @@ def run_trading_agent(
       if (side or "").lower() == "buy" and auto_protect and planned_stop and planned_tp:
         size_for_exit = size_est or (funds_val / price if price else None)
         bracket: Dict[str, Any] = {}
-        stop_res = await place_spot_stop_order(
+        stop_res = await _place_spot_stop_order_impl(
           symbol=symbol,
           side="sell",
           stop_price=planned_stop,
@@ -892,7 +892,7 @@ def run_trading_agent(
           size=size_for_exit,
         )
         bracket["stop"] = stop_res
-        tp_res = await place_spot_stop_order(
+        tp_res = await _place_spot_stop_order_impl(
           symbol=symbol,
           side="sell",
           stop_price=planned_tp,
@@ -908,8 +908,7 @@ def run_trading_agent(
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
 
-  @function_tool
-  async def place_spot_stop_order(
+  async def _place_spot_stop_order_impl(
     symbol: str,
     side: str,
     stop_price: float,
@@ -956,6 +955,31 @@ def run_trading_agent(
       return res
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__}
+
+  @function_tool
+  async def place_spot_stop_order(
+    symbol: str,
+    side: str,
+    stop_price: float,
+    stop_price_type: str = "MP",
+    order_type: str = "limit",
+    size: float | None = None,
+    funds: float | None = None,
+    limit_price: float | None = None,
+    client_oid: str | None = None,
+  ) -> Dict[str, Any]:
+    """Place a spot stop order (stop-loss or take-profit). stop_price_type: TP(trigger when price rises) or MP(falls)."""
+    return await _place_spot_stop_order_impl(
+      symbol=symbol,
+      side=side,
+      stop_price=stop_price,
+      stop_price_type=stop_price_type,
+      order_type=order_type,
+      size=size,
+      funds=funds,
+      limit_price=limit_price,
+      client_oid=client_oid,
+    )
 
   @function_tool
   async def cancel_spot_stop_order(order_id: str | None = None, client_oid: str | None = None) -> Dict[str, Any]:
@@ -1526,7 +1550,7 @@ def run_trading_agent(
       exit_side = "sell" if side == "buy" else "buy"
       size_for_exit = contracts * multiplier
       if protection_stop_val:
-        bracket["stopLoss"] = await place_futures_stop_order(
+        bracket["stopLoss"] = await _place_futures_stop_order_impl(
           symbol=spot_symbol,
           side=exit_side,
           leverage=lev,
@@ -1540,7 +1564,7 @@ def run_trading_agent(
           client_oid=f"{futures_symbol.lower()}-sl-{uuid.uuid4().hex[:12]}",
         )
       if protection_tp_val:
-        bracket["takeProfit"] = await place_futures_stop_order(
+        bracket["takeProfit"] = await _place_futures_stop_order_impl(
           symbol=spot_symbol,
           side=exit_side,
           leverage=lev,
@@ -1693,8 +1717,7 @@ def run_trading_agent(
       "transferUsed": transfer_used,
     }
 
-  @function_tool
-  async def place_futures_stop_order(
+  async def _place_futures_stop_order_impl(
     symbol: str,
     side: str,
     leverage: float,
@@ -1791,6 +1814,41 @@ def run_trading_agent(
       return res
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__}
+
+  @function_tool
+  async def place_futures_stop_order(
+    symbol: str,
+    side: str,
+    leverage: float,
+    size: float | None = None,
+    stop_price: float | None = None,
+    stop: str | None = None,
+    stop_price_type: str | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    reduce_only: bool | None = None,
+    close_order: bool | None = None,
+    order_type: str = "limit",
+    limit_price: float | None = None,
+    client_oid: str | None = None,
+  ) -> Dict[str, Any]:
+    """Place a futures stop/TP/SL order (works for reduce-only hedges)."""
+    return await _place_futures_stop_order_impl(
+      symbol=symbol,
+      side=side,
+      leverage=leverage,
+      size=size,
+      stop_price=stop_price,
+      stop=stop,
+      stop_price_type=stop_price_type,
+      take_profit_price=take_profit_price,
+      stop_loss_price=stop_loss_price,
+      reduce_only=reduce_only,
+      close_order=close_order,
+      order_type=order_type,
+      limit_price=limit_price,
+      client_oid=client_oid,
+    )
 
   @function_tool
   async def cancel_futures_order(order_id: str, symbol: str | None = None) -> Dict[str, Any]:
@@ -1915,7 +1973,7 @@ def run_trading_agent(
 
     bracket: Dict[str, Any] = {}
     if sl_val:
-      bracket["stopLoss"] = await place_futures_stop_order(
+      bracket["stopLoss"] = await _place_futures_stop_order_impl(
         symbol=symbol,
         side=exit_side,
         leverage=leverage_val,
@@ -1929,7 +1987,7 @@ def run_trading_agent(
         client_oid=f"{futures_symbol.lower()}-sl-{uuid.uuid4().hex[:12]}",
       )
     if tp_val:
-      bracket["takeProfit"] = await place_futures_stop_order(
+      bracket["takeProfit"] = await _place_futures_stop_order_impl(
         symbol=symbol,
         side=exit_side,
         leverage=leverage_val,
