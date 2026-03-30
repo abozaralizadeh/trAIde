@@ -529,6 +529,17 @@ def run_trading_agent(
       return None
     return {"net": net, "avg_entry": avg_entry_f}
 
+  def _spot_position_size(symbol: str) -> float:
+    """Return current live spot size for a symbol, even if avg entry is unknown."""
+    pos = positions.get(symbol)
+    if not pos:
+      return 0.0
+    try:
+      net = float(pos.get("netSize") or 0.0)
+    except Exception:
+      return 0.0
+    return net if net > 0 else 0.0
+
   def _fee_adjusted_breakeven(avg_entry: float, fee_rate: float) -> float:
     """Breakeven price that covers taker fees on both entry and exit."""
     fee_rate = max(0.0, float(fee_rate))
@@ -1000,6 +1011,92 @@ def run_trading_agent(
       return {"orders": orders, "status": status, "symbol": symbol}
     except Exception as exc:
       return {"error": str(exc), "status": status, "symbol": symbol}
+
+  @function_tool
+  async def set_spot_position_protection(
+    symbol: str,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    cancel_existing: bool = True,
+  ) -> Dict[str, Any]:
+    """Add or replace TP/SL for an existing open spot position using sell stop orders."""
+    symbol = _normalize_symbol(symbol)
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+
+    try:
+      tp_val = float(take_profit_price) if take_profit_price is not None else None
+    except Exception:
+      tp_val = None
+    try:
+      sl_val = float(stop_loss_price) if stop_loss_price is not None else None
+    except Exception:
+      sl_val = None
+    if not tp_val and not sl_val:
+      return {"error": "At least one of take_profit_price or stop_loss_price is required"}
+
+    position_size = _spot_position_size(symbol)
+    if position_size <= 0:
+      return {"error": "No open spot position", "symbol": symbol}
+
+    cancelled: list[Dict[str, Any]] = []
+    cancel_errors: list[Dict[str, Any]] = []
+    active_orders: list[Dict[str, Any]] = []
+    if cancel_existing:
+      try:
+        active_orders = kucoin.list_stop_orders(status="active", symbol=symbol) or []
+      except Exception as exc:
+        cancel_errors.append({"stage": "list", "error": str(exc)})
+      for order in active_orders:
+        if not isinstance(order, dict):
+          continue
+        order_side = str(order.get("side") or "").lower()
+        if order_side and order_side != "sell":
+          continue
+        order_symbol = _normalize_symbol(str(order.get("symbol") or symbol))
+        if order_symbol and order_symbol != symbol:
+          continue
+        order_id = str(order.get("id") or order.get("orderId") or "").strip()
+        client_oid = str(order.get("clientOid") or "").strip() or None
+        if not order_id and not client_oid:
+          continue
+        if snapshot.paper_trading:
+          cancelled.append({"paper": True, "orderId": order_id or None, "clientOid": client_oid, "symbol": symbol})
+          continue
+        try:
+          res = kucoin.cancel_stop_order(order_id=order_id or None, client_oid=client_oid)
+          cancelled.append({"orderId": order_id or None, "clientOid": client_oid, "response": res})
+        except Exception as exc:
+          cancel_errors.append({"orderId": order_id or None, "clientOid": client_oid, "error": str(exc)})
+
+    bracket: Dict[str, Any] = {}
+    if sl_val:
+      bracket["stopLoss"] = await _place_spot_stop_order_impl(
+        symbol=symbol,
+        side="sell",
+        stop_price=sl_val,
+        stop_price_type="MP",
+        order_type="market",
+        size=position_size,
+      )
+    if tp_val:
+      bracket["takeProfit"] = await _place_spot_stop_order_impl(
+        symbol=symbol,
+        side="sell",
+        stop_price=tp_val,
+        stop_price_type="TP",
+        order_type="limit",
+        size=position_size,
+        limit_price=tp_val,
+      )
+
+    return {
+      "symbol": symbol,
+      "positionSize": position_size,
+      "cancelledOrders": cancelled,
+      "cancelErrors": cancel_errors,
+      "bracket": bracket,
+    }
 
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
@@ -2431,7 +2528,7 @@ def run_trading_agent(
     "- Act autonomously as the execution owner; do not ask the user what to do. Choose the best venue (spot vs futures) and act or decline yourself.\n"
     "- First, call fetch_account_state to get a clear and up-to-date understanding of your available balances across all venues: spot(trade), funding(main), financial(pool), and futures(contract).\n"
     "- On every run, before considering new entries, audit all current spot and futures exposure plus their protective orders. Open positions without both a take-profit and a stop-loss are incomplete and must be fixed before adding new risk unless an immediate exit is the better decision.\n"
-    "- For every open spot position, check existing stop orders with list_spot_stop_orders. If TP or SL is missing, stale, sized incorrectly, or no longer matches the latest market analysis, cancel/replace them so the live spot position has both a valid TP and SL.\n"
+    "- For every open spot position, check existing stop orders with list_spot_stop_orders. If TP or SL is missing, stale, sized incorrectly, or no longer matches the latest market analysis, use set_spot_position_protection to replace the bracket so the live spot position has both a valid TP and SL.\n"
     "- For every open futures position, check existing protection with list_futures_positions plus list_futures_stop_orders. If TP or SL is missing, stale, sized incorrectly, or thesis has changed, use set_futures_position_protection to replace the current bracket so the live futures position always has both a valid TP and SL.\n"
     "- Treat all USDT in these accounts as your available trading capital. Financial/Earn funds are transferable via transfer_funds and are not 'locked' unless a transfer attempt fails.\n"
     "- If one venue is short, use transfer_funds to move capital where needed before or after planning a trade (supports financial->spot/futures and spot<->futures). Transfers into Earn are not supported.\n"
@@ -2442,7 +2539,7 @@ def run_trading_agent(
     "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
     "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
     "- Maintenance is mandatory, not optional: if market analysis, volatility, structure, or catalyst context changes, update TP/SL for existing positions before searching for new trades.\n"
-    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for fresh entries, and use set_futures_position_protection to add or replace TP/SL on discovered open futures positions. Keep stops in sync with position size. If spot balance+position size is ~0 but a SELL stop exists, cancel it via cancel_spot_stop_order to avoid stale orders.\n"
+    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for fresh entries, use set_spot_position_protection/set_futures_position_protection to add or replace TP/SL on discovered open positions, and keep stops in sync with position size. If spot balance+position size is ~0 but a SELL stop exists, cancel it via cancel_spot_stop_order to avoid stale orders.\n"
     "- Keep sizing fee-aware: use latest fees from state; refresh via refresh_fee_rates when stale; ensure spend caps include taker fees.\n"
     "- For spot sells, compute fee-adjusted breakeven (avgEntry*(1+fee)/(1-fee)); do not sell below breakeven unless explicitly cutting risk/stop/hedge. Aim for positive net PnL after fees on exits.\n"
     "- Favor intraday/day-trading profits: when confidence is high and research backs momentum/catalysts, prefer futures with sensible leverage (<= max_leverage) for higher R; size prudently and keep stops tight.\n"
@@ -2521,6 +2618,7 @@ def run_trading_agent(
       place_futures_market_order,
       place_market_order,
       place_spot_stop_order,
+      set_spot_position_protection,
       cancel_spot_stop_order,
       list_spot_stop_orders,
       place_futures_stop_order,
