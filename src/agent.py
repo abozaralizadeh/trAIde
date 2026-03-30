@@ -1173,6 +1173,7 @@ def run_trading_agent(
     take_profit_price: float | None = None,
     stop_loss_price: float | None = None,
     reduce_only: bool | None = None,
+    auto_protect: bool = True,
   ) -> Dict[str, Any]:
     """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
     spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
@@ -1253,6 +1254,7 @@ def run_trading_agent(
     # Check if this is a closing/reducing trade and validate profit
     closing_pnl = None
     closing_roi = None
+    is_closing_trade = False
     existing_pos = next((p for p in snapshot.futures_positions if p.get("symbol") == futures_symbol), None)
     if existing_pos:
       try:
@@ -1271,6 +1273,7 @@ def run_trading_agent(
         elif is_short and side == "buy":
           is_closing = True
           
+        is_closing_trade = is_closing
         if is_closing and pos_entry > 0:
           # Calculate estimated PnL on the portion being closed
           # Note: base_size is the amount we are TENTATIVELY sending
@@ -1409,6 +1412,10 @@ def run_trading_agent(
         "feeRate": fee_rate,
         "slippageRate": slippage_rate,
       }
+
+    protection_stop_val = sl_val or trigger_stop_val
+    protection_tp_val = tp_val
+    protection_price_type = (stop_price_type or "MP").upper() if (stop_price_type or "").upper() in {"TP", "MP", "IP"} else "MP"
     # Ensure required margin is funded; auto-transfer from spot if futures are empty.
     spot_accounts = kucoin.get_accounts()
     spot_balance_map: Dict[str, float] = {}
@@ -1500,14 +1507,6 @@ def run_trading_agent(
         mode_norm = mode.upper()
         if mode_norm == "ISOLATED":
           auto_deposit = False
-      # If only stop_loss_price is provided, use it as stopPrice to avoid KuCoin stop-price missing errors.
-      effective_stop_price = stop_price if stop_price is not None else stop_loss_price
-      effective_stop_type = stop_price_type
-      if effective_stop_price is not None and not effective_stop_type:
-        effective_stop_type = "MP"
-      stop_price_str = f"{effective_stop_price}" if effective_stop_price is not None else None
-      tp_str = f"{take_profit_price}" if take_profit_price is not None else None
-      sl_str = f"{stop_loss_price}" if stop_loss_price is not None else None
       return KucoinFuturesOrderRequest(
         symbol=futures_symbol,
         side="buy" if side == "buy" else "sell",
@@ -1517,13 +1516,44 @@ def run_trading_agent(
         clientOid=str(uuid.uuid4()),
         marginMode=mode_norm,
         autoDeposit=auto_deposit,
-        stop=stop,
-        stopPriceType=effective_stop_type,
-        stopPrice=stop_price_str,
-        takeProfitPrice=tp_str,
-        stopLossPrice=sl_str,
         reduceOnly=reduce_only,
       )
+
+    async def _create_futures_bracket() -> Dict[str, Any]:
+      if reduce_only or is_closing_trade or not auto_protect:
+        return {}
+      bracket: Dict[str, Any] = {}
+      exit_side = "sell" if side == "buy" else "buy"
+      size_for_exit = contracts * multiplier
+      if protection_stop_val:
+        bracket["stopLoss"] = await place_futures_stop_order(
+          symbol=spot_symbol,
+          side=exit_side,
+          leverage=lev,
+          size=size_for_exit,
+          stop_price=protection_stop_val,
+          stop="down" if side == "buy" else "up",
+          stop_price_type=protection_price_type,
+          reduce_only=True,
+          close_order=True,
+          order_type="market",
+          client_oid=f"{futures_symbol.lower()}-sl-{uuid.uuid4().hex[:12]}",
+        )
+      if protection_tp_val:
+        bracket["takeProfit"] = await place_futures_stop_order(
+          symbol=spot_symbol,
+          side=exit_side,
+          leverage=lev,
+          size=size_for_exit,
+          stop_price=protection_tp_val,
+          stop="up" if side == "buy" else "down",
+          stop_price_type=protection_price_type,
+          reduce_only=True,
+          close_order=True,
+          order_type="market",
+          client_oid=f"{futures_symbol.lower()}-tp-{uuid.uuid4().hex[:12]}",
+        )
+      return bracket
 
     if snapshot.paper_trading:
       order_req = _build_order(margin_mode)
@@ -1553,6 +1583,9 @@ def run_trading_agent(
         "leverageClampedFrom": lev_requested if leverage_clamped else None,
         "maxLeverageCap": max_leverage_cap,
       }
+      bracket = await _create_futures_bracket()
+      if bracket:
+        return_val["bracket"] = bracket
       if closing_pnl is not None:
         return_val["closingPnl"] = closing_pnl
         return_val["closingRoi"] = closing_roi
@@ -1592,6 +1625,9 @@ def run_trading_agent(
       res["appliedLeverage"] = lev
       res["previousAttempts"] = attempts
       res["maxLeverageCap"] = max_leverage_cap
+      bracket = await _create_futures_bracket()
+      if bracket:
+        res["bracket"] = bracket
       if leverage_clamped:
         res["leverageClampedFrom"] = lev_requested
       if closing_pnl is not None:
@@ -1636,6 +1672,9 @@ def run_trading_agent(
       res["appliedLeverage"] = lev
       res["previousAttempts"] = attempts
       res["maxLeverageCap"] = max_leverage_cap
+      bracket = await _create_futures_bracket()
+      if bracket:
+        res["bracket"] = bracket
       if leverage_clamped:
         res["leverageClampedFrom"] = lev_requested
       if closing_pnl is not None:
@@ -1787,6 +1826,135 @@ def run_trading_agent(
       return {"positions": positions, "status": status}
     except Exception as exc:
       return {"error": str(exc), "status": status, "snapshotPositions": snapshot.futures_positions}
+
+  @function_tool
+  async def set_futures_position_protection(
+    symbol: str,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    stop_price_type: str = "MP",
+    cancel_existing: bool = True,
+  ) -> Dict[str, Any]:
+    """Add or replace TP/SL for an existing open futures position using reduce-only close orders."""
+    requested_symbol = symbol
+    symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+    if not symbol:
+      symbol = _repair_allowed_symbol(requested_symbol)
+    if not symbol:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": requested_symbol}
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+
+    futures_symbol = _to_futures_symbol(symbol)
+    if not futures_symbol:
+      return {"error": "Invalid symbol for futures", "symbol": symbol}
+
+    tp_val = _to_float(take_profit_price)
+    sl_val = _to_float(stop_loss_price)
+    if not tp_val and not sl_val:
+      return {"error": "At least one of take_profit_price or stop_loss_price is required"}
+
+    price_type = (stop_price_type or "MP").upper()
+    if price_type not in {"TP", "MP", "IP"}:
+      return {"error": "Invalid stop_price_type", "allowed": ["IP", "MP", "TP"]}
+
+    try:
+      position = kucoin_futures.get_position(futures_symbol)
+    except Exception as exc:
+      return {"error": f"Position lookup failed: {exc}", "symbol": symbol, "futuresSymbol": futures_symbol}
+
+    if not isinstance(position, dict):
+      return {"error": "Unexpected position payload", "position": position, "symbol": symbol, "futuresSymbol": futures_symbol}
+
+    current_qty = _to_float(position.get("currentQty"))
+    if abs(current_qty) <= 0:
+      return {"error": "No open futures position", "symbol": symbol, "futuresSymbol": futures_symbol, "position": position}
+
+    contract = _get_contract_spec(futures_symbol)
+    multiplier = _to_float(contract.get("multiplier")) if contract else None
+    if multiplier is None or multiplier <= 0:
+      return {"error": "Invalid contract multiplier for protection", "contract": contract, "futuresSymbol": futures_symbol}
+
+    base_size = abs(current_qty) * multiplier
+    if base_size <= 0:
+      return {"error": "Computed protection size <= 0", "currentQty": current_qty, "multiplier": multiplier}
+
+    leverage_val = _to_float(position.get("realLeverage")) or _to_float(position.get("leverage")) or snapshot.max_leverage
+    if leverage_val <= 0:
+      leverage_val = snapshot.max_leverage or 1.0
+
+    exit_side = "sell" if current_qty > 0 else "buy"
+    tp_stop = "up" if current_qty > 0 else "down"
+    sl_stop = "down" if current_qty > 0 else "up"
+
+    cancelled: list[Dict[str, Any]] = []
+    cancel_errors: list[Dict[str, Any]] = []
+    if cancel_existing:
+      try:
+        active_orders = kucoin_futures.list_stop_orders(status="active", symbol=futures_symbol) or []
+      except Exception as exc:
+        active_orders = []
+        cancel_errors.append({"stage": "list", "error": str(exc)})
+      for order in active_orders:
+        if not isinstance(order, dict):
+          continue
+        order_side = str(order.get("side") or "").lower()
+        if order_side and order_side != exit_side:
+          continue
+        order_id = str(order.get("id") or order.get("orderId") or "").strip()
+        if not order_id:
+          continue
+        if snapshot.paper_trading:
+          cancelled.append({"paper": True, "orderId": order_id, "symbol": futures_symbol})
+          continue
+        try:
+          res = kucoin_futures.cancel_order(order_id, symbol=futures_symbol)
+          cancelled.append({"orderId": order_id, "response": res})
+        except Exception as exc:
+          cancel_errors.append({"orderId": order_id, "error": str(exc)})
+
+    bracket: Dict[str, Any] = {}
+    if sl_val:
+      bracket["stopLoss"] = await place_futures_stop_order(
+        symbol=symbol,
+        side=exit_side,
+        leverage=leverage_val,
+        size=base_size,
+        stop_price=sl_val,
+        stop=sl_stop,
+        stop_price_type=price_type,
+        reduce_only=True,
+        close_order=True,
+        order_type="market",
+        client_oid=f"{futures_symbol.lower()}-sl-{uuid.uuid4().hex[:12]}",
+      )
+    if tp_val:
+      bracket["takeProfit"] = await place_futures_stop_order(
+        symbol=symbol,
+        side=exit_side,
+        leverage=leverage_val,
+        size=base_size,
+        stop_price=tp_val,
+        stop=tp_stop,
+        stop_price_type=price_type,
+        reduce_only=True,
+        close_order=True,
+        order_type="market",
+        client_oid=f"{futures_symbol.lower()}-tp-{uuid.uuid4().hex[:12]}",
+      )
+
+    return {
+      "symbol": symbol,
+      "futuresSymbol": futures_symbol,
+      "positionSide": "long" if current_qty > 0 else "short",
+      "positionQty": current_qty,
+      "protectionSize": base_size,
+      "exitSide": exit_side,
+      "cancelledOrders": cancelled,
+      "cancelErrors": cancel_errors,
+      "bracket": bracket,
+      "position": position,
+    }
 
   @function_tool
   async def transfer_funds(
@@ -2212,7 +2380,7 @@ def run_trading_agent(
     "- If analyze_market_context shows mixed bias or elevated volatility without a high-conviction catalyst, prefer decline_trade.\n"
     "- After web_search and fetch_kucoin_news, assign a sentiment score 0-1; if sentiment_filter_enabled and score < sentiment_min_score, do NOT buy. Log via log_sentiment.\n"
     "- Use the provided positions (avgEntry, unrealized, realized PnL) to manage exits/hedges; if size>0 with profit risk of mean-reversion, consider trims/stops instead of only new entries.\n"
-    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for stops/TP, cancel/replace them when thesis changes; keep stops in sync with position size. If spot balance+position size is ~0 but a SELL stop exists, cancel it via cancel_spot_stop_order to avoid stale orders.\n"
+    "- Set and maintain protection: place_spot_stop_order/place_futures_stop_order for fresh entries, and use set_futures_position_protection to add or replace TP/SL on discovered open futures positions. Keep stops in sync with position size. If spot balance+position size is ~0 but a SELL stop exists, cancel it via cancel_spot_stop_order to avoid stale orders.\n"
     "- Keep sizing fee-aware: use latest fees from state; refresh via refresh_fee_rates when stale; ensure spend caps include taker fees.\n"
     "- For spot sells, compute fee-adjusted breakeven (avgEntry*(1+fee)/(1-fee)); do not sell below breakeven unless explicitly cutting risk/stop/hedge. Aim for positive net PnL after fees on exits.\n"
     "- Favor intraday/day-trading profits: when confidence is high and research backs momentum/catalysts, prefer futures with sensible leverage (<= max_leverage) for higher R; size prudently and keep stops tight.\n"
@@ -2294,6 +2462,7 @@ def run_trading_agent(
       cancel_spot_stop_order,
       list_spot_stop_orders,
       place_futures_stop_order,
+      set_futures_position_protection,
       cancel_futures_order,
       list_futures_stop_orders,
       list_futures_positions,
