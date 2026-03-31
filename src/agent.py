@@ -153,31 +153,6 @@ def _to_float(val: Any, default: float = 0.0) -> float:
     return default
 
 
-def _maybe_number(val: Any) -> Any:
-  if isinstance(val, (int, float)):
-    return float(val)
-  if isinstance(val, str):
-    try:
-      return float(val)
-    except ValueError:
-      return val
-  return val
-
-
-def _serialize_accounts(accounts: List[KucoinAccount]) -> List[Dict[str, Any]]:
-  return [
-    {
-      "id": acct.id,
-      "currency": acct.currency,
-      "type": acct.type,
-      "balance": _to_float(acct.balance),
-      "available": _to_float(acct.available),
-      "holds": _to_float(acct.holds),
-    }
-    for acct in accounts
-  ]
-
-
 def _aggregate_account_totals(accounts: List[KucoinAccount]) -> Dict[str, Dict[str, float]]:
   totals: Dict[str, Dict[str, float]] = {}
   for acct in accounts:
@@ -189,20 +164,148 @@ def _aggregate_account_totals(accounts: List[KucoinAccount]) -> Dict[str, Dict[s
   return totals
 
 
-def _summarize_futures_account(overview: Dict[str, Any] | None) -> Dict[str, Any]:
-  if not overview:
-    return {}
-  normalized = {k: _maybe_number(v) for k, v in overview.items()}
-  currency = str(overview.get("currency", "USDT"))
-  normalized["summary"] = {
+def _has_meaningful_balance(balance: Dict[str, float], threshold: float = 1e-12) -> bool:
+  return (
+    abs(balance.get("balance", 0.0)) > threshold
+    or abs(balance.get("available", 0.0)) > threshold
+    or abs(balance.get("holds", 0.0)) > threshold
+  )
+
+
+def _compact_balance_entry(currency: str, balance: Dict[str, float], venue_amount: float | None = None) -> Dict[str, Any]:
+  entry: Dict[str, Any] = {
     "currency": currency,
-    "availableBalance": _to_float(overview.get("availableBalance")),
-    "marginBalance": _to_float(overview.get("marginBalance")),
-    "accountEquity": _to_float(overview.get("accountEquity") or overview.get("marginBalance")),
-    "frozenBalance": _to_float(overview.get("frozenBalance")),
-    "unrealisedPnl": _to_float(overview.get("unrealisedPnl") or overview.get("unrealisedPNL")),
+    "total": balance.get("balance", 0.0),
   }
-  return normalized
+  if abs(balance.get("available", 0.0)) > 0:
+    entry["free"] = balance.get("available", 0.0)
+  if abs(balance.get("holds", 0.0)) > 0:
+    entry["locked"] = balance.get("holds", 0.0)
+  if venue_amount is not None and abs(venue_amount) > 0:
+    entry["amount"] = venue_amount
+  return entry
+
+
+def _compact_venue_balances(totals: Dict[str, Dict[str, float]]) -> List[Dict[str, Any]]:
+  entries: List[Dict[str, Any]] = []
+  for currency in sorted(totals):
+    balance = totals[currency]
+    if not _has_meaningful_balance(balance):
+      continue
+    entries.append(_compact_balance_entry(currency, balance))
+  return entries
+
+
+def _build_compact_account_state(
+  *,
+  spot_totals: Dict[str, Dict[str, float]],
+  funding_totals: Dict[str, Dict[str, float]],
+  financial_totals: Dict[str, Dict[str, float]],
+  futures_overview: Dict[str, Any] | None,
+  futures_enabled: bool,
+  futures_error: str | None = None,
+) -> Dict[str, Any]:
+  portfolio_index: Dict[str, Dict[str, Any]] = {}
+
+  def merge_venue(venue: str, totals: Dict[str, Dict[str, float]]) -> None:
+    for currency, balance in totals.items():
+      if not _has_meaningful_balance(balance):
+        continue
+      entry = portfolio_index.setdefault(
+        currency,
+        {
+          "currency": currency,
+          "total": 0.0,
+          "free": 0.0,
+          "locked": 0.0,
+          "venues": {},
+        },
+      )
+      entry["total"] += balance.get("balance", 0.0)
+      entry["free"] += balance.get("available", 0.0)
+      entry["locked"] += balance.get("holds", 0.0)
+      venue_amount = balance.get("balance", 0.0)
+      if abs(venue_amount) > 0:
+        entry["venues"][venue] = venue_amount
+
+  merge_venue("spot", spot_totals)
+  merge_venue("funding", funding_totals)
+  merge_venue("financial", financial_totals)
+
+  portfolio = []
+  for currency in sorted(portfolio_index):
+    entry = portfolio_index[currency]
+    compact: Dict[str, Any] = {
+      "currency": currency,
+      "total": entry["total"],
+      "venues": entry["venues"],
+    }
+    if abs(entry["free"]) > 0:
+      compact["free"] = entry["free"]
+    if abs(entry["locked"]) > 0:
+      compact["locked"] = entry["locked"]
+    portfolio.append(compact)
+
+  futures_summary = {"enabled": futures_enabled}
+  futures_free = 0.0
+  if futures_overview:
+    futures_currency = str(futures_overview.get("currency", "USDT")).upper()
+    futures_free = _to_float(futures_overview.get("availableBalance"))
+    futures_equity = _to_float(futures_overview.get("accountEquity") or futures_overview.get("marginBalance"))
+    futures_pnl = _to_float(futures_overview.get("unrealisedPnl") or futures_overview.get("unrealisedPNL"))
+    futures_summary = {
+      "enabled": True,
+      "currency": futures_currency,
+      "available": futures_free,
+      "equity": futures_equity,
+      "unrealizedPnl": futures_pnl,
+    }
+    if abs(_to_float(futures_overview.get("positionMargin"))) > 0:
+      futures_summary["positionMargin"] = _to_float(futures_overview.get("positionMargin"))
+    if abs(_to_float(futures_overview.get("orderMargin"))) > 0:
+      futures_summary["orderMargin"] = _to_float(futures_overview.get("orderMargin"))
+    if abs(_to_float(futures_overview.get("riskRatio"))) > 0:
+      futures_summary["riskRatio"] = _to_float(futures_overview.get("riskRatio"))
+  if futures_error:
+    futures_summary["error"] = futures_error
+
+  total_free_usdt = (
+    spot_totals.get("USDT", {}).get("available", 0.0)
+    + funding_totals.get("USDT", {}).get("available", 0.0)
+    + financial_totals.get("USDT", {}).get("available", 0.0)
+    + futures_free
+  )
+
+  result: Dict[str, Any] = {
+    "summary": {
+      "futuresEnabled": futures_enabled,
+      "assetCount": len(portfolio),
+      "freeUsdt": {
+        "spot": spot_totals.get("USDT", {}).get("available", 0.0),
+        "funding": funding_totals.get("USDT", {}).get("available", 0.0),
+        "financial": financial_totals.get("USDT", {}).get("available", 0.0),
+        "futures": futures_free,
+        "total": total_free_usdt,
+      },
+    },
+    "portfolio": portfolio,
+    "venues": {
+      "spot": _compact_venue_balances(spot_totals),
+      "funding": _compact_venue_balances(funding_totals),
+      "financial": _compact_venue_balances(financial_totals),
+      "futures": futures_summary,
+    },
+    "transferability": {
+      "canUseFinancialFunds": True,
+      "supportedDirections": [
+        "financial_to_spot",
+        "financial_to_futures",
+        "spot_to_futures",
+        "futures_to_spot",
+      ],
+    },
+  }
+  return result
 
 
 def _base_currency(symbol: str) -> str:
@@ -255,13 +358,17 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
   spot_accounts = snapshot.spot_accounts or snapshot.balances
   financial_accounts = snapshot.financial_accounts
   all_accounts = snapshot.all_accounts or (spot_accounts + financial_accounts)
-  spot_serialized = _serialize_accounts(spot_accounts)
-  financial_serialized = _serialize_accounts(financial_accounts)
-  all_serialized = _serialize_accounts(all_accounts)
   spot_totals = _aggregate_account_totals(spot_accounts)
   financial_totals = _aggregate_account_totals(financial_accounts)
-  all_totals = _aggregate_account_totals(all_accounts)
-  futures_info = _summarize_futures_account(snapshot.futures_account)
+  funding_accounts = [acct for acct in all_accounts if getattr(acct, "type", "") == "main"]
+  funding_totals = _aggregate_account_totals(funding_accounts)
+  compact_accounts = _build_compact_account_state(
+    spot_totals=spot_totals,
+    funding_totals=funding_totals,
+    financial_totals=financial_totals,
+    futures_overview=snapshot.futures_account,
+    futures_enabled=snapshot.futures_enabled,
+  )
   spot_usdt = spot_totals.get("USDT", {}).get("available", 0.0)
   financial_usdt = financial_totals.get("USDT", {}).get("available", 0.0)
   futures_usdt = _to_float(snapshot.futures_account.get("availableBalance")) if snapshot.futures_account else 0.0
@@ -286,12 +393,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
       ],
       "note": "Financial/Earn funds are transferable out via redeem->transfer; transfers into Earn are not supported by this bot.",
     },
-    "accountDetails": {
-      "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
-      "financial": {"accounts": financial_serialized, "byCurrency": financial_totals},
-      "futures": futures_info,
-      "allAccounts": {"accounts": all_serialized, "byCurrency": all_totals},
-    },
+    "accountState": compact_accounts,
     "paperTrading": snapshot.paper_trading,
     "maxPositionUsd": snapshot.max_position_usd,
     "minConfidence": snapshot.min_confidence,
@@ -2302,7 +2404,6 @@ def run_trading_agent(
       spot_accounts_fresh = kucoin.get_trade_accounts()
       main_accounts_fresh = kucoin.get_accounts("main")
       fin_accounts_fresh = kucoin.get_financial_accounts()
-      all_accounts_fresh = kucoin.get_accounts()
     except Exception as exc:
       return {"error": f"account_fetch_failed: {exc}"}
 
@@ -2314,42 +2415,17 @@ def run_trading_agent(
       except Exception as exc:
         futures_error = f"futures_fetch_failed: {exc}"
 
-    spot_serialized = _serialize_accounts(spot_accounts_fresh)
     spot_totals = _aggregate_account_totals(spot_accounts_fresh)
-    main_serialized = _serialize_accounts(main_accounts_fresh)
     main_totals = _aggregate_account_totals(main_accounts_fresh)
-    fin_serialized = _serialize_accounts(fin_accounts_fresh)
     fin_totals = _aggregate_account_totals(fin_accounts_fresh)
-    all_serialized = _serialize_accounts(all_accounts_fresh)
-    all_totals = _aggregate_account_totals(all_accounts_fresh)
-    
-    # Aggregate available balances across all account types for a quick overview
-    balances_map = {cur: vals.get("available", 0.0) for cur, vals in all_totals.items()}
-    # Financial/Pool accounts are not included in 'all' (main/trade/margin) by KuCoin API, so add them explicitly
-    for cur, totals in fin_totals.items():
-      balances_map[cur] = balances_map.get(cur, 0.0) + totals.get("available", 0.0)
-
-    futures_serialized: Dict[str, Any] = {}
-    if futures_overview:
-      futures_serialized = _summarize_futures_account(futures_overview)
-      fut_cur = str(futures_overview.get("currency", "USDT"))
-      balances_map[fut_cur] = balances_map.get(fut_cur, 0.0) + _to_float(futures_overview.get("availableBalance"))
-
-    result: Dict[str, Any] = {
-      "spot": {"accounts": spot_serialized, "byCurrency": spot_totals},
-      "funding": {"accounts": main_serialized, "byCurrency": main_totals},
-      "financial": {"accounts": fin_serialized, "byCurrency": fin_totals},
-      "allAccounts": {"accounts": all_serialized, "byCurrency": all_totals},
-      "balancesAvailable": balances_map,
-      "futuresEnabled": bool(cfg.kucoin_futures.enabled),
-    }
-    if futures_overview:
-      result["futures"] = futures_serialized or {"enabled": True}
-    else:
-      result["futures"] = {"enabled": bool(cfg.kucoin_futures.enabled)}
-    if futures_error:
-      result["futuresError"] = futures_error
-    return result
+    return _build_compact_account_state(
+      spot_totals=spot_totals,
+      funding_totals=main_totals,
+      financial_totals=fin_totals,
+      futures_overview=futures_overview,
+      futures_enabled=bool(cfg.kucoin_futures.enabled),
+      futures_error=futures_error,
+    )
 
   @function_tool
   async def refresh_fee_rates() -> Dict[str, Any]:
