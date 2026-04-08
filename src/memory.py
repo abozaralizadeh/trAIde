@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from .utils import normalize_symbol as _normalize_symbol
+
+logger = logging.getLogger(__name__)
 
 # Hard caps to keep the memory file small and readable (agent only needs recent history).
 MAX_PLANS = 3
@@ -17,23 +22,6 @@ MAX_DECISIONS = 10
 MAX_FEES = 3
 
 
-def _normalize_symbol(symbol: str) -> str:
-  s = (symbol or "").strip().upper()
-  if not s:
-    return s
-  if "-" in s:
-    return s
-  if s.endswith("M"):
-    base_quote = s[:-1]
-    if base_quote.startswith("XBT"):
-      base_quote = "BTC" + base_quote[3:]
-    if base_quote.endswith("USDT") and len(base_quote) > 4:
-      return f"{base_quote[:-4]}-USDT"
-  if s.endswith("USDT") and len(s) > 4:
-    return f"{s[:-4]}-USDT"
-  return s
-
-
 class MemoryStore:
   """Lightweight JSON-backed store for agent plans/notes."""
 
@@ -41,12 +29,16 @@ class MemoryStore:
     self.path = Path(path)
     self._lock = threading.Lock()
     self.retention_days = retention_days
+    self._cache: Dict[str, Any] | None = None
     # Sanitize on init.
     self._read()
 
   def _read(self) -> Dict[str, Any]:
+    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
+    if self._cache is not None:
+      return copy.deepcopy(self._cache)
     if not self.path.exists():
-      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
+      return _empty
     try:
       raw = json.loads(self.path.read_text())
       data = copy.deepcopy(raw)
@@ -153,7 +145,6 @@ class MemoryStore:
         return data
     except Exception:
       return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
-    return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
 
   def _prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
     """Drop entries older than retention_days."""
@@ -196,6 +187,7 @@ class MemoryStore:
     return data
 
   def _write(self, data: Dict[str, Any]) -> None:
+    self._cache = copy.deepcopy(data)
     self.path.write_text(json.dumps(data, indent=2))
 
   def save_plan(self, title: str, summary: str, actions: list[str], author: str | None = None) -> Dict[str, Any]:

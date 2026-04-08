@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import signal
 import sys
-import time
 from typing import Dict
 
 from agents import set_default_openai_client
@@ -11,6 +12,9 @@ from .agent import TradingSnapshot, run_trading_agent, setup_tracing, setup_lstr
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
+from .utils import normalize_symbol
+
+logger = logging.getLogger(__name__)
 
 
 def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
@@ -28,39 +32,24 @@ def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
   return coins
 
 
-def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
-  def _normalize_symbol(sym: str) -> str:
-    s = (sym or "").strip().upper()
-    if not s:
-      return s
-    if "-" in s:
-      return s
-    if s.endswith("M"):
-      base_quote = s[:-1]
-      if base_quote.startswith("XBT"):
-        base_quote = "BTC" + base_quote[3:]
-      if base_quote.endswith("USDT") and len(base_quote) > 4:
-        return f"{base_quote[:-4]}-USDT"
-    if "-" not in s and s.endswith("USDT") and len(s) > 4:
-      return f"{s[:-4]}-USDT"
-    return s
-
-  # Normalize symbols to KuCoin format (BTC-USDT) and de-duplicate.
-  coins = []
-  seen = set()
-  for sym in _load_active_coins(cfg, memory):
-    norm = _normalize_symbol(sym)
+def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemoryStore) -> tuple[list[str], dict]:
+  """Normalize symbols, fetch tickers, auto-remove unavailable symbols. Returns (valid_coins, tickers)."""
+  normalized: list[str] = []
+  seen: set[str] = set()
+  for sym in coins:
+    norm = normalize_symbol(sym)
     if norm and norm not in seen:
-      coins.append(norm)
+      normalized.append(norm)
       seen.add(norm)
+
   tickers = {}
-  missing_tickers: list[str] = []
-  for symbol in coins:
+  missing: list[str] = []
+  for symbol in normalized:
     try:
       tickers[symbol] = kucoin.get_ticker(symbol)
     except Exception as exc:
-      missing_tickers.append(symbol)
-      print(f"Warning: ticker fetch failed for {symbol}: {exc}", file=sys.stderr)
+      missing.append(symbol)
+      logger.warning("Ticker fetch failed for %s: %s", symbol, exc)
       if cfg.trading.flexible_coins_enabled:
         try:
           removal = memory.remove_coin(
@@ -68,65 +57,86 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
             reason=f"Ticker unavailable during snapshot build: {exc}",
             exit_plan="Auto-removed because KuCoin level1 ticker returned no data; re-add only after symbol availability is confirmed.",
           )
-          print(f"Warning: removed unavailable symbol from active universe: {removal.get('symbol')}", file=sys.stderr)
+          logger.warning("Removed unavailable symbol from active universe: %s", removal.get("symbol"))
         except Exception as remove_exc:
-          print(f"Warning: failed to remove unavailable symbol {symbol}: {remove_exc}", file=sys.stderr)
-      continue
+          logger.warning("Failed to remove unavailable symbol %s: %s", symbol, remove_exc)
 
   if not tickers:
-    raise RuntimeError(f"No tickers available; failed symbols: {missing_tickers}")
+    raise RuntimeError(f"No tickers available; failed symbols: {missing}")
 
+  return list(tickers.keys()), tickers
+
+
+def _fetch_balances(kucoin: KucoinClient) -> tuple[list, list, list]:
+  """Fetch spot trade accounts, financial accounts, and all accounts. Returns (spot, financial, all)."""
   spot_accounts = kucoin.get_trade_accounts()
-  financial_accounts = []
+  financial_accounts: list = []
   try:
     financial_accounts = kucoin.get_financial_accounts()
   except Exception as exc:
-    print("Warning: unable to fetch financial accounts:", exc, file=sys.stderr)
-  
+    logger.warning("Unable to fetch financial accounts: %s", exc)
   all_accounts = kucoin.get_accounts()
-  balances = list(spot_accounts)
-  for fa in financial_accounts:
-    balances.append(fa)
-  
-  futures_overview = None
-  futures_stops: list[dict] = []
-  futures_positions: list[dict] = []
-  if cfg.kucoin_futures.enabled and kucoin_futures:
-    try:
-      futures_overview = kucoin_futures.get_account_overview()
-      if futures_overview:
-        balances.append(
-          KucoinAccount(
-            id="futures",
-            currency=str(futures_overview.get("currency", "USDT")),
-            type="contract",
-            balance=str(futures_overview.get("accountEquity") or futures_overview.get("marginBalance") or futures_overview.get("availableBalance") or "0"),
-            available=str(futures_overview.get("availableBalance") or "0"),
-            holds=str(futures_overview.get("frozenBalance") or "0"),
-          )
-        )
-      futures_stops = kucoin_futures.list_stop_orders(status="active") or []
-      futures_positions = kucoin_futures.list_positions() or []
-    except Exception as exc:
-      print("Warning: unable to fetch futures account overview:", exc, file=sys.stderr)
+  return spot_accounts, financial_accounts, all_accounts
+
+
+def _fetch_futures(cfg, kucoin_futures: KucoinFuturesClient | None) -> tuple[dict | None, list, list]:
+  """Fetch futures account overview, positions, and stop orders. Returns (overview, positions, stops)."""
+  if not (cfg.kucoin_futures.enabled and kucoin_futures):
+    return None, [], []
+  try:
+    overview = kucoin_futures.get_account_overview()
+    stops = kucoin_futures.list_stop_orders(status="active") or []
+    positions = kucoin_futures.list_positions() or []
+    return overview, positions, stops
+  except Exception as exc:
+    logger.warning("Unable to fetch futures account overview: %s", exc)
+    return None, [], []
+
+
+def _fetch_fees(kucoin: KucoinClient) -> dict:
+  """Fetch base fee rates; returns empty dict on failure."""
+  try:
+    fee_info = kucoin.get_base_fee()
+    if fee_info:
+      return {
+        "spot_taker": float(fee_info.get("takerFeeRate") or 0.001),
+        "spot_maker": float(fee_info.get("makerFeeRate") or 0.001),
+      }
+  except Exception as exc:
+    logger.warning("Unable to fetch base fee: %s", exc)
+  return {}
+
+
+def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
+  raw_coins = _load_active_coins(cfg, memory)
+  coins, tickers = _fetch_tickers(cfg, kucoin, raw_coins, memory)
+  spot_accounts, financial_accounts, all_accounts = _fetch_balances(kucoin)
+
+  futures_overview, futures_positions, futures_stops = _fetch_futures(cfg, kucoin_futures)
 
   spot_stops: list[dict] = []
   try:
     spot_stops = kucoin.list_stop_orders(status="active")
   except Exception as exc:
-    print("Warning: unable to fetch spot stop orders:", exc, file=sys.stderr)
+    logger.warning("Unable to fetch spot stop orders: %s", exc)
 
-  fees: dict[str, float] = {}
-  try:
-    fee_info = kucoin.get_base_fee()
-    if fee_info:
-      fees = {
-        "spot_taker": float(fee_info.get("takerFeeRate") or 0.001),
-        "spot_maker": float(fee_info.get("makerFeeRate") or 0.001),
-      }
-      # futures fee endpoints differ; not available here, but keep structure
-  except Exception as exc:
-    print("Warning: unable to fetch base fee:", exc, file=sys.stderr)
+  fees = _fetch_fees(kucoin)
+
+  balances = list(spot_accounts)
+  for fa in financial_accounts:
+    balances.append(fa)
+
+  if futures_overview:
+    balances.append(
+      KucoinAccount(
+        id="futures",
+        currency=str(futures_overview.get("currency", "USDT")),
+        type="contract",
+        balance=str(futures_overview.get("accountEquity") or futures_overview.get("marginBalance") or futures_overview.get("availableBalance") or "0"),
+        available=str(futures_overview.get("availableBalance") or "0"),
+        holds=str(futures_overview.get("frozenBalance") or "0"),
+      )
+    )
 
   return TradingSnapshot(
     coins=coins,
@@ -168,12 +178,12 @@ async def trading_loop() -> None:
   idle_polls = 0
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
 
-  print("Starting trading loop...")
+  logger.info("Starting trading loop...")
   while True:
     try:
       snapshot = build_snapshot(cfg, kucoin, kucoin_futures, memory)
     except Exception as exc:
-      print("Snapshot failed, retrying after delay:", exc, file=sys.stderr)
+      logger.error("Snapshot failed, retrying after delay: %s", exc)
       await asyncio.sleep(cfg.trading.poll_interval_sec)
       continue
 
@@ -250,7 +260,7 @@ async def trading_loop() -> None:
 
     if snapshot.risk_off or snapshot.risk_off_spot or snapshot.risk_off_futures:
       reason = limits_total.get("reason") or limits_spot.get("reason") or limits_futures.get("reason") or "Kill switch active (drawdown limit reached)."
-      print(reason)
+      logger.warning("%s", reason)
 
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
@@ -268,36 +278,41 @@ async def trading_loop() -> None:
 
     if should_run:
       idle_polls = 0
-      print(f"Running agent. Triggers: {triggers or ['idle_threshold']}")
+      logger.info("Running agent. Triggers: %s", triggers or ["idle_threshold"])
       try:
-        # snapshot.risk_off already computed above from per-scope limits.
         result = await asyncio.to_thread(
           run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client
         )
-        print("\n--- Agent Decision Narrative ---")
-        print(result["narrative"])
+        logger.info("--- Agent Decision Narrative ---\n%s", result["narrative"])
         if result.get("decisions"):
-          print("\n--- Decisions ---")
-          for d in result["decisions"]:
-            print("-", d)
+          logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
       except Exception as exc:
         # Keep the loop alive across restarts and transient errors.
-        print("Agent run failed:", exc, file=sys.stderr)
+        logger.error("Agent run failed: %s", exc)
     else:
       idle_polls += 1
-      print(f"No triggers. Idle polls: {idle_polls}/{cfg.trading.max_idle_polls}")
+      logger.info("No triggers. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)
 
     await asyncio.sleep(cfg.trading.poll_interval_sec)
 
 
 def main() -> None:
+  logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+  )
+  loop = asyncio.new_event_loop()
+  asyncio.set_event_loop(loop)
+  loop.add_signal_handler(signal.SIGTERM, loop.stop)
   try:
-    asyncio.run(trading_loop())
+    loop.run_until_complete(trading_loop())
   except KeyboardInterrupt:
-    print("Shutting down...")
+    logger.info("Shutting down...")
   except Exception as exc:
-    print("Fatal error:", exc, file=sys.stderr)
+    logger.error("Fatal error: %s", exc)
     sys.exit(1)
+  finally:
+    loop.close()
 
 
 if __name__ == "__main__":

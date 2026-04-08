@@ -145,21 +145,28 @@ class KucoinClient:
     full_path = f"{path}{qs}"
     url = f"{self.base_url}{full_path}"
 
-    headers = {"Content-Type": "application/json"}
-    if auth:
-      headers.update(self._sign_headers(method, full_path, body))
+    def _make_headers() -> Dict[str, str]:
+      h = {"Content-Type": "application/json"}
+      if auth:
+        h.update(self._sign_headers(method, full_path, body))
+      return h
 
-    response = requests.request(method, url, headers=headers, json=body, timeout=15)
+    response = requests.request(method, url, headers=_make_headers(), json=body, timeout=15)
+
+    # Retry once on timestamp drift errors after syncing time.
+    if not response.ok and response.status_code == 400 and "Invalid KC-API-TIMESTAMP" in response.text:
+      self._sync_time()
+      response = requests.request(method, url, headers=_make_headers(), json=body, timeout=15)
+
+    # Retry with exponential backoff for transient errors (429, 5xx).
+    for delay in (1, 2):
+      if response.ok or response.status_code not in (429, 500, 502, 503, 504):
+        break
+      time.sleep(delay)
+      response = requests.request(method, url, headers=_make_headers(), json=body, timeout=15)
+
     if not response.ok:
-      # Retry once on timestamp errors after syncing time.
-      if response.status_code == 400 and "Invalid KC-API-TIMESTAMP" in response.text:
-        self._sync_time()
-        headers = {"Content-Type": "application/json"}
-        if auth:
-          headers.update(self._sign_headers(method, full_path, body))
-        response = requests.request(method, url, headers=headers, json=body, timeout=15)
-      if not response.ok:
-        raise RuntimeError(f"Kucoin HTTP {response.status_code}: {response.text}")
+      raise RuntimeError(f"Kucoin HTTP {response.status_code}: {response.text}")
 
     payload = response.json()
     if payload.get("code") != "200000":

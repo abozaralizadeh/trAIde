@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -12,6 +12,8 @@ from typing import Any, Dict, List
 import requests
 from datetime import datetime, timezone
 import contextlib
+
+logger = logging.getLogger(__name__)
 
 from agents import (
   Agent,
@@ -50,6 +52,7 @@ from .kucoin import (
   KucoinTicker,
 )
 from .memory import MemoryStore
+from .utils import normalize_symbol as _normalize_symbol
 
 
 class _RedactingConsoleExporter(ConsoleSpanExporter):
@@ -76,12 +79,13 @@ def setup_tracing(cfg: AppConfig):
       add_trace_processor(BatchTraceProcessor(exporter=_RedactingConsoleExporter()))
     if cfg.openai_trace_api_key:
       set_tracing_export_api_key(cfg.openai_trace_api_key)
-      print("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
+      logger.info("OpenAI tracing enabled with provided OPENAI_TRACE_API_KEY.")
   except Exception as exc:
-    print("Tracing setup failed:", exc)
+    logger.warning("Tracing setup failed: %s", exc)
 
 def setup_lstracing(cfg: AppConfig):
   """Register tracing processors once at startup."""
+  ls_client = None
   try:
     if cfg.langsmith.enabled and cfg.langsmith.tracing:
       from langsmith import Client as LangsmithClient
@@ -95,13 +99,13 @@ def setup_lstracing(cfg: AppConfig):
         client=ls_client,
         project_name=cfg.langsmith.project or None,
         tags=["trAIde", "openai-agents"],
-        name=f"trAIde-agent",
+        name="trAIde-agent",
       )
       add_trace_processor(processor)
-      print("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
-    return ls_client
+      logger.info("LangSmith tracing enabled via OpenAIAgentsTracingProcessor (per-run, OpenAI traces retained)")
   except Exception as exc:
-    print("Tracing setup failed:", exc)
+    logger.warning("Tracing setup failed: %s", exc)
+  return ls_client
 
 @dataclass
 class TradingSnapshot:
@@ -328,23 +332,6 @@ def _to_futures_symbol(spot_symbol: str) -> str | None:
   return f"{base}{quote}M"
 
 
-def _normalize_symbol(sym: str) -> str:
-  """Normalize symbols to KuCoin dash format (e.g., MOVAUSDT -> MOVA-USDT)."""
-  s = (sym or "").strip().upper()
-  if not s:
-    return s
-  if "-" in s:
-    return s
-  if s.endswith("M"):
-    base_quote = s[:-1]
-    if base_quote.startswith("XBT"):
-      base_quote = "BTC" + base_quote[3:]
-    if base_quote.endswith("USDT") and len(base_quote) > 4:
-      return f"{base_quote[:-4]}-USDT"
-  if "-" not in s and s.endswith("USDT") and len(s) > 4:
-    return f"{s[:-4]}-USDT"
-  return s
-
 
 def _resolve_allowed_spot_symbol(symbol: str, allowed_symbols: set[str]) -> str | None:
   """Resolve user input to an allowed spot symbol, accepting direct futures contract symbols."""
@@ -416,7 +403,6 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
   }
   return json.dumps(user_content)
 
-from langsmith import Client as LangsmithClient
 
 async def _run_agent_with_tracing(
   trading_agent: Agent,
@@ -437,7 +423,7 @@ async def _run_agent_with_tracing(
       try:
         tr.finish(reset_current=True)
       except Exception as exc:
-        print("Trace cleanup failed:", exc)
+        logger.warning("Trace cleanup failed: %s", exc)
 
 
 def run_trading_agent(
@@ -446,7 +432,7 @@ def run_trading_agent(
   kucoin: KucoinClient,
   kucoin_futures: KucoinFuturesClient | None = None,
   openai_client: AsyncAzureOpenAI | None = None,
-  langsmith_client: LangsmithClient | None = None,
+  langsmith_client: Any | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   if openai_client is None:
@@ -503,7 +489,7 @@ def run_trading_agent(
     try:
       ticker = kucoin.get_ticker(candidate)
     except Exception as exc:
-      print(f"Warning: runtime symbol repair failed for {requested_symbol} -> {candidate}: {exc}", file=sys.stderr)
+      logger.warning("Runtime symbol repair failed for %s -> %s: %s", requested_symbol, candidate, exc)
       return None
 
     snapshot.tickers[candidate] = ticker
@@ -604,7 +590,7 @@ def run_trading_agent(
         contract_cache[futures_symbol] = data
         return data
     except Exception as exc:
-      print(f"Warning: unable to fetch futures contract {futures_symbol}:", exc)
+      logger.warning("Unable to fetch futures contract %s: %s", futures_symbol, exc)
     return None
 
   def _spot_position_info(symbol: str) -> Dict[str, float] | None:
@@ -684,9 +670,9 @@ def run_trading_agent(
         client=langsmith_client,
       )
     except ImportError:
-      print("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
+      logger.warning("LangSmith tracing_context unavailable; skipping per-run LangSmith context.")
     except Exception as exc:
-      print("LangSmith run context init failed:", exc)
+      logger.warning("LangSmith run context init failed: %s", exc)
 
   @function_tool
   async def place_market_order(
@@ -750,7 +736,7 @@ def run_trading_agent(
         overview = kucoin_futures.get_account_overview()
         futures_available = float(overview.get("availableBalance") or 0.0)
       except Exception as exc:
-        print("Warning: futures overview unavailable:", exc)
+        logger.warning("Futures overview unavailable: %s", exc)
 
     try:
       mark_price = float(snapshot.tickers[symbol].price)
@@ -801,7 +787,7 @@ def run_trading_agent(
               spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
               need = max(0, funds_with_fee - spot_spendable)
             except Exception as exc:
-              print("Warning: financial->spot transfer failed:", exc)
+              logger.warning("Financial->spot transfer failed: %s", exc)
 
         # If still need more, try pulling from Futures account
         if need > 0 and futures_available > 0 and kucoin_futures:
@@ -819,7 +805,7 @@ def run_trading_agent(
               spot_usdt += transfer_amt
               spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
             except Exception as exc:
-              print("Warning: futures->spot transfer failed:", exc)
+              logger.warning("Futures->spot transfer failed: %s", exc)
     else:
       # No spend limits/transfers are needed for sells; they're bounded by position size below.
       max_spend = float("inf")
@@ -945,7 +931,7 @@ def run_trading_agent(
           "feeRate": fee_rate,
           "advice": "To cut loss, include 'stop loss' or 'cut loss' in rationale.",
         }
-      print(f"Selling {symbol} - Expected PnL: {expected_pnl:.4f} USD (ROI: {roi_pct*100:.2f}%)")
+      logger.info("Selling %s - Expected PnL: %.4f USD (ROI: %.2f%%)", symbol, expected_pnl, roi_pct * 100)
       order_req.size = f"{size_est:.8f}"
       order_req.funds = None
     else:
@@ -1548,10 +1534,10 @@ def run_trading_agent(
                 "closeSize": close_size,
                 "advice": "To cut loss, include 'stop loss' or 'cut loss' in rationale.",
                }
-            print(f"Closing Futures {futures_symbol} - Expected PnL: {net_pnl:.4f} USD (ROI: {roi_pct*100:.2f}%)")
+            logger.info("Closing Futures %s - Expected PnL: %.4f USD (ROI: %.2f%%)", futures_symbol, net_pnl, roi_pct * 100)
 
       except Exception as exc:
-        print(f"Warning: failed to calc closing PnL for {futures_symbol}: {exc}")
+        logger.warning("Failed to calc closing PnL for %s: %s", futures_symbol, exc)
 
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
@@ -1653,7 +1639,7 @@ def run_trading_agent(
       if isinstance(position_info, dict) and "crossMode" in position_info:
         margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception as exc:
-      print("Warning: futures position lookup failed; margin mode unknown:", exc)
+      logger.warning("Futures position lookup failed; margin mode unknown: %s", exc)
     if margin_mode is None:
       margin_mode = "cross"
     if kucoin_futures:
@@ -1661,7 +1647,7 @@ def run_trading_agent(
         futures_overview = kucoin_futures.get_account_overview()
         futures_available = _to_float(futures_overview.get("availableBalance"))
       except Exception as exc:
-        print("Warning: futures overview unavailable:", exc)
+        logger.warning("Futures overview unavailable: %s", exc)
 
     margin_needed = 0.0 if reduce_only else notional / lev
     fee_allowance = notional * (fee_rate + slippage_rate)
@@ -1693,7 +1679,7 @@ def run_trading_agent(
             futures_available += transfer_amt
             need = max(0, required_futures_balance - futures_available)
           except Exception as exc:
-            print("Warning: financial->futures transfer failed:", exc)
+            logger.warning("Financial->futures transfer failed: %s", exc)
 
       # If still need more, try pulling from Spot (Trade) account
       if need > 0:
@@ -1711,7 +1697,7 @@ def run_trading_agent(
             )
             futures_available += transfer_amt
           except Exception as exc:
-            print("Warning: spot->futures transfer failed:", exc)
+            logger.warning("Spot->futures transfer failed: %s", exc)
     if required_futures_balance > futures_available and not snapshot.paper_trading:
       return {
         "rejected": True,
@@ -1819,11 +1805,11 @@ def run_trading_agent(
     try:
       kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"), auto_deposit=(margin_mode or "").upper() == "ISOLATED" and False)
     except Exception as exc:
-      print("Warning: set_margin_mode failed (continuing):", exc)
+      logger.warning("set_margin_mode failed (continuing): %s", exc)
     try:
       kucoin_futures.set_leverage(futures_symbol, lev)
     except Exception as exc:
-      print("Warning: set_leverage failed (continuing):", exc)
+      logger.warning("set_leverage failed (continuing): %s", exc)
     try:
       res = kucoin_futures.place_order(order_req).__dict__
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
@@ -1866,11 +1852,11 @@ def run_trading_agent(
     try:
       kucoin_futures.set_margin_mode(futures_symbol, opposite_mode, auto_deposit=opposite_mode.upper() == "ISOLATED" and False)
     except Exception as exc:
-      print("Warning: set_margin_mode fallback failed (continuing):", exc)
+      logger.warning("set_margin_mode fallback failed (continuing): %s", exc)
     try:
       kucoin_futures.set_leverage(futures_symbol, lev)
     except Exception as exc:
-      print("Warning: set_leverage fallback failed (continuing):", exc)
+      logger.warning("set_leverage fallback failed (continuing): %s", exc)
     try:
       res = kucoin_futures.place_order(order_req).__dict__
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
@@ -1975,18 +1961,18 @@ def run_trading_agent(
       if isinstance(position_info, dict) and "crossMode" in position_info:
         margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception as exc:
-      print("Warning: futures position lookup failed for stop order; margin mode unknown:", exc)
+      logger.warning("Futures position lookup failed for stop order; margin mode unknown: %s", exc)
 
     margin_mode_norm = margin_mode.upper() if margin_mode else None
     auto_deposit = False if margin_mode_norm == "ISOLATED" else None
     try:
       kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS", auto_deposit=auto_deposit)
     except Exception as exc:
-      print("Warning: set_margin_mode failed for stop order (continuing):", exc)
+      logger.warning("set_margin_mode failed for stop order (continuing): %s", exc)
     try:
       kucoin_futures.set_leverage(futures_symbol, lev, cross=margin_mode_norm != "ISOLATED")
     except Exception as exc:
-      print("Warning: set_leverage failed for stop order (continuing):", exc)
+      logger.warning("set_leverage failed for stop order (continuing): %s", exc)
     order_req = KucoinFuturesOrderRequest(
       symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",

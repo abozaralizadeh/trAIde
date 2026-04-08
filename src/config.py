@@ -184,3 +184,20 @@ def validate_config(cfg: AppConfig) -> None:
     raise ValueError(
       f"Missing required configuration: {', '.join(missing)}. Fill .env or environment variables."
     )
+
+  invalid: list[str] = []
+  if not (0.0 <= cfg.trading.min_confidence <= 1.0):
+    invalid.append(f"MIN_CONFIDENCE={cfg.trading.min_confidence} (must be 0.0–1.0)")
+  if not (0 < cfg.trading.max_leverage <= 125):
+    invalid.append(f"MAX_LEVERAGE={cfg.trading.max_leverage} (must be >0 and <=125)")
+  if cfg.trading.poll_interval_sec <= 0:
+    invalid.append(f"POLL_INTERVAL_SEC={cfg.trading.poll_interval_sec} (must be >0)")
+  if not (0 < cfg.trading.max_daily_drawdown_pct <= 100):
+    invalid.append(f"MAX_DAILY_DRAWDOWN_PCT={cfg.trading.max_daily_drawdown_pct} (must be >0 and <=100)")
+  if cfg.trading.max_position_usd <= 0:
+    invalid.append(f"MAX_POSITION_USD={cfg.trading.max_position_usd} (must be >0)")
+
+  if invalid:
+    raise ValueError(
+      f"Invalid configuration values: {', '.join(invalid)}."
+    )
