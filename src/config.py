@@ -58,8 +58,6 @@ class TradingConfig:
   max_idle_polls: int
   max_leverage: float
   max_trades_per_symbol_per_day: int
-  max_daily_drawdown_pct: float
-  reset_drawdown_on_start: bool
   min_net_profit_usd: float
   min_profit_roi_pct: float
   estimated_slippage_pct: float
@@ -133,8 +131,6 @@ def load_config() -> AppConfig:
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
       max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "100")),
-      max_daily_drawdown_pct=float(os.getenv("MAX_DAILY_DRAWDOWN_PCT", "8")),
-      reset_drawdown_on_start=_as_bool(os.getenv("RESET_DRAWDOWN_ON_START"), False),
       min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "1.5")),
       min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.008")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0005")),
@@ -192,8 +188,6 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"MAX_LEVERAGE={cfg.trading.max_leverage} (must be >0 and <=125)")
   if cfg.trading.poll_interval_sec <= 0:
     invalid.append(f"POLL_INTERVAL_SEC={cfg.trading.poll_interval_sec} (must be >0)")
-  if not (0 < cfg.trading.max_daily_drawdown_pct <= 100):
-    invalid.append(f"MAX_DAILY_DRAWDOWN_PCT={cfg.trading.max_daily_drawdown_pct} (must be >0 and <=100)")
   if cfg.trading.max_position_usd <= 0:
     invalid.append(f"MAX_POSITION_USD={cfg.trading.max_position_usd} (must be >0)")
 

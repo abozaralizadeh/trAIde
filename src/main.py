@@ -147,9 +147,6 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     min_confidence=cfg.trading.min_confidence,
     max_leverage=cfg.trading.max_leverage,
     futures_enabled=cfg.kucoin_futures.enabled,
-    risk_off=False,  # will be set in loop
-    risk_off_spot=False,
-    risk_off_futures=False,
     drawdown_pct=0.0,
     drawdown_pct_spot=0.0,
     drawdown_pct_futures=0.0,
@@ -218,49 +215,20 @@ async def trading_loop() -> None:
 
     total_usdt = spot_usdt + futures_usdt + financial_usdt
 
-    # Update drawdown per venue and overall; auto-clear when recovered.
-    limits_total = memory.update_limits(total_usdt, cfg.trading.max_daily_drawdown_pct, scope="total")
-    limits_spot = memory.update_limits(spot_usdt, cfg.trading.max_daily_drawdown_pct, scope="spot")
-    if cfg.kucoin_futures.enabled and snapshot.futures_account:
-      limits_futures = memory.update_limits(futures_usdt, cfg.trading.max_daily_drawdown_pct, scope="futures")
-    else:
-      # If futures are empty/unavailable, clear futures risk-off so it does not block trading.
-      limits_futures = memory.reset_limits(futures_usdt, scope="futures")
-
-    def _maybe_reset(limits_obj, current_usdt, scope):
-      if limits_obj.get("kill") and (limits_obj.get("drawdownPct") or 0) < cfg.trading.max_daily_drawdown_pct * 0.5:
-        return memory.reset_limits(current_usdt, scope=scope)
-      return limits_obj
-
-    limits_total = _maybe_reset(limits_total, total_usdt, "total")
-    limits_spot = _maybe_reset(limits_spot, spot_usdt, "spot")
-    limits_futures = _maybe_reset(limits_futures, futures_usdt, "futures")
+    # Track daily drawdown per venue for informational context passed to the agent.
+    # No kill switch — the agent decides how to adapt when drawdown is high.
+    limits_total = memory.update_limits(total_usdt, scope="total")
+    limits_spot = memory.update_limits(spot_usdt, scope="spot")
+    limits_futures = memory.update_limits(futures_usdt, scope="futures")
 
     snapshot.total_usdt = total_usdt
     snapshot.drawdown_pct = float(limits_total.get("drawdownPct") or 0.0)
     snapshot.drawdown_pct_spot = float(limits_spot.get("drawdownPct") or 0.0)
     snapshot.drawdown_pct_futures = float(limits_futures.get("drawdownPct") or 0.0)
-    snapshot.risk_off_spot = bool(limits_spot.get("kill"))
-    snapshot.risk_off_futures = bool(limits_futures.get("kill"))
-    snapshot.risk_off = bool(limits_total.get("kill") and snapshot.risk_off_spot and snapshot.risk_off_futures)
 
-    # If futures are effectively empty (no positions and tiny balance), clear futures kill switch to avoid blocking.
-    empty_futures = (futures_usdt <= 1e-3) and not snapshot.futures_positions
-    # If no futures positions and no margin in use, reset futures drawdown/kill to avoid blocking when idle.
-    no_futures_pos = not snapshot.futures_positions
-    fut_margin = 0.0
-    try:
-      fut_margin = float(snapshot.futures_account.get("positionMargin") or 0.0)
-    except Exception:
-      pass
-    if (empty_futures or (no_futures_pos and fut_margin <= 1e-6)) and snapshot.risk_off_futures:
-      limits_futures = memory.reset_limits(futures_usdt, scope="futures")
-      snapshot.drawdown_pct_futures = float(limits_futures.get("drawdownPct") or 0.0)
-      snapshot.risk_off_futures = False
-
-    if snapshot.risk_off or snapshot.risk_off_spot or snapshot.risk_off_futures:
-      reason = limits_total.get("reason") or limits_spot.get("reason") or limits_futures.get("reason") or "Kill switch active (drawdown limit reached)."
-      logger.warning("%s", reason)
+    if snapshot.drawdown_pct > 0:
+      logger.info("Daily drawdown: total=%.2f%% spot=%.2f%% futures=%.2f%%",
+                  snapshot.drawdown_pct, snapshot.drawdown_pct_spot, snapshot.drawdown_pct_futures)
 
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():

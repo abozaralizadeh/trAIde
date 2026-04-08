@@ -45,25 +45,25 @@ def test_record_and_count_trades(store):
 
 
 def test_update_limits_no_drawdown(store):
-    limits = store.update_limits(1000.0, 8.0, scope="total")
+    limits = store.update_limits(1000.0, scope="total")
     assert limits["drawdownPct"] == 0.0
-    assert limits["kill"] is False
+    assert "kill" not in limits
 
 
-def test_update_limits_kill_switch(store):
-    store.update_limits(1000.0, 8.0, scope="total")
-    # Simulate a 10% loss
-    limits = store.update_limits(900.0, 8.0, scope="total")
-    assert limits["drawdownPct"] >= 8.0
-    assert limits["kill"] is True
+def test_update_limits_tracks_drawdown(store):
+    store.update_limits(1000.0, scope="total")
+    # Simulate a 10% loss — should track it, no kill switch
+    limits = store.update_limits(900.0, scope="total")
+    assert limits["drawdownPct"] >= 9.9
+    assert "kill" not in limits
 
 
 def test_reset_limits(store):
-    store.update_limits(1000.0, 8.0, scope="total")
-    store.update_limits(900.0, 8.0, scope="total")
+    store.update_limits(1000.0, scope="total")
+    store.update_limits(900.0, scope="total")
     limits = store.reset_limits(900.0, scope="total")
-    assert limits["kill"] is False
     assert limits["drawdownPct"] == 0.0
+    assert "kill" not in limits
 
 
 def test_pruning_drops_old_entries(tmp_path):

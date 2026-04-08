@@ -17,8 +17,6 @@ def _make_valid_config(**overrides) -> AppConfig:
         max_idle_polls=10,
         max_leverage=3.0,
         max_trades_per_symbol_per_day=10,
-        max_daily_drawdown_pct=8.0,
-        reset_drawdown_on_start=False,
         min_net_profit_usd=1.5,
         min_profit_roi_pct=0.008,
         estimated_slippage_pct=0.0005,
@@ -93,18 +91,6 @@ def test_invalid_max_leverage_too_high():
 def test_invalid_poll_interval():
     cfg = _make_valid_config(poll_interval_sec=0.0)
     with pytest.raises(ValueError, match="POLL_INTERVAL_SEC"):
-        validate_config(cfg)
-
-
-def test_invalid_drawdown_zero():
-    cfg = _make_valid_config(max_daily_drawdown_pct=0.0)
-    with pytest.raises(ValueError, match="MAX_DAILY_DRAWDOWN_PCT"):
-        validate_config(cfg)
-
-
-def test_invalid_drawdown_too_high():
-    cfg = _make_valid_config(max_daily_drawdown_pct=101.0)
-    with pytest.raises(ValueError, match="MAX_DAILY_DRAWDOWN_PCT"):
         validate_config(cfg)
 
 

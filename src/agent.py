@@ -117,9 +117,6 @@ class TradingSnapshot:
   min_confidence: float
   max_leverage: float
   futures_enabled: bool
-  risk_off: bool = False
-  risk_off_spot: bool = False
-  risk_off_futures: bool = False
   drawdown_pct: float = 0.0
   drawdown_pct_spot: float = 0.0
   drawdown_pct_futures: float = 0.0
@@ -386,9 +383,6 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "minConfidence": snapshot.min_confidence,
     "maxLeverage": snapshot.max_leverage,
     "futuresEnabled": snapshot.futures_enabled,
-    "riskOff": snapshot.risk_off,
-    "riskOffSpot": snapshot.risk_off_spot,
-    "riskOffFutures": snapshot.risk_off_futures,
     "drawdownPct": snapshot.drawdown_pct,
     "drawdownPctSpot": snapshot.drawdown_pct_spot,
     "drawdownPctFutures": snapshot.drawdown_pct_futures,
@@ -2617,12 +2611,13 @@ def run_trading_agent(
     "- Keep memory of current plan via save_trade_plan/latest_plan and update when conditions change; log auto triggers via set_auto_trigger.\n"
     "- When resuming from a Research Agent handoff, first read researchContext (latestPlan/recentResearch) or call latest_items('research',3)/latest_plan so the research output guides your trade decision.\n"
     "- Focus on intraday/day-trading setups, not long holds. Prefer short holding periods.\n"
-    "- Consider leverage only when conviction is high and risk is controlled; \n"
-    "- If riskOff=true in the snapshot (set by daily drawdown guard when drawdownPct > MAX_DAILY_DRAWDOWN_PCT), avoid new speculative entries. You may:\n"
-    "  - Close/trim existing exposure if it reduces risk.\n"
-    "  - Hedge (including futures shorts) or transfer funds between spot/futures to reduce net risk.\n"
-    "  - Set or adjust protective triggers. Avoid adding net long risk unless explicitly justified as a hedge.\n"
-    "- When riskOff and drawdownPct is high, analyze causes and propose steps to recover safely (e.g., hedges, rebalance, pause trades, tighten stops). If rules block entries, log a plan to exit riskOff when conditions improve.\n"
+    "- Consider leverage only when conviction is high and risk is controlled.\n"
+    "- drawdownPct in the snapshot is today's loss from the opening baseline (informational only — no hard block).\n"
+    "  When drawdownPct is elevated, adapt your approach to recover:\n"
+    "  - drawdownPct 5–10%: tighten stop distances, reduce position sizes by ~25%, prefer high-conviction setups only.\n"
+    "  - drawdownPct 10–20%: halve normal position sizes, prioritize closing losing positions or adding hedges before new entries, focus on recovery setups with strong momentum confirmation.\n"
+    "  - drawdownPct >20%: use minimum size (quarter normal), only trade the highest-conviction catalyst-driven setups; analyze what caused the drawdown and log a recovery plan via save_trade_plan.\n"
+    "- You can always trade regardless of drawdown — the goal is recovery, not paralysis.\n"
     f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
     f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades.\n"
     f"- Futures leverage must stay <= {snapshot.max_leverage}x. Keep sizing realistic; if unsure, prefer spot.\n"
@@ -2634,7 +2629,7 @@ def run_trading_agent(
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, just simulate orders via the tool.\n"
   )
 
-  # Secondary research agent to scout new coins while idle/riskOff.
+  # Secondary research agent to scout new coins while idle.
   research_agent = Agent(
     name="Research Agent",
     instructions=(

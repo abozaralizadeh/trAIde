@@ -448,7 +448,8 @@ class MemoryStore:
       day_key = int(time.time() // 86400)
       return len([t for t in data.get("trades", []) or [] if (t.get("day") or 0) == day_key])
 
-  def update_limits(self, current_usdt: float, drawdown_limit_pct: float, scope: str = "total") -> Dict[str, Any]:
+  def update_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:
+    """Track daily drawdown percentage for informational context. No kill switch."""
     with self._lock:
       data = self._read()
       now = int(time.time())
@@ -461,8 +462,6 @@ class MemoryStore:
           "baselineUsdt": float(current_usdt or 0.0),
           "currentUsdt": float(current_usdt or 0.0),
           "drawdownPct": 0.0,
-          "kill": False,
-          "reason": "",
           "updated": now,
         }
       baseline = limits.get("baselineUsdt") or float(current_usdt or 0.0)
@@ -471,11 +470,6 @@ class MemoryStore:
       drawdown_pct = 0.0
       if baseline > 0:
         drawdown_pct = max(0.0, (baseline - float(current_usdt or 0.0)) / baseline * 100)
-
-      if not limits.get("kill") and drawdown_limit_pct > 0 and drawdown_pct >= drawdown_limit_pct:
-        limits["kill"] = True
-        limits["reason"] = f"Daily drawdown {drawdown_pct:.2f}% >= limit {drawdown_limit_pct}%"
-
       limits.update(
         {
           "day": day_key,
@@ -558,15 +552,8 @@ class MemoryStore:
       pos["currentPrice"] = cur_price or None
     return positions
 
-  def kill_active(self, scope: str = "total") -> bool:
-    with self._lock:
-      data = self._read()
-      limits_all = data.get("limits") or {}
-      limits = limits_all.get(scope) or {}
-      return bool(limits.get("kill"))
-
   def reset_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:
-    """Reset daily limits baseline to current_usdt and clear kill flag."""
+    """Reset daily drawdown baseline to current_usdt."""
     with self._lock:
       data = self._read()
       now = int(time.time())
@@ -577,8 +564,6 @@ class MemoryStore:
         "baselineUsdt": float(current_usdt or 0.0),
         "currentUsdt": float(current_usdt or 0.0),
         "drawdownPct": 0.0,
-        "kill": False,
-        "reason": "manual reset",
         "updated": now,
       }
       limits_all[scope] = limits
