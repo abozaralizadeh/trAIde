@@ -131,8 +131,8 @@ def load_config() -> AppConfig:
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
       max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "100")),
-      min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "1.5")),
-      min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.008")),
+      min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "0.05")),
+      min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.001")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0005")),
     ),
     langsmith=LangsmithConfig(
