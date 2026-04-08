@@ -5,6 +5,13 @@ import logging
 import threading
 from typing import Iterable
 
+# Configure logging before anything else so all modules emit to stdout/stderr
+# (captured by gunicorn and forwarded to journald).
+logging.basicConfig(
+  level=logging.INFO,
+  format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 from .main import trading_loop
 
 logger = logging.getLogger(__name__)
