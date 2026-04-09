@@ -587,8 +587,8 @@ def run_trading_agent(
       logger.warning("Unable to fetch futures contract %s: %s", futures_symbol, exc)
     return None
 
-  def _spot_position_info(symbol: str) -> Dict[str, float] | None:
-    """Return current net size and avg entry for a spot position."""
+  def _spot_position_info(symbol: str) -> Dict[str, float | None] | None:
+    """Return current net size and avg entry for a spot position. avg_entry may be None for externally-acquired coins."""
     pos = positions.get(symbol)
     if not pos:
       return None
@@ -606,10 +606,8 @@ def run_trading_agent(
     try:
       avg_entry_f = float(avg_entry or 0.0)
     except Exception:
-      return None
-    if avg_entry_f <= 0:
-      return None
-    return {"net": net, "avg_entry": avg_entry_f}
+      avg_entry_f = 0.0
+    return {"net": net, "avg_entry": avg_entry_f if avg_entry_f > 0 else None}
 
   def _spot_position_size(symbol: str) -> float:
     """Return current live spot size for a symbol, even if avg entry is unknown."""
@@ -884,6 +882,11 @@ def run_trading_agent(
 
     if side == "sell":
       pos_info = _spot_position_info(symbol)
+      if not pos_info:
+        # Fallback: check live balance for externally-held coins
+        fallback_size = _spot_position_size(symbol)
+        if fallback_size > 0:
+          pos_info = {"net": fallback_size, "avg_entry": None}
       net_size = pos_info["net"] if pos_info else 0.0
       if net_size <= 0:
         return {"rejected": True, "reason": "No spot position available to sell"}
@@ -893,38 +896,42 @@ def run_trading_agent(
       if size_est > net_size:
         size_est = net_size
         funds_val = size_est * price
-      breakeven_px = _fee_adjusted_breakeven(pos_info["avg_entry"], fee_rate + slippage_rate) if pos_info else None
-      expected_proceeds = price * size_est * (1 - fee_rate - slippage_rate)
-      entry_cost = pos_info["avg_entry"] * size_est * (1 + fee_rate + slippage_rate) if pos_info else 0.0
-      expected_pnl = expected_proceeds - entry_cost
-      
-      # Calculate ROI if we have entry cost data
-      roi_pct = 0.0
-      if entry_cost > 0:
-        roi_pct = expected_pnl / entry_cost
 
       rationale_norm = (rationale or "").lower() if rationale else ""
-      # Stricter loss allowance: requires explicit stop/cut/emergency keywords
-      allow_loss = any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate"))
-      
-      min_profit_usd = cfg.trading.min_net_profit_usd
-      min_roi = cfg.trading.min_profit_roi_pct
+      allow_loss_keywords = ("stop loss", "cut loss", "emergency", "liquidate", "portfolio review", "close position", "rebalance")
+      allow_loss = any(term in rationale_norm for term in allow_loss_keywords)
 
-      if expected_pnl < 0 and not allow_loss:
-        return {
-          "rejected": True,
-          "reason": f"Sell at a loss (expected PnL ${expected_pnl:.4f}); include 'stop loss' or 'cut loss' in rationale to allow",
-          "breakevenPrice": breakeven_px,
-          "expectedPnl": expected_pnl,
-          "expectedRoi": roi_pct,
-          "minProfitUsd": min_profit_usd,
-          "minRoiPct": min_roi,
-          "positionSize": net_size,
-          "requestedSize": size_est,
-          "feeRate": fee_rate,
-          "advice": "To cut loss, include 'stop loss' or 'cut loss' in rationale.",
-        }
-      logger.info("Selling %s - Expected PnL: %.4f USD (ROI: %.2f%%)", symbol, expected_pnl, roi_pct * 100)
+      if pos_info and pos_info.get("avg_entry"):
+        # Known entry: full PnL validation
+        breakeven_px = _fee_adjusted_breakeven(pos_info["avg_entry"], fee_rate + slippage_rate)
+        expected_proceeds = price * size_est * (1 - fee_rate - slippage_rate)
+        entry_cost = pos_info["avg_entry"] * size_est * (1 + fee_rate + slippage_rate)
+        expected_pnl = expected_proceeds - entry_cost
+        roi_pct = expected_pnl / entry_cost if entry_cost > 0 else 0.0
+
+        if expected_pnl < 0 and not allow_loss:
+          return {
+            "rejected": True,
+            "reason": f"Sell at a loss (expected PnL ${expected_pnl:.4f}); include 'stop loss', 'cut loss', or 'portfolio review' in rationale to allow",
+            "breakevenPrice": breakeven_px,
+            "expectedPnl": expected_pnl,
+            "expectedRoi": roi_pct,
+            "positionSize": net_size,
+            "requestedSize": size_est,
+            "feeRate": fee_rate,
+          }
+        logger.info("Selling %s - Expected PnL: %.4f USD (ROI: %.2f%%)", symbol, expected_pnl, roi_pct * 100)
+      else:
+        # Unknown entry (externally acquired): allow sell with appropriate rationale
+        if not allow_loss:
+          return {
+            "rejected": True,
+            "reason": "Unknown entry price; include 'portfolio review', 'close position', or 'cut loss' in rationale to sell",
+            "positionSize": net_size,
+            "currentPrice": price,
+          }
+        logger.info("Selling %s (unknown entry) - Size: %.8f at price: %.6f", symbol, size_est, price)
+
       order_req.size = f"{size_est:.8f}"
       order_req.funds = None
     else:
@@ -2596,7 +2603,9 @@ def run_trading_agent(
     "- Call list_spot_stop_orders + list_futures_positions + list_futures_stop_orders to audit open positions and their protection.\n"
     "- For any open position missing a TP or SL: use set_spot_position_protection or set_futures_position_protection "
     "to add the bracket BEFORE looking for new trades.\n"
-    "- Cancel stale stop orders (stop exists but no position) via cancel_spot_stop_order.\n\n"
+    "- Cancel stale stop orders (stop exists but no position) via cancel_spot_stop_order.\n"
+    "- Check the 'staleStops' field: if any stop order has its price far above/below market "
+    "(e.g., stop-loss above current price), cancel it and replace with a proper stop based on current support/ATR.\n\n"
 
     "## STEP 1b — Review protection on existing positions:\n"
     "- Check the 'positions' field in your input — it lists every coin you hold in spot with netSize, avgEntry, "
@@ -2607,6 +2616,20 @@ def run_trading_agent(
     "- If momentum is shifting (RSI divergence, EMA cross against, trend weakening): tighten the SL or lower the TP to lock in gains.\n"
     "- If momentum is strengthening in your favor: consider trailing the SL up or raising the TP.\n"
     "- For positions with unknown avgEntry: estimate a reasonable SL based on current support/ATR and set protection.\n\n"
+
+    "## STEP 1c — Portfolio health review (unlisted/unknown-entry holdings):\n"
+    "- Check 'unlistedHoldings' in your input: these are coins you hold but that were NOT in your active coin list, "
+    "often bought externally. They have unknown entry prices.\n"
+    "- For EACH unlisted holding:\n"
+    "  1. Research the coin: call web_search for recent news, project health, and fundamentals.\n"
+    "  2. Call analyze_market_context (15min + 1hour) to assess current trend and momentum.\n"
+    "  3. Decide: HOLD (if fundamentals are strong and trend is recovering) or CLOSE (if project is declining, "
+    "no catalyst, or capital is better deployed elsewhere).\n"
+    "  4. If HOLD: add the coin to your universe via add_coin, set proper TP/SL via set_spot_position_protection.\n"
+    "  5. If CLOSE: sell via place_market_order with rationale containing 'portfolio review' or 'close position', "
+    "then cancel any stale stop orders for that symbol.\n"
+    "- A position with no recovery catalyst is a strong candidate for closing to free capital.\n"
+    "- Do NOT keep positions indefinitely out of hope — evaluate objectively with data.\n\n"
 
     "## STEP 2 — Research (required before every entry decision):\n"
     "- Call analyze_market_context for each coin (15min + 1hour) to get EMA/RSI/MACD/ATR/BB/VWAP signals.\n"
@@ -2768,6 +2791,60 @@ def run_trading_agent(
   user_state_obj["fees"] = fees
   user_state_obj["triggers"] = triggers
   user_state_obj["performanceSummary"] = memory.performance_summary()
+
+  # Detect stale/ineffective stop orders
+  stale_stops = []
+  for order in (snapshot.spot_stop_orders or []):
+    if not isinstance(order, dict):
+      continue
+    order_symbol = _normalize_symbol(str(order.get("symbol") or ""))
+    stop_px = _to_float(order.get("stopPrice"))
+    if not order_symbol or stop_px <= 0:
+      continue
+    cur_price = current_prices.get(order_symbol)
+    if not cur_price or cur_price <= 0:
+      continue
+    side = str(order.get("side") or "").lower()
+    distance_pct = abs(stop_px - cur_price) / cur_price * 100
+    is_stale = False
+    reason = ""
+    if side == "sell":
+      if stop_px > cur_price and distance_pct > 10:
+        is_stale = True
+        reason = f"Stop at {stop_px:.4f} is {distance_pct:.1f}% ABOVE current price {cur_price:.4f} — will never trigger as SL"
+      elif stop_px < cur_price and distance_pct > 50:
+        is_stale = True
+        reason = f"Stop at {stop_px:.4f} is {distance_pct:.1f}% below current price — extremely loose"
+    if is_stale:
+      stale_stops.append({
+        "orderId": order.get("id") or order.get("orderId"),
+        "symbol": order_symbol,
+        "side": side,
+        "stopPrice": stop_px,
+        "currentPrice": cur_price,
+        "distancePct": round(distance_pct, 1),
+        "issue": reason,
+      })
+  if stale_stops:
+    user_state_obj["staleStops"] = stale_stops
+
+  # Flag holdings with unknown entry price for portfolio review
+  unlisted_holdings = []
+  for sym, pos in positions.items():
+    if pos.get("avgEntry") is None and _to_float(pos.get("netSize")) > 0:
+      cur_price = pos.get("currentPrice") or current_prices.get(sym)
+      net_size = _to_float(pos.get("netSize"))
+      value_usd = net_size * cur_price if cur_price else None
+      unlisted_holdings.append({
+        "symbol": sym,
+        "netSize": net_size,
+        "currentPrice": cur_price,
+        "estimatedValueUsd": round(value_usd, 2) if value_usd else None,
+        "note": "Entry price unknown (externally acquired). Evaluate hold vs close.",
+      })
+  if unlisted_holdings:
+    user_state_obj["unlistedHoldings"] = unlisted_holdings
+
   research_context: Dict[str, Any] = {}
   if latest_plan_entry:
     research_context["latestPlan"] = latest_plan_entry

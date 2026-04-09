@@ -75,6 +75,33 @@ def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemorySt
   return list(tickers.keys()), tickers
 
 
+def _discover_unlisted_holdings(kucoin: KucoinClient, spot_accounts: list, existing_tickers: dict, min_value_usd: float = 0.50) -> tuple[list[str], dict]:
+  """Discover spot holdings not in the active coin list by scanning balances."""
+  known_bases = {sym.split("-")[0].upper() for sym in existing_tickers if "-" in sym}
+  known_bases.add("USDT")
+  extra_coins: list[str] = []
+  extra_tickers: dict = {}
+  for acct in spot_accounts:
+    cur = acct.currency.upper()
+    if cur in known_bases:
+      continue
+    bal = float(acct.balance or 0)
+    if bal <= 0:
+      continue
+    symbol = f"{cur}-USDT"
+    try:
+      ticker = kucoin.get_ticker(symbol)
+      if bal * float(ticker.price) < min_value_usd:
+        continue
+      extra_coins.append(symbol)
+      extra_tickers[symbol] = ticker
+      known_bases.add(cur)
+      logger.info("Discovered unlisted holding: %s (%.4f units, ~$%.2f)", symbol, bal, bal * float(ticker.price))
+    except Exception:
+      continue
+  return extra_coins, extra_tickers
+
+
 def _fetch_balances(kucoin: KucoinClient) -> tuple[list, list, list]:
   """Fetch spot trade accounts, financial accounts, and all accounts. Returns (spot, financial, all)."""
   spot_accounts = kucoin.get_trade_accounts()
@@ -119,6 +146,11 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
   raw_coins = _load_active_coins(cfg, memory)
   coins, tickers = _fetch_tickers(cfg, kucoin, raw_coins, memory)
   spot_accounts, financial_accounts, all_accounts = _fetch_balances(kucoin)
+
+  # Discover spot holdings not in the active coin list (e.g., externally bought coins).
+  extra_coins, extra_tickers = _discover_unlisted_holdings(kucoin, spot_accounts, tickers)
+  coins.extend(extra_coins)
+  tickers.update(extra_tickers)
 
   futures_overview, futures_positions, futures_stops = _fetch_futures(cfg, kucoin_futures)
 
