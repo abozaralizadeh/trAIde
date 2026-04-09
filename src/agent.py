@@ -2592,6 +2592,16 @@ def run_trading_agent(
     "to add the bracket BEFORE looking for new trades.\n"
     "- Cancel stale stop orders (stop exists but no position) via cancel_spot_stop_order.\n\n"
 
+    "## STEP 1b — Review protection on existing positions:\n"
+    "- Check the 'positions' field in your input — it lists every coin you hold in spot with netSize, avgEntry, "
+    "unrealizedPnl, and currentPrice.\n"
+    "- Exits are handled automatically by TP/SL stop orders — do NOT manually sell. Instead, ensure every position "
+    "has proper protection and adjust levels when conditions change.\n"
+    "- If a position has no TP or SL: set them immediately via set_spot_position_protection or set_futures_position_protection.\n"
+    "- If momentum is shifting (RSI divergence, EMA cross against, trend weakening): tighten the SL or lower the TP to lock in gains.\n"
+    "- If momentum is strengthening in your favor: consider trailing the SL up or raising the TP.\n"
+    "- For positions with unknown avgEntry: estimate a reasonable SL based on current support/ATR and set protection.\n\n"
+
     "## STEP 2 — Research (required before every entry decision):\n"
     "- Call analyze_market_context for each coin (15min + 1hour) to get EMA/RSI/MACD/ATR/BB/VWAP signals.\n"
     "- Call fetch_recent_candles if you need raw price detail to set precise TP/SL levels.\n"
@@ -2609,10 +2619,11 @@ def run_trading_agent(
     "or clearly negative news.\n\n"
 
     "**Venue preference:**\n"
-    "- Futures (place_futures_market_order) preferred when leverage adds meaningful R without excessive risk. "
-    f"Use for directional setups with conviction >= {snapshot.min_confidence + 0.1:.2f}.\n"
-    "- Spot (place_market_order) for lower-confidence setups or when futures is unavailable.\n"
-    "- Transfer USDT between venues with transfer_funds to fund the best trade.\n\n"
+    "- Your input includes availableUsdt with spot, futures, and total balances. Read ALL of them before choosing a venue.\n"
+    "- Pick the venue where you have the capital to act. If one venue is underfunded, use the other.\n"
+    "- Futures with leverage lets you trade with a smaller USDT balance than spot requires — factor this in.\n"
+    "- Use transfer_funds to move capital between venues when needed.\n"
+    "- A rejected spot order is not a reason to give up — reconsider via futures or a smaller size.\n\n"
 
     "**Sizing:**\n"
     "- Call plan_spot_position to compute ATR-based stop distance, size, and TP for spot trades.\n"
