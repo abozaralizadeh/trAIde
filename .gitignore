@@ -186,3 +186,4 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .agent_memory.json
+.env.local

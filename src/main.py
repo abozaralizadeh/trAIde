@@ -32,8 +32,12 @@ def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
   return coins
 
 
+_TICKER_FAIL_COUNTS: dict[str, int] = {}
+_TICKER_FAIL_THRESHOLD = 3  # consecutive failures before removal
+
+
 def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemoryStore) -> tuple[list[str], dict]:
-  """Normalize symbols, fetch tickers, auto-remove unavailable symbols. Returns (valid_coins, tickers)."""
+  """Normalize symbols, fetch tickers with retry. Only remove after repeated consecutive failures."""
   normalized: list[str] = []
   seen: set[str] = set()
   for sym in coins:
@@ -47,17 +51,21 @@ def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemorySt
   for symbol in normalized:
     try:
       tickers[symbol] = kucoin.get_ticker(symbol)
+      _TICKER_FAIL_COUNTS.pop(symbol, None)  # reset on success
     except Exception as exc:
       missing.append(symbol)
-      logger.warning("Ticker fetch failed for %s: %s", symbol, exc)
-      if cfg.trading.flexible_coins_enabled:
+      _TICKER_FAIL_COUNTS[symbol] = _TICKER_FAIL_COUNTS.get(symbol, 0) + 1
+      fail_count = _TICKER_FAIL_COUNTS[symbol]
+      logger.warning("Ticker fetch failed for %s (%d/%d): %s", symbol, fail_count, _TICKER_FAIL_THRESHOLD, exc)
+      if cfg.trading.flexible_coins_enabled and fail_count >= _TICKER_FAIL_THRESHOLD:
         try:
           removal = memory.remove_coin(
             symbol,
-            reason=f"Ticker unavailable during snapshot build: {exc}",
-            exit_plan="Auto-removed because KuCoin level1 ticker returned no data; re-add only after symbol availability is confirmed.",
+            reason=f"Ticker unavailable {fail_count} consecutive times: {exc}",
+            exit_plan="Auto-removed after repeated failures; re-add when symbol is confirmed available.",
           )
-          logger.warning("Removed unavailable symbol from active universe: %s", removal.get("symbol"))
+          logger.warning("Removed unavailable symbol from active universe after %d failures: %s", fail_count, removal.get("symbol"))
+          _TICKER_FAIL_COUNTS.pop(symbol, None)
         except Exception as remove_exc:
           logger.warning("Failed to remove unavailable symbol %s: %s", symbol, remove_exc)
 
