@@ -99,3 +99,27 @@ def test_in_memory_cache_avoids_extra_disk_reads(tmp_path, monkeypatch):
     _ = store.get_coins()
     _ = store.get_coins()
     assert write_count == 0
+
+
+def test_performance_summary_empty(store):
+    summary = store.performance_summary()
+    assert summary["totalTrades"] == 0
+
+
+def test_performance_summary_with_decisions(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=True, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=True, price=51000.0, size=0.002)
+    store.record_trade("ETH-USDT", "buy", 50.0, paper=True, price=3000.0, size=0.016)
+    store.record_trade("ETH-USDT", "sell", 50.0, paper=True, price=2900.0, size=0.016)
+    # Log decisions with PnL
+    store.log_decision("BTC-USDT", "spot_sell", 0.7, "take profit", pnl=2.0)
+    store.log_decision("ETH-USDT", "spot_sell", 0.6, "stop loss", pnl=-1.5)
+    summary = store.performance_summary()
+    assert summary["totalTrades"] == 4
+    assert summary["closedWithPnl"] == 2
+    assert summary["wins"] == 1
+    assert summary["losses"] == 1
+    assert summary["winRate"] == 0.5
+    assert summary["totalRealizedPnl"] == 0.5
+    assert summary["avgWin"] == 2.0
+    assert summary["avgLoss"] == -1.5

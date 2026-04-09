@@ -101,11 +101,18 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
   bb_mid = latest["bb_mid"] if pd.notna(latest["bb_mid"]) else None
   vwap = latest["vwap"] if pd.notna(latest["vwap"]) else None
 
-  bias = "bullish" if (latest["ema_fast"] > latest["ema_slow"]) and (latest["rsi"] >= 50) else "bearish"
-  if latest["ema_fast"] > latest["ema_slow"] and 45 <= latest["rsi"] < 50:
+  ema_bullish = latest["ema_fast"] > latest["ema_slow"]
+  rsi = latest["rsi"]
+  if ema_bullish and rsi >= 45:
+    bias = "bullish"
+  elif not ema_bullish and rsi <= 55:
+    bias = "bearish"
+  elif ema_bullish and 40 <= rsi < 45:
     bias = "neutral-to-bullish"
-  elif latest["ema_fast"] < latest["ema_slow"] and 50 > latest["rsi"] >= 45:
+  elif not ema_bullish and 55 < rsi <= 60:
     bias = "neutral-to-bearish"
+  else:
+    bias = "neutral"
 
   volatility = "elevated" if atr_pct and atr_pct >= 3 else "normal"
   bb_pos = None
@@ -114,11 +121,13 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
 
   commentary: list[str] = []
   if bias.startswith("bullish"):
-    commentary.append("Momentum leaning bullish (fast EMA above slow, RSI>50).")
+    commentary.append("Momentum leaning bullish (fast EMA above slow, RSI supportive).")
   elif bias.startswith("bearish"):
-    commentary.append("Momentum leaning bearish (fast EMA below slow or RSI<50).")
+    commentary.append("Momentum leaning bearish (fast EMA below slow, RSI confirming).")
+  elif bias.startswith("neutral-to"):
+    commentary.append("Momentum transitioning; early directional signal, confirm with price action.")
   else:
-    commentary.append("Momentum mixed; wait for confirmation.")
+    commentary.append("Momentum neutral; no clear directional edge.")
   if atr_pct:
     commentary.append(f"ATR {atr_pct:.2f}% of price ({'high' if volatility=='elevated' else 'moderate'} volatility).")
   if vwap and close > vwap:
@@ -152,22 +161,66 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
 
 
 def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
-  bullish = sum(1 for s in snapshots if s["trend_bias"].startswith("bullish"))
-  bearish = sum(1 for s in snapshots if s["trend_bias"].startswith("bearish"))
+  # Use the longest interval as primary driver; shorter interval as confirmation.
+  ordered = sorted(snapshots, key=lambda s: INTERVAL_SECONDS.get(s.get("interval", ""), 0), reverse=True)
+  primary = ordered[0] if ordered else {}
+  secondary = ordered[1] if len(ordered) > 1 else None
 
-  bias = "mixed"
-  if bullish == len(snapshots):
-    bias = "bullish"
-  elif bearish == len(snapshots):
-    bias = "bearish"
+  def _direction(bias: str) -> str:
+    if bias.startswith("bullish") or bias == "neutral-to-bullish":
+      return "bullish"
+    if bias.startswith("bearish") or bias == "neutral-to-bearish":
+      return "bearish"
+    return "neutral"
+
+  primary_dir = _direction(primary.get("trend_bias", "neutral"))
+  secondary_dir = _direction(secondary.get("trend_bias", "neutral")) if secondary else "neutral"
+
+  # Overall bias follows the primary (1h) interval.
+  overall_bias = primary_dir
+
+  # Strength: strong (both agree), moderate (primary clear, secondary neutral), weak (conflicting).
+  if primary_dir == secondary_dir and primary_dir != "neutral":
+    strength = "strong"
+  elif primary_dir != "neutral" and secondary_dir == "neutral":
+    strength = "moderate"
+  elif primary_dir != "neutral" and secondary_dir != primary_dir and secondary_dir != "neutral":
+    strength = "weak"
+  elif primary_dir != "neutral":
+    strength = "moderate"
+  else:
+    strength = "weak"
+    overall_bias = "neutral"
 
   vol_flags = [s.get("volatility") for s in snapshots]
   volatility = "elevated" if any(v == "elevated" for v in vol_flags) else "normal"
 
-  entry_hint = "Wait for alignment across timeframes before entering."
-  if bias == "bullish":
-    entry_hint = "Look for pullbacks above VWAP or mid-Bollinger with RSI>50; avoid chasing if ATR% is high."
-  elif bias == "bearish":
-    entry_hint = "Consider fades below VWAP with lower highs; size down if volatility is elevated."
+  # Always-actionable entry hints — never "Wait".
+  if overall_bias == "bullish":
+    if strength == "strong":
+      entry_hint = "Strong bullish alignment; look for pullbacks to VWAP or mid-Bollinger for long entries."
+    elif strength == "moderate":
+      entry_hint = "1h bullish but 15m not confirmed; consider reduced size long on pullback to support."
+    else:
+      entry_hint = "Weak bullish signal; use smaller size, tight stops, favor scalps over swings."
+  elif overall_bias == "bearish":
+    if strength == "strong":
+      entry_hint = "Strong bearish alignment; look for rallies to VWAP or mid-Bollinger for short entries."
+    elif strength == "moderate":
+      entry_hint = "1h bearish but 15m not confirmed; consider reduced size short near resistance."
+    else:
+      entry_hint = "Weak bearish signal; use smaller size, tight stops, favor scalps over swings."
+  else:
+    entry_hint = "No clear directional bias; consider range-bound strategies or reduce size significantly."
 
-  return {"overall_bias": bias, "volatility": volatility, "entry_hint": entry_hint}
+  if volatility == "elevated":
+    entry_hint += " Volatility elevated — widen stops and reduce size."
+
+  return {
+    "overall_bias": overall_bias,
+    "strength": strength,
+    "volatility": volatility,
+    "entry_hint": entry_hint,
+    "primary_interval": primary.get("interval"),
+    "secondary_interval": secondary.get("interval") if secondary else None,
+  }

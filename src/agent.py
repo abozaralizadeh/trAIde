@@ -910,11 +910,10 @@ def run_trading_agent(
       min_profit_usd = cfg.trading.min_net_profit_usd
       min_roi = cfg.trading.min_profit_roi_pct
 
-      if (expected_pnl < min_profit_usd or roi_pct < min_roi) and not allow_loss:
+      if expected_pnl < 0 and not allow_loss:
         return {
           "rejected": True,
-          "rejected": True,
-          "reason": f"Sell below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI after slippage)",
+          "reason": f"Sell at a loss (expected PnL ${expected_pnl:.4f}); include 'stop loss' or 'cut loss' in rationale to allow",
           "breakevenPrice": breakeven_px,
           "expectedPnl": expected_pnl,
           "expectedRoi": roi_pct,
@@ -1514,11 +1513,11 @@ def run_trading_agent(
             min_profit_usd = cfg.trading.min_net_profit_usd
             min_roi = cfg.trading.min_profit_roi_pct
             
-            # If PnL is below threshold (and not allowed loss), reject
-            if (net_pnl < min_profit_usd or roi_pct < min_roi) and not allow_loss_keyword:
+            # For closing trades: allow any non-negative PnL. Only block actual losses without explicit keyword.
+            if net_pnl < 0 and not allow_loss_keyword:
                return {
                 "rejected": True,
-                "reason": f"Closing trade below profit threshold (min ${min_profit_usd:.2f}, {min_roi*100:.2f}% ROI after slippage)",
+                "reason": f"Closing at a loss (expected PnL ${net_pnl:.4f}); include 'stop loss' or 'cut loss' in rationale to allow",
                 "expectedPnl": net_pnl,
                 "expectedRoi": roi_pct,
                 "minProfitUsd": min_profit_usd,
@@ -2642,9 +2641,17 @@ def run_trading_agent(
     "- drawdownPct >15%: use half normal size, prioritize recovery setups (strong momentum, tight stops).\n"
     "- You can always trade — the goal is to recover, not to sit idle.\n\n"
 
+    "## Performance awareness:\n"
+    "- Check the performanceSummary field in your input: it shows your recent win rate, avg win/loss, total PnL.\n"
+    "- If win rate is below 40%: prioritize higher-conviction setups and tighter stops.\n"
+    "- If avg loss exceeds avg win by 2x+: your stops may be too wide — tighten them.\n"
+    "- If total realized PnL is negative: focus on smaller positions until you find a winning pattern.\n"
+    "- Use this data to adapt — don't repeat losing patterns.\n\n"
+
     "## Coin universe management:\n"
     "- Use list_coins/add_coin/remove_coin to curate the universe. Remove a coin only with a documented reason and exit plan.\n"
-    "- Hand off to Research Agent when idle (no open positions, no clear setup) to scout new opportunities or catalysts.\n"
+    "- Hand off to Research Agent proactively: when no high-conviction setup exists in current coins, OR after completing a trade to find the next opportunity.\n"
+    "- If the current universe has fewer than 3 active coins, immediately hand off to Research Agent to expand it.\n"
     "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) before deciding.\n\n"
 
     "## Narrative:\n"
@@ -2736,6 +2743,7 @@ def run_trading_agent(
   user_state_obj["positions"] = positions
   user_state_obj["fees"] = fees
   user_state_obj["triggers"] = triggers
+  user_state_obj["performanceSummary"] = memory.performance_summary()
   research_context: Dict[str, Any] = {}
   if latest_plan_entry:
     research_context["latestPlan"] = latest_plan_entry

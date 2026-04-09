@@ -16,9 +16,9 @@ logger = logging.getLogger(__name__)
 MAX_PLANS = 3
 MAX_TRIGGERS = 5
 MAX_COINS = 50
-MAX_TRADES = 10
+MAX_TRADES = 100
 MAX_SENTIMENTS = 10
-MAX_DECISIONS = 10
+MAX_DECISIONS = 50
 MAX_FEES = 3
 
 
@@ -551,6 +551,44 @@ class MemoryStore:
       pos["unrealizedPnl"] = unrealized
       pos["currentPrice"] = cur_price or None
     return positions
+
+  def performance_summary(self) -> Dict[str, Any]:
+    """Compute win/loss stats from recorded decisions that include PnL."""
+    with self._lock:
+      data = self._prune(self._read())
+      trades = data.get("trades", [])
+      decisions = data.get("decisions", [])
+
+    if not trades:
+      return {"totalTrades": 0, "message": "No trade history yet."}
+
+    realized_pnls: list[float] = []
+    for d in decisions:
+      pnl = d.get("pnl")
+      if pnl is not None:
+        try:
+          realized_pnls.append(float(pnl))
+        except (TypeError, ValueError):
+          pass
+
+    wins = [p for p in realized_pnls if p > 0]
+    losses = [p for p in realized_pnls if p < 0]
+
+    total_realized = sum(realized_pnls)
+    win_rate = len(wins) / len(realized_pnls) if realized_pnls else 0.0
+
+    return {
+      "totalTrades": len(trades),
+      "closedWithPnl": len(realized_pnls),
+      "wins": len(wins),
+      "losses": len(losses),
+      "winRate": round(win_rate, 3),
+      "totalRealizedPnl": round(total_realized, 4),
+      "avgWin": round(sum(wins) / len(wins), 4) if wins else 0.0,
+      "avgLoss": round(sum(losses) / len(losses), 4) if losses else 0.0,
+      "bestTrade": round(max(wins), 4) if wins else 0.0,
+      "worstTrade": round(min(losses), 4) if losses else 0.0,
+    }
 
   def reset_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:
     """Reset daily drawdown baseline to current_usdt."""
