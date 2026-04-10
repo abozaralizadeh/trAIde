@@ -12,6 +12,7 @@ from .agent import TradingSnapshot, run_trading_agent, setup_tracing, setup_lstr
 from .config import load_config
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
+from .telegram import TelegramNotifier
 from .utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -214,6 +215,8 @@ async def trading_loop() -> None:
   last_prices: Dict[str, float] = {}
   idle_polls = 0
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
+  notifier = TelegramNotifier(cfg)
+  notifier.notify_startup(cfg)
 
   logger.info("Starting trading loop...")
   while True:
@@ -221,6 +224,7 @@ async def trading_loop() -> None:
       snapshot = build_snapshot(cfg, kucoin, kucoin_futures, memory)
     except Exception as exc:
       logger.error("Snapshot failed, retrying after delay: %s", exc)
+      notifier.notify_error(str(exc), context="Snapshot build")
       await asyncio.sleep(cfg.trading.poll_interval_sec)
       continue
 
@@ -294,9 +298,11 @@ async def trading_loop() -> None:
         logger.info("--- Agent Decision Narrative ---\n%s", result["narrative"])
         if result.get("decisions"):
           logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
+        notifier.notify_agent_run(triggers or ["idle_threshold"], result)
       except Exception as exc:
         # Keep the loop alive across restarts and transient errors.
         logger.error("Agent run failed: %s", exc)
+        notifier.notify_error(str(exc), context="Agent run")
     else:
       idle_polls += 1
       logger.info("No triggers. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)

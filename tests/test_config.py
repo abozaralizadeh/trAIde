@@ -1,5 +1,5 @@
 import pytest
-from src.config import AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig, TradingConfig, LangsmithConfig, validate_config
+from src.config import AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig, TradingConfig, LangsmithConfig, TelegramConfig, validate_config
 
 
 def _make_valid_config(**overrides) -> AppConfig:
@@ -29,6 +29,7 @@ def _make_valid_config(**overrides) -> AppConfig:
         kucoin_futures=KucoinFuturesConfig(enabled=False, base_url="https://api-futures.kucoin.com"),
         trading=TradingConfig(**trading_kwargs),
         langsmith=LangsmithConfig(enabled=False, api_key=None, project=None, api_url=None, tracing=False),
+        telegram=TelegramConfig(enabled=False, bot_token="", chat_id="", silent=False),
         tracing_enabled=False,
         console_tracing=False,
         openai_trace_api_key=None,

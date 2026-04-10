@@ -64,6 +64,14 @@ class TradingConfig:
 
 
 @dataclass
+class TelegramConfig:
+  enabled: bool
+  bot_token: str
+  chat_id: str
+  silent: bool
+
+
+@dataclass
 class LangsmithConfig:
   enabled: bool
   api_key: Optional[str]
@@ -80,6 +88,7 @@ class AppConfig:
   kucoin_futures: KucoinFuturesConfig
   trading: TradingConfig
   langsmith: LangsmithConfig
+  telegram: TelegramConfig
   tracing_enabled: bool
   console_tracing: bool
   openai_trace_api_key: Optional[str]
@@ -141,6 +150,12 @@ def load_config() -> AppConfig:
       project=os.getenv("LANGSMITH_PROJECT"),
       api_url=os.getenv("LANGSMITH_API_URL"),
       tracing=_as_bool(os.getenv("LANGSMITH_TRACING"), False),
+    ),
+    telegram=TelegramConfig(
+      enabled=_as_bool(os.getenv("TELEGRAM_ENABLED"), False),
+      bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
+      chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+      silent=_as_bool(os.getenv("TELEGRAM_SILENT"), False),
     ),
     tracing_enabled=_as_bool(os.getenv("ENABLE_TRACING"), False),
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),

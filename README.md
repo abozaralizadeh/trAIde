@@ -15,6 +15,47 @@ autonomous AI Agent crypto trader powered by Azure OpenAI and Kucoin APIs in Pyt
 - Tracing: set `ENABLE_TRACING=true` to enable Agents SDK spans. Optional: `ENABLE_CONSOLE_TRACING=true` for console span export; `OPENAI_TRACE_API_KEY` to export to the OpenAI traces endpoint; and OTLP envs (`OTEL_EXPORTER_OTLP_ENDPOINT`/`OTEL_EXPORTER_OTLP_HEADERS`) for Azure Monitor/APIM ingestion per the tutorial.
 - Transfers: Flex transfers are supported via the agent tool to move funds between spot (trade) and futures (contract) when enabled.
 
+## Telegram Notifications
+
+Get real-time updates on your phone for every trading decision, order execution, and error.
+
+### 1. Create a Telegram bot
+1. Open Telegram and search for **@BotFather**.
+2. Send `/newbot` and follow the prompts to choose a name and username.
+3. BotFather replies with your **bot token** (e.g., `123456:ABC-DEF1234...`). Save it.
+
+### 2. Get your chat ID
+1. Start a conversation with your new bot (search its username and press **Start**).
+2. Send any message to the bot (e.g., "hello").
+3. Open this URL in your browser (replace `<BOT_TOKEN>` with your token):
+   ```
+   https://api.telegram.org/bot<BOT_TOKEN>/getUpdates
+   ```
+4. In the JSON response, find `"chat":{"id":123456789}` — that number is your **chat ID**.
+
+### 3. Configure `.env`
+```env
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+TELEGRAM_CHAT_ID=123456789
+TELEGRAM_SILENT=false
+```
+
+| Variable | Description |
+|----------|-------------|
+| `TELEGRAM_ENABLED` | `true` to activate notifications, `false` to disable (default: `false`) |
+| `TELEGRAM_BOT_TOKEN` | Bot token from @BotFather |
+| `TELEGRAM_CHAT_ID` | Your personal or group chat ID |
+| `TELEGRAM_SILENT` | `true` to send notifications without sound (default: `false`) |
+
+### What you'll receive
+- **Startup** — bot mode (live/paper), active coins, max position, leverage, futures status.
+- **Agent run summaries** — triggers that fired, every order placed (symbol, side, price, TP/SL, RR ratio, paper/live), declines with reason and confidence, and a narrative excerpt.
+- **Order details** — full breakdown of each executed order including stop-loss, take-profit, expected PnL for sells, and order ID.
+- **Errors** — immediate alerts when the agent run or snapshot build fails, so you know if the bot needs attention.
+
+Messages are sent asynchronously via a background thread and never block the trading loop. If Telegram is unreachable, failures are logged and silently skipped.
+
 ## Install & Run
 ```bash
 python -m venv .venv
