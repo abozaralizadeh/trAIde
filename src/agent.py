@@ -154,6 +154,24 @@ def _to_float(val: Any, default: float = 0.0) -> float:
     return default
 
 
+def _truncate_to_increment(value: float, increment: str) -> str:
+  """Truncate *value* down to the nearest allowed increment (e.g. '0.01' → 2 decimals).
+
+  KuCoin rejects orders whose size doesn't match the symbol's baseIncrement.
+  We always truncate (floor) rather than round to avoid exceeding the available balance.
+  """
+  inc = float(increment)
+  if inc <= 0:
+    return f"{value:.8f}"
+  # Number of decimal places implied by the increment string (e.g. '0.001' → 3).
+  if "." in increment:
+    decimals = len(increment.rstrip("0").split(".")[-1])
+  else:
+    decimals = 0
+  truncated = math.floor(value / inc) * inc
+  return f"{truncated:.{decimals}f}"
+
+
 def _aggregate_account_totals(accounts: List[KucoinAccount]) -> Dict[str, Dict[str, float]]:
   totals: Dict[str, Dict[str, float]] = {}
   for acct in accounts:
@@ -805,6 +823,14 @@ def run_trading_agent(
     price = mark_price
     size_est = funds_val / price if price else 0.0
 
+    # Fetch symbol info for size/price increments so orders conform to exchange rules.
+    try:
+      sym_info = kucoin.get_symbol_info(symbol)
+    except Exception as exc:
+      logger.warning("Failed to fetch symbol info for %s: %s", symbol, exc)
+      sym_info = {}
+    base_increment = sym_info.get("baseIncrement", "0.00000001")
+
     planned_stop = None
     planned_tp = None
     rr_actual = None
@@ -932,7 +958,7 @@ def run_trading_agent(
           }
         logger.info("Selling %s (unknown entry) - Size: %.8f at price: %.6f", symbol, size_est, price)
 
-      order_req.size = f"{size_est:.8f}"
+      order_req.size = _truncate_to_increment(size_est, base_increment)
       order_req.funds = None
     else:
       if size_est <= 0:
@@ -1035,11 +1061,18 @@ def run_trading_agent(
     ok, reason = _stop_distance_ok(symbol, validation_side, stop_price_f, ref_px, fees.get("spot_taker", 0.001))
     if not ok:
       return {"rejected": True, "reason": reason, "price": ref_px, "stop": stop_price_f}
+    # Fetch symbol info to respect baseIncrement for size.
+    try:
+      sym_info = kucoin.get_symbol_info(symbol)
+    except Exception:
+      sym_info = {}
+    base_inc = sym_info.get("baseIncrement", "0.00000001")
+
     order_req = KucoinOrderRequest(
       symbol=symbol,
       side="buy" if side == "buy" else "sell",
       type="limit" if order_type == "limit" else "market",
-      size=f"{size}" if size is not None else None,
+      size=_truncate_to_increment(float(size), base_inc) if size is not None else None,
       funds=f"{funds:.2f}" if funds is not None else None,
       price=f"{limit_price:.6f}" if limit_price is not None else None,
       clientOid=client_oid or str(uuid.uuid4()),

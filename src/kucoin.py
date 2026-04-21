@@ -376,6 +376,15 @@ class KucoinClient:
     # API returns list of [time, open, close, high, low, volume, turnover].
     return data
 
+  def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
+    """Fetch symbol details (baseIncrement, quoteIncrement, baseMinSize, etc.)."""
+    data = self._request("GET", "/api/v2/symbols", query={"symbol": symbol})
+    if isinstance(data, list) and data:
+      return data[0]
+    if isinstance(data, dict):
+      return data
+    return {}
+
   def get_orderbook_levels(self, symbol: str, depth: int = 20) -> Dict[str, Any]:
     """Fetch level2 orderbook snapshot. Depth must be 20 or 100."""
     depth_allowed = 20 if depth <= 20 else 100
