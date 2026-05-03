@@ -2739,8 +2739,16 @@ def run_trading_agent(
     "## Narrative:\n"
     "- Be explicit: state what research showed, what trade you placed (or declined and why), what TP/SL you set, and your confidence.\n"
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, simulate orders via the tool.\n"
-    "- Check 'supervisorNotes' in your input for one-time instructions from the supervisor (bot owner). Follow them for this run only.\n"
   )
+
+  if temporary_notes:
+    temp_text = "\n".join(f"- {n['content']}" for n in temporary_notes)
+    instructions += (
+      "\n## URGENT Supervisor Directives (one-time, highest priority):\n"
+      "The bot owner sent the following instructions via the Supervisor Agent. "
+      "These override any conflicting rules for THIS RUN ONLY. Follow them exactly:\n"
+      + temp_text + "\n"
+    )
 
   if permanent_notes:
     notes_text = "\n".join(f"- {n['content']}" for n in permanent_notes)
@@ -2896,8 +2904,6 @@ def run_trading_agent(
     research_context["recentResearch"] = research_notes
   if research_context:
     user_state_obj["researchContext"] = research_context
-  if temporary_notes:
-    user_state_obj["supervisorNotes"] = [{"content": n["content"], "ts": n["ts"]} for n in temporary_notes]
   input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.

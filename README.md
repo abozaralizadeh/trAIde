@@ -56,6 +56,50 @@ TELEGRAM_SILENT=false
 
 Messages are sent asynchronously via a background thread and never block the trading loop. If Telegram is unreachable, failures are logged and silently skipped.
 
+## Supervisor Agent (Interactive Telegram Bot)
+
+Talk back to the bot. The Supervisor Agent listens for your Telegram messages, processes them through an AI agent with full read access to the system, and replies in the same chat.
+
+### What it can do
+- **Query status** — ask about positions, balances, performance, win rate, recent trades, or recent decisions. It fetches live data from KuCoin and agent memory.
+- **Read & search logs** — ask it to check logs for errors, search for a specific symbol, or show the last N lines.
+- **Read source code** — inspect any file in the `src/` directory.
+- **View configuration** — see all non-secret config values (API keys are never exposed).
+- **Web search** — search the web for market context, news, or any other information.
+- **Write notes for the trading agent** — influence the trading agent's behavior:
+  - **Temporary notes** (one-time, highest priority): injected into the trading agent's system prompt on the next run only, then auto-deleted. These override any conflicting rules. Example: "Close all BTC positions immediately."
+  - **Permanent notes**: added to the trading agent's system prompt on every run until manually deleted. Example: "Never trade DOGE-USDT."
+- **Conversation memory** — the supervisor remembers the last 3 exchanges and maintains a rolling summary of older conversations, so you can have multi-turn dialogues without repeating context.
+
+### Enable it
+Add to your `.env`:
+```env
+SUPERVISOR_ENABLED=true
+TELEGRAM_ENABLED=true
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+| Variable | Description |
+|----------|-------------|
+| `SUPERVISOR_ENABLED` | `true` to start the interactive bot (default: `false`) |
+| `LOG_FILE` | Log file path the supervisor reads (default: `traide.log`) |
+| `LOG_MAX_BYTES` | Max log file size before rotation (default: `5242880` / 5MB) |
+| `LOG_BACKUP_COUNT` | Number of rotated log backups (default: `3`) |
+
+The supervisor runs as a daemon thread alongside the trading loop, using Telegram long-polling. Only messages from the configured `TELEGRAM_CHAT_ID` are processed; all others are silently ignored.
+
+### Example commands
+- "What's my current P&L?"
+- "Show me the last 5 trades"
+- "Search logs for ERROR"
+- "Add a temporary note: skip all trades this run, market is too volatile"
+- "Add a permanent note: always check BTC dominance before trading altcoins"
+- "List all notes"
+- "Delete permanent note 0"
+- "What's the current config?"
+- "Show me my KuCoin balances"
+
 ## Install & Run
 ```bash
 python -m venv .venv

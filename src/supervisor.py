@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from agents import Agent, OpenAIResponsesModel, Runner
-from agents.tool import function_tool
+from agents.tool import WebSearchTool, function_tool
 from openai import AsyncAzureOpenAI
 
 from .config import AppConfig
+from .conversation_memory import ConversationMemory
 from .kucoin import KucoinClient, KucoinFuturesClient
 from .memory import MemoryStore
 
@@ -265,12 +266,24 @@ def run_supervisor_agent(
     "- For permanent notes: phrase as an ongoing rule (e.g., 'Always check BTC dominance chart before trading altcoins').\n"
     "- You cannot place trades directly. Use notes to influence the trading agent's behavior.\n"
     "- If asked to analyze something, use the available tools to gather data first, then provide your analysis.\n"
+    "- You have conversation memory. Use prior context when relevant, but always fetch fresh data via tools.\n"
   )
+
+  conv_memory = ConversationMemory(
+    file_path=Path(cfg.memory_file).with_name(".supervisor_conversation.json"),
+    recent_count=3,
+    max_context_message_chars=500,
+  )
+
+  context = conv_memory.get_context()
+  if context:
+    instructions += "\n## Conversation History:\n" + context + "\n"
 
   supervisor_agent = Agent(
     name="Supervisor Agent",
     instructions=instructions,
     tools=[
+      WebSearchTool(search_context_size="high"),
       read_logs,
       search_logs,
       read_memory,
@@ -291,4 +304,48 @@ def run_supervisor_agent(
   )
 
   result = asyncio.run(Runner.run(supervisor_agent, message_text, max_turns=30))
-  return str(result.final_output)
+  response = str(result.final_output)
+
+  conv_memory.add_exchange(message_text, response)
+
+  if conv_memory.needs_compaction():
+    _compact_conversation(conv_memory, openai_client, cfg.azure.deployment)
+
+  return response
+
+
+def _compact_conversation(
+  conv_memory: ConversationMemory,
+  openai_client: AsyncAzureOpenAI,
+  deployment: str,
+) -> None:
+  """Summarize older messages using the LLM, keeping only recent exchanges."""
+
+  def summarizer(existing_summary: str, old_messages: list) -> str:
+    formatted = "\n".join(
+      f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:800]}"
+      for m in old_messages
+    )
+    prompt = (
+      "Summarize this conversation between a crypto trading bot owner and a supervisor assistant. "
+      "Capture: key questions asked, important answers/findings, any instructions or directives given, "
+      "and ongoing topics of interest. Be concise (max 300 words).\n\n"
+    )
+    if existing_summary:
+      prompt += f"Existing summary to incorporate:\n{existing_summary}\n\n"
+    prompt += f"New messages to summarize:\n{formatted}"
+
+    async def _call() -> str:
+      resp = await openai_client.chat.completions.create(
+        model=deployment,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=500,
+      )
+      return resp.choices[0].message.content or ""
+
+    return asyncio.run(_call())
+
+  try:
+    conv_memory.compact(summarizer)
+  except Exception as exc:
+    logger.warning("Supervisor conversation compaction failed: %s", exc)
