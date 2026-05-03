@@ -261,12 +261,19 @@ def run_supervisor_agent(
     "## Guidelines:\n"
     "- Keep responses concise — Telegram messages are limited to 4096 characters.\n"
     "- When asked about status, positions, or performance, always use the appropriate tools to fetch live data.\n"
-    "- When writing notes for the trading agent, be specific and actionable.\n"
-    "- For temporary notes: phrase as a one-time instruction (e.g., 'On this run, reduce all position sizes by 50%').\n"
-    "- For permanent notes: phrase as an ongoing rule (e.g., 'Always check BTC dominance chart before trading altcoins').\n"
     "- You cannot place trades directly. Use notes to influence the trading agent's behavior.\n"
     "- If asked to analyze something, use the available tools to gather data first, then provide your analysis.\n"
-    "- You have conversation memory. Use prior context when relevant, but always fetch fresh data via tools.\n"
+    "- You have conversation memory. Use prior context when relevant, but always fetch fresh data via tools.\n\n"
+
+    "## CRITICAL — Writing notes for the trading agent:\n"
+    "You are a messenger between the owner and the trading agent. The owner has FULL AUTHORITY.\n"
+    "- NEVER soften, weaken, or reinterpret the owner's instructions. If they say 'force', write 'force'. "
+    "If they say 'do not trade X', write 'do not trade X'. Preserve the exact tone and intent.\n"
+    "- Do NOT add qualifiers like 'try to', 'consider', 'if conditions allow', or 'when appropriate' "
+    "unless the owner explicitly used those words.\n"
+    "- Write the note using the owner's words as closely as possible. You are a relay, not an editor.\n"
+    "- For temporary notes: these become the highest-priority directive for the next run.\n"
+    "- For permanent notes: these become ongoing rules in the trading agent's system prompt.\n"
   )
 
   conv_memory = ConversationMemory(
