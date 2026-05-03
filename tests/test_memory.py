@@ -101,6 +101,44 @@ def test_in_memory_cache_avoids_extra_disk_reads(tmp_path, monkeypatch):
     assert write_count == 0
 
 
+def test_cross_instance_notes_survive_update_limits(tmp_path):
+    """Supervisor writes notes via one MemoryStore; main loop's update_limits must not erase them."""
+    path = str(tmp_path / "memory.json")
+    main_loop = MemoryStore(path, retention_days=7)
+    supervisor = MemoryStore(path, retention_days=7)
+
+    # Main loop populates cache via update_limits
+    main_loop.update_limits(1000.0, scope="total")
+
+    # Supervisor writes a temporary note (different instance, same file)
+    supervisor.add_temporary_note("reduce position sizes by 50%")
+
+    # Main loop does another update_limits (this used to overwrite the note)
+    main_loop.update_limits(990.0, scope="total")
+
+    # A fresh reader (like run_trading_agent creates) must see the note
+    agent = MemoryStore(path, retention_days=7)
+    notes = agent.consume_temporary_notes()
+    assert len(notes) == 1
+    assert "reduce position sizes" in notes[0]["content"]
+
+
+def test_cross_instance_permanent_notes_survive(tmp_path):
+    """Permanent notes written by supervisor must survive main loop writes."""
+    path = str(tmp_path / "memory.json")
+    main_loop = MemoryStore(path, retention_days=7)
+    supervisor = MemoryStore(path, retention_days=7)
+
+    main_loop.set_coins(["BTC-USDT"], reason="init")
+    supervisor.add_permanent_note("always check BTC dominance")
+    main_loop.update_limits(500.0, scope="total")
+
+    agent = MemoryStore(path, retention_days=7)
+    notes = agent.get_permanent_notes()
+    assert len(notes) == 1
+    assert "BTC dominance" in notes[0]["content"]
+
+
 def test_performance_summary_empty(store):
     summary = store.performance_summary()
     assert summary["totalTrades"] == 0

@@ -32,11 +32,19 @@ class MemoryStore:
     self._lock = threading.Lock()
     self.retention_days = retention_days
     self._cache: Dict[str, Any] | None = None
+    self._cache_mtime: float | None = None
     # Sanitize on init.
     self._read()
 
   def _read(self) -> Dict[str, Any]:
     _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}
+    if self._cache is not None:
+      try:
+        disk_mtime = self.path.stat().st_mtime
+        if disk_mtime != self._cache_mtime:
+          self._cache = None
+      except OSError:
+        pass
     if self._cache is not None:
       return copy.deepcopy(self._cache)
     if not self.path.exists():
@@ -146,6 +154,12 @@ class MemoryStore:
         data = self._prune(data)
         if data != raw:
           self._write(data)
+        else:
+          self._cache = copy.deepcopy(data)
+          try:
+            self._cache_mtime = self.path.stat().st_mtime
+          except OSError:
+            self._cache_mtime = None
         return data
     except Exception:
       return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}
@@ -197,6 +211,10 @@ class MemoryStore:
   def _write(self, data: Dict[str, Any]) -> None:
     self._cache = copy.deepcopy(data)
     self.path.write_text(json.dumps(data, indent=2))
+    try:
+      self._cache_mtime = self.path.stat().st_mtime
+    except OSError:
+      self._cache_mtime = None
 
   def save_plan(self, title: str, summary: str, actions: list[str], author: str | None = None) -> Dict[str, Any]:
     with self._lock:
