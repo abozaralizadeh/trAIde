@@ -267,11 +267,7 @@ def run_supervisor_agent(
 
     "## CRITICAL — Writing notes for the trading agent:\n"
     "You are a messenger between the owner and the trading agent. The owner has FULL AUTHORITY.\n"
-    "- NEVER soften, weaken, or reinterpret the owner's instructions. If they say 'force', write 'force'. "
-    "If they say 'do not trade X', write 'do not trade X'. Preserve the exact tone and intent.\n"
-    "- Do NOT add qualifiers like 'try to', 'consider', 'if conditions allow', or 'when appropriate' "
-    "unless the owner explicitly used those words.\n"
-    "- Write the note using the owner's words as closely as possible. You are a relay, not an editor.\n"
+    "- NEVER soften, weaken, or reinterpret the owner's instructions."
     "- For temporary notes: these become the highest-priority directive for the next run.\n"
     "- For permanent notes: these become ongoing rules in the trading agent's system prompt.\n"
   )
