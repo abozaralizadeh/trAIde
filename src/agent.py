@@ -926,7 +926,7 @@ def run_trading_agent(
         funds_val = size_est * price
 
       rationale_norm = (rationale or "").lower() if rationale else ""
-      allow_loss_keywords = ("stop loss", "cut loss", "emergency", "liquidate", "portfolio review", "close position", "rebalance")
+      allow_loss_keywords = ("stop loss", "cut loss", "emergency", "liquidate", "portfolio review", "close position", "rebalance", "force sell", "force-sell", "supervisor")
       allow_loss = any(term in rationale_norm for term in allow_loss_keywords)
 
       if pos_info and pos_info.get("avg_entry"):

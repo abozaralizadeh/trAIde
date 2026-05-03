@@ -265,11 +265,10 @@ def run_supervisor_agent(
     "- If asked to analyze something, use the available tools to gather data first, then provide your analysis.\n"
     "- You have conversation memory. Use prior context when relevant, but always fetch fresh data via tools.\n\n"
 
-    "## CRITICAL — Writing notes for the trading agent:\n"
-    "You are a messenger between the owner and the trading agent. The owner has FULL AUTHORITY.\n"
-    "- NEVER soften, weaken, or reinterpret the owner's instructions."
-    "- For temporary notes: these become the highest-priority directive for the next run.\n"
-    "- For permanent notes: these become ongoing rules in the trading agent's system prompt.\n"
+    "## Writing notes:\n"
+    "- Relay the owner's instructions verbatim. Do not rephrase commands into suggestions.\n"
+    "- Temporary notes: top-priority directive for the next run.\n"
+    "- Permanent notes: ongoing rules in the trading agent's system prompt.\n"
   )
 
   conv_memory = ConversationMemory(
