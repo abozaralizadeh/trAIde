@@ -308,44 +308,6 @@ def run_supervisor_agent(
 
   conv_memory.add_exchange(message_text, response)
 
-  if conv_memory.needs_compaction():
-    _compact_conversation(conv_memory, openai_client, cfg.azure.deployment)
+  conv_memory.compact_with_llm(model, context="a crypto trading bot owner and a supervisor assistant")
 
   return response
-
-
-def _compact_conversation(
-  conv_memory: ConversationMemory,
-  openai_client: AsyncAzureOpenAI,
-  deployment: str,
-) -> None:
-  """Summarize older messages using the LLM, keeping only recent exchanges."""
-
-  def summarizer(existing_summary: str, old_messages: list) -> str:
-    formatted = "\n".join(
-      f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:800]}"
-      for m in old_messages
-    )
-    prompt = (
-      "Summarize this conversation between a crypto trading bot owner and a supervisor assistant. "
-      "Capture: key questions asked, important answers/findings, any instructions or directives given, "
-      "and ongoing topics of interest. Be concise (max 300 words).\n\n"
-    )
-    if existing_summary:
-      prompt += f"Existing summary to incorporate:\n{existing_summary}\n\n"
-    prompt += f"New messages to summarize:\n{formatted}"
-
-    async def _call() -> str:
-      resp = await openai_client.chat.completions.create(
-        model=deployment,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=500,
-      )
-      return resp.choices[0].message.content or ""
-
-    return asyncio.run(_call())
-
-  try:
-    conv_memory.compact(summarizer)
-  except Exception as exc:
-    logger.warning("Supervisor conversation compaction failed: %s", exc)

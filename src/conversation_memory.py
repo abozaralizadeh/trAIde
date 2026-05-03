@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List
+
+from agents import Agent, Model, Runner
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +128,45 @@ class ConversationMemory:
       data["summary"] = new_summary
       data["messages"] = recent_messages
       self._write(data)
+
+  def compact_with_llm(self, model: Model, context: str = "an AI assistant and a user") -> None:
+    """Compact older messages using an LLM agent.
+
+    Args:
+      model: An Agents SDK model instance (e.g. OpenAIResponsesModel).
+      context: Short description of the conversation participants,
+               used in the summarization prompt.
+    """
+    if not self.needs_compaction():
+      return
+
+    compactor = Agent(
+      name="Conversation Compactor",
+      instructions=(
+        f"Summarize the conversation between {context}. "
+        "Capture: key questions asked, important answers/findings, any instructions or directives given, "
+        "and ongoing topics of interest. Be concise (max 300 words). Output only the summary, nothing else."
+      ),
+      model=model,
+    )
+
+    def summarizer(existing_summary: str, old_messages: List[Dict[str, Any]]) -> str:
+      formatted = "\n".join(
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:800]}"
+        for m in old_messages
+      )
+      prompt = ""
+      if existing_summary:
+        prompt += f"Existing summary to incorporate:\n{existing_summary}\n\n"
+      prompt += f"New messages to summarize:\n{formatted}"
+
+      result = asyncio.run(Runner.run(compactor, prompt, max_turns=1))
+      return str(result.final_output)
+
+    try:
+      self.compact(summarizer)
+    except Exception as exc:
+      logger.warning("LLM conversation compaction failed: %s", exc)
 
   def clear(self) -> None:
     with self._lock:
