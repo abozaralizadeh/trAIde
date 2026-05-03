@@ -72,6 +72,14 @@ class TelegramConfig:
 
 
 @dataclass
+class SupervisorConfig:
+  enabled: bool
+  log_file: str
+  log_max_bytes: int
+  log_backup_count: int
+
+
+@dataclass
 class LangsmithConfig:
   enabled: bool
   api_key: Optional[str]
@@ -89,6 +97,7 @@ class AppConfig:
   trading: TradingConfig
   langsmith: LangsmithConfig
   telegram: TelegramConfig
+  supervisor: SupervisorConfig
   tracing_enabled: bool
   console_tracing: bool
   openai_trace_api_key: Optional[str]
@@ -156,6 +165,12 @@ def load_config() -> AppConfig:
       bot_token=os.getenv("TELEGRAM_BOT_TOKEN", ""),
       chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
       silent=_as_bool(os.getenv("TELEGRAM_SILENT"), False),
+    ),
+    supervisor=SupervisorConfig(
+      enabled=_as_bool(os.getenv("SUPERVISOR_ENABLED"), True),
+      log_file=os.getenv("LOG_FILE", "traide.log"),
+      log_max_bytes=int(os.getenv("LOG_MAX_BYTES", "5242880")),
+      log_backup_count=int(os.getenv("LOG_BACKUP_COUNT", "3")),
     ),
     tracing_enabled=_as_bool(os.getenv("ENABLE_TRACING"), False),
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),

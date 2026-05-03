@@ -20,6 +20,8 @@ MAX_TRADES = 100
 MAX_SENTIMENTS = 10
 MAX_DECISIONS = 50
 MAX_FEES = 3
+MAX_TEMPORARY_NOTES = 20
+MAX_PERMANENT_NOTES = 10
 
 
 class MemoryStore:
@@ -34,7 +36,7 @@ class MemoryStore:
     self._read()
 
   def _read(self) -> Dict[str, Any]:
-    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
+    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}
     if self._cache is not None:
       return copy.deepcopy(self._cache)
     if not self.path.exists():
@@ -51,6 +53,8 @@ class MemoryStore:
         data.setdefault("sentiments", [])
         data.setdefault("decisions", [])
         data.setdefault("fees", [])
+        data.setdefault("supervisor_notes_temporary", [])
+        data.setdefault("supervisor_notes_permanent", [])
         # prune invalid entries while keeping timestamp
         data["plans"] = [
           p
@@ -144,7 +148,7 @@ class MemoryStore:
           self._write(data)
         return data
     except Exception:
-      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": []}
+      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}
 
   def _prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
     """Drop entries older than retention_days."""
@@ -165,6 +169,8 @@ class MemoryStore:
     data["sentiments"] = [s for s in data.get("sentiments", []) if (s.get("ts") or now) >= cutoff]
     data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
     data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
+    data["supervisor_notes_temporary"] = [n for n in data.get("supervisor_notes_temporary", []) if (n.get("ts") or now) >= cutoff]
+    data["supervisor_notes_permanent"] = [n for n in data.get("supervisor_notes_permanent", []) if (n.get("ts") or now) >= cutoff]
 
     def _cap_list(key: str, max_items: int) -> None:
       items = data.get(key) or []
@@ -183,6 +189,8 @@ class MemoryStore:
     _cap_list("sentiments", MAX_SENTIMENTS)
     _cap_list("decisions", MAX_DECISIONS)
     _cap_list("fees", MAX_FEES)
+    _cap_list("supervisor_notes_temporary", MAX_TEMPORARY_NOTES)
+    _cap_list("supervisor_notes_permanent", MAX_PERMANENT_NOTES)
 
     return data
 
@@ -630,3 +638,55 @@ class MemoryStore:
       data = self._prune(self._read())
       fees = data.get("fees") or []
       return fees[-1] if fees else None
+
+  def add_temporary_note(self, content: str, author: str = "Supervisor") -> Dict[str, Any]:
+    with self._lock:
+      data = self._prune(self._read())
+      entry = {"content": content, "author": author, "ts": int(time.time())}
+      data.setdefault("supervisor_notes_temporary", [])
+      data["supervisor_notes_temporary"].append(entry)
+      self._write(data)
+      return entry
+
+  def add_permanent_note(self, content: str, author: str = "Supervisor") -> Dict[str, Any]:
+    with self._lock:
+      data = self._prune(self._read())
+      entry = {"content": content, "author": author, "ts": int(time.time())}
+      data.setdefault("supervisor_notes_permanent", [])
+      data["supervisor_notes_permanent"].append(entry)
+      self._write(data)
+      return entry
+
+  def consume_temporary_notes(self) -> list[Dict[str, Any]]:
+    """Return all temporary notes and delete them atomically."""
+    with self._lock:
+      data = self._read()
+      notes = list(data.get("supervisor_notes_temporary") or [])
+      if notes:
+        data["supervisor_notes_temporary"] = []
+        self._write(data)
+      return notes
+
+  def get_permanent_notes(self) -> list[Dict[str, Any]]:
+    with self._lock:
+      data = self._read()
+      return list(data.get("supervisor_notes_permanent") or [])
+
+  def list_all_notes(self) -> Dict[str, Any]:
+    with self._lock:
+      data = self._read()
+      return {
+        "temporary": list(data.get("supervisor_notes_temporary") or []),
+        "permanent": list(data.get("supervisor_notes_permanent") or []),
+      }
+
+  def delete_permanent_note(self, index: int) -> Dict[str, Any]:
+    with self._lock:
+      data = self._read()
+      notes = data.get("supervisor_notes_permanent") or []
+      if index < 0 or index >= len(notes):
+        return {"error": f"Invalid index {index}; {len(notes)} permanent notes exist"}
+      removed = notes.pop(index)
+      data["supervisor_notes_permanent"] = notes
+      self._write(data)
+      return {"deleted": removed}

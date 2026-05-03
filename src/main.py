@@ -4,6 +4,8 @@ import asyncio
 import logging
 import signal
 import sys
+import threading
+from logging.handlers import RotatingFileHandler
 from typing import Dict
 
 from agents import set_default_openai_client
@@ -315,6 +317,23 @@ def main() -> None:
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
   )
+  cfg = load_config()
+
+  if cfg.supervisor.log_file:
+    fh = RotatingFileHandler(
+      cfg.supervisor.log_file,
+      maxBytes=cfg.supervisor.log_max_bytes,
+      backupCount=cfg.supervisor.log_backup_count,
+    )
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(fh)
+
+  if cfg.supervisor.enabled and cfg.telegram.enabled:
+    from .telegram_bot import start_telegram_bot
+    bot_thread = threading.Thread(target=start_telegram_bot, args=(cfg,), daemon=True, name="supervisor-bot")
+    bot_thread.start()
+    logger.info("Supervisor Telegram bot started.")
+
   loop = asyncio.new_event_loop()
   asyncio.set_event_loop(loop)
   loop.add_signal_handler(signal.SIGTERM, loop.stop)

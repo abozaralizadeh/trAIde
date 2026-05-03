@@ -477,6 +477,8 @@ def run_trading_agent(
 
   allowed_symbols = set(snapshot.tickers.keys())
   memory = MemoryStore(cfg.memory_file)
+  permanent_notes = memory.get_permanent_notes()
+  temporary_notes = memory.consume_temporary_notes()
   current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
 
   def _repair_allowed_symbol(requested_symbol: str) -> str | None:
@@ -2737,7 +2739,16 @@ def run_trading_agent(
     "## Narrative:\n"
     "- Be explicit: state what research showed, what trade you placed (or declined and why), what TP/SL you set, and your confidence.\n"
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, simulate orders via the tool.\n"
+    "- Check 'supervisorNotes' in your input for one-time instructions from the supervisor (bot owner). Follow them for this run only.\n"
   )
+
+  if permanent_notes:
+    notes_text = "\n".join(f"- {n['content']}" for n in permanent_notes)
+    instructions += (
+      "\n## Supervisor Directives (permanent):\n"
+      "The following instructions were set by the bot owner via the Supervisor Agent. "
+      "Treat them as additional rules:\n" + notes_text + "\n"
+    )
 
   # Secondary research agent to scout new coins while idle.
   research_agent = Agent(
@@ -2885,6 +2896,8 @@ def run_trading_agent(
     research_context["recentResearch"] = research_notes
   if research_context:
     user_state_obj["researchContext"] = research_context
+  if temporary_notes:
+    user_state_obj["supervisorNotes"] = [{"content": n["content"], "ts": n["ts"]} for n in temporary_notes]
   input_payload = json.dumps(user_state_obj)
 
   # Ensure a fresh trace per agent loop using the official processor setup and a unique trace_id.

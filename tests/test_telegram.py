@@ -5,7 +5,7 @@ import pytest
 
 from src.config import (
   AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig,
-  TradingConfig, LangsmithConfig, TelegramConfig,
+  TradingConfig, LangsmithConfig, TelegramConfig, SupervisorConfig,
 )
 from src.telegram import TelegramNotifier, _esc, _fmt_price, _format_orders, MAX_MESSAGE_LENGTH
 
@@ -37,6 +37,7 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     trading=TradingConfig(**trading_kwargs),
     langsmith=LangsmithConfig(enabled=False, api_key=None, project=None, api_url=None, tracing=False),
     telegram=TelegramConfig(enabled=telegram_enabled, bot_token=bot_token, chat_id=chat_id, silent=silent),
+    supervisor=SupervisorConfig(enabled=False, log_file="traide.log", log_max_bytes=5242880, log_backup_count=3),
     tracing_enabled=False,
     console_tracing=False,
     openai_trace_api_key=None,
