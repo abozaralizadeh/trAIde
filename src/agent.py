@@ -1579,10 +1579,10 @@ def run_trading_agent(
             else:
               raw_pnl = (pos_entry - price) * close_size
               
-            # Approximate fees on the close (fees on entry are sunk cost)
-            # But to be safe, let's deduct the exit fee from the PnL
+            # Deduct fees on both entry and exit for accurate net PnL.
+            entry_fee = pos_entry * close_size * (fee_rate + slippage_rate)
             exit_fee = price * close_size * (fee_rate + slippage_rate)
-            net_pnl = raw_pnl - exit_fee
+            net_pnl = raw_pnl - entry_fee - exit_fee
             
             entry_value = pos_entry * close_size
             roi_pct = 0.0
@@ -1594,7 +1594,7 @@ def run_trading_agent(
               
             # Re-check allow_loss rationale
             rationale_norm = (rationale or "").lower() if rationale else ""
-            allow_loss_keyword = any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate"))
+            allow_loss_keyword = any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate", "portfolio review", "close position", "rebalance", "force sell", "force-sell", "supervisor"))
             
             min_profit_usd = cfg.trading.min_net_profit_usd
             min_roi = cfg.trading.min_profit_roi_pct
@@ -1683,8 +1683,7 @@ def run_trading_agent(
         expected_tp_pnl = (price * (1 - fee_rate - slippage_rate) - tp_val * (1 + fee_rate + slippage_rate)) * base_size
     
     rationale_norm = (rationale or "").lower() if rationale else ""
-    # Stricter loss allowance: requires explicit stop/cut/emergency keywords
-    allow_loss = reduce_only or any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate"))
+    allow_loss = reduce_only or any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate", "portfolio review", "close position", "rebalance", "force sell", "force-sell", "supervisor"))
     
     min_profit_usd = cfg.trading.min_net_profit_usd
     
