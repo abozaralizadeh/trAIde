@@ -516,7 +516,7 @@ def run_trading_agent(
   positions = memory.positions(current_prices)
   # Reconcile tracked positions with live spot balances to avoid phantom exposure when trades happen outside the agent.
   spot_balances_by_currency = {
-    cur.upper(): _to_float(totals.get("balance"))
+    cur.upper(): _to_float(totals.get("available"))
     for cur, totals in (spot_totals or {}).items()
   }
   reconciled_positions: Dict[str, Dict[str, Any]] = {}
@@ -909,6 +909,8 @@ def run_trading_agent(
     )
 
     if side == "sell":
+      expected_pnl = None
+      roi_pct = None
       pos_info = _spot_position_info(symbol)
       if not pos_info:
         # Fallback: check live balance for externally-held coins
@@ -918,11 +920,53 @@ def run_trading_agent(
       net_size = pos_info["net"] if pos_info else 0.0
       if net_size <= 0:
         return {"rejected": True, "reason": "No spot position available to sell"}
+
+      # Cancel active sell-side stop orders to release held balance before selling.
+      if not snapshot.paper_trading:
+        try:
+          active_stops = kucoin.list_stop_orders(status="active", symbol=symbol) or []
+          for order in active_stops:
+            if not isinstance(order, dict):
+              continue
+            order_side = str(order.get("side") or "").lower()
+            if order_side and order_side != "sell":
+              continue
+            oid = str(order.get("id") or order.get("orderId") or "").strip()
+            coid = str(order.get("clientOid") or "").strip() or None
+            if oid or coid:
+              try:
+                kucoin.cancel_stop_order(order_id=oid or None, client_oid=coid)
+              except Exception as cancel_exc:
+                logger.warning("Failed to cancel stop %s for %s: %s", oid or coid, symbol, cancel_exc)
+        except Exception as exc:
+          logger.warning("Failed to list stop orders for %s pre-sell: %s", symbol, exc)
+
+        # Re-fetch balances after cancelling stops so freed holds are reflected.
+        fresh_balances = kucoin.get_trade_accounts()
+        fresh_by_currency = {}
+        for bal in fresh_balances:
+          fresh_by_currency[bal.currency] = fresh_by_currency.get(bal.currency, 0.0) + float(bal.available or 0)
+
       if size_est <= 0:
         size_est = net_size
         funds_val = size_est * price
       if size_est > net_size:
         size_est = net_size
+        funds_val = size_est * price
+
+      # Clamp to fresh available balance to avoid 200004 insufficient balance errors.
+      base_currency = _base_currency(symbol)
+      fresh_available = fresh_by_currency.get(base_currency, 0.0)
+      if fresh_available <= 0:
+        return {
+          "rejected": True,
+          "reason": "No available balance to sell (zero after stop cancellation)",
+          "symbol": symbol,
+          "staleNetSize": net_size,
+        }
+      if size_est > fresh_available:
+        logger.warning("Clamping sell size for %s from %.8f to fresh available %.8f", symbol, size_est, fresh_available)
+        size_est = fresh_available
         funds_val = size_est * price
 
       rationale_norm = (rationale or "").lower() if rationale else ""
@@ -995,7 +1039,7 @@ def run_trading_agent(
       res = kucoin.place_order(order_req).__dict__
       record = memory.record_trade(symbol, side, funds_val, paper=False, price=price, size=size_est)
       res["tradeRecord"] = record
-      if side == "sell":
+      if side == "sell" and expected_pnl is not None:
         res["expectedPnl"] = expected_pnl
         res["expectedRoi"] = roi_pct
       if confidence is not None:
