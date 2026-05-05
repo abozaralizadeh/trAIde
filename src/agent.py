@@ -1094,7 +1094,28 @@ def run_trading_agent(
           paper=False,
         )
       if (side or "").lower() == "buy" and auto_protect and planned_stop and planned_tp:
-        size_for_exit = size_est or (funds_val / price if price else None)
+        # Cancel existing sell-side stops for this symbol to avoid stacking duplicates.
+        try:
+          existing_stops = kucoin.list_stop_orders(status="active", symbol=symbol) or []
+          for old_order in existing_stops:
+            if not isinstance(old_order, dict):
+              continue
+            if str(old_order.get("side") or "").lower() != "sell":
+              continue
+            oid = str(old_order.get("id") or old_order.get("orderId") or "").strip()
+            coid = str(old_order.get("clientOid") or "").strip() or None
+            if oid or coid:
+              try:
+                kucoin.cancel_stop_order(order_id=oid or None, client_oid=coid)
+              except Exception:
+                pass
+        except Exception as exc:
+          logger.warning("Failed to clean up old stops for %s before bracket: %s", symbol, exc)
+
+        # Cover the full position (prior holdings + this buy) since we cancelled all old stops.
+        prior_position = _spot_position_size(symbol)
+        this_buy_size = size_est or (funds_val / price if price else 0)
+        size_for_exit = prior_position + this_buy_size if prior_position > 0 else this_buy_size
         bracket: Dict[str, Any] = {}
         stop_res = await _place_spot_stop_order_impl(
           symbol=symbol,
