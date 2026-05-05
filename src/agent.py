@@ -768,6 +768,7 @@ def run_trading_agent(
           "spotAvailable": spot_usdt,
           "futuresAvailable": futures_available,
           "feeRate": fee_rate,
+          "hint": f"Retry with funds <= {max_spend:.2f}, or use futures with leverage instead, or sell a spot position to free capital.",
         }
 
       # If spot alone is insufficient but futures/financial has free balance, auto-transfer the shortfall.
@@ -818,6 +819,20 @@ def run_trading_agent(
               spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
             except Exception as exc:
               logger.warning("Futures->spot transfer failed: %s", exc)
+
+      # Re-check actual balance after transfers instead of trusting optimistic addition.
+      if transfer_used:
+        post_balances = kucoin.get_trade_accounts()
+        spot_usdt = sum(float(b.available or 0) for b in post_balances if b.currency == "USDT")
+        spot_spendable = max(0.0, spot_usdt - spot_usdt * 0.10)
+        if funds_with_fee > spot_spendable:
+          return {
+            "rejected": True,
+            "reason": "Insufficient balance after transfer (post-transfer verification)",
+            "spotAvailable": spot_usdt,
+            "fundsNeeded": funds_with_fee,
+            "transferAttempt": transfer_used,
+          }
     else:
       # No spend limits/transfers are needed for sells; they're bounded by position size below.
       max_spend = float("inf")
@@ -878,18 +893,25 @@ def run_trading_agent(
       size_est = float(size_est or 0.0)
       # PnL = (Exit - Entry) - Fees - Slippage
       expected_tp_pnl = (planned_tp * (1 - fee_rate - slippage_rate) - price * (1 + fee_rate + slippage_rate)) * size_est
+      entry_cost_est = price * size_est * (1 + fee_rate + slippage_rate)
+      expected_roi = expected_tp_pnl / entry_cost_est if entry_cost_est > 0 else 0.0
       min_profit_usd = cfg.trading.min_net_profit_usd
-      if expected_tp_pnl < min_profit_usd:
+      min_roi = cfg.trading.min_profit_roi_pct
+      if expected_tp_pnl < min_profit_usd and expected_roi < min_roi:
+        min_tp_for_profit = price * (1 + fee_rate + slippage_rate) + min_profit_usd / size_est if size_est > 0 else None
         return {
           "rejected": True,
-          "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit (after slippage)",
+          "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit or {min_roi*100:.2f}% ROI (after slippage)",
           "expectedTpPnl": expected_tp_pnl,
+          "expectedRoi": expected_roi,
           "minProfitUsd": min_profit_usd,
+          "minRoiPct": min_roi,
           "size": size_est,
           "price": price,
           "tp": planned_tp,
           "feeRate": fee_rate,
           "slippageRate": slippage_rate,
+          "hint": f"Set TP farther from entry (try >= {min_tp_for_profit:.2f} for buy) or increase position size to make the edge worthwhile. Alternatively, try futures with leverage to amplify the same move.",
         }
 
     # Adjust funds down so fee fits in spend cap.
@@ -991,6 +1013,7 @@ def run_trading_agent(
             "positionSize": net_size,
             "requestedSize": size_est,
             "feeRate": fee_rate,
+            "hint": "To proceed, include 'cut loss', 'stop loss', or 'portfolio review' in the rationale, then retry.",
           }
         logger.info("Selling %s - Expected PnL: %.4f USD (ROI: %.2f%%)", symbol, expected_pnl, roi_pct * 100)
       else:
@@ -1001,11 +1024,30 @@ def run_trading_agent(
             "reason": "Unknown entry price; include 'portfolio review', 'close position', or 'cut loss' in rationale to sell",
             "positionSize": net_size,
             "currentPrice": price,
+            "hint": "Retry with rationale containing 'close position' or 'portfolio review'.",
           }
         logger.info("Selling %s (unknown entry) - Size: %.8f at price: %.6f", symbol, size_est, price)
 
       order_req.size = _truncate_to_increment(size_est, base_increment)
       order_req.funds = None
+      truncated_size = float(order_req.size)
+      base_min_size = _to_float(sym_info.get("baseMinSize"))
+      quote_min_size = _to_float(sym_info.get("quoteMinSize"))
+      if base_min_size > 0 and truncated_size < base_min_size:
+        return {
+          "rejected": True,
+          "reason": "Sell size below exchange minimum after truncation",
+          "truncatedSize": truncated_size,
+          "baseMinSize": base_min_size,
+          "positionSize": net_size,
+        }
+      if quote_min_size > 0 and truncated_size * price < quote_min_size:
+        return {
+          "rejected": True,
+          "reason": "Sell notional below exchange minimum",
+          "notional": truncated_size * price,
+          "quoteMinSize": quote_min_size,
+        }
     else:
       if size_est <= 0:
         return {"error": "Computed size is zero", "price": price}
@@ -1611,7 +1653,7 @@ def run_trading_agent(
                 "entryPrice": pos_entry,
                 "currentPrice": price,
                 "closeSize": close_size,
-                "advice": "To cut loss, include 'stop loss' or 'cut loss' in rationale.",
+                "hint": "Retry with 'cut loss' or 'stop loss' in rationale to allow closing at a loss.",
                }
             logger.info("Closing Futures %s - Expected PnL: %.4f USD (ROI: %.2f%%)", futures_symbol, net_pnl, roi_pct * 100)
 
@@ -1664,6 +1706,8 @@ def run_trading_agent(
       if edge_candidates:
         min_edge_found = min(edge_candidates)
         if min_edge_found < min_edge_pct:
+          min_tp = price * (1 + min_edge_pct) if side == "buy" else price * (1 - min_edge_pct)
+          min_sl = price * (1 - min_edge_pct) if side == "buy" else price * (1 + min_edge_pct)
           return {
             "rejected": True,
             "reason": "TP/SL distance too tight relative to fees",
@@ -1673,6 +1717,7 @@ def run_trading_agent(
             "takeProfit": tp_val,
             "stopLoss": sl_val or trigger_stop_val,
             "feeRate": fee_rate,
+            "hint": f"Widen TP to at least {min_tp:.2f} and SL to at least {min_sl:.2f} (>{min_edge_pct*100:.2f}% from entry), then retry.",
           }
     base_size = contracts * multiplier
     expected_tp_pnl = None
@@ -1686,18 +1731,24 @@ def run_trading_agent(
     allow_loss = reduce_only or any(term in rationale_norm for term in ("stop loss", "cut loss", "emergency", "liquidate", "portfolio review", "close position", "rebalance", "force sell", "force-sell", "supervisor"))
     
     min_profit_usd = cfg.trading.min_net_profit_usd
-    
-    if expected_tp_pnl is not None and expected_tp_pnl < min_profit_usd and not allow_loss:
+    min_roi = cfg.trading.min_profit_roi_pct
+    futures_entry_cost = price * base_size * (1 + fee_rate + slippage_rate)
+    expected_tp_roi = expected_tp_pnl / futures_entry_cost if expected_tp_pnl is not None and futures_entry_cost > 0 else None
+
+    if expected_tp_pnl is not None and expected_tp_pnl < min_profit_usd and (expected_tp_roi is None or expected_tp_roi < min_roi) and not allow_loss:
       return {
         "rejected": True,
-        "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit (after slippage)",
+        "reason": f"Take-profit too close; requires at least ${min_profit_usd:.2f} net profit or {min_roi*100:.2f}% ROI (after slippage)",
         "expectedTpPnl": expected_tp_pnl,
+        "expectedTpRoi": expected_tp_roi,
         "minProfitUsd": min_profit_usd,
+        "minRoiPct": min_roi,
         "size": base_size,
         "price": price,
         "tp": tp_val,
         "feeRate": fee_rate,
         "slippageRate": slippage_rate,
+        "hint": f"Widen TP farther from entry (min {min_edge_pct*100:.2f}% away), increase notional, or increase leverage to amplify the edge.",
       }
 
     protection_stop_val = sl_val or trigger_stop_val
@@ -1776,14 +1827,25 @@ def run_trading_agent(
             futures_available += transfer_amt
           except Exception as exc:
             logger.warning("Spot->futures transfer failed: %s", exc)
+
+      # Re-check actual futures balance after transfers.
+      if transfer_used and kucoin_futures:
+        try:
+          post_overview = kucoin_futures.get_account_overview()
+          futures_available = _to_float(post_overview.get("availableBalance"))
+        except Exception as exc:
+          logger.warning("Post-transfer futures balance check failed: %s", exc)
     if required_futures_balance > futures_available and not snapshot.paper_trading:
+      spot_usdt_available = spot_balance_map.get("USDT", 0.0)
+      shortfall = required_futures_balance - futures_available
       return {
         "rejected": True,
         "reason": "Insufficient futures margin after transfer attempt",
         "requiredBalance": required_futures_balance,
         "available": futures_available,
-        "spotAvailable": spot_balance_map.get("USDT", 0.0),
+        "spotAvailable": spot_usdt_available,
         "transferAttempt": transfer_used,
+        "hint": f"Need {shortfall:.2f} more USDT in futures. Try: transfer_funds('spot_to_futures', amount={min(shortfall, spot_usdt_available):.2f}), or sell a spot position to free capital, or reduce notional/increase leverage.",
       }
 
     def _build_order(mode: str | None) -> KucoinFuturesOrderRequest:
@@ -2778,6 +2840,22 @@ def run_trading_agent(
     "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) and act on findings.\n"
     "- Remove coins that have gone stale (no volatility, no catalyst, no edge) to keep the list focused. "
     "Use remove_coin with a documented reason.\n\n"
+
+    "## CRITICAL — Handle rejections, don't give up:\n"
+    "A rejected tool call is NOT a reason to stop. It's feedback — read the 'reason' and 'hint' fields and fix the issue:\n"
+    "- **TP/SL too tight**: widen your TP/SL targets using the suggested minimum values in the hint, then retry.\n"
+    "- **Insufficient balance (spot)**: use transfer_funds to move USDT from futures/financial to spot, "
+    "or sell an underperforming spot position to free capital, or switch to futures with leverage.\n"
+    "- **Insufficient margin (futures)**: use transfer_funds('spot_to_futures') or sell a spot position first, "
+    "or reduce notional, or increase leverage.\n"
+    "- **Size too small / below minimum**: increase position size or skip this particular coin for one with better sizing.\n"
+    "- **Daily trade cap**: move to another symbol.\n"
+    "- **Profit too low**: widen TP, increase size, or use futures leverage to amplify the same price move.\n\n"
+    "**Multi-step execution is expected.** If you want to open a futures trade but funds are in spot:\n"
+    "1. Sell an unneeded spot position (place_market_order with rationale 'portfolio review')\n"
+    "2. Transfer the freed USDT to futures (transfer_funds)\n"
+    "3. Place the futures order\n"
+    "This is a normal workflow — do not skip steps 1-2 and accept rejection.\n\n"
 
     "## Narrative:\n"
     "- Be explicit: state what research showed, what trade you placed (or declined and why), what TP/SL you set, and your confidence.\n"
