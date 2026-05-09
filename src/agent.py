@@ -1964,7 +1964,7 @@ def run_trading_agent(
     attempts: list[Dict[str, Any]] = []
     order_req = _build_order(margin_mode)
     try:
-      kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"), auto_deposit=(margin_mode or "").upper() == "ISOLATED" and False)
+      kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"))
     except Exception as exc:
       logger.warning("set_margin_mode failed (continuing): %s", exc)
     try:
@@ -2011,7 +2011,7 @@ def run_trading_agent(
     opposite_mode = "isolated" if margin_mode == "cross" else "cross"
     order_req = _build_order(opposite_mode)
     try:
-      kucoin_futures.set_margin_mode(futures_symbol, opposite_mode, auto_deposit=opposite_mode.upper() == "ISOLATED" and False)
+      kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
     except Exception as exc:
       logger.warning("set_margin_mode fallback failed (continuing): %s", exc)
     try:
@@ -2125,13 +2125,12 @@ def run_trading_agent(
       logger.warning("Futures position lookup failed for stop order; margin mode unknown: %s", exc)
 
     margin_mode_norm = margin_mode.upper() if margin_mode else None
-    auto_deposit = False if margin_mode_norm == "ISOLATED" else None
     try:
-      kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS", auto_deposit=auto_deposit)
+      kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS")
     except Exception as exc:
       logger.warning("set_margin_mode failed for stop order (continuing): %s", exc)
     try:
-      kucoin_futures.set_leverage(futures_symbol, lev, cross=margin_mode_norm != "ISOLATED")
+      kucoin_futures.set_leverage(futures_symbol, lev)
     except Exception as exc:
       logger.warning("set_leverage failed for stop order (continuing): %s", exc)
     order_req = KucoinFuturesOrderRequest(

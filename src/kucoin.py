@@ -742,25 +742,32 @@ class KucoinFuturesClient:
       return data.get("items") or []
     return data or []
 
-  def set_leverage(self, symbol: str, leverage: float, cross: bool = True) -> Dict[str, Any]:
-    """Set leverage for a futures symbol using the official leverage endpoint."""
+  def set_leverage(self, symbol: str, leverage: float) -> Dict[str, Any]:
+    """Set leverage for a futures symbol (v2 endpoint)."""
     body = {"symbol": symbol, "leverage": str(int(leverage))}
     return self._request(
       "POST",
-      "/api/v1/position/margin/leverage",
+      "/api/v2/changeCrossUserLeverage",
       auth=True,
       body=body,
     )
 
-  def set_margin_mode(self, symbol: str, margin_mode: str, auto_deposit: Optional[bool] = None) -> Dict[str, Any]:
-    """Set margin mode (CROSS/ISOLATED) for a futures symbol."""
+  def get_leverage(self, symbol: str) -> Dict[str, Any]:
+    """Get current leverage setting for a futures symbol (v2 endpoint)."""
+    return self._request(
+      "GET",
+      "/api/v2/getCrossUserLeverage",
+      auth=True,
+      query={"symbol": symbol},
+    )
+
+  def set_margin_mode(self, symbol: str, margin_mode: str) -> Dict[str, Any]:
+    """Set margin mode (CROSS/ISOLATED) for a futures symbol (v2 endpoint)."""
     mode_norm = margin_mode.upper()
     body: Dict[str, Any] = {"symbol": symbol, "marginMode": mode_norm}
-    if auto_deposit is not None:
-      body["autoDeposit"] = auto_deposit
     return self._request(
       "POST",
-      "/api/v1/position/margin/mode",
+      "/api/v2/position/changeMarginMode",
       auth=True,
       body=body,
     )
