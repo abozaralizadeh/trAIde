@@ -2149,7 +2149,7 @@ def run_trading_agent(
       takeProfitPrice=tp_str,
       stopLossPrice=sl_str,
       marginMode=margin_mode_norm,
-      autoDeposit=auto_deposit,
+      autoDeposit=False if margin_mode_norm == "ISOLATED" else None,
     )
     if snapshot.paper_trading:
       return {"paper": True, "orderRequest": order_req.__dict__}
@@ -2912,7 +2912,7 @@ def run_trading_agent(
       "- NEVER place orders or change the coin list yourself; propose candidates only.\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
       "- When handing off, remind the Trading Agent to read the saved note via latest_plan/latest_items so your research is used.\n"
-      "- Always return to the main Trading Agent after your research is done."
+      "- Always handoff to the main Trading Agent after your research is done passing the new coins to be added to the coin list or the ones that should be deleted."
     ),
     tools=[
       WebSearchTool(search_context_size="high"),
