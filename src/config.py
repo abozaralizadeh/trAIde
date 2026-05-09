@@ -61,6 +61,11 @@ class TradingConfig:
   min_net_profit_usd: float
   min_profit_roi_pct: float
   estimated_slippage_pct: float
+  preferred_venue: str
+  tp_fee_buffer_pct: float
+  sl_atr_multiplier_min: float
+  sl_atr_multiplier_max: float
+  researcher_auto_enabled: bool
 
 
 @dataclass
@@ -140,7 +145,7 @@ def load_config() -> AppConfig:
       flexible_coins_enabled=_as_bool(os.getenv("FLEXIBLE_COINS_ENABLED"), True),
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
       max_position_usd=float(os.getenv("MAX_POSITION_USD", "1000")),
-      risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.01")),
+      risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.10")),
       min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.6")),
       sentiment_filter_enabled=_as_bool(os.getenv("SENTIMENT_FILTER_ENABLED"), False),
       sentiment_min_score=float(os.getenv("SENTIMENT_MIN_SCORE", "0.55")),
@@ -152,6 +157,11 @@ def load_config() -> AppConfig:
       min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "0.05")),
       min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.001")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0005")),
+      preferred_venue=os.getenv("PREFERRED_VENUE", "auto").lower(),
+      tp_fee_buffer_pct=float(os.getenv("TP_FEE_BUFFER_PCT", "0.002")),
+      sl_atr_multiplier_min=float(os.getenv("SL_ATR_MULTIPLIER_MIN", "1.5")),
+      sl_atr_multiplier_max=float(os.getenv("SL_ATR_MULTIPLIER_MAX", "2.5")),
+      researcher_auto_enabled=_as_bool(os.getenv("RESEARCHER_AUTO_ENABLED"), True),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),
@@ -220,6 +230,14 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"POLL_INTERVAL_SEC={cfg.trading.poll_interval_sec} (must be >0)")
   if cfg.trading.max_position_usd <= 0:
     invalid.append(f"MAX_POSITION_USD={cfg.trading.max_position_usd} (must be >0)")
+  if cfg.trading.preferred_venue not in ("futures", "spot", "auto"):
+    invalid.append(f"PREFERRED_VENUE={cfg.trading.preferred_venue} (must be 'futures', 'spot', or 'auto')")
+  if cfg.trading.tp_fee_buffer_pct < 0:
+    invalid.append(f"TP_FEE_BUFFER_PCT={cfg.trading.tp_fee_buffer_pct} (must be >= 0)")
+  if cfg.trading.sl_atr_multiplier_min <= 0:
+    invalid.append(f"SL_ATR_MULTIPLIER_MIN={cfg.trading.sl_atr_multiplier_min} (must be > 0)")
+  if cfg.trading.sl_atr_multiplier_max < cfg.trading.sl_atr_multiplier_min:
+    invalid.append(f"SL_ATR_MULTIPLIER_MAX={cfg.trading.sl_atr_multiplier_max} (must be >= SL_ATR_MULTIPLIER_MIN={cfg.trading.sl_atr_multiplier_min})")
 
   if invalid:
     raise ValueError(

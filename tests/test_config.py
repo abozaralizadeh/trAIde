@@ -8,7 +8,7 @@ def _make_valid_config(**overrides) -> AppConfig:
         flexible_coins_enabled=True,
         paper_trading=True,
         max_position_usd=100.0,
-        risk_per_trade_pct=0.01,
+        risk_per_trade_pct=0.10,
         min_confidence=0.6,
         sentiment_filter_enabled=False,
         sentiment_min_score=0.55,
@@ -20,6 +20,11 @@ def _make_valid_config(**overrides) -> AppConfig:
         min_net_profit_usd=1.5,
         min_profit_roi_pct=0.008,
         estimated_slippage_pct=0.0005,
+        preferred_venue="auto",
+        tp_fee_buffer_pct=0.002,
+        sl_atr_multiplier_min=1.5,
+        sl_atr_multiplier_max=2.5,
+        researcher_auto_enabled=True,
     )
     trading_kwargs.update(overrides)
     return AppConfig(
@@ -99,4 +104,33 @@ def test_invalid_poll_interval():
 def test_invalid_max_position_usd():
     cfg = _make_valid_config(max_position_usd=0.0)
     with pytest.raises(ValueError, match="MAX_POSITION_USD"):
+        validate_config(cfg)
+
+
+def test_invalid_preferred_venue():
+    cfg = _make_valid_config(preferred_venue="margin")
+    with pytest.raises(ValueError, match="PREFERRED_VENUE"):
+        validate_config(cfg)
+
+
+def test_valid_preferred_venue_futures():
+    cfg = _make_valid_config(preferred_venue="futures")
+    validate_config(cfg)
+
+
+def test_invalid_tp_fee_buffer_negative():
+    cfg = _make_valid_config(tp_fee_buffer_pct=-0.001)
+    with pytest.raises(ValueError, match="TP_FEE_BUFFER_PCT"):
+        validate_config(cfg)
+
+
+def test_invalid_sl_atr_multiplier_min_zero():
+    cfg = _make_valid_config(sl_atr_multiplier_min=0.0)
+    with pytest.raises(ValueError, match="SL_ATR_MULTIPLIER_MIN"):
+        validate_config(cfg)
+
+
+def test_invalid_sl_atr_multiplier_max_below_min():
+    cfg = _make_valid_config(sl_atr_multiplier_min=2.0, sl_atr_multiplier_max=1.0)
+    with pytest.raises(ValueError, match="SL_ATR_MULTIPLIER_MAX"):
         validate_config(cfg)

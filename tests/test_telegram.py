@@ -16,7 +16,7 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     flexible_coins_enabled=True,
     paper_trading=True,
     max_position_usd=100.0,
-    risk_per_trade_pct=0.01,
+    risk_per_trade_pct=0.10,
     min_confidence=0.6,
     sentiment_filter_enabled=False,
     sentiment_min_score=0.55,
@@ -28,6 +28,11 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     min_net_profit_usd=1.5,
     min_profit_roi_pct=0.008,
     estimated_slippage_pct=0.0005,
+    preferred_venue="auto",
+    tp_fee_buffer_pct=0.002,
+    sl_atr_multiplier_min=1.5,
+    sl_atr_multiplier_max=2.5,
+    researcher_auto_enabled=True,
   )
   return AppConfig(
     azure=AzureConfig(endpoint="https://x.openai.azure.com/", deployment="gpt-5.2", api_version="2024-10-01-preview", api_key="key"),

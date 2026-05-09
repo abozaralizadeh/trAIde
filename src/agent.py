@@ -1424,7 +1424,7 @@ def run_trading_agent(
   async def plan_spot_position(
     symbol: str,
     risk_pct: float | None = None,
-    atr_multiple: float = 1.5,
+    atr_multiple: float | None = None,
     target_rr: float = 2.0,
     entry_price: float | None = None,
   ) -> Dict[str, Any]:
@@ -1437,6 +1437,9 @@ def run_trading_agent(
     if balance_usdt <= 0:
       return {"error": "No USDT balance available"}
     risk_fraction = risk_pct if risk_pct is not None else cfg.trading.risk_per_trade_pct
+    if atr_multiple is None:
+      atr_multiple = (cfg.trading.sl_atr_multiplier_min + cfg.trading.sl_atr_multiplier_max) / 2.0
+    atr_multiple = max(cfg.trading.sl_atr_multiplier_min, min(atr_multiple, cfg.trading.sl_atr_multiplier_max))
     risk_fraction = max(0.0, float(risk_fraction))
     risk_dollars = balance_usdt * risk_fraction
     if risk_dollars <= 0:
@@ -1475,7 +1478,8 @@ def run_trading_agent(
     notional_with_fee = notional * (1 + fee_rate)
     size = notional / price if price else 0
     stop_price = max(0.0, price - stop_distance)
-    target_price = price + stop_distance * target_rr
+    fee_buffer = price * cfg.trading.tp_fee_buffer_pct
+    target_price = price + stop_distance * target_rr + fee_buffer
 
     trades_today = memory.trades_today(symbol)
 
@@ -1503,6 +1507,8 @@ def run_trading_agent(
       "notionalUsd": notional,
       "notionalUsdWithFee": notional_with_fee,
       "rawNotionalUsd": notional_unclipped,
+      "tpFeeBuffer": fee_buffer,
+      "slAtrMultRange": [cfg.trading.sl_atr_multiplier_min, cfg.trading.sl_atr_multiplier_max],
       "tradesToday": trades_today,
       "maxTradesPerDay": cfg.trading.max_trades_per_symbol_per_day,
       "warnings": warnings,
@@ -2807,21 +2813,38 @@ def run_trading_agent(
     "- Skip (decline): 1h AND 15m both flat/ranging with no catalyst, RSI at extreme (>75 or <25) against direction, "
     "or clearly negative news.\n\n"
 
-    "**Venue preference:**\n"
+    "**Venue preference"
+    + (" — FUTURES PREFERRED" if cfg.trading.preferred_venue == "futures"
+       else " — SPOT PREFERRED" if cfg.trading.preferred_venue == "spot"
+       else "") + ":**\n"
     "- Your input includes availableUsdt with spot, futures, and total balances. Read ALL of them before choosing a venue.\n"
-    "- Pick the venue where you have the capital to act. If one venue is underfunded, use the other.\n"
-    "- Futures with leverage lets you trade with a smaller USDT balance than spot requires — factor this in.\n"
-    "- Use transfer_funds to move capital between venues when needed.\n"
+    + (
+      "- Your preferred venue is FUTURES. Always try futures first for new entries.\n"
+      "- Use spot only when: (a) closing an existing spot position, (b) futures contract unavailable for the symbol, "
+      "or (c) futures account has insufficient margin even after transfers.\n"
+      "- Futures with leverage lets you control larger positions with less capital — use this advantage.\n"
+      if cfg.trading.preferred_venue == "futures"
+      else
+      "- Your preferred venue is SPOT. Always try spot first for new entries.\n"
+      "- Use futures only when: (a) closing an existing futures position, (b) spot account has insufficient balance, "
+      "or (c) you need leverage for a high-conviction trade.\n"
+      if cfg.trading.preferred_venue == "spot"
+      else
+      "- Pick the venue where you have the capital to act. If one venue is underfunded, use the other.\n"
+      "- Futures with leverage lets you trade with a smaller USDT balance than spot requires — factor this in.\n"
+    )
+    + "- Use transfer_funds to move capital between venues when needed.\n"
     "- A rejected spot order is not a reason to give up — reconsider via futures or a smaller size.\n\n"
 
     "**Sizing:**\n"
+    f"- Default risk per trade: {cfg.trading.risk_per_trade_pct*100:.0f}% of balance. Adjust risk_pct parameter on plan_spot_position when you want different sizing.\n"
     "- Call plan_spot_position to compute ATR-based stop distance, size, and TP for spot trades.\n"
     f"- For futures: size so margin required is 20–40% of available futures USDT (up to maxPositionUsd={snapshot.max_position_usd}).\n"
     "- Keep at least 10% USDT reserve across all venues combined.\n\n"
 
     "**TP/SL rules (mandatory on every new entry):**\n"
-    "- Stop-loss: ATR-based (1.0–1.5x ATR below entry) OR 0.5–1.5% if ATR is unavailable.\n"
-    "- Take-profit: RR >= 1.2 (minimum). Aim for 1.5–2.0 when momentum is strong.\n"
+    f"- Stop-loss: ATR-based ({cfg.trading.sl_atr_multiplier_min}–{cfg.trading.sl_atr_multiplier_max}x ATR below entry) OR 0.5–1.5% if ATR is unavailable.\n"
+    f"- Take-profit: RR >= 1.2 (minimum). Aim for 1.5–2.0 when momentum is strong. TP must include a {cfg.trading.tp_fee_buffer_pct*100:.1f}% fee buffer beyond breakeven.\n"
     "- Place stops immediately after entry using place_spot_stop_order or the stop/TP params on place_futures_market_order.\n\n"
 
     "## STEP 4 — Log and save:\n"
@@ -2850,16 +2873,31 @@ def run_trading_agent(
     "- If total realized PnL is negative: focus on smaller positions until you find a winning pattern.\n"
     "- Use this data to adapt — don't repeat losing patterns.\n\n"
 
-    "## Opportunity discovery (every run):\n"
-    "- The coin list is a starting point, not a boundary. Better opportunities may exist outside it.\n"
-    "- Use web_search and fetch_kucoin_news every run to scan for market-moving events: new listings, breakouts, "
-    "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"
-    "- If you spot a coin with a stronger setup than anything in your current list, hand off to Research Agent "
-    "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it.\n"
-    "- Hand off to Research Agent after completing your trades for the current coins — use idle time to scout.\n"
-    "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) and act on findings.\n"
-    "- Remove coins that have gone stale (no volatility, no catalyst, no edge) to keep the list focused. "
-    "Use remove_coin with a documented reason.\n\n"
+    + (
+      "## Opportunity discovery (MANDATORY every run):\n"
+      "- The coin list is a starting point, not a boundary. Better opportunities may exist outside it.\n"
+      "- Use web_search and fetch_kucoin_news every run to scan for market-moving events: new listings, breakouts, "
+      "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"
+      "- If you spot a coin with a stronger setup than anything in your current list, hand off to Research Agent "
+      "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it.\n"
+      "- After completing ALL trading tasks (entries, exits, protection updates), you MUST hand off to the Research Agent. "
+      "This is not optional — the Research Agent should run every cycle to find new opportunities.\n"
+      "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) and act on findings: "
+      "use add_coin for recommended additions and remove_coin for stale coins.\n"
+      "- Remove coins that have gone stale (no volatility, no catalyst, no edge) to keep the list focused. "
+      "Use remove_coin with a documented reason.\n\n"
+      if cfg.trading.researcher_auto_enabled else
+      "## Opportunity discovery (every run):\n"
+      "- The coin list is a starting point, not a boundary. Better opportunities may exist outside it.\n"
+      "- Use web_search and fetch_kucoin_news every run to scan for market-moving events: new listings, breakouts, "
+      "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"
+      "- If you spot a coin with a stronger setup than anything in your current list, hand off to Research Agent "
+      "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it.\n"
+      "- Hand off to Research Agent after completing your trades for the current coins — use idle time to scout.\n"
+      "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) and act on findings.\n"
+      "- Remove coins that have gone stale (no volatility, no catalyst, no edge) to keep the list focused. "
+      "Use remove_coin with a documented reason.\n\n"
+    ) +
 
     "## CRITICAL — Handle rejections, don't give up:\n"
     "A rejected tool call is NOT a reason to stop. It's feedback — read the 'reason' and 'hint' fields and fix the issue:\n"
