@@ -445,6 +445,7 @@ def run_trading_agent(
   kucoin_futures: KucoinFuturesClient | None = None,
   openai_client: AsyncAzureOpenAI | None = None,
   langsmith_client: Any | None = None,
+  recent_fills: Dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   if openai_client is None:
@@ -2231,6 +2232,44 @@ def run_trading_agent(
       return {"error": str(exc), "status": status, "snapshotPositions": snapshot.futures_positions}
 
   @function_tool
+  async def get_recent_fills(venue: str = "all", symbol: str | None = None) -> Dict[str, Any]:
+    """Get recent trade fills (executions) including those from triggered stop orders. venue: 'spot', 'futures', or 'all'."""
+    result: Dict[str, Any] = {}
+    resolved = _resolve_allowed_spot_symbol(symbol, allowed_symbols) if symbol else None
+    if venue in ("all", "spot"):
+      try:
+        spot_fills = kucoin.get_fills(symbol=resolved, page_size=30)
+        result["spotFills"] = spot_fills
+      except Exception as exc:
+        result["spotFillsError"] = str(exc)
+    if venue in ("all", "futures"):
+      if not cfg.kucoin_futures.enabled or not kucoin_futures:
+        result["futuresFillsError"] = "Futures disabled"
+      else:
+        futures_sym = _to_futures_symbol(resolved) if resolved else None
+        try:
+          futures_fills = kucoin_futures.get_fills(symbol=futures_sym, page_size=30)
+          result["futuresFills"] = futures_fills
+        except Exception as exc:
+          result["futuresFillsError"] = str(exc)
+    return result
+
+  @function_tool
+  async def get_closed_positions(symbol: str | None = None) -> Dict[str, Any]:
+    """Get closed futures positions with realized PnL. Shows positions that were closed (by TP/SL triggers, manual close, or liquidation)."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    futures_sym = None
+    if symbol:
+      resolved = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+      futures_sym = _to_futures_symbol(resolved) if resolved else None
+    try:
+      closed = kucoin_futures.get_position_history(symbol=futures_sym, page_size=20)
+      return {"closedPositions": closed}
+    except Exception as exc:
+      return {"error": str(exc)}
+
+  @function_tool
   async def set_futures_position_protection(
     symbol: str,
     take_profit_price: float | None = None,
@@ -2953,6 +2992,8 @@ def run_trading_agent(
       cancel_futures_order,
       list_futures_stop_orders,
       list_futures_positions,
+      get_recent_fills,
+      get_closed_positions,
       save_trade_plan,
       latest_plan,
       latest_items,
@@ -2984,6 +3025,21 @@ def run_trading_agent(
   user_state_obj["fees"] = fees
   user_state_obj["triggers"] = triggers
   user_state_obj["performanceSummary"] = memory.performance_summary()
+
+  if recent_fills:
+    events: Dict[str, Any] = {}
+    if recent_fills.get("spot_fills"):
+      events["spotFills"] = recent_fills["spot_fills"]
+    if recent_fills.get("futures_fills"):
+      events["futuresFills"] = recent_fills["futures_fills"]
+    if recent_fills.get("closed_positions"):
+      events["closedPositions"] = recent_fills["closed_positions"]
+    if events:
+      user_state_obj["recentEvents"] = events
+      user_state_obj["recentEventsNote"] = (
+        "NEW since last round: orders were filled or positions were closed "
+        "(likely by triggered TP/SL). Review the PnL and adjust your strategy accordingly."
+      )
 
   # Detect stale/ineffective stop orders
   stale_stops = []

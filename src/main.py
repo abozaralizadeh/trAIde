@@ -131,6 +131,43 @@ def _fetch_futures(cfg, kucoin_futures: KucoinFuturesClient | None) -> tuple[dic
     return None, [], []
 
 
+def _fetch_recent_fills(kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, lookback_minutes: int = 10) -> Dict:
+  """Fetch fills and closed positions from the last N minutes (using KuCoin server time to avoid clock drift)."""
+  now_ms = kucoin._timestamp_ms()
+  cutoff_ms = now_ms - lookback_minutes * 60 * 1000
+  result: Dict[str, Any] = {"spot_fills": [], "futures_fills": [], "closed_positions": []}
+
+  def _after_cutoff(entry: dict, *ts_keys: str) -> bool:
+    for k in ts_keys:
+      v = entry.get(k)
+      if v is not None:
+        ts = int(v) if int(v) > 1e12 else int(v) * 1000
+        if ts >= cutoff_ms:
+          return True
+    return False
+
+  try:
+    spot_fills = kucoin.get_fills(page_size=50) or []
+    result["spot_fills"] = [f for f in spot_fills if _after_cutoff(f, "createdAt", "tradeCreatedAt")]
+  except Exception as exc:
+    logger.warning("Unable to fetch spot fills: %s", exc)
+
+  if kucoin_futures:
+    try:
+      futures_fills = kucoin_futures.get_fills(page_size=50) or []
+      result["futures_fills"] = [f for f in futures_fills if _after_cutoff(f, "createdAt", "tradeCreatedAt")]
+    except Exception as exc:
+      logger.warning("Unable to fetch futures fills: %s", exc)
+
+    try:
+      closed = kucoin_futures.get_position_history(page_size=20) or []
+      result["closed_positions"] = [p for p in closed if _after_cutoff(p, "closeTime", "updatedAt")]
+    except Exception as exc:
+      logger.warning("Unable to fetch closed positions: %s", exc)
+
+  return result
+
+
 def _fetch_fees(kucoin: KucoinClient) -> dict:
   """Fetch base fee rates; returns empty dict on failure."""
   try:
@@ -290,12 +327,19 @@ async def trading_loop() -> None:
 
     should_run = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
 
+    recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=10)
+    new_events_count = len(recent_fills["spot_fills"]) + len(recent_fills["futures_fills"]) + len(recent_fills["closed_positions"])
+    if new_events_count:
+      logger.info("Detected %d new fill/close events (spot=%d, futures=%d, closed=%d)",
+                   new_events_count, len(recent_fills["spot_fills"]), len(recent_fills["futures_fills"]), len(recent_fills["closed_positions"]))
+
     if should_run:
       idle_polls = 0
       logger.info("Running agent. Triggers: %s", triggers or ["idle_threshold"])
       try:
         result = await asyncio.to_thread(
-          run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client
+          run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client,
+          recent_fills=recent_fills if new_events_count else None,
         )
         logger.info("--- Agent Decision Narrative ---\n%s", result["narrative"])
         if result.get("decisions"):

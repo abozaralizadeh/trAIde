@@ -219,6 +219,36 @@ def run_supervisor_agent(
     return result
 
   @function_tool
+  async def get_recent_fills(venue: str = "all", symbol: str | None = None) -> Dict[str, Any]:
+    """Get recent trade fills (executions) including triggered stops. venue: 'spot', 'futures', or 'all'."""
+    result: Dict[str, Any] = {}
+    if venue in ("all", "spot"):
+      try:
+        result["spotFills"] = kucoin.get_fills(symbol=symbol, page_size=30) if kucoin else []
+      except Exception as exc:
+        result["spotFillsError"] = str(exc)
+    if venue in ("all", "futures"):
+      if kucoin_futures:
+        try:
+          result["futuresFills"] = kucoin_futures.get_fills(symbol=symbol, page_size=30)
+        except Exception as exc:
+          result["futuresFillsError"] = str(exc)
+      else:
+        result["futuresFillsError"] = "Futures disabled"
+    return result
+
+  @function_tool
+  async def get_closed_positions(symbol: str | None = None) -> Dict[str, Any]:
+    """Get closed futures positions with realized PnL (TP/SL triggered, manual close, liquidation)."""
+    if not kucoin_futures:
+      return {"error": "Futures client not available"}
+    try:
+      closed = kucoin_futures.get_position_history(symbol=symbol, page_size=20)
+      return {"closedPositions": closed}
+    except Exception as exc:
+      return {"error": str(exc)}
+
+  @function_tool
   async def write_temporary_note(content: str) -> Dict[str, Any]:
     """Write a temporary note for the trading agent. It will be read once on the next run, then deleted."""
     if not content:
@@ -254,6 +284,7 @@ def run_supervisor_agent(
     "- Read source code files\n"
     "- View non-secret configuration\n"
     "- Fetch live KuCoin account balances and positions\n"
+    "- View recent trade fills and closed futures positions with realized PnL\n"
     "- Write notes to the trading agent:\n"
     "  - **Temporary notes**: read once by the trading agent on its next run, then auto-deleted\n"
     "  - **Permanent notes**: added to the trading agent's system prompt until manually deleted\n\n"
@@ -297,6 +328,8 @@ def run_supervisor_agent(
       list_source_files,
       get_config_summary,
       get_account_snapshot,
+      get_recent_fills,
+      get_closed_positions,
       write_temporary_note,
       write_permanent_note,
       list_notes,
