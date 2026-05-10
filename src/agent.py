@@ -3042,14 +3042,58 @@ def run_trading_agent(
     "- Call fetch_futures_candles when futures price may diverge from spot (high funding, liquidation cascades).\n"
     "- Call fetch_contract_details to check multiplier, maxLeverage, tick size, and fees before sizing.\n\n"
 
+    + (
+    "## STEP 2c — Regime-aware strategy (range vs. trend):\n"
+    "- analyze_market_context now returns a 'market_regime' field: 'trending', 'ranging', or 'squeeze'.\n"
+    "- The summary also includes 'market_regime' with multi-timeframe confirmation.\n"
+    "- ADX < 20 + BBW 2-6% = RANGING. ADX > 25 = TRENDING. BBW < 2% + ADX < 20 = SQUEEZE.\n\n"
+
+    "**When market_regime is 'ranging' (confirmed by summary):**\n"
+    "- STRATEGY: Mean-reversion. Buy low, sell/short high within the range.\n"
+    "- LONG ENTRY: Price near BB lower band AND (RSI < 35 OR Stochastic %K < 20). Target: BB midline.\n"
+    "- SHORT ENTRY (futures): Price near BB upper band AND (RSI > 65 OR Stochastic %K > 80). Target: BB midline.\n"
+    "- TP: Set at BB midline (the mean). This is a conservative target — do NOT aim for the opposite band.\n"
+    "- SL: 1.0 ATR beyond the BB band you entered at. Example: long near BB lower at 80,800 with ATR=200, SL=80,600.\n"
+    "- SIZE: 50-70% of normal position size. Range trades are higher frequency, lower conviction.\n"
+    "- CRITICAL: If the entry would yield less than 0.3% profit after fees (2x round-trip), skip it. "
+    "The range must be wide enough to profit from.\n"
+    "- You CAN have alternating long/short positions on the same coin as it oscillates within the range.\n"
+    "- Use reduce_only=True to take profit on a portion when price reaches the midline.\n\n"
+
+    "**When market_regime is 'squeeze':**\n"
+    "- A Bollinger Band squeeze means volatility is compressed and a big move is coming.\n"
+    "- Do NOT enter new range trades during a squeeze — the breakout will stop you out.\n"
+    "- Tighten stops on existing positions. Reduce size on any new entries.\n"
+    "- When the squeeze resolves (BBW expands AND ADX rises above 25), enter in the breakout direction.\n\n"
+
+    "**When market_regime is 'trending':**\n"
+    "- Use your standard trend-following strategy (STEP 3 below). The regime confirms your edge.\n"
+    "- Do NOT mean-revert against a confirmed trend. Do NOT short rallies or buy dips against the trend.\n"
+    "- A trending regime with ADX > 35 is a STRONG signal — use full size and wider TP targets.\n\n"
+
+    "**Regime transitions (breakout/breakdown):**\n"
+    "- If the commentary says 'ADX rising' during a range, a breakout is forming. "
+    "Tighten range trade stops and prepare to flip to trend-following.\n"
+    "- If the commentary says 'ADX weakening' during a trend, the trend is exhausting. "
+    "Take profit on trend trades and prepare for range conditions.\n"
+    "- Close range trades when ADX crosses 25. Close trend trades when ADX drops below 18.\n\n"
+    if cfg.trading.range_trading_enabled else "") +
+
     "## STEP 3 — Trade decision:\n"
     "Use the research to decide direction and build a complete trade plan (entry, stop, TP) BEFORE placing the order.\n\n"
 
     "**Entry signal — trade when the 1h trend_bias is clear (bullish or bearish):**\n"
     "- Strong setup (trade full size): 1h AND 15m both agree on direction, RSI 40–65, MACD confirms, catalyst from news.\n"
     "- Normal setup (trade reduced size, 50–70% of normal): 1h is clear, 15m mixed, OR 1h mixed but strong news catalyst.\n"
+    + (
+    "- Range setup (when market_regime='ranging'): Use mean-reversion entries per STEP 2c above. "
+    "Flat/ranging is now tradeable — oscillations within the range are your edge.\n"
+    "- Skip (decline): RSI at extreme (>75 or <25) against direction, clearly negative news, "
+    "or range too narrow for fees (< 0.3% half-range).\n\n"
+    if cfg.trading.range_trading_enabled else
     "- Skip (decline): 1h AND 15m both flat/ranging with no catalyst, RSI at extreme (>75 or <25) against direction, "
     "or clearly negative news.\n\n"
+    ) +
 
     "**Venue preference:**\n"
     "- Your input includes availableUsdt with spot, futures, and total balances. Read ALL of them before choosing a venue.\n"
@@ -3066,7 +3110,12 @@ def run_trading_agent(
     "**TP/SL rules (mandatory on every new entry):**\n"
     "- Stop-loss: ATR-based (1.0–1.5x ATR below entry) OR 0.5–1.5% if ATR is unavailable.\n"
     "- Take-profit: RR >= 1.2 (minimum). Aim for 1.5–2.0 when momentum is strong.\n"
-    "- Place stops immediately after entry using place_spot_stop_order or the stop/TP params on place_futures_market_order.\n\n"
+    "- Place stops immediately after entry using place_spot_stop_order or the stop/TP params on place_futures_market_order.\n"
+    + (
+    "- FOR RANGE TRADES: TP at BB midline (mean). SL at BB band + 1 ATR. "
+    "RR may be as low as 1.0 for range trades (the high win rate compensates). "
+    "Never set a range trade TP beyond the opposite BB band.\n\n"
+    if cfg.trading.range_trading_enabled else "\n") +
 
     "## STEP 4 — Log and save:\n"
     "- Log every decision (trade or decline) with confidence via log_decision.\n"

@@ -20,6 +20,7 @@ def _make_valid_config(**overrides) -> AppConfig:
         min_net_profit_usd=1.5,
         min_profit_roi_pct=0.008,
         estimated_slippage_pct=0.0005,
+        range_trading_enabled=True,
     )
     trading_kwargs.update(overrides)
     return AppConfig(

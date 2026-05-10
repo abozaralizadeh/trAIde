@@ -61,6 +61,7 @@ class TradingConfig:
   min_net_profit_usd: float
   min_profit_roi_pct: float
   estimated_slippage_pct: float
+  range_trading_enabled: bool
 
 
 @dataclass
@@ -152,6 +153,7 @@ def load_config() -> AppConfig:
       min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "0.05")),
       min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.001")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0005")),
+      range_trading_enabled=_as_bool(os.getenv("RANGE_TRADING_ENABLED"), True),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

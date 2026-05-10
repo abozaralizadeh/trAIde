@@ -178,6 +178,7 @@ def run_supervisor_agent(
       "min_net_profit_usd": cfg.trading.min_net_profit_usd,
       "min_profit_roi_pct": cfg.trading.min_profit_roi_pct,
       "estimated_slippage_pct": cfg.trading.estimated_slippage_pct,
+      "range_trading_enabled": cfg.trading.range_trading_enabled,
       "futures_enabled": cfg.kucoin_futures.enabled,
       "telegram_enabled": cfg.telegram.enabled,
       "supervisor_enabled": cfg.supervisor.enabled,
