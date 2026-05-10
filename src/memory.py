@@ -100,6 +100,7 @@ class MemoryStore:
             "price": t.get("price"),
             "size": t.get("size"),
             "paper": t.get("paper", False),
+            "venue": t.get("venue", "spot"),
             "ts": t.get("ts") or int(time.time()),
             "day": t.get("day"),
           }
@@ -395,6 +396,7 @@ class MemoryStore:
     paper: bool = False,
     price: float | None = None,
     size: float | None = None,
+    venue: str = "spot",
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -407,6 +409,7 @@ class MemoryStore:
         "price": price,
         "size": size,
         "paper": paper,
+        "venue": venue,
         "ts": now,
         "day": day_key,
       }
@@ -510,11 +513,13 @@ class MemoryStore:
       self._write(data)
       return limits
 
-  def positions(self, prices: Dict[str, float] | None = None) -> Dict[str, Any]:
-    """Derive positions (avg entry, unrealized/realized PnL) from recorded trades."""
+  def positions(self, prices: Dict[str, float] | None = None, venue: str | None = None) -> Dict[str, Any]:
+    """Derive positions (avg entry, unrealized/realized PnL) from recorded trades. Filter by venue ('spot'/'futures') when set."""
     with self._lock:
       data = self._prune(self._read())
       trades = sorted(data.get("trades", []), key=lambda t: t.get("ts", 0))
+    if venue:
+      trades = [t for t in trades if t.get("venue", "spot") == venue]
 
     positions: Dict[str, Dict[str, float]] = {}
 
@@ -531,7 +536,7 @@ class MemoryStore:
         continue
       if not sym or qty <= 0 or price <= 0 or side not in {"buy", "sell"}:
         continue
-      pos = positions.setdefault(sym, {"netSize": 0.0, "cost": 0.0, "realizedPnl": 0.0, "lastTs": t.get("ts", 0)})
+      pos = positions.setdefault(sym, {"netSize": 0.0, "cost": 0.0, "realizedPnl": 0.0, "venue": t.get("venue", "spot"), "lastTs": t.get("ts", 0)})
       net = pos["netSize"]
       cost = pos["cost"]
       realized = pos["realizedPnl"]
@@ -578,8 +583,35 @@ class MemoryStore:
       pos["currentPrice"] = cur_price or None
     return positions
 
+  @staticmethod
+  def _pnl_stats(decisions: list[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute win/loss stats from a list of decision dicts."""
+    realized: list[float] = []
+    for d in decisions:
+      pnl = d.get("pnl")
+      if pnl is not None:
+        try:
+          realized.append(float(pnl))
+        except (TypeError, ValueError):
+          pass
+    wins = [p for p in realized if p > 0]
+    losses = [p for p in realized if p < 0]
+    total = sum(realized)
+    wr = len(wins) / len(realized) if realized else 0.0
+    return {
+      "closedWithPnl": len(realized),
+      "wins": len(wins),
+      "losses": len(losses),
+      "winRate": round(wr, 3),
+      "totalRealizedPnl": round(total, 4),
+      "avgWin": round(sum(wins) / len(wins), 4) if wins else 0.0,
+      "avgLoss": round(sum(losses) / len(losses), 4) if losses else 0.0,
+      "bestTrade": round(max(wins), 4) if wins else 0.0,
+      "worstTrade": round(min(losses), 4) if losses else 0.0,
+    }
+
   def performance_summary(self) -> Dict[str, Any]:
-    """Compute win/loss stats from recorded decisions that include PnL."""
+    """Compute win/loss stats from recorded decisions, split by venue and paper/live."""
     with self._lock:
       data = self._prune(self._read())
       trades = data.get("trades", [])
@@ -588,33 +620,32 @@ class MemoryStore:
     if not trades:
       return {"totalTrades": 0, "message": "No trade history yet."}
 
-    realized_pnls: list[float] = []
-    for d in decisions:
-      pnl = d.get("pnl")
-      if pnl is not None:
-        try:
-          realized_pnls.append(float(pnl))
-        except (TypeError, ValueError):
-          pass
+    overall = self._pnl_stats(decisions)
+    overall["totalTrades"] = len(trades)
 
-    wins = [p for p in realized_pnls if p > 0]
-    losses = [p for p in realized_pnls if p < 0]
+    spot_decisions = [d for d in decisions if (d.get("action") or "").startswith("spot_")]
+    futures_decisions = [d for d in decisions if (d.get("action") or "").startswith("futures_")]
+    spot_trades = [t for t in trades if t.get("venue", "spot") == "spot"]
+    futures_trades = [t for t in trades if t.get("venue", "spot") == "futures"]
 
-    total_realized = sum(realized_pnls)
-    win_rate = len(wins) / len(realized_pnls) if realized_pnls else 0.0
+    def _venue_block(venue_decisions: list, venue_trades: list) -> Dict[str, Any]:
+      block = self._pnl_stats(venue_decisions)
+      block["totalTrades"] = len(venue_trades)
+      live_d = [d for d in venue_decisions if not d.get("paper", False)]
+      paper_d = [d for d in venue_decisions if d.get("paper", False)]
+      live_t = [t for t in venue_trades if not t.get("paper", False)]
+      paper_t = [t for t in venue_trades if t.get("paper", False)]
+      live_stats = self._pnl_stats(live_d)
+      live_stats["totalTrades"] = len(live_t)
+      paper_stats = self._pnl_stats(paper_d)
+      paper_stats["totalTrades"] = len(paper_t)
+      block["live"] = live_stats
+      block["paper"] = paper_stats
+      return block
 
-    return {
-      "totalTrades": len(trades),
-      "closedWithPnl": len(realized_pnls),
-      "wins": len(wins),
-      "losses": len(losses),
-      "winRate": round(win_rate, 3),
-      "totalRealizedPnl": round(total_realized, 4),
-      "avgWin": round(sum(wins) / len(wins), 4) if wins else 0.0,
-      "avgLoss": round(sum(losses) / len(losses), 4) if losses else 0.0,
-      "bestTrade": round(max(wins), 4) if wins else 0.0,
-      "worstTrade": round(min(losses), 4) if losses else 0.0,
-    }
+    overall["spot"] = _venue_block(spot_decisions, spot_trades)
+    overall["futures"] = _venue_block(futures_decisions, futures_trades)
+    return overall
 
   def reset_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:
     """Reset daily drawdown baseline to current_usdt."""

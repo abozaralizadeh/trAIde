@@ -161,3 +161,72 @@ def test_performance_summary_with_decisions(store):
     assert summary["totalRealizedPnl"] == 0.5
     assert summary["avgWin"] == 2.0
     assert summary["avgLoss"] == -1.5
+    # Venue breakdown should exist
+    assert "spot" in summary
+    assert summary["spot"]["totalTrades"] == 4
+    assert summary["spot"]["closedWithPnl"] == 2
+    assert "futures" in summary
+    assert summary["futures"]["totalTrades"] == 0
+
+
+def test_record_trade_venue_futures(store):
+    entry = store.record_trade("BTC-USDT", "buy", 500.0, paper=False, price=100000.0, size=0.005, venue="futures")
+    assert entry["venue"] == "futures"
+
+
+def test_record_trade_venue_defaults_to_spot(store):
+    entry = store.record_trade("BTC-USDT", "buy", 100.0, paper=True, price=50000.0, size=0.002)
+    assert entry["venue"] == "spot"
+
+
+def test_old_records_without_venue_default_to_spot(tmp_path):
+    import json
+    path = tmp_path / "memory.json"
+    old_trade = {"symbol": "BTC-USDT", "side": "buy", "notionalUsd": 100.0, "price": 50000.0, "size": 0.002, "paper": False, "ts": int(time.time()), "day": int(time.time() // 86400)}
+    path.write_text(json.dumps({"trades": [old_trade], "decisions": [], "plans": [], "triggers": [], "coins": [], "limits": {}, "sentiments": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}))
+    store = MemoryStore(str(path), retention_days=7)
+    summary = store.performance_summary()
+    assert summary["spot"]["totalTrades"] == 1
+    assert summary["futures"]["totalTrades"] == 0
+
+
+def test_performance_summary_splits_spot_futures(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=False, price=51000.0, size=0.002)
+    store.record_trade("ETH-USDT", "buy", 200.0, paper=False, price=3000.0, size=0.066, venue="futures")
+    store.record_trade("ETH-USDT", "sell", 200.0, paper=False, price=3100.0, size=0.066, venue="futures")
+    store.log_decision("BTC-USDT", "spot_sell", 0.8, "take profit", pnl=2.0, paper=False)
+    store.log_decision("ETH-USDT", "futures_sell", 0.7, "close long", pnl=5.0, paper=False)
+    summary = store.performance_summary()
+    assert summary["totalTrades"] == 4
+    assert summary["spot"]["totalTrades"] == 2
+    assert summary["spot"]["closedWithPnl"] == 1
+    assert summary["spot"]["totalRealizedPnl"] == 2.0
+    assert summary["futures"]["totalTrades"] == 2
+    assert summary["futures"]["closedWithPnl"] == 1
+    assert summary["futures"]["totalRealizedPnl"] == 5.0
+
+
+def test_performance_summary_splits_paper_live(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=True, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=True, price=51000.0, size=0.002)
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=False, price=52000.0, size=0.002)
+    store.log_decision("BTC-USDT", "spot_sell", 0.7, "paper tp", pnl=1.0, paper=True)
+    store.log_decision("BTC-USDT", "spot_sell", 0.8, "live tp", pnl=3.0, paper=False)
+    summary = store.performance_summary()
+    assert summary["spot"]["paper"]["closedWithPnl"] == 1
+    assert summary["spot"]["paper"]["totalRealizedPnl"] == 1.0
+    assert summary["spot"]["live"]["closedWithPnl"] == 1
+    assert summary["spot"]["live"]["totalRealizedPnl"] == 3.0
+
+
+def test_positions_venue_filter(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "buy", 500.0, paper=False, price=100000.0, size=0.005, venue="futures")
+    all_pos = store.positions()
+    assert all_pos["BTC-USDT"]["netSize"] == pytest.approx(0.007)
+    spot_pos = store.positions(venue="spot")
+    assert spot_pos["BTC-USDT"]["netSize"] == pytest.approx(0.002)
+    futures_pos = store.positions(venue="futures")
+    assert futures_pos["BTC-USDT"]["netSize"] == pytest.approx(0.005)

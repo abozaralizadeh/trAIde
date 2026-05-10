@@ -931,8 +931,8 @@ def run_trading_agent(
       clientOid=str(uuid.uuid4()),
     )
 
+    expected_pnl = None
     if side == "sell":
-      expected_pnl = None
       roi_pct = None
       pos_info = _spot_position_info(symbol)
       if not pos_info:
@@ -1061,7 +1061,7 @@ def run_trading_agent(
           f"spot_{side}",
           float(confidence),
           rationale or "paper trade",
-          pnl=None,
+          pnl=expected_pnl,
           paper=True,
         )
       bracket = {}
@@ -1091,7 +1091,7 @@ def run_trading_agent(
           f"spot_{side}",
           float(confidence),
           rationale or "live trade",
-          pnl=None,
+          pnl=expected_pnl,
           paper=False,
         )
       if (side or "").lower() == "buy" and auto_protect and planned_stop and planned_tp:
@@ -1928,7 +1928,7 @@ def run_trading_agent(
 
     if snapshot.paper_trading:
       order_req = _build_order(margin_mode)
-      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=contracts * multiplier)
+      record = memory.record_trade(symbol, side, notional, paper=True, price=price, size=contracts * multiplier, venue="futures")
       decision = None
       if confidence is not None:
         decision = memory.log_decision(
@@ -1936,7 +1936,7 @@ def run_trading_agent(
         f"futures_{side}",
         float(confidence),
         rationale or "paper trade",
-        pnl=None,
+        pnl=closing_pnl,
         paper=True,
       )
       return_val = {
@@ -1974,7 +1974,7 @@ def run_trading_agent(
       logger.warning("set_leverage failed (continuing): %s", exc)
     try:
       res = kucoin_futures.place_order(order_req).__dict__
-      record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
+      record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(
@@ -1982,7 +1982,7 @@ def run_trading_agent(
           f"futures_{side}",
           float(confidence),
           rationale or "live trade",
-          pnl=None,
+          pnl=closing_pnl,
           paper=False,
         )
       res["rationale"] = rationale
@@ -2021,7 +2021,7 @@ def run_trading_agent(
       logger.warning("set_leverage fallback failed (continuing): %s", exc)
     try:
       res = kucoin_futures.place_order(order_req).__dict__
-      record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier)
+      record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(
@@ -2029,7 +2029,7 @@ def run_trading_agent(
           f"futures_{side}",
           float(confidence),
           rationale or "live trade",
-          pnl=None,
+          pnl=closing_pnl,
           paper=False,
         )
       res["rationale"] = rationale
