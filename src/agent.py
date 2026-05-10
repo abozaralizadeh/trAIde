@@ -2269,6 +2269,158 @@ def run_trading_agent(
     except Exception as exc:
       return {"error": str(exc)}
 
+  def _resolve_futures_symbol(symbol: str) -> tuple[str | None, str | None]:
+    """Resolve flexible symbol input to a futures contract symbol. Returns (futures_sym, error_msg)."""
+    upper = (symbol or "").upper().strip()
+    if upper.endswith("USDTM"):
+      return upper, None
+    spot = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+    if not spot:
+      spot = _repair_allowed_symbol(symbol)
+    if not spot:
+      return None, f"Unknown symbol '{symbol}'"
+    fsym = _to_futures_symbol(spot)
+    return fsym, None if fsym else f"Cannot map '{symbol}' to futures"
+
+  @function_tool
+  async def fetch_funding_rate(symbol: str, history_hours: int = 0) -> Dict[str, Any]:
+    """Get current funding rate (and predicted next). Set history_hours > 0 to include recent funding rate history."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    fsym, err = _resolve_futures_symbol(symbol)
+    if err:
+      return {"error": err, "requested": symbol}
+    result: Dict[str, Any] = {}
+    try:
+      result["current"] = kucoin_futures.get_funding_rate(fsym)
+    except Exception as exc:
+      result["currentError"] = str(exc)
+    if history_hours > 0:
+      history_hours = min(history_hours, 168)
+      end_ms = kucoin._timestamp_ms()
+      start_ms = end_ms - history_hours * 3600 * 1000
+      try:
+        result["history"] = kucoin_futures.get_funding_rate_history(fsym, start_at=start_ms, end_at=end_ms)
+      except Exception as exc:
+        result["historyError"] = str(exc)
+    result["symbol"] = fsym
+    return result
+
+  @function_tool
+  async def fetch_open_interest(symbol: str) -> Dict[str, Any]:
+    """Get current open interest, mark price, index price, and key contract specs for a futures symbol."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    fsym, err = _resolve_futures_symbol(symbol)
+    if err:
+      return {"error": err, "requested": symbol}
+    try:
+      contract = kucoin_futures.get_contract_detail(fsym)
+      return {
+        "symbol": fsym,
+        "openInterest": contract.get("openInterest"),
+        "markPrice": contract.get("markPrice"),
+        "indexPrice": contract.get("indexPrice"),
+        "lastTradePrice": contract.get("lastTradePrice"),
+        "fundingFeeRate": contract.get("fundingFeeRate"),
+        "predictedFundingFeeRate": contract.get("predictedFundingFeeRate"),
+        "turnoverOf24h": contract.get("turnoverOf24h"),
+        "volumeOf24h": contract.get("volumeOf24h"),
+      }
+    except Exception as exc:
+      return {"error": str(exc), "symbol": fsym}
+
+  @function_tool
+  async def fetch_futures_orderbook(symbol: str, depth: int = 20) -> Dict[str, Any]:
+    """Fetch futures level2 orderbook snapshot (depth 20 or 100). Use to assess futures-specific liquidity and support/resistance."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    fsym, err = _resolve_futures_symbol(symbol)
+    if err:
+      return {"error": err, "requested": symbol}
+    depth_safe = 20 if depth <= 20 else 100
+    try:
+      ob = kucoin_futures.get_orderbook(fsym, depth=depth_safe)
+      ob["bids"] = (ob.get("bids") or [])[:depth_safe]
+      ob["asks"] = (ob.get("asks") or [])[:depth_safe]
+      return {"symbol": fsym, "depth": depth_safe, "orderbook": ob}
+    except Exception as exc:
+      return {"error": str(exc), "symbol": fsym}
+
+  @function_tool
+  async def fetch_futures_mark_price(symbol: str) -> Dict[str, Any]:
+    """Get current mark price and index price for a futures contract. The basis (mark - index) reveals futures premium/discount and market sentiment."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    fsym, err = _resolve_futures_symbol(symbol)
+    if err:
+      return {"error": err, "requested": symbol}
+    try:
+      data = kucoin_futures.get_mark_price(fsym)
+      mark = float(data.get("value") or 0)
+      index = float(data.get("indexPrice") or 0)
+      basis = mark - index if mark and index else None
+      basis_pct = (basis / index * 100) if basis is not None and index else None
+      return {
+        "symbol": fsym,
+        "markPrice": mark,
+        "indexPrice": index,
+        "basis": round(basis, 6) if basis is not None else None,
+        "basisPct": round(basis_pct, 4) if basis_pct is not None else None,
+        "timePoint": data.get("timePoint"),
+      }
+    except Exception as exc:
+      return {"error": str(exc), "symbol": fsym}
+
+  @function_tool
+  async def fetch_futures_candles(
+    symbol: str,
+    interval: str = "15min",
+    lookback_minutes: int = 360,
+  ) -> Dict[str, Any]:
+    """Fetch futures OHLCV candles. Use to compare futures price action vs spot. Intervals: 1min, 5min, 15min, 30min, 1hour, 2hour, 4hour, 8hour, 12hour, 1day, 1week."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    fsym, err = _resolve_futures_symbol(symbol)
+    if err:
+      return {"error": err, "requested": symbol}
+    granularity_map = {
+      "1min": 1, "5min": 5, "15min": 15, "30min": 30,
+      "1hour": 60, "2hour": 120, "4hour": 240, "8hour": 480,
+      "12hour": 720, "1day": 1440, "1week": 10080,
+    }
+    gran = granularity_map.get(interval)
+    if gran is None:
+      return {"error": "Invalid interval", "allowed": list(granularity_map.keys())}
+    lookback_min = max(1, min(int(lookback_minutes or 0), 10080))
+    end_ms = kucoin._timestamp_ms()
+    points = min(500, max(1, lookback_min // gran))
+    start_ms = end_ms - points * gran * 60 * 1000
+    try:
+      candles = kucoin_futures.get_candles(fsym, granularity=gran, start_at=start_ms, end_at=end_ms)
+      return {
+        "symbol": fsym,
+        "interval": interval,
+        "points": candles[:500],
+        "rows": len(candles),
+        "note": "Each row: [time_ms, open, high, low, close, volume, turnover]",
+      }
+    except Exception as exc:
+      return {"error": str(exc), "symbol": fsym}
+
+  @function_tool
+  async def fetch_contract_details(symbol: str) -> Dict[str, Any]:
+    """Get full contract specification: multiplier, lotSize, tickSize, maxLeverage, maxOrderQty, takerFee, makerFee, funding interval, settlement currency, etc."""
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    fsym, err = _resolve_futures_symbol(symbol)
+    if err:
+      return {"error": err, "requested": symbol}
+    try:
+      return {"symbol": fsym, "contract": kucoin_futures.get_contract_detail(fsym)}
+    except Exception as exc:
+      return {"error": str(exc), "symbol": fsym}
+
   @function_tool
   async def set_futures_position_protection(
     symbol: str,
@@ -2958,6 +3110,12 @@ def run_trading_agent(
       fetch_recent_candles,
       analyze_market_context,
       fetch_orderbook,
+      fetch_funding_rate,
+      fetch_open_interest,
+      fetch_futures_orderbook,
+      fetch_futures_mark_price,
+      fetch_futures_candles,
+      fetch_contract_details,
       fetch_kucoin_news,
       log_research,
       latest_items,
@@ -2994,6 +3152,12 @@ def run_trading_agent(
       list_futures_positions,
       get_recent_fills,
       get_closed_positions,
+      fetch_funding_rate,
+      fetch_open_interest,
+      fetch_futures_orderbook,
+      fetch_futures_mark_price,
+      fetch_futures_candles,
+      fetch_contract_details,
       save_trade_plan,
       latest_plan,
       latest_items,

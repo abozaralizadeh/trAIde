@@ -824,3 +824,57 @@ class KucoinFuturesClient:
     if isinstance(data, dict) and "items" in data:
       return data.get("items") or []
     return data or []
+
+  # ── Market data (no auth) ─────────────────────────────────────────
+
+  def get_contract_detail(self, symbol: str) -> Dict[str, Any]:
+    """Get contract specs: multiplier, tickSize, maxLeverage, fundingFeeRate, openInterest, markPrice, etc."""
+    data = self._request("GET", f"/api/v1/contracts/{symbol}")
+    return data or {}
+
+  def list_active_contracts(self) -> list[Dict[str, Any]]:
+    """List all active futures contracts."""
+    data = self._request("GET", "/api/v1/contracts/active")
+    return data or []
+
+  def get_funding_rate(self, symbol: str) -> Dict[str, Any]:
+    """Get current funding rate and predicted next rate."""
+    data = self._request("GET", f"/api/v1/funding-rate/{symbol}/current")
+    return data or {}
+
+  def get_funding_rate_history(self, symbol: str, start_at: Optional[int] = None, end_at: Optional[int] = None) -> list[Dict[str, Any]]:
+    """Get historical funding rates. Times are in milliseconds."""
+    query: Dict[str, Any] = {"symbol": symbol}
+    if start_at is not None:
+      query["from"] = start_at
+    if end_at is not None:
+      query["to"] = end_at
+    data = self._request("GET", "/api/v1/contract/funding-rates", query=query)
+    if isinstance(data, list):
+      return data
+    if isinstance(data, dict) and "dataList" in data:
+      return data.get("dataList") or []
+    return data or []
+
+  def get_mark_price(self, symbol: str) -> Dict[str, Any]:
+    """Get current mark price, index price, and granularity."""
+    data = self._request("GET", f"/api/v1/mark-price/{symbol}/current")
+    return data or {}
+
+  def get_orderbook(self, symbol: str, depth: int = 20) -> Dict[str, Any]:
+    """Get futures level2 orderbook snapshot. Depth: 20 or 100."""
+    path = "/api/v1/level2/depth20" if depth <= 20 else "/api/v1/level2/depth100"
+    data = self._request("GET", path, query={"symbol": symbol})
+    return data or {}
+
+  def get_candles(self, symbol: str, granularity: int = 1, start_at: Optional[int] = None, end_at: Optional[int] = None) -> list[list]:
+    """Get futures OHLCV candles. Granularity in minutes: 1,5,15,30,60,120,240,480,720,1440,10080."""
+    query: Dict[str, Any] = {"symbol": symbol, "granularity": granularity}
+    if start_at is not None:
+      query["from"] = start_at
+    if end_at is not None:
+      query["to"] = end_at
+    data = self._request("GET", "/api/v1/kline/query", query=query)
+    if isinstance(data, list):
+      return data
+    return []

@@ -249,6 +249,63 @@ def run_supervisor_agent(
       return {"error": str(exc)}
 
   @function_tool
+  async def fetch_funding_rate(symbol: str, history_hours: int = 0) -> Dict[str, Any]:
+    """Get current funding rate and predicted next rate for a futures symbol (e.g. XBTUSDTM). Set history_hours > 0 for history."""
+    if not kucoin_futures:
+      return {"error": "Futures client not available"}
+    result: Dict[str, Any] = {"symbol": symbol}
+    try:
+      result["current"] = kucoin_futures.get_funding_rate(symbol)
+    except Exception as exc:
+      result["currentError"] = str(exc)
+    if history_hours > 0:
+      try:
+        end_ms = int(__import__("time").time() * 1000)
+        start_ms = end_ms - min(history_hours, 168) * 3600 * 1000
+        result["history"] = kucoin_futures.get_funding_rate_history(symbol, start_at=start_ms, end_at=end_ms)
+      except Exception as exc:
+        result["historyError"] = str(exc)
+    return result
+
+  @function_tool
+  async def fetch_open_interest(symbol: str) -> Dict[str, Any]:
+    """Get open interest, mark/index price, and 24h volume for a futures symbol."""
+    if not kucoin_futures:
+      return {"error": "Futures client not available"}
+    try:
+      c = kucoin_futures.get_contract_detail(symbol)
+      return {
+        "symbol": symbol,
+        "openInterest": c.get("openInterest"),
+        "markPrice": c.get("markPrice"),
+        "indexPrice": c.get("indexPrice"),
+        "turnoverOf24h": c.get("turnoverOf24h"),
+        "volumeOf24h": c.get("volumeOf24h"),
+        "fundingFeeRate": c.get("fundingFeeRate"),
+      }
+    except Exception as exc:
+      return {"error": str(exc), "symbol": symbol}
+
+  @function_tool
+  async def fetch_futures_mark_price(symbol: str) -> Dict[str, Any]:
+    """Get mark price, index price, and basis (premium/discount) for a futures symbol."""
+    if not kucoin_futures:
+      return {"error": "Futures client not available"}
+    try:
+      data = kucoin_futures.get_mark_price(symbol)
+      mark = float(data.get("value") or 0)
+      index = float(data.get("indexPrice") or 0)
+      basis = mark - index if mark and index else None
+      basis_pct = (basis / index * 100) if basis and index else None
+      return {
+        "symbol": symbol, "markPrice": mark, "indexPrice": index,
+        "basis": round(basis, 6) if basis is not None else None,
+        "basisPct": round(basis_pct, 4) if basis_pct is not None else None,
+      }
+    except Exception as exc:
+      return {"error": str(exc), "symbol": symbol}
+
+  @function_tool
   async def write_temporary_note(content: str) -> Dict[str, Any]:
     """Write a temporary note for the trading agent. It will be read once on the next run, then deleted."""
     if not content:
@@ -330,6 +387,9 @@ def run_supervisor_agent(
       get_account_snapshot,
       get_recent_fills,
       get_closed_positions,
+      fetch_funding_rate,
+      fetch_open_interest,
+      fetch_futures_mark_price,
       write_temporary_note,
       write_permanent_note,
       list_notes,
