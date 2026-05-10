@@ -1390,7 +1390,7 @@ def run_trading_agent(
     slow_interval: str = "1hour",
     lookback_minutes: int = 360,
   ) -> Dict[str, Any]:
-    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP across two intervals and summarize bias."""
+    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP across two intervals and summarize bias. When futures are enabled, also returns funding rate, open interest, basis, and 24h volume."""
     symbol = _normalize_symbol(symbol)
 
     interval_order: list[str] = []
@@ -1419,7 +1419,41 @@ def run_trading_agent(
         return {"error": str(exc), "interval": iv}
 
     summary = summarize_multi_timeframe(snapshots)
-    return {"symbol": symbol, "snapshots": snapshots, "summary": summary}
+    result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
+
+    if cfg.kucoin_futures.enabled and kucoin_futures:
+      fsym = _to_futures_symbol(symbol)
+      if fsym:
+        futures_data: Dict[str, Any] = {"symbol": fsym}
+        try:
+          fr = kucoin_futures.get_funding_rate(fsym)
+          futures_data["fundingRate"] = fr.get("value")
+          futures_data["predictedRate"] = fr.get("predictedValue")
+        except Exception:
+          pass
+        try:
+          contract = kucoin_futures.get_contract_detail(fsym)
+          futures_data["openInterest"] = contract.get("openInterest")
+          futures_data["volumeOf24h"] = contract.get("volumeOf24h")
+          futures_data["turnoverOf24h"] = contract.get("turnoverOf24h")
+        except Exception:
+          pass
+        try:
+          mp = kucoin_futures.get_mark_price(fsym)
+          mark = float(mp.get("value") or 0)
+          index = float(mp.get("indexPrice") or 0)
+          futures_data["markPrice"] = mark
+          futures_data["indexPrice"] = index
+          if mark and index:
+            basis = mark - index
+            futures_data["basis"] = round(basis, 6)
+            futures_data["basisPct"] = round(basis / index * 100, 4)
+        except Exception:
+          pass
+        if futures_data.keys() - {"symbol"}:
+          result["futures"] = futures_data
+
+    return result
 
   @function_tool
   async def plan_spot_position(
@@ -2982,12 +3016,31 @@ def run_trading_agent(
     "- A position with no recovery catalyst is a strong candidate for closing to free capital.\n"
     "- Do NOT keep positions indefinitely out of hope — evaluate objectively with data.\n\n"
 
+    "## STEP 1d — Review recent events (triggered TP/SL):\n"
+    "- Check the 'recentEvents' field in your input. If present, orders were filled or positions were closed since last round.\n"
+    "- 'closedPositions': futures positions closed by triggered TP/SL — review the realized PnL, ROE, and close type.\n"
+    "- 'spotFills' / 'futuresFills': individual trade executions — check if stop orders triggered.\n"
+    "- Use this feedback to adapt: if a SL triggered, assess whether the stop was too tight or the entry was wrong.\n"
+    "  If a TP triggered, note the profit and consider whether you left money on the table.\n"
+    "- Call get_recent_fills or get_closed_positions for more detail if needed.\n\n"
+
     "## STEP 2 — Research (required before every entry decision):\n"
     "- Call analyze_market_context for each coin (15min + 1hour) to get EMA/RSI/MACD/ATR/BB/VWAP signals.\n"
+    "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis (mark - index), and 24h volume.\n"
     "- Call fetch_recent_candles if you need raw price detail to set precise TP/SL levels.\n"
     "- Call web_search for news, sentiment, and catalysts. Call fetch_kucoin_news for exchange-specific events.\n"
     "- Use fetch_orderbook when you need microstructure (depth, imbalance) to time entry or set tight stops.\n"
     "- Assign a sentiment score 0–1 from news. If sentiment_filter_enabled and score < sentiment_min_score, skip buys.\n\n"
+
+    "## STEP 2b — Futures-specific research (when considering futures trades):\n"
+    "- Call fetch_funding_rate to check current and predicted funding. High positive = longs pay shorts (bearish crowding); "
+    "high negative = shorts pay longs. Avoid opening a position that pays high funding unless the trade is very short-term.\n"
+    "- Call fetch_open_interest to gauge crowding. Rising OI + rising price = strong trend; rising OI + falling price = shorts building.\n"
+    "- Call fetch_futures_mark_price to check basis (mark - index). Positive basis = futures premium (bullish sentiment); "
+    "negative = discount (bearish). Large basis can mean reversion risk.\n"
+    "- Call fetch_futures_orderbook for futures-specific liquidity and support/resistance walls.\n"
+    "- Call fetch_futures_candles when futures price may diverge from spot (high funding, liquidation cascades).\n"
+    "- Call fetch_contract_details to check multiplier, maxLeverage, tick size, and fees before sizing.\n\n"
 
     "## STEP 3 — Trade decision:\n"
     "Use the research to decide direction and build a complete trade plan (entry, stop, TP) BEFORE placing the order.\n\n"
