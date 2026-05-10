@@ -253,6 +253,7 @@ async def trading_loop() -> None:
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
   idle_polls = 0
+  logged_closed_position_ids: set[str] = set()
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   notifier = TelegramNotifier(cfg)
   notifier.notify_startup(cfg)
@@ -332,6 +333,29 @@ async def trading_loop() -> None:
     if new_events_count:
       logger.info("Detected %d new fill/close events (spot=%d, futures=%d, closed=%d)",
                    new_events_count, len(recent_fills["spot_fills"]), len(recent_fills["futures_fills"]), len(recent_fills["closed_positions"]))
+
+    for cp in recent_fills["closed_positions"]:
+      cp_id = str(cp.get("id") or cp.get("openTime") or "")
+      if not cp_id or cp_id in logged_closed_position_ids:
+        continue
+      try:
+        sym = normalize_symbol(cp.get("symbol") or "")
+        pnl = float(cp.get("pnl") or 0)
+        roe = float(cp.get("roe") or 0)
+        close_type = cp.get("type") or "unknown"
+        side = "sell" if "LONG" in close_type.upper() else "buy"
+        memory.log_decision(
+          sym,
+          f"futures_{side}_triggered",
+          confidence=0.0,
+          reason=f"TP/SL triggered ({close_type}, ROE {roe:.2%})",
+          pnl=pnl,
+          paper=False,
+        )
+        logged_closed_position_ids.add(cp_id)
+        logger.info("Recorded triggered close for %s: PnL=%.4f (%s)", sym, pnl, close_type)
+      except Exception as exc:
+        logger.warning("Failed to record triggered close: %s", exc)
 
     if should_run:
       idle_polls = 0
