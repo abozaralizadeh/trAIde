@@ -326,6 +326,12 @@ async def trading_loop() -> None:
           triggers.append(f"price_move:{symbol}:{change_pct:.2f}%")
       last_prices[symbol] = price
 
+    try:
+      current_positions = memory.positions(last_prices)
+      memory.update_position_extremes(current_positions)
+    except Exception as exc:
+      logger.warning("Failed to update position extremes: %s", exc)
+
     should_run = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
 
     recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=10)

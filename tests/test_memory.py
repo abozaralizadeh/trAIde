@@ -230,3 +230,82 @@ def test_positions_venue_filter(store):
     assert spot_pos["BTC-USDT"]["netSize"] == pytest.approx(0.002)
     futures_pos = store.positions(venue="futures")
     assert futures_pos["BTC-USDT"]["netSize"] == pytest.approx(0.005)
+
+
+# --- Position extremes (peak/trough PnL) tests ---
+
+
+def test_update_position_extremes_tracks_peak_and_trough(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    # Simulate rising price
+    pos1 = store.positions(prices={"BTC-USDT": 51000.0})
+    store.update_position_extremes(pos1)
+    ext = store.get_position_extremes("BTC-USDT")
+    assert ext["peakPnl"] == pytest.approx(2.0)
+    assert ext["troughPnl"] == pytest.approx(2.0)
+    # Simulate price drop
+    pos2 = store.positions(prices={"BTC-USDT": 49000.0})
+    store.update_position_extremes(pos2)
+    ext = store.get_position_extremes("BTC-USDT")
+    assert ext["peakPnl"] == pytest.approx(2.0)  # peak unchanged
+    assert ext["troughPnl"] == pytest.approx(-2.0)  # new trough
+    # Simulate new high
+    pos3 = store.positions(prices={"BTC-USDT": 53000.0})
+    store.update_position_extremes(pos3)
+    ext = store.get_position_extremes("BTC-USDT")
+    assert ext["peakPnl"] == pytest.approx(6.0)  # new peak
+    assert ext["troughPnl"] == pytest.approx(-2.0)  # trough unchanged
+
+
+def test_extremes_cleared_when_position_closes(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    pos = store.positions(prices={"BTC-USDT": 51000.0})
+    store.update_position_extremes(pos)
+    assert store.get_position_extremes("BTC-USDT")
+    # Close the position
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=False, price=51000.0, size=0.002)
+    pos_empty = store.positions(prices={"BTC-USDT": 51000.0})
+    store.update_position_extremes(pos_empty)
+    assert store.get_position_extremes("BTC-USDT") == {}
+
+
+def test_positions_include_peak_trough(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    pos = store.positions(prices={"BTC-USDT": 52000.0})
+    store.update_position_extremes(pos)
+    pos = store.positions(prices={"BTC-USDT": 49000.0})
+    store.update_position_extremes(pos)
+    pos = store.positions(prices={"BTC-USDT": 50500.0})
+    assert pos["BTC-USDT"]["peakPnl"] == pytest.approx(4.0)
+    assert pos["BTC-USDT"]["troughPnl"] == pytest.approx(-2.0)
+
+
+def test_log_decision_auto_attaches_extremes(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
+    pos = store.positions(prices={"BTC-USDT": 53000.0})
+    store.update_position_extremes(pos)
+    pos = store.positions(prices={"BTC-USDT": 48000.0})
+    store.update_position_extremes(pos)
+    # Log a sell decision — should auto-attach peak/trough
+    decision = store.log_decision("BTC-USDT", "spot_sell", 0.8, "take profit", pnl=1.0)
+    assert decision["peakPnl"] == pytest.approx(6.0)
+    assert decision["troughPnl"] == pytest.approx(-4.0)
+
+
+def test_performance_summary_missed_profit(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=True, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=True, price=50500.0, size=0.002)
+    # Log a decision where peak was much higher than final PnL
+    store.log_decision("BTC-USDT", "spot_sell", 0.7, "take profit", pnl=1.0, peak_pnl=5.0, trough_pnl=-0.5)
+    summary = store.performance_summary()
+    assert summary["missedProfitCount"] == 1
+    assert summary["totalMissedProfit"] == pytest.approx(4.0)  # peak 5.0 - actual 1.0
+    assert summary["avgMissedProfit"] == pytest.approx(4.0)
+
+
+def test_performance_summary_no_missed_profit_when_peak_equals_pnl(store):
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=True, price=50000.0, size=0.002)
+    store.record_trade("BTC-USDT", "sell", 100.0, paper=True, price=51000.0, size=0.002)
+    store.log_decision("BTC-USDT", "spot_sell", 0.8, "perfect exit", pnl=2.0, peak_pnl=2.0, trough_pnl=-0.1)
+    summary = store.performance_summary()
+    assert "missedProfitCount" not in summary

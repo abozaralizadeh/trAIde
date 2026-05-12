@@ -37,7 +37,7 @@ class MemoryStore:
     self._read()
 
   def _read(self) -> Dict[str, Any]:
-    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}
+    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}}
     if self._cache is not None:
       try:
         disk_mtime = self.path.stat().st_mtime
@@ -63,6 +63,7 @@ class MemoryStore:
         data.setdefault("fees", [])
         data.setdefault("supervisor_notes_temporary", [])
         data.setdefault("supervisor_notes_permanent", [])
+        data.setdefault("position_extremes", {})
         # prune invalid entries while keeping timestamp
         data["plans"] = [
           p
@@ -451,13 +452,23 @@ class MemoryStore:
     reason: str,
     pnl: Optional[float] = None,
     paper: bool = False,
+    peak_pnl: Optional[float] = None,
+    trough_pnl: Optional[float] = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
       now = int(time.time())
       day_key = int(now // 86400)
-      entry = {
-        "symbol": _normalize_symbol(symbol),
+      sym = _normalize_symbol(symbol)
+      if pnl is not None and (peak_pnl is None or trough_pnl is None):
+        ext = data.get("position_extremes", {}).get(sym, {})
+        if ext:
+          if peak_pnl is None:
+            peak_pnl = ext.get("peakPnl")
+          if trough_pnl is None:
+            trough_pnl = ext.get("troughPnl")
+      entry: Dict[str, Any] = {
+        "symbol": sym,
         "action": action,
         "confidence": float(confidence),
         "reason": reason,
@@ -466,6 +477,10 @@ class MemoryStore:
         "ts": now,
         "day": day_key,
       }
+      if peak_pnl is not None:
+        entry["peakPnl"] = round(float(peak_pnl), 4)
+      if trough_pnl is not None:
+        entry["troughPnl"] = round(float(trough_pnl), 4)
       data.setdefault("decisions", [])
       data["decisions"].append(entry)
       self._write(data)
@@ -568,8 +583,10 @@ class MemoryStore:
       pos["realizedPnl"] = realized
       pos["lastTs"] = max(pos.get("lastTs", 0), ts)
 
-    # Attach derived values and unrealized PnL when prices are supplied.
+    # Attach derived values, unrealized PnL, and peak/trough extremes when prices are supplied.
     prices = prices or {}
+    with self._lock:
+      extremes = self._read().get("position_extremes", {})
     for sym, pos in positions.items():
       net = pos.get("netSize", 0.0)
       cost = pos.get("cost", 0.0)
@@ -581,24 +598,87 @@ class MemoryStore:
       pos["avgEntry"] = avg_entry
       pos["unrealizedPnl"] = unrealized
       pos["currentPrice"] = cur_price or None
+      ext = extremes.get(sym, {})
+      if ext:
+        pos["peakPnl"] = ext.get("peakPnl")
+        pos["troughPnl"] = ext.get("troughPnl")
     return positions
+
+  def update_position_extremes(self, positions: Dict[str, Dict[str, Any]]) -> None:
+    """Update peak/trough unrealized PnL for open positions. Call each poll round."""
+    with self._lock:
+      data = self._read()
+      extremes = data.get("position_extremes", {})
+      now = int(time.time())
+      active_symbols: set[str] = set()
+      for sym, pos in positions.items():
+        net = pos.get("netSize") or 0
+        upnl = pos.get("unrealizedPnl")
+        if not net or upnl is None:
+          continue
+        active_symbols.add(sym)
+        ext = extremes.get(sym)
+        if ext is None:
+          extremes[sym] = {"peakPnl": upnl, "troughPnl": upnl, "peakTs": now, "troughTs": now, "openTs": now}
+        else:
+          if upnl > (ext.get("peakPnl") or float("-inf")):
+            ext["peakPnl"] = upnl
+            ext["peakTs"] = now
+          if upnl < (ext.get("troughPnl") or float("inf")):
+            ext["troughPnl"] = upnl
+            ext["troughTs"] = now
+      for sym in list(extremes.keys()):
+        if sym not in active_symbols:
+          del extremes[sym]
+      data["position_extremes"] = extremes
+      self._write(data)
+
+  def get_position_extremes(self, symbol: str | None = None) -> Dict[str, Any]:
+    """Get peak/trough PnL extremes for open positions (or a specific symbol)."""
+    with self._lock:
+      data = self._read()
+      extremes = data.get("position_extremes", {})
+    if symbol:
+      return extremes.get(_normalize_symbol(symbol), {})
+    return extremes
 
   @staticmethod
   def _pnl_stats(decisions: list[Dict[str, Any]]) -> Dict[str, Any]:
     """Compute win/loss stats from a list of decision dicts."""
     realized: list[float] = []
+    missed_profits: list[float] = []
+    unnecessary_losses: list[float] = []
     for d in decisions:
       pnl = d.get("pnl")
       if pnl is not None:
         try:
-          realized.append(float(pnl))
+          pnl_f = float(pnl)
         except (TypeError, ValueError):
-          pass
+          continue
+        realized.append(pnl_f)
+        peak = d.get("peakPnl")
+        trough = d.get("troughPnl")
+        if peak is not None:
+          try:
+            peak_f = float(peak)
+          except (TypeError, ValueError):
+            peak_f = None
+        else:
+          peak_f = None
+        if peak_f is not None and peak_f > pnl_f and peak_f > 0:
+          missed_profits.append(round(peak_f - pnl_f, 4))
+        if trough is not None and pnl_f <= 0:
+          try:
+            trough_f = float(trough)
+          except (TypeError, ValueError):
+            trough_f = None
+          if trough_f is not None and trough_f < pnl_f:
+            unnecessary_losses.append(round(pnl_f - trough_f, 4))
     wins = [p for p in realized if p > 0]
     losses = [p for p in realized if p < 0]
     total = sum(realized)
     wr = len(wins) / len(realized) if realized else 0.0
-    return {
+    stats: Dict[str, Any] = {
       "closedWithPnl": len(realized),
       "wins": len(wins),
       "losses": len(losses),
@@ -609,6 +689,14 @@ class MemoryStore:
       "bestTrade": round(max(wins), 4) if wins else 0.0,
       "worstTrade": round(min(losses), 4) if losses else 0.0,
     }
+    if missed_profits:
+      stats["missedProfitCount"] = len(missed_profits)
+      stats["totalMissedProfit"] = round(sum(missed_profits), 4)
+      stats["avgMissedProfit"] = round(sum(missed_profits) / len(missed_profits), 4)
+    if unnecessary_losses:
+      stats["unnecessaryLossCount"] = len(unnecessary_losses)
+      stats["totalUnnecessaryLoss"] = round(sum(unnecessary_losses), 4)
+    return stats
 
   def performance_summary(self) -> Dict[str, Any]:
     """Compute win/loss stats from recorded decisions, split by venue and paper/live."""

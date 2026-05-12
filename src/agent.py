@@ -3141,6 +3141,11 @@ def run_trading_agent(
     "- If win rate is below 40%: prioritize higher-conviction setups and tighter stops.\n"
     "- If avg loss exceeds avg win by 2x+: your stops may be too wide — tighten them.\n"
     "- If total realized PnL is negative: focus on smaller positions until you find a winning pattern.\n"
+    "- **Missed profit analysis**: performanceSummary includes missedProfitCount/totalMissedProfit — these show trades "
+    "where the position was in profit (peakPnl > 0) but you closed at a lower PnL. High missed profit means "
+    "you're being too greedy with TP targets; lower them or take partial profits earlier.\n"
+    "- **Position extremes**: each open position shows peakPnl (best it reached) and troughPnl (worst it reached). "
+    "If peakPnl was positive but current unrealizedPnl is negative, you missed an exit opportunity.\n"
     "- Use this data to adapt — don't repeat losing patterns.\n\n"
 
     "## Opportunity discovery (every run):\n"
@@ -3204,6 +3209,11 @@ def run_trading_agent(
       "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
       "- NEVER place orders or change the coin list yourself; propose candidates only.\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
+      "- **Strategy review**: Use latest_items('decisions') to review recent trades. Look for patterns:\n"
+      "  - Trades with high peakPnl but low/negative final pnl = greedy TP targets (suggest tighter TPs).\n"
+      "  - Trades with deep troughPnl = poor entries or wide stops (suggest better entry timing).\n"
+      "  - Repeated losses on the same coin = bad coin choice (suggest removal).\n"
+      "  - Log strategy improvement suggestions via log_research so the Trading Agent can adapt.\n"
       "- When handing off, remind the Trading Agent to read the saved note via latest_plan/latest_items so your research is used.\n"
       "- Always handoff to the main Trading Agent after your research is done passing the new coins to be added to the coin list or the ones that should be deleted."
     ),
