@@ -7,7 +7,7 @@ from src.config import (
   AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig,
   TradingConfig, LangsmithConfig, TelegramConfig, SupervisorConfig,
 )
-from src.telegram import TelegramNotifier, _esc, _fmt_price, _format_orders, MAX_MESSAGE_LENGTH
+from src.telegram import TelegramNotifier, _esc, _fmt_price, _format_orders, _split_message, MAX_MESSAGE_LENGTH
 
 
 def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=False, **overrides) -> AppConfig:
@@ -209,21 +209,62 @@ class TestNotifierMessages:
     assert "ConnectionError" in msg
 
 
-class TestTruncation:
-  def test_long_message_truncated(self):
+class TestSplitMessage:
+  def test_short_message_not_split(self):
+    chunks = _split_message("hello")
+    assert chunks == ["hello"]
+
+  def test_exact_limit_not_split(self):
+    text = "x" * MAX_MESSAGE_LENGTH
+    chunks = _split_message(text)
+    assert len(chunks) == 1
+    assert chunks[0] == text
+
+  def test_long_message_split_at_newlines(self):
+    line = "a" * 100 + "\n"
+    text = line * 50  # 5050 chars, > 4096
+    chunks = _split_message(text)
+    assert len(chunks) >= 2
+    for chunk in chunks:
+      assert len(chunk) <= MAX_MESSAGE_LENGTH
+    reassembled = "\n".join(chunks)
+    assert reassembled.replace("\n", "") == text.replace("\n", "")
+
+  def test_long_message_hard_split_when_no_newlines(self):
+    text = "x" * (MAX_MESSAGE_LENGTH * 2 + 100)
+    chunks = _split_message(text)
+    assert len(chunks) == 3
+    for chunk in chunks:
+      assert len(chunk) <= MAX_MESSAGE_LENGTH
+    assert "".join(chunks) == text
+
+  def test_send_raw_sends_all_chunks(self):
     cfg = _make_cfg(telegram_enabled=False)
     notifier = TelegramNotifier(cfg)
-    long_text = "x" * (MAX_MESSAGE_LENGTH + 500)
-    result = notifier._send_raw  # we'll test the truncation logic directly
-    # Directly check truncation in _send_raw by mocking requests
+    long_text = ("x" * 100 + "\n") * 50  # > 4096 chars
     with patch("src.telegram.requests.post") as mock_post:
       mock_post.return_value = MagicMock(status_code=200)
       notifier.token = "tok"
       notifier._send_raw(long_text)
-      call_args = mock_post.call_args
-      sent_text = call_args.kwargs["json"]["text"] if "json" in call_args.kwargs else call_args[1]["json"]["text"]
-      assert len(sent_text) <= MAX_MESSAGE_LENGTH
-      assert "truncated" in sent_text
+      assert mock_post.call_count >= 2
+      for call in mock_post.call_args_list:
+        sent_text = call.kwargs["json"]["text"] if "json" in call.kwargs else call[1]["json"]["text"]
+        assert len(sent_text) <= MAX_MESSAGE_LENGTH
+
+
+class TestNarrativeNotTruncated:
+  def test_full_narrative_sent(self):
+    cfg = _make_cfg(telegram_enabled=False)
+    notifier = TelegramNotifier(cfg)
+    notifier.enabled = True
+    messages = []
+    notifier.send = lambda text: messages.append(text)
+    long_narrative = "word " * 200  # 1000 chars
+    result = {"narrative": long_narrative, "decisions": [], "tool_results": []}
+    notifier.notify_agent_run(["idle"], result)
+    full_text = "".join(messages)
+    assert "...truncated" not in full_text
+    assert "word " * 199 in full_text
 
 
 class TestQueueFull:

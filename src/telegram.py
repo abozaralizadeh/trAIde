@@ -51,22 +51,20 @@ class TelegramNotifier:
         logger.warning("Telegram worker error: %s", exc)
 
   def _send_raw(self, text: str) -> None:
-    suffix = "\n\n<i>...truncated</i>"
-    if len(text) > MAX_MESSAGE_LENGTH:
-      text = text[: MAX_MESSAGE_LENGTH - len(suffix)] + suffix
-    url = TELEGRAM_API_URL.format(token=self.token)
-    payload = {
-      "chat_id": self.chat_id,
-      "text": text,
-      "parse_mode": "HTML",
-      "disable_notification": self.silent,
-    }
-    try:
-      resp = requests.post(url, json=payload, timeout=SEND_TIMEOUT_SEC)
-      if resp.status_code != 200:
-        logger.warning("Telegram API error %d: %s", resp.status_code, resp.text[:200])
-    except Exception as exc:
-      logger.warning("Telegram send failed: %s", exc)
+    for chunk in _split_message(text):
+      url = TELEGRAM_API_URL.format(token=self.token)
+      payload = {
+        "chat_id": self.chat_id,
+        "text": chunk,
+        "parse_mode": "HTML",
+        "disable_notification": self.silent,
+      }
+      try:
+        resp = requests.post(url, json=payload, timeout=SEND_TIMEOUT_SEC)
+        if resp.status_code != 200:
+          logger.warning("Telegram API error %d: %s", resp.status_code, resp.text[:200])
+      except Exception as exc:
+        logger.warning("Telegram send failed: %s", exc)
 
   def send(self, text: str) -> None:
     """Enqueue a message for async sending. Drops if queue is full."""
@@ -118,14 +116,10 @@ class TelegramNotifier:
       for d in decisions:
         parts.append(f" - {_esc(d)}")
 
-    # Truncated narrative
     if narrative:
       parts.append("")
       parts.append("<b>Narrative:</b>")
-      excerpt = narrative[:500]
-      if len(narrative) > 500:
-        excerpt += "..."
-      parts.append(f"<i>{_esc(excerpt)}</i>")
+      parts.append(f"<i>{_esc(narrative)}</i>")
 
     self.send("\n".join(parts))
 
@@ -135,6 +129,26 @@ class TelegramNotifier:
       lines.append(f"<b>Context:</b> {_esc(context)}")
     lines.append(f"<pre>{_esc(error[:1000])}</pre>")
     self.send("\n".join(lines))
+
+
+def _split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> List[str]:
+  """Split a long message into chunks that each fit within *limit* characters.
+
+  Splits at newline boundaries when possible; falls back to hard split.
+  """
+  if len(text) <= limit:
+    return [text]
+  chunks: List[str] = []
+  while text:
+    if len(text) <= limit:
+      chunks.append(text)
+      break
+    cut = text.rfind("\n", 0, limit)
+    if cut <= 0:
+      cut = limit
+    chunks.append(text[:cut])
+    text = text[cut:].lstrip("\n")
+  return chunks
 
 
 def _esc(text: str) -> str:
