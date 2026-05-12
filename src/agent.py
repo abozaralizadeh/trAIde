@@ -2869,10 +2869,15 @@ def run_trading_agent(
 
   @function_tool
   async def add_coin(symbol: str, reason: str) -> Dict[str, Any]:
-    """Add a coin to the active universe (requires reason)."""
+    """Add a coin to the active universe (requires reason). The symbol is validated against KuCoin first."""
     if not symbol:
       return {"error": "symbol required"}
-    entry = memory.add_coin(_normalize_symbol(symbol), reason)
+    norm = _normalize_symbol(symbol)
+    try:
+      kucoin.get_ticker(norm)
+    except Exception:
+      return {"error": f"Symbol {norm} not found on KuCoin. Verify the symbol exists before adding."}
+    entry = memory.add_coin(norm, reason)
     return {"added": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
