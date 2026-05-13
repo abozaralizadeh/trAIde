@@ -100,14 +100,14 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PAPER_TRADING` | `true` | Simulate orders without real execution |
-| `MAX_POSITION_USD` | `1000` | Maximum spend per trade |
-| `RISK_PER_TRADE_PCT` | `0.01` | Risk per trade as fraction of equity |
-| `MIN_CONFIDENCE` | `0.6` | Minimum confidence score (0-1) to place a trade |
+| `MAX_POSITION_USD` | `500` | Maximum spend per trade |
+| `RISK_PER_TRADE_PCT` | `0.10` | Risk per trade as fraction of equity (10%) |
+| `MIN_CONFIDENCE` | `0.65` | Minimum confidence score (0-1) to place a trade |
 | `MAX_LEVERAGE` | `3` | Maximum futures leverage (1-125) |
-| `MAX_TRADES_PER_SYMBOL_PER_DAY` | `100` | Daily trade cap per symbol |
-| `MIN_NET_PROFIT_USD` | `0.05` | Minimum net profit target after fees |
-| `MIN_PROFIT_ROI_PCT` | `0.001` | Minimum ROI target after fees |
-| `ESTIMATED_SLIPPAGE_PCT` | `0.0005` | Estimated slippage for profit calculations |
+| `MAX_TRADES_PER_SYMBOL_PER_DAY` | `10` | Daily trade cap per symbol |
+| `MIN_NET_PROFIT_USD` | `0.50` | Minimum net profit target after fees |
+| `MIN_PROFIT_ROI_PCT` | `0.008` | Minimum ROI target (0.8%) after fees |
+| `ESTIMATED_SLIPPAGE_PCT` | `0.001` | Estimated slippage (0.1%) for profit calculations |
 | `RANGE_TRADING_ENABLED` | `true` | Enable mean-reversion in ranging/sideways markets |
 | `SENTIMENT_FILTER_ENABLED` | `false` | Require positive sentiment before trading |
 | `SENTIMENT_MIN_SCORE` | `0.55` | Minimum sentiment score (0-1) when filter enabled |
@@ -121,14 +121,14 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `KELLY_MIN_TRADES` | `30` | Minimum trade history before Kelly sizing activates |
 | `PREFER_LIMIT_ORDERS` | `true` | Place limit orders at best ask instead of market orders |
 | `LIMIT_ORDER_TIMEOUT_SEC` | `20` | Timeout before falling back to market order |
-| `POST_LOSS_COOLDOWN_MINUTES` | `30` | Block new entries on a symbol after a loss |
+| `POST_LOSS_COOLDOWN_MINUTES` | `45` | Block new entries on a symbol after a loss |
 
 ### Circuit Breakers
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CB_MAX_DAILY_DRAWDOWN_PCT` | `8.0` | Restrict trading when daily drawdown exceeds this % |
-| `CB_MAX_CONSECUTIVE_LOSSES` | `4` | Restrict trading after N consecutive losses |
+| `CB_MAX_DAILY_DRAWDOWN_PCT` | `10.0` | Restrict trading when daily drawdown exceeds this % |
+| `CB_MAX_CONSECUTIVE_LOSSES` | `3` | Restrict trading after N consecutive losses |
 | `CB_MAX_PORTFOLIO_HEAT_PCT` | `20.0` | Maximum total capital at risk % |
 | `CB_COOLDOWN_MINUTES` | `120` | Cooldown duration after consecutive loss trigger |
 
@@ -138,9 +138,9 @@ When a circuit breaker fires, the agent enters close-only mode: it can adjust st
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `POLL_INTERVAL_SEC` | `30` | Seconds between polling cycles |
-| `PRICE_CHANGE_TRIGGER_PCT` | `0.3` | Price move % that triggers an agent run |
-| `MAX_IDLE_POLLS` | `3` | Force agent run after N idle polls |
+| `POLL_INTERVAL_SEC` | `60` | Seconds between polling cycles |
+| `PRICE_CHANGE_TRIGGER_PCT` | `0.5` | Price move % that triggers an agent run |
+| `MAX_IDLE_POLLS` | `10` | Force agent run after N idle polls |
 | `AGENT_MAX_TURNS` | `100` | Max tool-call turns per agent run |
 
 ### KuCoin
@@ -168,7 +168,7 @@ If `AZURE_APIM_OPENAI_SUBSCRIPTION_KEY` is set, the client uses APIM endpoint/de
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MEMORY_FILE` | `.agent_memory.json` | Path to agent memory store |
-| `RETENTION_DAYS` | `7` | Auto-prune items older than this |
+| `RETENTION_DAYS` | `14` | Auto-prune items older than this |
 
 ### Tracing (Optional)
 
