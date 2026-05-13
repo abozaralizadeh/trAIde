@@ -5,7 +5,7 @@ import pytest
 
 from src.config import (
   AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig,
-  TradingConfig, LangsmithConfig, TelegramConfig, SupervisorConfig,
+  TradingConfig, CircuitBreakerConfig, LangsmithConfig, TelegramConfig, SupervisorConfig,
 )
 from src.telegram import TelegramNotifier, _esc, _fmt_price, _format_orders, _split_message, MAX_MESSAGE_LENGTH
 
@@ -29,6 +29,12 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     min_profit_roi_pct=0.008,
     estimated_slippage_pct=0.0005,
     range_trading_enabled=True,
+    partial_tp_enabled=True,
+    kelly_sizing_enabled=True,
+    kelly_min_trades=30,
+    prefer_limit_orders=True,
+    limit_order_timeout_sec=20.0,
+    post_loss_cooldown_minutes=30.0,
   )
   return AppConfig(
     azure=AzureConfig(endpoint="https://x.openai.azure.com/", deployment="gpt-5.2", api_version="2024-10-01-preview", api_key="key"),
@@ -36,6 +42,7 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     kucoin=KucoinConfig(api_key="k", secret="s", passphrase="p", base_url="https://api.kucoin.com"),
     kucoin_futures=KucoinFuturesConfig(enabled=True, base_url="https://api-futures.kucoin.com"),
     trading=TradingConfig(**trading_kwargs),
+    circuit_breaker=CircuitBreakerConfig(max_daily_drawdown_pct=8.0, max_consecutive_losses=4, max_portfolio_heat_pct=20.0, cooldown_minutes=120.0),
     langsmith=LangsmithConfig(enabled=False, api_key=None, project=None, api_url=None, tracing=False),
     telegram=TelegramConfig(enabled=telegram_enabled, bot_token=bot_token, chat_id=chat_id, silent=silent),
     supervisor=SupervisorConfig(enabled=False, log_file="traide.log", log_max_bytes=5242880, log_backup_count=3),

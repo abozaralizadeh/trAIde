@@ -5,6 +5,7 @@ import logging
 import signal
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from typing import Dict
 
@@ -362,6 +363,40 @@ async def trading_loop() -> None:
         logger.info("Recorded triggered close for %s: PnL=%.4f (%s)", sym, pnl, close_type)
       except Exception as exc:
         logger.warning("Failed to record triggered close: %s", exc)
+
+    # --- Circuit Breaker Checks ---
+    cb = cfg.circuit_breaker
+    restriction_reasons: list[str] = []
+
+    if snapshot.drawdown_pct >= cb.max_daily_drawdown_pct:
+      restriction_reasons.append(f"Daily drawdown {snapshot.drawdown_pct:.1f}% >= {cb.max_daily_drawdown_pct}% limit")
+
+    consec_losses = memory.consecutive_losses()
+    if consec_losses >= cb.max_consecutive_losses:
+      last_loss_ts = None
+      with memory._lock:
+        decs = memory._read().get("decisions", [])
+      for d in sorted(decs, key=lambda x: x.get("ts", 0), reverse=True):
+        pnl = d.get("pnl")
+        if pnl is not None:
+          try:
+            if float(pnl) < 0:
+              last_loss_ts = d.get("ts")
+              break
+          except (TypeError, ValueError):
+            continue
+      if last_loss_ts:
+        elapsed_min = (int(time.time()) - last_loss_ts) / 60
+        if elapsed_min < cb.cooldown_minutes:
+          restriction_reasons.append(
+            f"{consec_losses} consecutive losses (cooldown {int(cb.cooldown_minutes - elapsed_min)}min remaining)"
+          )
+
+    if restriction_reasons:
+      snapshot.trading_restricted = True
+      snapshot.restriction_reason = "; ".join(restriction_reasons)
+      logger.warning("CIRCUIT BREAKER: %s", snapshot.restriction_reason)
+      notifier.send(f"<b>CIRCUIT BREAKER ACTIVE</b>\n{snapshot.restriction_reason}\nAgent restricted to close-only mode.")
 
     if should_run:
       idle_polls = 0

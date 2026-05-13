@@ -129,6 +129,8 @@ class TradingSnapshot:
   futures_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
   financial_accounts: List[KucoinAccount] = field(default_factory=list)
   fees: Dict[str, Any] = field(default_factory=dict)
+  trading_restricted: bool = False
+  restriction_reason: str = ""
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -412,6 +414,8 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
       "futures": snapshot.futures_stop_orders,
     },
     "fees": snapshot.fees if hasattr(snapshot, "fees") else {},
+    "tradingRestricted": snapshot.trading_restricted,
+    "restrictionReason": snapshot.restriction_reason if snapshot.trading_restricted else None,
   }
   return json.dumps(user_content)
 
@@ -705,6 +709,20 @@ def run_trading_agent(
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+
+    # Circuit breaker: block new entries when trading is restricted
+    if (side or "").lower() == "buy" and snapshot.trading_restricted:
+      return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only sell/close operations are allowed during circuit breaker activation."}
+
+    # Post-loss cooldown: prevent revenge trading on same symbol
+    if (side or "").lower() == "buy" and cfg.trading.post_loss_cooldown_minutes > 0:
+      last_loss_ts = memory.last_loss_time(symbol)
+      if last_loss_ts:
+        elapsed_min = (int(time.time()) - last_loss_ts) / 60
+        if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
+          remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Post-loss cooldown active for {symbol} ({remaining}min remaining)", "hint": "Prevents revenge trading after a stop-loss. Try a different symbol or wait for cooldown to expire."}
+
     try:
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
@@ -1078,6 +1096,25 @@ def run_trading_agent(
         "bracket": bracket,
         "rr": rr_actual,
       }
+    # Limit order preference: use limit at best ask price instead of market for potential fee savings
+    if cfg.trading.prefer_limit_orders and side == "buy" and price > 0:
+      try:
+        ticker = kucoin.get_ticker(symbol)
+        best_ask = float(getattr(ticker, 'bestAsk', 0) or 0)
+        if best_ask > 0:
+          limit_price_str = str(best_ask)
+          limit_size = _truncate_to_increment(funds_val / best_ask, base_increment)
+          if float(limit_size) > 0:
+            order_req = KucoinOrderRequest(
+              symbol=symbol, side="buy", type="limit",
+              size=limit_size, price=limit_price_str,
+              clientOid=str(uuid.uuid4()),
+            )
+            price = best_ask
+            size_est = float(limit_size)
+      except Exception:
+        pass
+
     try:
       res = kucoin.place_order(order_req).__dict__
       record = memory.record_trade(symbol, side, funds_val, paper=False, price=price, size=size_est)
@@ -1311,15 +1348,49 @@ def run_trading_agent(
         size=position_size,
       )
     if tp_val:
-      bracket["takeProfit"] = await _place_spot_stop_order_impl(
-        symbol=symbol,
-        side="sell",
-        stop_price=tp_val,
-        stop_price_type="TP",
-        order_type="limit",
-        size=position_size,
-        limit_price=tp_val,
-      )
+      if cfg.trading.partial_tp_enabled and position_size > 0:
+        try:
+          sym_info = kucoin.get_symbol_info(symbol)
+        except Exception:
+          sym_info = {}
+        base_increment = sym_info.get("baseIncrement", "0.00000001")
+        base_min_size = _to_float(sym_info.get("baseMinSize"))
+        cur_price = float(snapshot.tickers.get(symbol, snapshot.tickers.get(list(snapshot.tickers.keys())[0])).price) if snapshot.tickers else 0.0
+        tp_distance = tp_val - cur_price if cur_price > 0 else 0
+        tp1_price = cur_price + tp_distance * 0.6 if tp_distance > 0 else tp_val
+        tp2_price = tp_val
+        size_tranche1 = float(_truncate_to_increment(position_size * 0.6, base_increment))
+        size_tranche2 = float(_truncate_to_increment(position_size - size_tranche1, base_increment))
+        tranches_placed = []
+        if size_tranche1 >= base_min_size and tp1_price > cur_price:
+          res1 = await _place_spot_stop_order_impl(
+            symbol=symbol, side="sell", stop_price=tp1_price,
+            stop_price_type="TP", order_type="limit", size=size_tranche1, limit_price=tp1_price,
+          )
+          tranches_placed.append({"tranche": 1, "size": size_tranche1, "price": tp1_price, "result": res1})
+        if size_tranche2 >= base_min_size and tp2_price > cur_price:
+          res2 = await _place_spot_stop_order_impl(
+            symbol=symbol, side="sell", stop_price=tp2_price,
+            stop_price_type="TP", order_type="limit", size=size_tranche2, limit_price=tp2_price,
+          )
+          tranches_placed.append({"tranche": 2, "size": size_tranche2, "price": tp2_price, "result": res2})
+        if tranches_placed:
+          bracket["takeProfit"] = {"staged": True, "tranches": tranches_placed}
+        else:
+          bracket["takeProfit"] = await _place_spot_stop_order_impl(
+            symbol=symbol, side="sell", stop_price=tp_val,
+            stop_price_type="TP", order_type="limit", size=position_size, limit_price=tp_val,
+          )
+      else:
+        bracket["takeProfit"] = await _place_spot_stop_order_impl(
+          symbol=symbol,
+          side="sell",
+          stop_price=tp_val,
+          stop_price_type="TP",
+          order_type="limit",
+          size=position_size,
+          limit_price=tp_val,
+        )
 
     return {
       "symbol": symbol,
@@ -1390,7 +1461,7 @@ def run_trading_agent(
     slow_interval: str = "1hour",
     lookback_minutes: int = 360,
   ) -> Dict[str, Any]:
-    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP across two intervals and summarize bias. When futures are enabled, also returns funding rate, open interest, basis, and 24h volume."""
+    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP/VolumeProfile across up to three intervals (15m, 1h, 4h) and summarize bias. When futures are enabled, also returns funding rate, open interest, basis, OI-price signal, and funding divergence."""
     symbol = _normalize_symbol(symbol)
 
     interval_order: list[str] = []
@@ -1399,16 +1470,23 @@ def run_trading_agent(
         return {"error": "Invalid interval", "allowed": list(INTERVAL_SECONDS.keys())}
       if iv not in interval_order:
         interval_order.append(iv)
+    if "4hour" not in interval_order:
+      interval_order.append("4hour")
 
     snapshots: list[Dict[str, Any]] = []
     end_at = int(time.time())
     for iv in interval_order:
       interval_sec = INTERVAL_SECONDS[iv]
-      lookback_min = max(120, min(int(lookback_minutes or 0), 720))
+      if iv == "4hour":
+        lookback_min = 2880
+      else:
+        lookback_min = max(120, min(int(lookback_minutes or 0), 720))
       points = min(500, max(50, int(lookback_min * 60 / interval_sec)))
       start_at = end_at - points * interval_sec
       candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
       if not candles:
+        if iv == "4hour":
+          continue
         return {"error": "No candles returned", "interval": iv}
       try:
         df = candles_to_dataframe(candles)
@@ -1416,6 +1494,8 @@ def run_trading_agent(
         snapshot["rows"] = len(df)
         snapshots.append(snapshot)
       except Exception as exc:
+        if iv == "4hour":
+          continue
         return {"error": str(exc), "interval": iv}
 
     summary = summarize_multi_timeframe(snapshots)
@@ -1425,15 +1505,19 @@ def run_trading_agent(
       fsym = _to_futures_symbol(symbol)
       if fsym:
         futures_data: Dict[str, Any] = {"symbol": fsym}
+        current_funding_rate = None
         try:
           fr = kucoin_futures.get_funding_rate(fsym)
-          futures_data["fundingRate"] = fr.get("value")
+          current_funding_rate = fr.get("value")
+          futures_data["fundingRate"] = current_funding_rate
           futures_data["predictedRate"] = fr.get("predictedValue")
         except Exception:
           pass
+        current_oi = None
         try:
           contract = kucoin_futures.get_contract_detail(fsym)
-          futures_data["openInterest"] = contract.get("openInterest")
+          current_oi = contract.get("openInterest")
+          futures_data["openInterest"] = current_oi
           futures_data["volumeOf24h"] = contract.get("volumeOf24h")
           futures_data["turnoverOf24h"] = contract.get("turnoverOf24h")
         except Exception:
@@ -1450,6 +1534,55 @@ def run_trading_agent(
             futures_data["basisPct"] = round(basis / index * 100, 4)
         except Exception:
           pass
+
+        # OI-Price divergence signal
+        price_dir = None
+        for snap in snapshots:
+          if snap.get("interval") in ("4hour", "1hour"):
+            ema_f = snap.get("ema_fast")
+            ema_s = snap.get("ema_slow")
+            if ema_f is not None and ema_s is not None:
+              price_dir = "up" if ema_f > ema_s else "down"
+              break
+        if price_dir and current_oi is not None:
+          try:
+            oi_val = float(current_oi)
+            vol_24h = float(futures_data.get("volumeOf24h") or 0)
+            oi_trend = "up" if vol_24h > 0 else "neutral"
+            if oi_trend != "neutral":
+              if price_dir == "up" and oi_trend == "up":
+                futures_data["oiPriceSignal"] = "strong_trend"
+                futures_data["oiPriceHint"] = "Rising price + rising OI = strong trend continuation. Stay in or add to position."
+              elif price_dir == "up" and oi_trend != "up":
+                futures_data["oiPriceSignal"] = "short_covering"
+                futures_data["oiPriceHint"] = "Rising price + flat/falling OI = short covering rally. Exit longs cautiously, don't add."
+              elif price_dir == "down" and oi_trend == "up":
+                futures_data["oiPriceSignal"] = "aggressive_shorts"
+                futures_data["oiPriceHint"] = "Falling price + rising OI = aggressive short building. Stay short or enter short."
+              else:
+                futures_data["oiPriceSignal"] = "long_capitulation"
+                futures_data["oiPriceHint"] = "Falling price + flat/falling OI = long capitulation. Potential reversal zone for contrarian long."
+          except (TypeError, ValueError):
+            pass
+
+        # Funding rate divergence
+        if current_funding_rate is not None and price_dir:
+          try:
+            fr_val = float(current_funding_rate)
+            if price_dir == "up" and fr_val < 0:
+              futures_data["fundingDivergence"] = "hidden_strength"
+              futures_data["fundingDivergenceHint"] = "Price rising but funding negative = hidden bullish strength (shorts paying longs)."
+            elif price_dir == "down" and fr_val > 0:
+              futures_data["fundingDivergence"] = "hidden_weakness"
+              futures_data["fundingDivergenceHint"] = "Price falling but funding positive = hidden bearish weakness (longs paying shorts)."
+            elif (price_dir == "up" and fr_val > 0) or (price_dir == "down" and fr_val < 0):
+              futures_data["fundingDivergence"] = "aligned"
+              futures_data["fundingDivergenceHint"] = "Funding rate aligned with price direction."
+            else:
+              futures_data["fundingDivergence"] = "neutral"
+          except (TypeError, ValueError):
+            pass
+
         if futures_data.keys() - {"symbol"}:
           result["futures"] = futures_data
 
@@ -1463,7 +1596,7 @@ def run_trading_agent(
     target_rr: float = 2.0,
     entry_price: float | None = None,
   ) -> Dict[str, Any]:
-    """Size a spot trade using risk-per-trade % with ATR-based stop/target."""
+    """Size a spot trade using risk-per-trade % with ATR-based stop/target. Uses Kelly criterion when enabled and sufficient trade history exists."""
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
@@ -1472,6 +1605,17 @@ def run_trading_agent(
     if balance_usdt <= 0:
       return {"error": "No USDT balance available"}
     risk_fraction = risk_pct if risk_pct is not None else cfg.trading.risk_per_trade_pct
+
+    # Kelly criterion: dynamically adjust risk fraction based on historical edge
+    kelly_used = False
+    if risk_pct is None and cfg.trading.kelly_sizing_enabled:
+      perf = memory.performance_summary()
+      total_closed = perf.get("closedWithPnl", 0)
+      if total_closed >= cfg.trading.kelly_min_trades:
+        kelly_frac = memory.kelly_fraction(venue="spot")
+        risk_fraction = kelly_frac
+        kelly_used = True
+
     risk_fraction = max(0.0, float(risk_fraction))
     risk_dollars = balance_usdt * risk_fraction
     if risk_dollars <= 0:
@@ -1567,6 +1711,21 @@ def run_trading_agent(
       spot_symbol = _repair_allowed_symbol(symbol)
     if not spot_symbol:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
+
+    is_entry = not reduce_only
+    # Circuit breaker: block new entries when trading is restricted
+    if is_entry and snapshot.trading_restricted:
+      return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
+
+    # Post-loss cooldown: prevent revenge trading on same symbol
+    if is_entry and cfg.trading.post_loss_cooldown_minutes > 0:
+      last_loss_ts = memory.last_loss_time(spot_symbol)
+      if last_loss_ts:
+        elapsed_min = (int(time.time()) - last_loss_ts) / 60
+        if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
+          remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Post-loss cooldown active for {spot_symbol} ({remaining}min remaining)", "hint": "Prevents revenge trading after a stop-loss. Try a different symbol or wait for cooldown to expire."}
+
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
@@ -2557,19 +2716,58 @@ def run_trading_agent(
         client_oid=f"{futures_symbol.lower()}-sl-{uuid.uuid4().hex[:12]}",
       )
     if tp_val:
-      bracket["takeProfit"] = await _place_futures_stop_order_impl(
-        symbol=symbol,
-        side=exit_side,
-        leverage=leverage_val,
-        size=base_size,
-        stop_price=tp_val,
-        stop=tp_stop,
-        stop_price_type=price_type,
-        reduce_only=True,
-        close_order=True,
-        order_type="market",
-        client_oid=f"{futures_symbol.lower()}-tp-{uuid.uuid4().hex[:12]}",
-      )
+      if cfg.trading.partial_tp_enabled and base_size > 0:
+        contract_spec = _get_contract_spec(futures_symbol) or {}
+        lot_size = int(contract_spec.get("lotSize") or 1)
+        cur_price = float(snapshot.tickers.get(symbol, next(iter(snapshot.tickers.values()))).price) if snapshot.tickers else 0.0
+        tp_distance = abs(tp_val - cur_price) if cur_price > 0 else 0
+        tp1_price = cur_price + tp_distance * 0.6 * (1 if current_qty > 0 else -1) if tp_distance > 0 else tp_val
+        tp2_price = tp_val
+        raw_contracts = abs(current_qty)
+        size_t1 = int(raw_contracts * 0.6 / lot_size) * lot_size
+        size_t2 = int((raw_contracts - size_t1) / lot_size) * lot_size
+        tranches_placed = []
+        if size_t1 > 0 and ((current_qty > 0 and tp1_price > cur_price) or (current_qty < 0 and tp1_price < cur_price)):
+          size_t1_base = size_t1 * multiplier
+          res1 = await _place_futures_stop_order_impl(
+            symbol=symbol, side=exit_side, leverage=leverage_val, size=size_t1_base,
+            stop_price=tp1_price, stop=tp_stop, stop_price_type=price_type,
+            reduce_only=True, close_order=False, order_type="market",
+            client_oid=f"{futures_symbol.lower()}-tp1-{uuid.uuid4().hex[:12]}",
+          )
+          tranches_placed.append({"tranche": 1, "contracts": size_t1, "price": tp1_price, "result": res1})
+        if size_t2 > 0 and ((current_qty > 0 and tp2_price > cur_price) or (current_qty < 0 and tp2_price < cur_price)):
+          size_t2_base = size_t2 * multiplier
+          res2 = await _place_futures_stop_order_impl(
+            symbol=symbol, side=exit_side, leverage=leverage_val, size=size_t2_base,
+            stop_price=tp2_price, stop=tp_stop, stop_price_type=price_type,
+            reduce_only=True, close_order=True, order_type="market",
+            client_oid=f"{futures_symbol.lower()}-tp2-{uuid.uuid4().hex[:12]}",
+          )
+          tranches_placed.append({"tranche": 2, "contracts": size_t2, "price": tp2_price, "result": res2})
+        if tranches_placed:
+          bracket["takeProfit"] = {"staged": True, "tranches": tranches_placed}
+        else:
+          bracket["takeProfit"] = await _place_futures_stop_order_impl(
+            symbol=symbol, side=exit_side, leverage=leverage_val, size=base_size,
+            stop_price=tp_val, stop=tp_stop, stop_price_type=price_type,
+            reduce_only=True, close_order=True, order_type="market",
+            client_oid=f"{futures_symbol.lower()}-tp-{uuid.uuid4().hex[:12]}",
+          )
+      else:
+        bracket["takeProfit"] = await _place_futures_stop_order_impl(
+          symbol=symbol,
+          side=exit_side,
+          leverage=leverage_val,
+          size=base_size,
+          stop_price=tp_val,
+          stop=tp_stop,
+          stop_price_type=price_type,
+          reduce_only=True,
+          close_order=True,
+          order_type="market",
+          client_oid=f"{futures_symbol.lower()}-tp-{uuid.uuid4().hex[:12]}",
+        )
 
     return {
       "symbol": symbol,
@@ -3030,21 +3228,30 @@ def run_trading_agent(
     "- Call get_recent_fills or get_closed_positions for more detail if needed.\n\n"
 
     "## STEP 2 — Research (required before every entry decision):\n"
-    "- Call analyze_market_context for each coin (15min + 1hour) to get EMA/RSI/MACD/ATR/BB/VWAP signals.\n"
-    "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis (mark - index), and 24h volume.\n"
+    "- Call analyze_market_context for each coin — it now fetches 15m + 1h + 4h timeframes automatically.\n"
+    "  The 4H timeframe acts as a directional filter (40% weight). Only trade in the direction of the 4H trend unless in a confirmed ranging regime.\n"
+    "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis, OI-price signal, and funding divergence.\n"
+    "- The summary now includes: weighted_score (-1 to +1), timeframe_conflict (bool), and volume_profile (POC, VAH, VAL).\n"
+    "- **Volume Profile levels**: POC = Point of Control (highest volume price, acts as magnet). "
+    "VAH = Value Area High (resistance). VAL = Value Area Low (support). Use these for entry/exit targeting:\n"
+    "  - For mean-reversion: enter near VAL (longs) or VAH (shorts), target POC.\n"
+    "  - For trend-following: use POC as pullback entry level; target VAH (bullish) or VAL (bearish).\n"
     "- Call fetch_recent_candles if you need raw price detail to set precise TP/SL levels.\n"
     "- Call web_search for news, sentiment, and catalysts. Call fetch_kucoin_news for exchange-specific events.\n"
     "- Use fetch_orderbook when you need microstructure (depth, imbalance) to time entry or set tight stops.\n"
     "- Assign a sentiment score 0–1 from news. If sentiment_filter_enabled and score < sentiment_min_score, skip buys.\n\n"
 
     "## STEP 2b — Futures-specific research (when considering futures trades):\n"
-    "- Call fetch_funding_rate to check current and predicted funding. High positive = longs pay shorts (bearish crowding); "
-    "high negative = shorts pay longs. Avoid opening a position that pays high funding unless the trade is very short-term.\n"
-    "- Call fetch_open_interest to gauge crowding. Rising OI + rising price = strong trend; rising OI + falling price = shorts building.\n"
-    "- Call fetch_futures_mark_price to check basis (mark - index). Positive basis = futures premium (bullish sentiment); "
-    "negative = discount (bearish). Large basis can mean reversion risk.\n"
-    "- Call fetch_futures_orderbook for futures-specific liquidity and support/resistance walls.\n"
-    "- Call fetch_futures_candles when futures price may diverge from spot (high funding, liquidation cascades).\n"
+    "- analyze_market_context now returns pre-computed futures signals. Read them carefully:\n"
+    "  - **oiPriceSignal**: 'strong_trend' (stay in), 'short_covering' (exit longs), "
+    "'aggressive_shorts' (stay/enter short), 'long_capitulation' (contrarian long opportunity).\n"
+    "  - **fundingDivergence**: 'hidden_strength' (bullish despite negative funding), "
+    "'hidden_weakness' (bearish despite positive funding), 'aligned', 'neutral'.\n"
+    "- Use these signals to confirm or veto your trade direction. Do NOT ignore them.\n"
+    "- A 'short_covering' signal with bullish indicators = weak rally, avoid new longs.\n"
+    "- A 'long_capitulation' signal with oversold RSI = high-probability reversal setup.\n"
+    "- Call fetch_funding_rate for detailed rate history, fetch_open_interest for OI levels.\n"
+    "- Call fetch_futures_mark_price to check basis. Large basis = mean reversion risk.\n"
     "- Call fetch_contract_details to check multiplier, maxLeverage, tick size, and fees before sizing.\n\n"
 
     + (
@@ -3179,6 +3386,29 @@ def run_trading_agent(
     "2. Transfer the freed USDT to futures (transfer_funds)\n"
     "3. Place the futures order\n"
     "This is a normal workflow — do not skip steps 1-2 and accept rejection.\n\n"
+
+    "## Circuit Breaker Awareness:\n"
+    + (f"- **TRADING RESTRICTED**: {snapshot.restriction_reason}. You are in CLOSE-ONLY mode. "
+       "Do NOT open new positions. You may only: close existing positions, adjust TP/SL, and manage risk. "
+       "Focus on protecting capital until the restriction lifts.\n\n"
+       if snapshot.trading_restricted else
+       "- Trading is unrestricted. Circuit breakers are active and will block entries if daily drawdown "
+       f"exceeds {cfg.circuit_breaker.max_daily_drawdown_pct}% or after {cfg.circuit_breaker.max_consecutive_losses} consecutive losses.\n\n") +
+
+    "## Staged Take-Profit:\n"
+    + ("- **Partial TP is ENABLED.** When you set position protection (set_spot_position_protection / set_futures_position_protection), "
+       "the system automatically splits your TP into 2 tranches:\n"
+       "  - Tranche 1 (60%): TP at 60% of the way to your target — locks in base profit early.\n"
+       "  - Tranche 2 (40%): TP at your full target — captures the extended move.\n"
+       "- Set your TP at the full intended target; the system handles the split.\n"
+       "- For range trades, the midline TP is split 60/40 automatically.\n\n"
+       if cfg.trading.partial_tp_enabled else "") +
+
+    "## Post-Loss Cooldown:\n"
+    + (f"- After a stop-loss on any symbol, a {int(cfg.trading.post_loss_cooldown_minutes)}-minute cooldown is enforced. "
+       "You cannot re-enter the same symbol during cooldown. This prevents revenge trading. "
+       "Move to a different symbol or wait.\n\n"
+       if cfg.trading.post_loss_cooldown_minutes > 0 else "") +
 
     "## Narrative:\n"
     "- Be explicit: state what research showed, what trade you placed (or declined and why), what TP/SL you set, and your confidence.\n"

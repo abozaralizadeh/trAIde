@@ -827,3 +827,88 @@ class MemoryStore:
       data["supervisor_notes_permanent"] = notes
       self._write(data)
       return {"deleted": removed}
+
+  def kelly_fraction(self, venue: str | None = None, lookback: int = 50) -> float:
+    """Compute quarter-Kelly fraction from recent trade performance.
+    Returns a sizing fraction between 0.01 and 0.25."""
+    with self._lock:
+      data = self._prune(self._read())
+      decisions = data.get("decisions", [])
+    if venue:
+      prefix = f"{venue}_"
+      decisions = [d for d in decisions if (d.get("action") or "").startswith(prefix)]
+    decisions = sorted(decisions, key=lambda d: d.get("ts", 0))[-lookback:]
+    realized = []
+    for d in decisions:
+      pnl = d.get("pnl")
+      if pnl is not None:
+        try:
+          realized.append(float(pnl))
+        except (TypeError, ValueError):
+          continue
+    if len(realized) < 10:
+      return 0.05
+    wins = [p for p in realized if p > 0]
+    losses = [p for p in realized if p < 0]
+    if not wins or not losses:
+      return 0.05
+    win_rate = len(wins) / len(realized)
+    avg_win = sum(wins) / len(wins)
+    avg_loss = abs(sum(losses) / len(losses))
+    if avg_loss == 0:
+      return 0.25
+    reward_risk = avg_win / avg_loss
+    kelly = win_rate - (1 - win_rate) / reward_risk
+    return max(0.01, min(0.25, kelly * 0.25))
+
+  def consecutive_losses(self, venue: str | None = None) -> int:
+    """Count current streak of consecutive losing decisions (most recent first)."""
+    with self._lock:
+      data = self._prune(self._read())
+      decisions = data.get("decisions", [])
+    if venue:
+      prefix = f"{venue}_"
+      decisions = [d for d in decisions if (d.get("action") or "").startswith(prefix)]
+    decisions = sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True)
+    streak = 0
+    for d in decisions:
+      pnl = d.get("pnl")
+      if pnl is None:
+        continue
+      try:
+        if float(pnl) < 0:
+          streak += 1
+        else:
+          break
+      except (TypeError, ValueError):
+        continue
+    return streak
+
+  def last_loss_time(self, symbol: str) -> int | None:
+    """Return the timestamp of the most recent losing decision for a symbol, or None."""
+    sym = _normalize_symbol(symbol)
+    with self._lock:
+      data = self._prune(self._read())
+      decisions = data.get("decisions", [])
+    for d in sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True):
+      if d.get("symbol") != sym:
+        continue
+      pnl = d.get("pnl")
+      if pnl is None:
+        continue
+      try:
+        if float(pnl) < 0:
+          return d.get("ts")
+        else:
+          return None
+      except (TypeError, ValueError):
+        continue
+    return None
+
+  def portfolio_heat(self, stop_distances: Dict[str, float], total_equity: float) -> float:
+    """Compute portfolio heat = sum of capital at risk / total equity * 100.
+    stop_distances: {symbol: usd_amount_at_risk}"""
+    if total_equity <= 0:
+      return 0.0
+    total_risk = sum(abs(v) for v in stop_distances.values())
+    return round(total_risk / total_equity * 100, 2)

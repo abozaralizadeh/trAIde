@@ -62,6 +62,20 @@ class TradingConfig:
   min_profit_roi_pct: float
   estimated_slippage_pct: float
   range_trading_enabled: bool
+  partial_tp_enabled: bool
+  kelly_sizing_enabled: bool
+  kelly_min_trades: int
+  prefer_limit_orders: bool
+  limit_order_timeout_sec: float
+  post_loss_cooldown_minutes: float
+
+
+@dataclass
+class CircuitBreakerConfig:
+  max_daily_drawdown_pct: float
+  max_consecutive_losses: int
+  max_portfolio_heat_pct: float
+  cooldown_minutes: float
 
 
 @dataclass
@@ -96,6 +110,7 @@ class AppConfig:
   kucoin: KucoinConfig
   kucoin_futures: KucoinFuturesConfig
   trading: TradingConfig
+  circuit_breaker: CircuitBreakerConfig
   langsmith: LangsmithConfig
   telegram: TelegramConfig
   supervisor: SupervisorConfig
@@ -154,6 +169,18 @@ def load_config() -> AppConfig:
       min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.001")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0005")),
       range_trading_enabled=_as_bool(os.getenv("RANGE_TRADING_ENABLED"), True),
+      partial_tp_enabled=_as_bool(os.getenv("PARTIAL_TP_ENABLED"), True),
+      kelly_sizing_enabled=_as_bool(os.getenv("KELLY_SIZING_ENABLED"), True),
+      kelly_min_trades=int(os.getenv("KELLY_MIN_TRADES", "30")),
+      prefer_limit_orders=_as_bool(os.getenv("PREFER_LIMIT_ORDERS"), True),
+      limit_order_timeout_sec=float(os.getenv("LIMIT_ORDER_TIMEOUT_SEC", "20")),
+      post_loss_cooldown_minutes=float(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "30")),
+    ),
+    circuit_breaker=CircuitBreakerConfig(
+      max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "8.0")),
+      max_consecutive_losses=int(os.getenv("CB_MAX_CONSECUTIVE_LOSSES", "4")),
+      max_portfolio_heat_pct=float(os.getenv("CB_MAX_PORTFOLIO_HEAT_PCT", "20.0")),
+      cooldown_minutes=float(os.getenv("CB_COOLDOWN_MINUTES", "120")),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

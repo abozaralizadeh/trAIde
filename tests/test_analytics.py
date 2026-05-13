@@ -53,16 +53,28 @@ def test_summarize_interval_keys():
     assert result["trend_bias"] in ("bullish", "bearish", "neutral-to-bullish", "neutral-to-bearish", "neutral")
 
 
-def test_summarize_multi_timeframe_primary_drives_bias():
-    """1h bullish + 15m bearish should still yield bullish (1h is primary)."""
+def test_summarize_multi_timeframe_conflicting_yields_neutral():
+    """1h bullish + 15m bearish yields neutral under weighted scoring."""
     snapshots = [
         {"interval": "1hour", "trend_bias": "bullish", "volatility": "normal"},
         {"interval": "15min", "trend_bias": "bearish", "volatility": "normal"},
     ]
     result = summarize_multi_timeframe(snapshots)
+    assert result["overall_bias"] == "neutral"
+    assert result["timeframe_conflict"] is True
+
+
+def test_summarize_multi_timeframe_higher_tf_drives_bias():
+    """4h+1h bullish overrides 15m bearish with weighted scoring."""
+    snapshots = [
+        {"interval": "4hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "15min", "trend_bias": "bearish", "volatility": "normal"},
+    ]
+    result = summarize_multi_timeframe(snapshots)
     assert result["overall_bias"] == "bullish"
-    assert result["strength"] == "weak"
-    assert "Wait" not in result["entry_hint"]
+    assert result["strength"] == "moderate"
+    assert result["timeframe_conflict"] is True
 
 
 def test_summarize_multi_timeframe_both_agree():

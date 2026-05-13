@@ -1,5 +1,5 @@
 import pytest
-from src.config import AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig, TradingConfig, LangsmithConfig, TelegramConfig, SupervisorConfig, validate_config
+from src.config import AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig, TradingConfig, CircuitBreakerConfig, LangsmithConfig, TelegramConfig, SupervisorConfig, validate_config
 
 
 def _make_valid_config(**overrides) -> AppConfig:
@@ -21,6 +21,12 @@ def _make_valid_config(**overrides) -> AppConfig:
         min_profit_roi_pct=0.008,
         estimated_slippage_pct=0.0005,
         range_trading_enabled=True,
+        partial_tp_enabled=True,
+        kelly_sizing_enabled=True,
+        kelly_min_trades=30,
+        prefer_limit_orders=True,
+        limit_order_timeout_sec=20.0,
+        post_loss_cooldown_minutes=30.0,
     )
     trading_kwargs.update(overrides)
     return AppConfig(
@@ -29,6 +35,7 @@ def _make_valid_config(**overrides) -> AppConfig:
         kucoin=KucoinConfig(api_key="k", secret="s", passphrase="p", base_url="https://api.kucoin.com"),
         kucoin_futures=KucoinFuturesConfig(enabled=False, base_url="https://api-futures.kucoin.com"),
         trading=TradingConfig(**trading_kwargs),
+        circuit_breaker=CircuitBreakerConfig(max_daily_drawdown_pct=8.0, max_consecutive_losses=4, max_portfolio_heat_pct=20.0, cooldown_minutes=120.0),
         langsmith=LangsmithConfig(enabled=False, api_key=None, project=None, api_url=None, tracing=False),
         telegram=TelegramConfig(enabled=False, bot_token="", chat_id="", silent=False),
         supervisor=SupervisorConfig(enabled=False, log_file="traide.log", log_max_bytes=5242880, log_backup_count=3),

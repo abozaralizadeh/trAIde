@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence
 
 import pandas as pd
 
 # Kucoin candle fields: [time, open, close, high, low, volume, turnover]
-INTERVAL_SECONDS: Dict[str, int] = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600}
+INTERVAL_SECONDS: Dict[str, int] = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600, "4hour": 14400}
 
 
 @dataclass
@@ -116,6 +117,45 @@ def compute_indicators(df: pd.DataFrame, settings: IndicatorSettings | None = No
   out["vwap"] = (typical_price * out["volume"]).cumsum() / vol_cum
 
   return out
+
+
+def compute_volume_profile(df: pd.DataFrame, num_bins: int = 50) -> Dict[str, Any]:
+  high_max = df["high"].max()
+  low_min = df["low"].min()
+  price_range = high_max - low_min
+  if price_range <= 0 or len(df) == 0:
+    return {"poc": None, "vah": None, "val": None}
+  bin_size = price_range / num_bins
+  bins: Dict[float, float] = {}
+  for _, row in df.iterrows():
+    row_range = row["high"] - row["low"]
+    if row_range <= 0:
+      continue
+    vol_per_unit = row["volume"] / row_range
+    lo = row["low"]
+    hi = row["high"]
+    b = math.floor(lo / bin_size) * bin_size
+    while b < hi:
+      overlap = min(b + bin_size, hi) - max(b, lo)
+      if overlap > 0:
+        bins[b] = bins.get(b, 0.0) + vol_per_unit * overlap
+      b += bin_size
+  if not bins:
+    return {"poc": None, "vah": None, "val": None}
+  poc_bin = max(bins, key=bins.get)
+  poc = poc_bin + bin_size / 2
+  sorted_bins = sorted(bins.items(), key=lambda x: x[1], reverse=True)
+  total_vol = sum(v for _, v in sorted_bins)
+  cum = 0.0
+  va_prices: list[float] = []
+  for price, vol in sorted_bins:
+    cum += vol
+    va_prices.append(price + bin_size / 2)
+    if cum >= total_vol * 0.70:
+      break
+  vah = max(va_prices)
+  val = min(va_prices)
+  return {"poc": round(poc, 6), "vah": round(vah, 6), "val": round(val, 6)}
 
 
 def _round(val: Any, decimals: int = 4) -> float | None:
@@ -258,6 +298,8 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
       elif regime["regime"] == "trending" and adx_delta < -3:
         commentary.append(f"ADX weakening ({adx_delta:.1f}). Trend may be exhausting; watch for range formation.")
 
+  vol_profile = compute_volume_profile(df)
+
   return {
     "interval": interval,
     "close": _round(close, 6),
@@ -282,15 +324,19 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
     "market_regime": regime,
     "trend_bias": bias,
     "volatility": volatility,
+    "volume_profile": vol_profile,
     "commentary": " ".join(commentary),
   }
 
 
+_TF_WEIGHTS = {"4hour": 0.40, "1hour": 0.35, "15min": 0.25}
+
+
 def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
-  # Use the longest interval as primary driver; shorter interval as confirmation.
   ordered = sorted(snapshots, key=lambda s: INTERVAL_SECONDS.get(s.get("interval", ""), 0), reverse=True)
   primary = ordered[0] if ordered else {}
   secondary = ordered[1] if len(ordered) > 1 else None
+  tertiary = ordered[2] if len(ordered) > 2 else None
 
   def _direction(bias: str) -> str:
     if bias.startswith("bullish") or bias == "neutral-to-bullish":
@@ -299,29 +345,61 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
       return "bearish"
     return "neutral"
 
+  def _dir_score(direction: str) -> float:
+    if direction == "bullish":
+      return 1.0
+    if direction == "bearish":
+      return -1.0
+    return 0.0
+
+  all_dirs = []
+  for snap in ordered:
+    interval = snap.get("interval", "")
+    direction = _direction(snap.get("trend_bias", "neutral"))
+    weight = _TF_WEIGHTS.get(interval, 0.2)
+    all_dirs.append((interval, direction, weight))
+
+  weighted_score = sum(_dir_score(d) * w for _, d, w in all_dirs)
+  total_weight = sum(w for _, _, w in all_dirs) or 1.0
+  normalized_score = weighted_score / total_weight
+
+  if normalized_score > 0.3:
+    overall_bias = "bullish"
+  elif normalized_score < -0.3:
+    overall_bias = "bearish"
+  else:
+    overall_bias = "neutral"
+
   primary_dir = _direction(primary.get("trend_bias", "neutral"))
   secondary_dir = _direction(secondary.get("trend_bias", "neutral")) if secondary else "neutral"
+  tertiary_dir = _direction(tertiary.get("trend_bias", "neutral")) if tertiary else "neutral"
 
-  # Overall bias follows the primary (1h) interval.
-  overall_bias = primary_dir
+  agreeing = sum(1 for _, d, _ in all_dirs if d == overall_bias and d != "neutral")
+  total_non_neutral = sum(1 for _, d, _ in all_dirs if d != "neutral")
+  conflicting = sum(1 for _, d, _ in all_dirs if d != "neutral" and d != overall_bias)
 
-  # Strength: strong (both agree), moderate (primary clear, secondary neutral), weak (conflicting).
-  if primary_dir == secondary_dir and primary_dir != "neutral":
+  if agreeing >= 2 and conflicting == 0:
     strength = "strong"
-  elif primary_dir != "neutral" and secondary_dir == "neutral":
+  elif agreeing >= 1 and conflicting == 0:
     strength = "moderate"
-  elif primary_dir != "neutral" and secondary_dir != primary_dir and secondary_dir != "neutral":
+  elif conflicting > 0 and agreeing > conflicting:
+    strength = "moderate"
+  elif overall_bias != "neutral":
     strength = "weak"
-  elif primary_dir != "neutral":
-    strength = "moderate"
   else:
     strength = "weak"
     overall_bias = "neutral"
 
+  tf_conflict = False
+  if len(all_dirs) >= 2:
+    higher_dir = all_dirs[0][1]
+    lower_dirs = [d for _, d, _ in all_dirs[1:] if d != "neutral"]
+    if higher_dir != "neutral" and lower_dirs and any(d != higher_dir for d in lower_dirs):
+      tf_conflict = True
+
   vol_flags = [s.get("volatility") for s in snapshots]
   volatility = "elevated" if any(v == "elevated" for v in vol_flags) else "normal"
 
-  # Regime assessment across timeframes.
   primary_regime = (primary.get("market_regime") or {}).get("regime", "unknown")
   secondary_regime = ((secondary.get("market_regime") or {}).get("regime", "unknown")) if secondary else "unknown"
   primary_regime_conf = (primary.get("market_regime") or {}).get("confidence", 0)
@@ -346,14 +424,13 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     overall_regime = primary_regime
     regime_confidence = primary_regime_conf * 0.5
 
-  # Always-actionable entry hints — never "Wait".
   if overall_regime == "ranging":
     entry_hint = (
-      "RANGE REGIME: Both timeframes confirm range-bound conditions. "
+      "RANGE REGIME: Multiple timeframes confirm range-bound conditions. "
       "Use mean-reversion strategy: "
-      "LONG near BB lower band when Stochastic <20 or RSI <35; "
-      "SHORT near BB upper band when Stochastic >80 or RSI >65. "
-      "Target: BB midline. Stop: 1 ATR beyond the BB band you entered at. "
+      "LONG near BB lower band or Volume Profile VAL when Stochastic <20 or RSI <35; "
+      "SHORT near BB upper band or Volume Profile VAH when Stochastic >80 or RSI >65. "
+      "Target: BB midline or POC. Stop: 1 ATR beyond the BB band you entered at. "
       "Size: 50-70% of normal."
     )
   elif overall_regime == "squeeze":
@@ -364,20 +441,23 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     )
   elif overall_bias == "bullish":
     if strength == "strong":
-      entry_hint = "Strong bullish alignment; look for pullbacks to VWAP or mid-Bollinger for long entries."
+      entry_hint = "Strong bullish alignment across timeframes; look for pullbacks to VWAP, POC, or mid-Bollinger for long entries."
     elif strength == "moderate":
-      entry_hint = "1h bullish but 15m not confirmed; consider reduced size long on pullback to support."
+      entry_hint = "Moderate bullish bias; higher TF bullish but lower TF not fully confirmed. Consider reduced size long on pullback."
     else:
-      entry_hint = "Weak bullish signal; use smaller size, tight stops, favor scalps over swings."
+      entry_hint = "Weak bullish signal with timeframe conflict; use smaller size, tight stops, favor scalps over swings."
   elif overall_bias == "bearish":
     if strength == "strong":
-      entry_hint = "Strong bearish alignment; look for rallies to VWAP or mid-Bollinger for short entries."
+      entry_hint = "Strong bearish alignment across timeframes; look for rallies to VWAP, POC, or mid-Bollinger for short entries."
     elif strength == "moderate":
-      entry_hint = "1h bearish but 15m not confirmed; consider reduced size short near resistance."
+      entry_hint = "Moderate bearish bias; higher TF bearish but lower TF not fully confirmed. Consider reduced size short near resistance."
     else:
-      entry_hint = "Weak bearish signal; use smaller size, tight stops, favor scalps over swings."
+      entry_hint = "Weak bearish signal with timeframe conflict; use smaller size, tight stops, favor scalps over swings."
   else:
     entry_hint = "No clear directional bias; consider range-bound strategies or reduce size significantly."
+
+  if tf_conflict:
+    entry_hint += " WARNING: Timeframe conflict detected — higher and lower timeframes disagree. Reduce size or wait for alignment."
 
   if overall_regime == "trending":
     entry_hint += " [Trend regime confirmed by ADX.]"
@@ -388,6 +468,8 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
   return {
     "overall_bias": overall_bias,
     "strength": strength,
+    "weighted_score": _round(normalized_score, 3),
+    "timeframe_conflict": tf_conflict,
     "volatility": volatility,
     "market_regime": overall_regime,
     "regime_confidence": _round(regime_confidence, 3),
@@ -396,4 +478,6 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "entry_hint": entry_hint,
     "primary_interval": primary.get("interval"),
     "secondary_interval": secondary.get("interval") if secondary else None,
+    "tertiary_interval": tertiary.get("interval") if tertiary else None,
+    "volume_profile": primary.get("volume_profile"),
   }
