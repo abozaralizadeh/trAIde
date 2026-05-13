@@ -33,7 +33,7 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 
 ### Technical Analysis
 - **12+ indicators**: EMA (fast/slow), MACD (line/signal/histogram), RSI, ATR, Bollinger Bands (with BBW%), Stochastic %K/%D, VWAP, ADX, Plus/Minus DI
-- **3 timeframes**: 4H (40% weight), 1H (35%), 15m (25%) with weighted directional scoring and timeframe conflict detection
+- **4 timeframes**: 1D (regime gate), 4H (40% weight), 1H (35%), 15m (25%) with weighted directional scoring, daily trend gate, and timeframe conflict detection
 - **Market regime detection**: Trending (ADX > 25), Ranging (ADX < 20), Squeeze (BBW < 2% + low ADX) -- each with confidence scores
 - **Volume profile**: Point of Control (POC), Value Area High/Low (VAH/VAL) for support/resistance levels
 - **OI-price divergence**: Classifies open interest vs price movement (strong trend, short covering, aggressive shorts, long capitulation)

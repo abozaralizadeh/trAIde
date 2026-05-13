@@ -77,6 +77,62 @@ def test_summarize_multi_timeframe_higher_tf_drives_bias():
     assert result["timeframe_conflict"] is True
 
 
+def test_summarize_multi_timeframe_daily_gate_vetoes_counter_trend():
+    """1D bearish vetoes intraday bullish bias to neutral."""
+    snapshots = [
+        {"interval": "1day", "trend_bias": "bearish", "volatility": "normal"},
+        {"interval": "4hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "15min", "trend_bias": "bullish", "volatility": "normal"},
+    ]
+    result = summarize_multi_timeframe(snapshots)
+    assert result["overall_bias"] == "neutral"
+    assert result["daily_gate_applied"] is True
+    assert result["daily_bias"] == "bearish"
+    assert "DAILY GATE" in result["entry_hint"]
+
+
+def test_summarize_multi_timeframe_daily_confirms_boosts_strength():
+    """1D bullish + intraday bullish boosts strength from moderate to strong."""
+    snapshots = [
+        {"interval": "1day", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "4hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "neutral", "volatility": "normal"},
+        {"interval": "15min", "trend_bias": "bullish", "volatility": "normal"},
+    ]
+    result = summarize_multi_timeframe(snapshots)
+    assert result["overall_bias"] == "bullish"
+    assert result["daily_gate_applied"] is False
+    assert result["strength"] == "strong"
+    assert "Daily trend confirms" in result["entry_hint"]
+
+
+def test_summarize_multi_timeframe_daily_neutral_no_effect():
+    """1D neutral does not gate or boost."""
+    snapshots = [
+        {"interval": "1day", "trend_bias": "neutral", "volatility": "normal"},
+        {"interval": "4hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "bullish", "volatility": "normal"},
+    ]
+    result = summarize_multi_timeframe(snapshots)
+    assert result["overall_bias"] == "bullish"
+    assert result["daily_gate_applied"] is False
+    assert result["daily_bias"] == "neutral"
+
+
+def test_summarize_multi_timeframe_no_daily_backward_compatible():
+    """Without a 1D snapshot, behavior is unchanged."""
+    snapshots = [
+        {"interval": "4hour", "trend_bias": "bearish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "bearish", "volatility": "normal"},
+    ]
+    result = summarize_multi_timeframe(snapshots)
+    assert result["overall_bias"] == "bearish"
+    assert result["daily_bias"] == "neutral"
+    assert result["daily_gate_applied"] is False
+    assert result["daily_interval"] is None
+
+
 def test_summarize_multi_timeframe_both_agree():
     """When both intervals agree, strength should be strong."""
     snapshots = [

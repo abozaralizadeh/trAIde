@@ -1461,7 +1461,7 @@ def run_trading_agent(
     slow_interval: str = "1hour",
     lookback_minutes: int = 360,
   ) -> Dict[str, Any]:
-    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP/VolumeProfile across up to three intervals (15m, 1h, 4h) and summarize bias. When futures are enabled, also returns funding rate, open interest, basis, OI-price signal, and funding divergence."""
+    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP/VolumeProfile across up to four intervals (15m, 1h, 4h, 1d) and summarize bias. The 1D acts as a regime gate — it can veto counter-trend trades. When futures are enabled, also returns funding rate, open interest, basis, OI-price signal, and funding divergence."""
     symbol = _normalize_symbol(symbol)
 
     interval_order: list[str] = []
@@ -1470,14 +1470,17 @@ def run_trading_agent(
         return {"error": "Invalid interval", "allowed": list(INTERVAL_SECONDS.keys())}
       if iv not in interval_order:
         interval_order.append(iv)
-    if "4hour" not in interval_order:
-      interval_order.append("4hour")
+    for extra in ("4hour", "1day"):
+      if extra not in interval_order:
+        interval_order.append(extra)
 
     snapshots: list[Dict[str, Any]] = []
     end_at = int(time.time())
     for iv in interval_order:
       interval_sec = INTERVAL_SECONDS[iv]
-      if iv == "4hour":
+      if iv == "1day":
+        lookback_min = 43200  # 30 days
+      elif iv == "4hour":
         lookback_min = 2880
       else:
         lookback_min = max(120, min(int(lookback_minutes or 0), 720))
@@ -1485,7 +1488,7 @@ def run_trading_agent(
       start_at = end_at - points * interval_sec
       candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
       if not candles:
-        if iv == "4hour":
+        if iv in ("4hour", "1day"):
           continue
         return {"error": "No candles returned", "interval": iv}
       try:
@@ -1494,7 +1497,7 @@ def run_trading_agent(
         snapshot["rows"] = len(df)
         snapshots.append(snapshot)
       except Exception as exc:
-        if iv == "4hour":
+        if iv in ("4hour", "1day"):
           continue
         return {"error": str(exc), "interval": iv}
 
@@ -3210,7 +3213,7 @@ def run_trading_agent(
     "often bought externally. They have unknown entry prices.\n"
     "- For EACH unlisted holding:\n"
     "  1. Research the coin: call web_search for recent news, project health, and fundamentals.\n"
-    "  2. Call analyze_market_context (15min + 1hour) to assess current trend and momentum.\n"
+    "  2. Call analyze_market_context (15min + 1hour) to assess current trend and momentum (also fetches 4H + 1D automatically).\n"
     "  3. Decide: HOLD (if fundamentals are strong and trend is recovering) or CLOSE (if project is declining, "
     "no catalyst, or capital is better deployed elsewhere).\n"
     "  4. If HOLD: add the coin to your universe via add_coin, set proper TP/SL via set_spot_position_protection.\n"
@@ -3228,10 +3231,13 @@ def run_trading_agent(
     "- Call get_recent_fills or get_closed_positions for more detail if needed.\n\n"
 
     "## STEP 2 — Research (required before every entry decision):\n"
-    "- Call analyze_market_context for each coin — it now fetches 15m + 1h + 4h timeframes automatically.\n"
-    "  The 4H timeframe acts as a directional filter (40% weight). Only trade in the direction of the 4H trend unless in a confirmed ranging regime.\n"
+    "- Call analyze_market_context for each coin — it fetches 15m + 1h + 4h + 1D timeframes automatically.\n"
+    "  The 4H timeframe has the highest intraday weight (40%). The 1D acts as a REGIME GATE:\n"
+    "  - If the 1D trend opposes your intraday bias, the system overrides to neutral — do NOT open counter-daily trades.\n"
+    "  - If the 1D confirms your intraday bias, strength is boosted (e.g., moderate -> strong).\n"
+    "  - Check 'daily_bias' and 'daily_gate_applied' in the summary to see the 1D effect.\n"
     "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis, OI-price signal, and funding divergence.\n"
-    "- The summary now includes: weighted_score (-1 to +1), timeframe_conflict (bool), and volume_profile (POC, VAH, VAL).\n"
+    "- The summary includes: weighted_score (-1 to +1), daily_bias, daily_gate_applied, timeframe_conflict (bool), and volume_profile (POC, VAH, VAL).\n"
     "- **Volume Profile levels**: POC = Point of Control (highest volume price, acts as magnet). "
     "VAH = Value Area High (resistance). VAL = Value Area Low (support). Use these for entry/exit targeting:\n"
     "  - For mean-reversion: enter near VAL (longs) or VAH (shorts), target POC.\n"

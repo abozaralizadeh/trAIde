@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Sequence
 import pandas as pd
 
 # Kucoin candle fields: [time, open, close, high, low, volume, turnover]
-INTERVAL_SECONDS: Dict[str, int] = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600, "4hour": 14400}
+INTERVAL_SECONDS: Dict[str, int] = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600, "4hour": 14400, "1day": 86400}
 
 
 @dataclass
@@ -330,13 +330,24 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
 
 
 _TF_WEIGHTS = {"4hour": 0.40, "1hour": 0.35, "15min": 0.25}
+_DAILY_INTERVAL = "1day"
 
 
 def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]:
   ordered = sorted(snapshots, key=lambda s: INTERVAL_SECONDS.get(s.get("interval", ""), 0), reverse=True)
-  primary = ordered[0] if ordered else {}
-  secondary = ordered[1] if len(ordered) > 1 else None
-  tertiary = ordered[2] if len(ordered) > 2 else None
+
+  # Separate daily snapshot (regime gate) from intraday snapshots (weighted scoring)
+  daily_snap = None
+  intraday = []
+  for snap in ordered:
+    if snap.get("interval") == _DAILY_INTERVAL:
+      daily_snap = snap
+    else:
+      intraday.append(snap)
+
+  primary = intraday[0] if intraday else {}
+  secondary = intraday[1] if len(intraday) > 1 else None
+  tertiary = intraday[2] if len(intraday) > 2 else None
 
   def _direction(bias: str) -> str:
     if bias.startswith("bullish") or bias == "neutral-to-bullish":
@@ -353,7 +364,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     return 0.0
 
   all_dirs = []
-  for snap in ordered:
+  for snap in intraday:
     interval = snap.get("interval", "")
     direction = _direction(snap.get("trend_bias", "neutral"))
     weight = _TF_WEIGHTS.get(interval, 0.2)
@@ -390,11 +401,30 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     strength = "weak"
     overall_bias = "neutral"
 
+  # Daily gate: if 1D bias opposes the intraday bias, downgrade; if it agrees, boost
+  daily_bias = "neutral"
+  daily_gate_applied = False
+  if daily_snap:
+    daily_bias = _direction(daily_snap.get("trend_bias", "neutral"))
+    if daily_bias != "neutral" and overall_bias != "neutral" and daily_bias != overall_bias:
+      overall_bias = "neutral"
+      strength = "weak"
+      daily_gate_applied = True
+    elif daily_bias != "neutral" and daily_bias == overall_bias:
+      if strength == "moderate":
+        strength = "strong"
+      elif strength == "weak":
+        strength = "moderate"
+
   tf_conflict = False
   if len(all_dirs) >= 2:
     higher_dir = all_dirs[0][1]
     lower_dirs = [d for _, d, _ in all_dirs[1:] if d != "neutral"]
     if higher_dir != "neutral" and lower_dirs and any(d != higher_dir for d in lower_dirs):
+      tf_conflict = True
+  if daily_bias != "neutral" and all_dirs:
+    intraday_dirs = [d for _, d, _ in all_dirs if d != "neutral"]
+    if intraday_dirs and any(d != daily_bias for d in intraday_dirs):
       tf_conflict = True
 
   vol_flags = [s.get("volatility") for s in snapshots]
@@ -456,6 +486,11 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
   else:
     entry_hint = "No clear directional bias; consider range-bound strategies or reduce size significantly."
 
+  if daily_gate_applied:
+    entry_hint += f" DAILY GATE: 1D trend is {daily_bias} — opposing intraday bias was overridden to neutral. Do NOT open counter-daily trades."
+  elif daily_bias != "neutral":
+    entry_hint += f" Daily trend confirms: 1D bias is {daily_bias}."
+
   if tf_conflict:
     entry_hint += " WARNING: Timeframe conflict detected — higher and lower timeframes disagree. Reduce size or wait for alignment."
 
@@ -469,6 +504,8 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "overall_bias": overall_bias,
     "strength": strength,
     "weighted_score": _round(normalized_score, 3),
+    "daily_bias": daily_bias,
+    "daily_gate_applied": daily_gate_applied,
     "timeframe_conflict": tf_conflict,
     "volatility": volatility,
     "market_regime": overall_regime,
@@ -479,5 +516,6 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "primary_interval": primary.get("interval"),
     "secondary_interval": secondary.get("interval") if secondary else None,
     "tertiary_interval": tertiary.get("interval") if tertiary else None,
+    "daily_interval": _DAILY_INTERVAL if daily_snap else None,
     "volume_profile": primary.get("volume_profile"),
   }
