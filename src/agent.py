@@ -882,7 +882,7 @@ def run_trading_agent(
         tp_val = float(take_profit_price) if take_profit_price is not None else None
       except Exception:
         tp_val = None
-      atr_mult = 1.5 if atr_multiple is None else float(atr_multiple)
+      atr_mult = 2.0 if atr_multiple is None else float(atr_multiple)
       target_rr_val = 2.0 if target_rr is None else float(target_rr)
       if stop_val is None or tp_val is None:
         plan = await plan_spot_position(
@@ -905,8 +905,8 @@ def run_trading_agent(
       if tp_val <= price:
         return {"rejected": True, "reason": "Take-profit must be above entry"}
       rr_actual = (tp_val - price) / (price - float(stop_val)) if price > float(stop_val) else None
-      if rr_actual is not None and rr_actual < 1.2:
-        return {"rejected": True, "reason": "RR below minimum", "rr": rr_actual, "minRr": 1.2}
+      if rr_actual is not None and rr_actual < 1.0:
+        return {"rejected": True, "reason": "RR below minimum", "rr": rr_actual, "minRr": 1.0}
       planned_stop = float(stop_val)
       planned_tp = float(tp_val)
       size_est = float(size_est or 0.0)
@@ -1592,7 +1592,7 @@ def run_trading_agent(
   async def plan_spot_position(
     symbol: str,
     risk_pct: float | None = None,
-    atr_multiple: float = 1.5,
+    atr_multiple: float = 2.0,
     target_rr: float = 2.0,
     entry_price: float | None = None,
   ) -> Dict[str, Any]:
@@ -1643,7 +1643,7 @@ def run_trading_agent(
       atr_val = None
     if atr_val != atr_val:  # NaN check
       atr_val = None
-    stop_distance = atr_val * atr_multiple if atr_val else price * 0.005  # fallback 0.5%
+    stop_distance = atr_val * atr_multiple if atr_val else price * 0.015  # fallback 1.5%
     if stop_distance <= 0:
       return {"error": "Stop distance invalid", "atr": atr_val}
 
@@ -3320,8 +3320,10 @@ def run_trading_agent(
     "- Keep at least 10% USDT reserve across all venues combined.\n\n"
 
     "**TP/SL rules (mandatory on every new entry):**\n"
-    "- Stop-loss: ATR-based (1.0–1.5x ATR below entry) OR 0.5–1.5% if ATR is unavailable.\n"
-    "- Take-profit: RR >= 1.2 (minimum). Aim for 1.5–2.0 when momentum is strong.\n"
+    "- Stop-loss: ATR-based (1.5–2.5x ATR from entry) OR 1.0–2.0% if ATR is unavailable. "
+    "ALWAYS give the SL more room than the TP — crypto wicks frequently sweep tight stops before "
+    "reversing to your target. A wider stop with a smaller position keeps dollar risk the same but avoids noise stopouts.\n"
+    "- Take-profit: RR >= 1.0 (minimum). Aim for 1.5–2.0 when momentum is strong.\n"
     "- Place stops immediately after entry using place_spot_stop_order or the stop/TP params on place_futures_market_order.\n"
     + (
     "- FOR RANGE TRADES: TP at BB midline (mean). SL at BB band + 1 ATR. "
