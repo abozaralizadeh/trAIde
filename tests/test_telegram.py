@@ -35,6 +35,8 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     prefer_limit_orders=True,
     limit_order_timeout_sec=20.0,
     post_loss_cooldown_minutes=30.0,
+    max_entry_leverage=3.0,
+    min_trade_interval_minutes=5.0,
   )
   return AppConfig(
     azure=AzureConfig(endpoint="https://x.openai.azure.com/", deployment="gpt-5.2", api_version="2024-10-01-preview", api_key="key"),

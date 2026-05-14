@@ -486,6 +486,10 @@ def run_trading_agent(
   temporary_notes = memory.consume_temporary_notes()
   current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
 
+  # Shared state: daily gate info per symbol, written by analyze_market_context,
+  # read by order functions to hard-block counter-daily-trend entries.
+  _daily_gate_state: Dict[str, Dict[str, Any]] = {}
+
   def _repair_allowed_symbol(requested_symbol: str) -> str | None:
     candidate = _normalize_symbol(requested_symbol)
     if not candidate:
@@ -722,6 +726,23 @@ def run_trading_agent(
         if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
           remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
           return {"rejected": True, "reason": f"Post-loss cooldown active for {symbol} ({remaining}min remaining)", "hint": "Prevents revenge trading after a stop-loss. Try a different symbol or wait for cooldown to expire."}
+
+    # Post-trade cooldown: minimum interval between trades on same symbol
+    if (side or "").lower() == "buy" and cfg.trading.min_trade_interval_minutes > 0:
+      last_trade_ts = memory.last_trade_time(symbol)
+      if last_trade_ts:
+        elapsed_min = (int(time.time()) - last_trade_ts) / 60
+        if elapsed_min < cfg.trading.min_trade_interval_minutes:
+          remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Trade interval cooldown for {symbol} ({remaining}min remaining)", "hint": f"Minimum {cfg.trading.min_trade_interval_minutes:.0f}min between trades on same symbol to prevent overtrading."}
+
+    # Daily gate enforcement: block spot buys opposing the 1D trend
+    if (side or "").lower() == "buy" and symbol in _daily_gate_state:
+      gate = _daily_gate_state[symbol]
+      daily_bias = gate.get("daily_bias", "neutral")
+      if daily_bias == "bearish":
+        logger.warning("DAILY GATE BLOCK: spot buy %s rejected — 1D trend is bearish", symbol)
+        return {"rejected": True, "reason": f"Daily gate: 1D trend is bearish — spot buy blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe is bearish. Spot buys are blocked until the daily trend turns neutral or bullish."}
 
     try:
       funds_val = float(funds or 0)
@@ -1502,6 +1523,11 @@ def run_trading_agent(
         return {"error": str(exc), "interval": iv}
 
     summary = summarize_multi_timeframe(snapshots)
+    _daily_gate_state[symbol] = {
+      "daily_bias": summary.get("daily_bias", "neutral"),
+      "daily_gate_applied": summary.get("daily_gate_applied", False),
+      "overall_bias": summary.get("overall_bias", "neutral"),
+    }
     result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
 
     if cfg.kucoin_futures.enabled and kucoin_futures:
@@ -1729,6 +1755,26 @@ def run_trading_agent(
           remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
           return {"rejected": True, "reason": f"Post-loss cooldown active for {spot_symbol} ({remaining}min remaining)", "hint": "Prevents revenge trading after a stop-loss. Try a different symbol or wait for cooldown to expire."}
 
+    # Post-trade cooldown: minimum interval between trades on same symbol
+    if is_entry and cfg.trading.min_trade_interval_minutes > 0:
+      last_trade_ts = memory.last_trade_time(spot_symbol)
+      if last_trade_ts:
+        elapsed_min = (int(time.time()) - last_trade_ts) / 60
+        if elapsed_min < cfg.trading.min_trade_interval_minutes:
+          remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Trade interval cooldown for {spot_symbol} ({remaining}min remaining)", "hint": f"Minimum {cfg.trading.min_trade_interval_minutes:.0f}min between trades on same symbol to prevent overtrading."}
+
+    # Daily gate enforcement: block entries opposing the 1D trend
+    if is_entry and spot_symbol in _daily_gate_state:
+      gate = _daily_gate_state[spot_symbol]
+      daily_bias = gate.get("daily_bias", "neutral")
+      if daily_bias != "neutral":
+        side_lower = (side or "").lower()
+        opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
+        if opposing:
+          logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
+          return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend or wait for it to turn neutral."}
+
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
@@ -1788,9 +1834,13 @@ def run_trading_agent(
       )
       if c and c > 0
     ]
+    if is_entry and cfg.trading.max_entry_leverage > 0:
+      leverage_caps.append(cfg.trading.max_entry_leverage)
     max_leverage_cap = min(leverage_caps) if leverage_caps else 3.0
     lev = min(max(1.0, lev_requested), max_leverage_cap)
     leverage_clamped = lev < lev_requested - 1e-9
+    if leverage_clamped and is_entry:
+      logger.info("Entry leverage capped: requested %.1fx → applied %.1fx (max_entry_leverage=%.1f)", lev_requested, lev, cfg.trading.max_entry_leverage)
 
     try:
       base_size = float(size_override) if size_override is not None else notional_input / price
@@ -3232,10 +3282,11 @@ def run_trading_agent(
 
     "## STEP 2 — Research (required before every entry decision):\n"
     "- Call analyze_market_context for each coin — it fetches 15m + 1h + 4h + 1D timeframes automatically.\n"
-    "  The 4H timeframe has the highest intraday weight (40%). The 1D acts as a REGIME GATE:\n"
-    "  - If the 1D trend opposes your intraday bias, the system overrides to neutral — do NOT open counter-daily trades.\n"
+    "  The 4H timeframe has the highest intraday weight (40%). The 1D acts as a HARD REGIME GATE:\n"
+    "  - Counter-daily trades are BLOCKED at the code level. If daily_bias='bearish', buy/long orders are rejected. "
+    "If daily_bias='bullish', sell/short orders are rejected. This is NOT optional.\n"
     "  - If the 1D confirms your intraday bias, strength is boosted (e.g., moderate -> strong).\n"
-    "  - Check 'daily_bias' and 'daily_gate_applied' in the summary to see the 1D effect.\n"
+    "  - Check 'daily_bias' and 'daily_gate_applied' in the summary. Trade WITH the daily trend, not against it.\n"
     "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis, OI-price signal, and funding divergence.\n"
     "- The summary includes: weighted_score (-1 to +1), daily_bias, daily_gate_applied, timeframe_conflict (bool), and volume_profile (POC, VAH, VAL).\n"
     "- **Volume Profile levels**: POC = Point of Control (highest volume price, acts as magnet). "
@@ -3345,9 +3396,10 @@ def run_trading_agent(
     "## Capital and risk limits:\n"
     f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
     f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades for that symbol.\n"
-    f"- Futures leverage must stay <= {snapshot.max_leverage}x.\n"
+    f"- Futures entry leverage is HARD CAPPED at {cfg.trading.max_entry_leverage}x by the system. Do NOT request higher leverage to meet profit thresholds — if a trade doesn't work at {cfg.trading.max_entry_leverage}x, skip it.\n"
     f"- Only place a trade if your confidence >= {snapshot.min_confidence}.\n"
-    "- Keep at least 10% of total USDT untouched as reserve.\n\n"
+    "- Keep at least 10% of total USDT untouched as reserve.\n"
+    f"- Minimum {cfg.trading.min_trade_interval_minutes:.0f} minutes between trades on the same symbol (enforced by system).\n\n"
 
     "## Drawdown context (informational only — never a reason to stop trading):\n"
     "- drawdownPct is based on USDT cash, not total portfolio value. If you hold coins in spot, the USDT cash "
@@ -3385,10 +3437,12 @@ def run_trading_agent(
     "- **Insufficient balance (spot)**: use transfer_funds to move USDT from futures/financial to spot, "
     "or sell an underperforming spot position to free capital, or switch to futures with leverage.\n"
     "- **Insufficient margin (futures)**: use transfer_funds('spot_to_futures') or sell a spot position first, "
-    "or reduce notional, or increase leverage.\n"
+    "or reduce notional. Do NOT increase leverage to compensate.\n"
     "- **Size too small / below minimum**: increase position size or skip this particular coin for one with better sizing.\n"
     "- **Daily trade cap**: move to another symbol.\n"
-    "- **Profit too low**: widen TP, increase size, or use futures leverage to amplify the same price move.\n\n"
+    "- **Profit too low**: widen TP or increase size. Do NOT increase leverage beyond the entry cap.\n"
+    "- **Daily gate rejection**: the 1D trend opposes your trade direction. Do NOT retry the same direction — trade WITH the daily trend or move to another symbol.\n"
+    "- **Trade interval cooldown**: you traded this symbol too recently. Move to another symbol or wait.\n\n"
     "**Multi-step execution is expected.** If you want to open a futures trade but funds are in spot:\n"
     "1. Sell an unneeded spot position (place_market_order with rationale 'portfolio review')\n"
     "2. Transfer the freed USDT to futures (transfer_funds)\n"

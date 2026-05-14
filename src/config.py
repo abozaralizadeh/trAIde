@@ -68,6 +68,8 @@ class TradingConfig:
   prefer_limit_orders: bool
   limit_order_timeout_sec: float
   post_loss_cooldown_minutes: float
+  max_entry_leverage: float
+  min_trade_interval_minutes: float
 
 
 @dataclass
@@ -175,6 +177,8 @@ def load_config() -> AppConfig:
       prefer_limit_orders=_as_bool(os.getenv("PREFER_LIMIT_ORDERS"), True),
       limit_order_timeout_sec=float(os.getenv("LIMIT_ORDER_TIMEOUT_SEC", "20")),
       post_loss_cooldown_minutes=float(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "30")),
+      max_entry_leverage=float(os.getenv("MAX_ENTRY_LEVERAGE", "3")),
+      min_trade_interval_minutes=float(os.getenv("MIN_TRADE_INTERVAL_MINUTES", "5")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "10.0")),

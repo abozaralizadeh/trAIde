@@ -884,6 +884,17 @@ class MemoryStore:
         continue
     return streak
 
+  def last_trade_time(self, symbol: str) -> int | None:
+    """Return the timestamp of the most recent trade (any side) for a symbol, or None."""
+    sym = _normalize_symbol(symbol)
+    with self._lock:
+      data = self._prune(self._read())
+      trades = data.get("trades", [])
+    for t in sorted(trades, key=lambda t: t.get("ts", 0), reverse=True):
+      if t.get("symbol") == sym:
+        return t.get("ts")
+    return None
+
   def last_loss_time(self, symbol: str) -> int | None:
     """Return the timestamp of the most recent losing decision for a symbol, or None."""
     sym = _normalize_symbol(symbol)
