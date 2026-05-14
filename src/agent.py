@@ -3719,6 +3719,20 @@ def run_trading_agent(
   )
   narrative = str(result.final_output)
 
+  # Log token usage and prompt cache stats
+  total_input = sum(r.usage.input_tokens for r in result.raw_responses if r.usage)
+  total_output = sum(r.usage.output_tokens for r in result.raw_responses if r.usage)
+  total_cached = sum(
+    (r.usage.input_tokens_details.cached_tokens or 0)
+    for r in result.raw_responses
+    if r.usage and r.usage.input_tokens_details
+  )
+  cache_pct = (total_cached / total_input * 100) if total_input > 0 else 0
+  logger.info(
+    "Agent run tokens: input=%d output=%d cached=%d (%.0f%%) requests=%d",
+    total_input, total_output, total_cached, cache_pct, len(result.raw_responses),
+  )
+
   tool_outputs: List[Any] = []
   for item in result.new_items:
     if isinstance(item, ToolCallOutputItem):
