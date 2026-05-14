@@ -335,7 +335,7 @@ async def trading_loop() -> None:
 
     should_run = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
 
-    recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=10)
+    recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=30)
     new_events_count = len(recent_fills["spot_fills"]) + len(recent_fills["futures_fills"]) + len(recent_fills["closed_positions"])
     if new_events_count:
       logger.info("Detected %d new fill/close events (spot=%d, futures=%d, closed=%d)",

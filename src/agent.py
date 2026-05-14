@@ -2132,7 +2132,7 @@ def run_trading_agent(
         f"futures_{side}",
         float(confidence),
         rationale or "paper trade",
-        pnl=closing_pnl,
+        pnl=None,
         paper=True,
       )
       return_val = {
@@ -2178,7 +2178,7 @@ def run_trading_agent(
           f"futures_{side}",
           float(confidence),
           rationale or "live trade",
-          pnl=closing_pnl,
+          pnl=None,
           paper=False,
         )
       res["rationale"] = rationale
@@ -2225,7 +2225,7 @@ def run_trading_agent(
           f"futures_{side}",
           float(confidence),
           rationale or "live trade",
-          pnl=closing_pnl,
+          pnl=None,
           paper=False,
         )
       res["rationale"] = rationale
