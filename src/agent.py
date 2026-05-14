@@ -744,6 +744,10 @@ def run_trading_agent(
         logger.warning("DAILY GATE BLOCK: spot buy %s rejected — 1D trend is bearish", symbol)
         return {"rejected": True, "reason": f"Daily gate: 1D trend is bearish — spot buy blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe is bearish. Spot buys are blocked until the daily trend turns neutral or bullish."}
 
+    # Confidence enforcement: reject buys below minimum confidence
+    if (side or "").lower() == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
+      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}", "hint": "Only enter trades with sufficient conviction. Analyze another coin or wait for a better setup."}
+
     try:
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
@@ -1774,6 +1778,23 @@ def run_trading_agent(
         if opposing:
           logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
           return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend or wait for it to turn neutral."}
+
+    # Confidence enforcement: reject entries below minimum confidence
+    if is_entry and confidence is not None and confidence < cfg.trading.min_confidence:
+      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}", "hint": "Only enter trades with sufficient conviction. Analyze another coin or wait for a better setup."}
+
+    # Anti-stacking: block add-on entries when existing position is losing
+    if is_entry and snapshot.futures_positions:
+      futures_symbol_check = _to_futures_symbol(spot_symbol)
+      if futures_symbol_check:
+        existing = next((p for p in snapshot.futures_positions if p.get("symbol") == futures_symbol_check), None)
+        if existing:
+          unrealized = _to_float(existing.get("unrealisedPnl")) or _to_float(existing.get("unrealizedPnl")) or 0
+          pos_qty = _to_float(existing.get("currentQty")) or 0
+          same_direction = (pos_qty > 0 and (side or "").lower() == "buy") or (pos_qty < 0 and (side or "").lower() == "sell")
+          if same_direction and unrealized < 0:
+            logger.warning("ANTI-STACKING: %s %s add-on rejected — existing position unrealizedPnl=%.4f", side, spot_symbol, unrealized)
+            return {"rejected": True, "reason": f"Cannot add to losing {spot_symbol} position (unrealizedPnl={unrealized:.4f})", "hint": "Do NOT add to losing positions. Wait for the position to recover or close it first, then trade a different symbol."}
 
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
@@ -2859,6 +2880,7 @@ def run_trading_agent(
       return {"error": "Invalid amount"}
     if amt <= 0:
       return {"error": "Amount must be positive"}
+    amt = math.floor(amt * 1e8) / 1e8
 
     # Pull fresh balances to avoid stale state.
     spot_accounts = kucoin.get_trade_accounts()
@@ -3237,7 +3259,11 @@ def run_trading_agent(
     "or RSI extreme (>80 or <20) directly against your intended direction.\n"
     "- If you find yourself writing 'wait for pullback' or 'no edge' — STOP. Check the other venue, check other coins, "
     "check futures. Find a trade.\n"
-    "- A small profitable trade is infinitely better than no trade. Use smaller size when uncertain, but trade.\n\n"
+    "- A small profitable trade is infinitely better than no trade. Use smaller size when uncertain, but trade.\n"
+    "- You are FULLY AUTONOMOUS. NEVER write 'If you want...', 'Would you like...', or 'Do you want...'. "
+    "Just execute. No one is reading your output interactively.\n"
+    "- DIVERSIFY: analyze multiple coins every run. If one coin is blocked or has no edge, move to the next. "
+    "Do NOT spend the entire run on a single symbol.\n\n"
 
     "## STEP 1 — Account audit (always first):\n"
     "- Call fetch_account_state to confirm live balances across spot, funding, financial, and futures.\n"
@@ -3420,7 +3446,11 @@ def run_trading_agent(
     "If peakPnl was positive but current unrealizedPnl is negative, you missed an exit opportunity.\n"
     "- Use this data to adapt — don't repeat losing patterns.\n\n"
 
-    "## Opportunity discovery (every run):\n"
+    "## MANDATORY — Diversification and opportunity discovery:\n"
+    "- You MUST analyze at least 2 different coins every run. Do NOT fixate on a single coin.\n"
+    "- If a coin is rejected (daily gate, cooldown, trade cap, low confidence), IMMEDIATELY move to the next coin. "
+    "Do NOT keep retrying the same symbol.\n"
+    "- NEVER output 'If you want, I can scout...' or 'Would you like me to...' — just DO it. You are autonomous.\n"
     "- The coin list is a starting point, not a boundary. Better opportunities may exist outside it.\n"
     "- Use web_search and fetch_kucoin_news every run to scan for market-moving events: new listings, breakouts, "
     "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"

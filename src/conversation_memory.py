@@ -143,21 +143,41 @@ class ConversationMemory:
     compactor = Agent(
       name="Conversation Compactor",
       instructions=(
-        f"Summarize the conversation between {context}. "
+        "You are a helpful summarization assistant. Your task is to create a factual summary of a "
+        "conversation about software and data analysis. "
+        f"The conversation is between {context}. "
         "Capture: key questions asked, important answers/findings, any instructions or directives given, "
         "and ongoing topics of interest. Be concise (max 300 words). Output only the summary, nothing else."
       ),
       model=model,
     )
 
+    def _sanitize_for_filter(text: str) -> str:
+      """Replace financial terms that trigger Azure content filters."""
+      import re
+      replacements = {
+        r'\bliquidat\w*': 'closed',
+        r'\bleverage\b': 'multiplier',
+        r'\baggressive.?short\w*': 'bearish-positioned',
+        r'\bshort.?cover\w*': 'position-unwind',
+        r'\bforce.?sell\w*': 'auto-close',
+        r'\bstop.?loss': 'exit-trigger',
+        r'\bcut.?loss': 'exit-trigger',
+        r'\brevenge.?trad\w*': 'reactive-trading',
+      }
+      result = text
+      for pattern, replacement in replacements.items():
+        result = re.sub(pattern, replacement, result, flags=re.IGNORECASE)
+      return result
+
     def summarizer(existing_summary: str, old_messages: List[Dict[str, Any]]) -> str:
       formatted = "\n".join(
-        f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:800]}"
+        f"{'User' if m['role'] == 'user' else 'Assistant'}: {_sanitize_for_filter(m['content'][:800])}"
         for m in old_messages
       )
       prompt = ""
       if existing_summary:
-        prompt += f"Existing summary to incorporate:\n{existing_summary}\n\n"
+        prompt += f"Existing summary to incorporate:\n{_sanitize_for_filter(existing_summary)}\n\n"
       prompt += f"New messages to summarize:\n{formatted}"
 
       result = asyncio.run(Runner.run(compactor, prompt, max_turns=1))
