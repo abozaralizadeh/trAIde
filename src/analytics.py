@@ -404,8 +404,22 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
   # Daily gate: if 1D bias opposes the intraday bias, downgrade; if it agrees, boost
   daily_bias = "neutral"
   daily_gate_applied = False
+  daily_exhausted = False
   if daily_snap:
     daily_bias = _direction(daily_snap.get("trend_bias", "neutral"))
+    # Exhaustion detection: if daily RSI is extreme and ADX is weakening, the
+    # daily trend is exhausted — don't use it as a directional gate.
+    daily_rsi = daily_snap.get("rsi")
+    daily_adx = daily_snap.get("adx")
+    if daily_bias == "bullish" and daily_rsi is not None and daily_rsi >= 70:
+      daily_exhausted = True
+    elif daily_bias == "bearish" and daily_rsi is not None and daily_rsi <= 30:
+      daily_exhausted = True
+    elif daily_adx is not None and daily_adx < 18:
+      # Weak/choppy daily trend — gate would force trades into chop
+      daily_exhausted = True
+    if daily_exhausted:
+      daily_bias = "neutral"
     if daily_bias != "neutral" and overall_bias != "neutral" and daily_bias != overall_bias:
       overall_bias = "neutral"
       strength = "weak"
@@ -486,7 +500,9 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
   else:
     entry_hint = "No clear directional bias; consider range-bound strategies or reduce size significantly."
 
-  if daily_gate_applied:
+  if daily_exhausted:
+    entry_hint += " DAILY EXHAUSTED: 1D RSI extreme or ADX weak — daily trend gate disabled. Trade with caution, prefer mean-reversion."
+  elif daily_gate_applied:
     entry_hint += f" DAILY GATE: 1D trend is {daily_bias} — opposing intraday bias was overridden to neutral. Do NOT open counter-daily trades."
   elif daily_bias != "neutral":
     entry_hint += f" Daily trend confirms: 1D bias is {daily_bias}."
@@ -506,6 +522,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "weighted_score": _round(normalized_score, 3),
     "daily_bias": daily_bias,
     "daily_gate_applied": daily_gate_applied,
+    "daily_exhausted": daily_exhausted,
     "timeframe_conflict": tf_conflict,
     "volatility": volatility,
     "market_regime": overall_regime,

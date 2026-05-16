@@ -29,6 +29,8 @@ def _make_valid_config(**overrides) -> AppConfig:
         post_loss_cooldown_minutes=30.0,
         max_entry_leverage=3.0,
         min_trade_interval_minutes=5.0,
+        max_24h_volatility_pct=25.0,
+        max_atr_pct_for_entry=5.0,
     )
     trading_kwargs.update(overrides)
     return AppConfig(

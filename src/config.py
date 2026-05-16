@@ -70,6 +70,8 @@ class TradingConfig:
   post_loss_cooldown_minutes: float
   max_entry_leverage: float
   min_trade_interval_minutes: float
+  max_24h_volatility_pct: float
+  max_atr_pct_for_entry: float
 
 
 @dataclass
@@ -179,6 +181,8 @@ def load_config() -> AppConfig:
       post_loss_cooldown_minutes=float(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "30")),
       max_entry_leverage=float(os.getenv("MAX_ENTRY_LEVERAGE", "3")),
       min_trade_interval_minutes=float(os.getenv("MIN_TRADE_INTERVAL_MINUTES", "5")),
+      max_24h_volatility_pct=float(os.getenv("MAX_24H_VOLATILITY_PCT", "25")),
+      max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "5")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "10.0")),

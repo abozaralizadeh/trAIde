@@ -736,13 +736,22 @@ def run_trading_agent(
           remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
           return {"rejected": True, "reason": f"Trade interval cooldown for {symbol} ({remaining}min remaining)", "hint": f"Minimum {cfg.trading.min_trade_interval_minutes:.0f}min between trades on same symbol to prevent overtrading."}
 
-    # Daily gate enforcement: block spot buys opposing the 1D trend
+    # Daily gate enforcement: block spot buys opposing the 1D trend (unless exhausted)
     if (side or "").lower() == "buy" and symbol in _daily_gate_state:
       gate = _daily_gate_state[symbol]
       daily_bias = gate.get("daily_bias", "neutral")
-      if daily_bias == "bearish":
+      daily_exhausted = gate.get("daily_exhausted", False)
+      if daily_bias == "bearish" and not daily_exhausted:
         logger.warning("DAILY GATE BLOCK: spot buy %s rejected — 1D trend is bearish", symbol)
         return {"rejected": True, "reason": f"Daily gate: 1D trend is bearish — spot buy blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe is bearish. Spot buys are blocked until the daily trend turns neutral or bullish."}
+
+    # Volatility filter: block spot buys on highly volatile symbols
+    if (side or "").lower() == "buy" and symbol in _daily_gate_state:
+      gate = _daily_gate_state[symbol]
+      daily_atr_pct = gate.get("daily_atr_pct")
+      if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
+        logger.warning("VOLATILITY BLOCK: spot buy %s rejected — daily ATR=%.2f%% exceeds max %.2f%%", symbol, daily_atr_pct, cfg.trading.max_atr_pct_for_entry)
+        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max", "hint": "This symbol is too volatile for the current strategy. Pick a less volatile coin or wait for volatility to settle."}
 
     # Confidence enforcement: reject buys below minimum confidence
     if (side or "").lower() == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
@@ -1527,10 +1536,23 @@ def run_trading_agent(
         return {"error": str(exc), "interval": iv}
 
     summary = summarize_multi_timeframe(snapshots)
+    # Extract daily ATR% and 15m ATR% for volatility filtering
+    daily_atr_pct = None
+    intraday_atr_pct = None
+    for snap in snapshots:
+      iv = snap.get("interval")
+      atr_pct = snap.get("atr_pct")
+      if iv == "1day" and atr_pct is not None:
+        daily_atr_pct = atr_pct
+      elif iv == "15min" and atr_pct is not None:
+        intraday_atr_pct = atr_pct
     _daily_gate_state[symbol] = {
       "daily_bias": summary.get("daily_bias", "neutral"),
       "daily_gate_applied": summary.get("daily_gate_applied", False),
+      "daily_exhausted": summary.get("daily_exhausted", False),
       "overall_bias": summary.get("overall_bias", "neutral"),
+      "daily_atr_pct": daily_atr_pct,
+      "intraday_atr_pct": intraday_atr_pct,
     }
     result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
 
@@ -1768,16 +1790,25 @@ def run_trading_agent(
           remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
           return {"rejected": True, "reason": f"Trade interval cooldown for {spot_symbol} ({remaining}min remaining)", "hint": f"Minimum {cfg.trading.min_trade_interval_minutes:.0f}min between trades on same symbol to prevent overtrading."}
 
-    # Daily gate enforcement: block entries opposing the 1D trend
+    # Daily gate enforcement: block entries opposing the 1D trend (unless exhausted)
     if is_entry and spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_bias = gate.get("daily_bias", "neutral")
-      if daily_bias != "neutral":
+      daily_exhausted = gate.get("daily_exhausted", False)
+      if daily_bias != "neutral" and not daily_exhausted:
         side_lower = (side or "").lower()
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
           logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
           return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend or wait for it to turn neutral."}
+
+    # Volatility filter: block entries on highly volatile symbols (pump/dump risk)
+    if is_entry and spot_symbol in _daily_gate_state:
+      gate = _daily_gate_state[spot_symbol]
+      daily_atr_pct = gate.get("daily_atr_pct")
+      if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
+        logger.warning("VOLATILITY BLOCK: %s rejected — daily ATR=%.2f%% exceeds max %.2f%%", spot_symbol, daily_atr_pct, cfg.trading.max_atr_pct_for_entry)
+        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max", "hint": "This symbol is too volatile for the current strategy. Pick a less volatile coin or wait for volatility to settle."}
 
     # Confidence enforcement: reject entries below minimum confidence
     if is_entry and confidence is not None and confidence < cfg.trading.min_confidence:
