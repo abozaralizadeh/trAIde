@@ -862,7 +862,12 @@ class MemoryStore:
     return max(0.01, min(0.25, kelly * 0.25))
 
   def consecutive_losses(self, venue: str | None = None) -> int:
-    """Count current streak of consecutive losing decisions (most recent first)."""
+    """Count current streak of consecutive losing CLOSED trades (most recent first).
+
+    Only counts decisions that represent realized closes (TP/SL triggered or
+    explicit close orders). Excludes 'manage', 'hold', 'decline' decisions
+    whose pnl field reflects unrealized state, not a realized loss.
+    """
     with self._lock:
       data = self._prune(self._read())
       decisions = data.get("decisions", [])
@@ -872,6 +877,14 @@ class MemoryStore:
     decisions = sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True)
     streak = 0
     for d in decisions:
+      action = (d.get("action") or "").lower()
+      # Only count realized closes — skip manage/hold/decline regardless of pnl
+      is_realized_close = (
+        "triggered" in action
+        or action in ("futures_sell", "futures_buy", "spot_sell")
+      )
+      if not is_realized_close:
+        continue
       pnl = d.get("pnl")
       if pnl is None:
         continue
@@ -896,13 +909,24 @@ class MemoryStore:
     return None
 
   def last_loss_time(self, symbol: str) -> int | None:
-    """Return the timestamp of the most recent losing decision for a symbol, or None."""
+    """Return the timestamp of the most recent realized losing close for a symbol, or None.
+
+    Only counts realized closes (triggered TP/SL or explicit close orders),
+    not 'manage'/'hold' decisions whose pnl reflects unrealized state.
+    """
     sym = _normalize_symbol(symbol)
     with self._lock:
       data = self._prune(self._read())
       decisions = data.get("decisions", [])
     for d in sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True):
       if d.get("symbol") != sym:
+        continue
+      action = (d.get("action") or "").lower()
+      is_realized_close = (
+        "triggered" in action
+        or action in ("futures_sell", "futures_buy", "spot_sell")
+      )
+      if not is_realized_close:
         continue
       pnl = d.get("pnl")
       if pnl is None:
