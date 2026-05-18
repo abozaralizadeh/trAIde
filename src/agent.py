@@ -1214,6 +1214,7 @@ def run_trading_agent(
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
 
+  @function_tool
   async def place_limit_order(
     symbol: str,
     side: str,
@@ -2524,6 +2525,7 @@ def run_trading_agent(
       "transferUsed": transfer_used,
     }
 
+  @function_tool
   async def place_futures_limit_order(
     symbol: str,
     side: str,
