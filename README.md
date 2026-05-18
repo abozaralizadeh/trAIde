@@ -23,7 +23,7 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
      Source Mgmt    Memory I/O        Balances
 ```
 
-**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 42 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
+**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 44 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
 
 **Research Agent** -- Runs concurrently while the Trading Agent executes. Searches CoinDesk, The Block, Cointelegraph, exchange blogs, X/Twitter, and macro news. Analyzes strategy patterns (missed profits, repeated losses). Logs findings for the Trading Agent to consume.
 
@@ -51,7 +51,8 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 
 ### Order Execution
 - **Spot + Futures**: Full support for both KuCoin spot and futures markets
-- **Limit order preference**: Places limit orders at best ask instead of market orders to save on fees (configurable)
+- **Target-price limit entries**: New `place_limit_order` / `place_futures_limit_order` tools place orders at a technically derived price level (EMA, Bollinger Band, swing high/low, VWAP) and wait for price to come to the order — preventing the worst-case timing of shorting into dumps or buying into pumps. Market orders are reserved for closes and emergency exits.
+- **Limit order fee saving**: Separate `PREFER_LIMIT_ORDERS` mode places spot buys at best ask instead of market to save on taker fees
 - **Leverage control**: Configurable max leverage (up to 125x) with automatic margin mode management
 - **Fund transfers**: Move USDT between spot, futures, and financial/Earn accounts
 
@@ -119,8 +120,10 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `PARTIAL_TP_ENABLED` | `true` | Split take-profit into staged tranches (60%/40%) |
 | `KELLY_SIZING_ENABLED` | `true` | Use Kelly criterion for adaptive position sizing |
 | `KELLY_MIN_TRADES` | `30` | Minimum trade history before Kelly sizing activates |
-| `PREFER_LIMIT_ORDERS` | `true` | Place limit orders at best ask instead of market orders |
-| `LIMIT_ORDER_TIMEOUT_SEC` | `20` | Timeout before falling back to market order |
+| `PREFER_LIMIT_ORDERS` | `true` | Place spot buys at best ask instead of market for fee savings |
+| `LIMIT_ORDER_TIMEOUT_SEC` | `20` | Timeout before falling back to market order (fee-saving path) |
+| `ENTRY_LIMIT_EXPIRY_MINUTES` | `30` | Cancel unfilled target-price entry limit orders after this many minutes |
+| `MIN_ENTRY_DEVIATION_PCT` | `0.002` | Minimum distance (0.2%) from current price to use a target-price limit order |
 | `POST_LOSS_COOLDOWN_MINUTES` | `45` | Block new entries on a symbol after a loss |
 
 ### Circuit Breakers
@@ -300,7 +303,7 @@ Trigger types: `initial:SYMBOL` (first snapshot), `price_move:SYMBOL:X.XX%` (pri
 
 ```
 src/
-  agent.py             Trading + Research agent definitions, 42 tools, system prompts
+  agent.py             Trading + Research agent definitions, 44 tools, system prompts
   analytics.py         Technical indicators, regime detection, volume profile, multi-TF scoring
   backtest.py          Strategy backtester with parameter sweeps
   config.py            Configuration dataclasses, env var loading, validation

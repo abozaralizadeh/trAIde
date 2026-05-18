@@ -1214,6 +1214,168 @@ def run_trading_agent(
     except Exception as exc:
       return {"error": str(exc), "orderRequest": order_req.__dict__, "transfer": transfer_used}
 
+  async def place_limit_order(
+    symbol: str,
+    side: str,
+    funds: float,
+    entry_price: float,
+    confidence: float | None = None,
+    rationale: str | None = None,
+    stop_price: float | None = None,
+    take_profit_price: float | None = None,
+    risk_pct: float | None = None,
+  ) -> Dict[str, Any]:
+    """Place a spot limit entry order at a technically derived target price.
+    Use for new entries where you want to wait for price to reach a key level
+    (EMA, Bollinger Band, swing high/low, VWAP) rather than entering at the
+    current market price. Rejects if entry_price is too close to current price
+    — use place_market_order instead when price is already at the target level.
+    Bracket TP/SL are placed on the NEXT run after the limit fills."""
+    symbol = _normalize_symbol(symbol)
+    if symbol not in allowed_symbols:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    try:
+      entry_price_val = float(entry_price)
+    except (TypeError, ValueError):
+      return {"error": "entry_price must be a valid number"}
+    if entry_price_val <= 0:
+      return {"error": "entry_price must be positive"}
+
+    side_lower = (side or "").lower()
+
+    if side_lower == "buy" and snapshot.trading_restricted:
+      return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only sell/close operations are allowed during circuit breaker activation."}
+
+    if side_lower == "buy" and cfg.trading.post_loss_cooldown_minutes > 0:
+      last_loss_ts = memory.last_loss_time(symbol)
+      if last_loss_ts:
+        elapsed_min = (int(time.time()) - last_loss_ts) / 60
+        if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
+          remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Post-loss cooldown active for {symbol} ({remaining}min remaining)", "hint": "Try a different symbol or wait for cooldown to expire."}
+
+    if side_lower == "buy" and cfg.trading.min_trade_interval_minutes > 0:
+      last_trade_ts = memory.last_trade_time(symbol)
+      if last_trade_ts:
+        elapsed_min = (int(time.time()) - last_trade_ts) / 60
+        if elapsed_min < cfg.trading.min_trade_interval_minutes:
+          remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Trade interval cooldown for {symbol} ({remaining}min remaining)", "hint": f"Minimum {cfg.trading.min_trade_interval_minutes:.0f}min between trades."}
+
+    if side_lower == "buy" and symbol in _daily_gate_state:
+      gate = _daily_gate_state[symbol]
+      if gate.get("daily_bias") == "bearish" and not gate.get("daily_exhausted", False):
+        return {"rejected": True, "reason": "Daily gate: 1D trend is bearish — spot buy blocked", "hint": "Trade with the daily trend or switch symbol."}
+
+    if side_lower == "buy" and symbol in _daily_gate_state:
+      gate = _daily_gate_state[symbol]
+      daily_atr_pct = gate.get("daily_atr_pct")
+      if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
+        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max"}
+
+    if side_lower == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
+      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
+
+    try:
+      funds_val = float(funds or 0)
+    except (TypeError, ValueError):
+      funds_val = 0.0
+    if funds_val <= 0 or not symbol:
+      return {"error": "Invalid funds or symbol"}
+    if funds_val > snapshot.max_position_usd:
+      return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
+    trades_today = memory.trades_today(symbol)
+    if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
+      return {"rejected": True, "reason": "Daily trade cap reached"}
+
+    if cfg.trading.sentiment_filter_enabled and side_lower == "buy":
+      latest_sent = memory.latest_sentiment(symbol)
+      day_key = int(time.time() // 86400)
+      if not latest_sent or latest_sent.get("day") != day_key:
+        return {"rejected": True, "reason": "Sentiment missing for today"}
+      if latest_sent.get("score", 0) < cfg.trading.sentiment_min_score:
+        return {"rejected": True, "reason": "Sentiment below threshold", "score": latest_sent.get("score")}
+
+    try:
+      current_price = float(snapshot.tickers[symbol].price)
+    except Exception:
+      return {"error": "Unable to fetch current price for deviation check"}
+    if current_price <= 0:
+      return {"error": "Invalid current price"}
+
+    deviation = abs(entry_price_val - current_price) / current_price
+    if deviation < cfg.trading.min_entry_deviation_pct:
+      return {
+        "rejected": True,
+        "reason": f"entry_price {entry_price_val} is within {deviation*100:.3f}% of current price {current_price:.4f} (minimum deviation: {cfg.trading.min_entry_deviation_pct*100:.2f}%)",
+        "hint": "Price is already at your target — use place_market_order to enter immediately, or pick a further entry_price to genuinely wait for a better level.",
+        "currentPrice": current_price,
+        "entryPrice": entry_price_val,
+      }
+
+    try:
+      sym_info = kucoin.get_symbol_info(symbol)
+    except Exception:
+      sym_info = {}
+    base_increment = sym_info.get("baseIncrement", "0.00000001")
+    size_str = _truncate_to_increment(funds_val / entry_price_val, base_increment)
+    size_val = float(size_str)
+    if size_val <= 0:
+      return {"error": "Computed size is zero; increase funds or adjust entry_price"}
+    base_min_size = _to_float(sym_info.get("baseMinSize"))
+    if base_min_size > 0 and size_val < base_min_size:
+      return {"rejected": True, "reason": "Size below exchange minimum", "size": size_val, "minSize": base_min_size, "hint": "Increase funds or choose a symbol with smaller minimum lot size."}
+
+    order_req = KucoinOrderRequest(
+      symbol=symbol,
+      side=side_lower,
+      type="limit",
+      size=size_str,
+      price=str(entry_price_val),
+      clientOid=str(uuid.uuid4()),
+    )
+    expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
+    pending_protection = {"stopPrice": stop_price, "takeProfitPrice": take_profit_price}
+    note = (
+      f"Limit {side_lower} placed at {entry_price_val} (current {current_price:.4f}, {deviation*100:.2f}% away). "
+      f"Order expires in {cfg.trading.entry_limit_expiry_minutes:.0f}min if unfilled. "
+      "On next run: check open positions — if filled, place bracket TP/SL with place_spot_stop_order."
+    )
+
+    if snapshot.paper_trading:
+      record = memory.record_trade(symbol, side, funds_val, paper=True, price=entry_price_val, size=size_val)
+      decision = None
+      if confidence is not None:
+        decision = memory.log_decision(symbol, f"spot_{side_lower}_limit", float(confidence), rationale or "paper limit entry", paper=True)
+      return {
+        "paper": True,
+        "pendingLimitEntry": True,
+        "orderRequest": order_req.__dict__,
+        "entryPrice": entry_price_val,
+        "currentPrice": current_price,
+        "deviationPct": round(deviation * 100, 3),
+        "expiresAt": expiry_ts,
+        "pendingProtection": pending_protection,
+        "tradeRecord": record,
+        "decisionLog": decision,
+        "note": note,
+      }
+
+    try:
+      res = kucoin.place_order(order_req).__dict__
+      if confidence is not None:
+        res["decisionLog"] = memory.log_decision(symbol, f"spot_{side_lower}_limit", float(confidence), rationale or "live limit entry", paper=False)
+      res["pendingLimitEntry"] = True
+      res["entryPrice"] = entry_price_val
+      res["currentPrice"] = current_price
+      res["deviationPct"] = round(deviation * 100, 3)
+      res["expiresAt"] = expiry_ts
+      res["pendingProtection"] = pending_protection
+      res["note"] = note
+      return res
+    except Exception as exc:
+      return {"error": str(exc), "orderRequest": order_req.__dict__}
+
   async def _place_spot_stop_order_impl(
     symbol: str,
     side: str,
@@ -2362,6 +2524,261 @@ def run_trading_agent(
       "transferUsed": transfer_used,
     }
 
+  async def place_futures_limit_order(
+    symbol: str,
+    side: str,
+    notional_usd: float,
+    entry_price: float,
+    leverage: float = 1.0,
+    size_override: float | None = None,
+    confidence: float | None = None,
+    rationale: str | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+  ) -> Dict[str, Any]:
+    """Place a futures limit entry order at a technically derived target price.
+    Use for new entries where you want to wait for price to reach a key level
+    (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
+    Rejects if entry_price is too close to current price — use place_futures_market_order
+    for closes or when price is already at the target level.
+    Bracket TP/SL are placed on the NEXT run after the limit fills."""
+    spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+    if not spot_symbol:
+      spot_symbol = _repair_allowed_symbol(symbol)
+    if not spot_symbol:
+      return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
+
+    try:
+      entry_price_val = float(entry_price)
+    except (TypeError, ValueError):
+      return {"error": "entry_price must be a valid number"}
+    if entry_price_val <= 0:
+      return {"error": "entry_price must be positive"}
+
+    side_lower = (side or "").lower()
+    lev_requested = max(1.0, float(leverage or 1.0))
+
+    if snapshot.trading_restricted:
+      return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
+
+    if cfg.trading.post_loss_cooldown_minutes > 0:
+      last_loss_ts = memory.last_loss_time(spot_symbol)
+      if last_loss_ts:
+        elapsed_min = (int(time.time()) - last_loss_ts) / 60
+        if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
+          remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Post-loss cooldown active for {spot_symbol} ({remaining}min remaining)", "hint": "Try a different symbol or wait."}
+
+    if cfg.trading.min_trade_interval_minutes > 0:
+      last_trade_ts = memory.last_trade_time(spot_symbol)
+      if last_trade_ts:
+        elapsed_min = (int(time.time()) - last_trade_ts) / 60
+        if elapsed_min < cfg.trading.min_trade_interval_minutes:
+          remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
+          return {"rejected": True, "reason": f"Trade interval cooldown for {spot_symbol} ({remaining}min remaining)"}
+
+    if spot_symbol in _daily_gate_state:
+      gate = _daily_gate_state[spot_symbol]
+      daily_bias = gate.get("daily_bias", "neutral")
+      daily_exhausted = gate.get("daily_exhausted", False)
+      if daily_bias != "neutral" and not daily_exhausted:
+        opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
+        if opposing:
+          return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend or switch symbol."}
+
+    if spot_symbol in _daily_gate_state:
+      gate = _daily_gate_state[spot_symbol]
+      daily_atr_pct = gate.get("daily_atr_pct")
+      if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
+        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max"}
+
+    if confidence is not None and confidence < cfg.trading.min_confidence:
+      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
+
+    trades_today = memory.trades_today(spot_symbol)
+    if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
+      return {"rejected": True, "reason": "Daily trade cap reached"}
+
+    if cfg.trading.sentiment_filter_enabled:
+      latest_sent = memory.latest_sentiment(symbol)
+      day_key = int(time.time() // 86400)
+      if not latest_sent or latest_sent.get("day") != day_key:
+        return {"rejected": True, "reason": "Sentiment missing for today"}
+      if latest_sent.get("score", 0) < cfg.trading.sentiment_min_score:
+        return {"rejected": True, "reason": "Sentiment below threshold", "score": latest_sent.get("score")}
+
+    futures_symbol = _to_futures_symbol(spot_symbol)
+    if not futures_symbol:
+      return {"error": "Invalid symbol for futures", "symbol": spot_symbol}
+    contract = _get_contract_spec(futures_symbol)
+    if not contract:
+      return {"error": "Futures contract spec unavailable", "futuresSymbol": futures_symbol}
+
+    try:
+      current_price = float(snapshot.tickers[spot_symbol].price)
+    except Exception:
+      return {"error": "Unable to fetch current price for deviation check"}
+    if current_price <= 0:
+      return {"error": "Invalid current price"}
+
+    deviation = abs(entry_price_val - current_price) / current_price
+    if deviation < cfg.trading.min_entry_deviation_pct:
+      return {
+        "rejected": True,
+        "reason": f"entry_price {entry_price_val} is within {deviation*100:.3f}% of current price {current_price:.4f} (minimum deviation: {cfg.trading.min_entry_deviation_pct*100:.2f}%)",
+        "hint": "Price is already at your target — use place_futures_market_order to enter immediately, or pick a further entry_price to genuinely wait for a better level.",
+        "currentPrice": current_price,
+        "entryPrice": entry_price_val,
+      }
+
+    multiplier = _to_float(contract.get("multiplier"))
+    lot_size = int(contract.get("lotSize") or 1)
+    max_order_qty = contract.get("maxOrderQty")
+    contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
+    fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
+    slippage_rate = cfg.trading.estimated_slippage_pct
+    if multiplier <= 0:
+      return {"error": "Invalid contract multiplier", "contract": contract}
+
+    leverage_caps = [c for c in (snapshot.max_leverage, cfg.trading.max_leverage, contract_max_leverage) if c and c > 0]
+    if cfg.trading.max_entry_leverage > 0:
+      leverage_caps.append(cfg.trading.max_entry_leverage)
+    max_leverage_cap = min(leverage_caps) if leverage_caps else 3.0
+    lev = min(max(1.0, lev_requested), max_leverage_cap)
+    leverage_clamped = lev < lev_requested - 1e-9
+
+    notional_input = float(notional_usd or 0)
+    try:
+      base_size = float(size_override) if size_override is not None else notional_input / entry_price_val
+    except (TypeError, ValueError):
+      return {"error": "Invalid size_override"}
+    if base_size <= 0:
+      return {"error": "Computed size is zero"}
+
+    contracts_raw = base_size / multiplier
+    lot = max(1, lot_size)
+    contracts = int(math.ceil(contracts_raw / lot) * lot)
+    actual_notional = contracts * multiplier * entry_price_val
+    min_notional = lot * multiplier * entry_price_val
+    if actual_notional < min_notional:
+      return {"rejected": True, "reason": "Below contract minimum notional", "minNotionalUsd": min_notional}
+    if max_order_qty and isinstance(max_order_qty, (int, float)) and contracts > max_order_qty:
+      return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty}
+    if actual_notional > snapshot.max_position_usd * max_leverage_cap:
+      return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd * max_leverage_cap}
+
+    expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
+    pending_protection = {"takeProfitPrice": take_profit_price, "stopLossPrice": stop_loss_price}
+    note = (
+      f"Futures limit {side_lower} placed at {entry_price_val} (current {current_price:.4f}, {deviation*100:.2f}% away). "
+      f"Order expires in {cfg.trading.entry_limit_expiry_minutes:.0f}min if unfilled. "
+      "On next run: check open positions — if filled, place bracket TP/SL with place_futures_stop_order."
+    )
+
+    def _build_limit_order(mode: str | None) -> KucoinFuturesOrderRequest:
+      mode_norm = None
+      auto_deposit = None
+      if mode:
+        mode_norm = mode.upper()
+        if mode_norm == "ISOLATED":
+          auto_deposit = False
+      return KucoinFuturesOrderRequest(
+        symbol=futures_symbol,
+        side=side_lower,
+        type="limit",
+        leverage=str(int(lev)),
+        size=str(contracts),
+        price=str(entry_price_val),
+        clientOid=str(uuid.uuid4()),
+        marginMode=mode_norm,
+        autoDeposit=auto_deposit,
+        reduceOnly=False,
+      )
+
+    if snapshot.paper_trading:
+      order_req = _build_limit_order(None)
+      record = memory.record_trade(spot_symbol, side, actual_notional, paper=True, price=entry_price_val, size=contracts * multiplier, venue="futures")
+      decision = None
+      if confidence is not None:
+        decision = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "paper futures limit entry", paper=True)
+      return {
+        "paper": True,
+        "pendingLimitEntry": True,
+        "orderRequest": order_req.__dict__,
+        "entryPrice": entry_price_val,
+        "currentPrice": current_price,
+        "deviationPct": round(deviation * 100, 3),
+        "contracts": contracts,
+        "futuresSymbol": futures_symbol,
+        "appliedLeverage": lev,
+        "leverageClampedFrom": lev_requested if leverage_clamped else None,
+        "expiresAt": expiry_ts,
+        "pendingProtection": pending_protection,
+        "tradeRecord": record,
+        "decisionLog": decision,
+        "note": note,
+      }
+
+    # Detect margin mode from existing position if available
+    margin_mode: str | None = None
+    try:
+      position_info = kucoin_futures.get_position(futures_symbol)
+      if isinstance(position_info, dict) and "crossMode" in position_info:
+        margin_mode = "cross" if position_info.get("crossMode") else "isolated"
+    except Exception:
+      pass
+    if margin_mode is None:
+      margin_mode = "cross"
+
+    order_req = _build_limit_order(margin_mode)
+    try:
+      kucoin_futures.set_margin_mode(futures_symbol, margin_mode)
+    except Exception as exc:
+      logger.warning("set_margin_mode failed (continuing): %s", exc)
+    try:
+      kucoin_futures.set_leverage(futures_symbol, lev)
+    except Exception as exc:
+      logger.warning("set_leverage failed (continuing): %s", exc)
+    try:
+      res = kucoin_futures.place_order(order_req).__dict__
+      if confidence is not None:
+        res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
+      res["pendingLimitEntry"] = True
+      res["entryPrice"] = entry_price_val
+      res["currentPrice"] = current_price
+      res["deviationPct"] = round(deviation * 100, 3)
+      res["contracts"] = contracts
+      res["futuresSymbol"] = futures_symbol
+      res["appliedLeverage"] = lev
+      res["leverageClampedFrom"] = lev_requested if leverage_clamped else None
+      res["expiresAt"] = expiry_ts
+      res["pendingProtection"] = pending_protection
+      res["note"] = note
+      return res
+    except Exception as exc:
+      # Fallback: try opposite margin mode
+      opposite_mode = "isolated" if margin_mode == "cross" else "cross"
+      order_req = _build_limit_order(opposite_mode)
+      try:
+        kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
+        kucoin_futures.set_leverage(futures_symbol, lev)
+        res = kucoin_futures.place_order(order_req).__dict__
+        if confidence is not None:
+          res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
+        res["pendingLimitEntry"] = True
+        res["entryPrice"] = entry_price_val
+        res["currentPrice"] = current_price
+        res["deviationPct"] = round(deviation * 100, 3)
+        res["contracts"] = contracts
+        res["futuresSymbol"] = futures_symbol
+        res["appliedLeverage"] = lev
+        res["expiresAt"] = expiry_ts
+        res["pendingProtection"] = pending_protection
+        res["note"] = note
+        return res
+      except Exception as exc2:
+        return {"error": f"Futures limit order failed: {exc2}", "firstAttemptError": str(exc), "futuresSymbol": futures_symbol}
+
   async def _place_futures_stop_order_impl(
     symbol: str,
     side: str,
@@ -3408,6 +3825,34 @@ def run_trading_agent(
     "## STEP 3 — Trade decision:\n"
     "Use the research to decide direction and build a complete trade plan (entry, stop, TP) BEFORE placing the order.\n\n"
 
+    "**Entry tool selection (MANDATORY for all new positions):**\n"
+    "- Use place_limit_order (spot) or place_futures_limit_order (futures) for ALL new entries.\n"
+    "- Reserve place_market_order / place_futures_market_order ONLY for closing positions or emergency exits.\n"
+    "- Why: market orders execute at current price regardless of chart structure. Limit orders let price "
+    "come TO you at a better level — avoiding the worst timing failures (shorting into a dump, buying into a pump).\n\n"
+
+    "**How to pick entry_price (REQUIRED for limit order tools):**\n"
+    "Choose a level where MULTIPLE reference points converge (confluence of 2+ levels is far more reliable than any single one):\n"
+    "  - SHORT entry — set entry_price ABOVE current price at a resistance zone:\n"
+    "    * 15m/1h EMA (price bouncing into a declining EMA from below)\n"
+    "    * Upper Bollinger Band (price stretched to +2 SD, RSI > 65)\n"
+    "    * Recent swing high or VAH (Value Area High from volume profile)\n"
+    "    * VWAP retest from below after a breakdown\n"
+    "    * Fibonacci retracement of the recent drop: 38.2%, 50%, or 61.8% bounce levels\n"
+    "  - LONG entry — set entry_price BELOW current price at a support zone:\n"
+    "    * 15m/1h EMA pullback (price returning to a rising EMA from above)\n"
+    "    * Lower Bollinger Band (price stretched to -2 SD, RSI < 35)\n"
+    "    * Recent swing low or VAL (Value Area Low)\n"
+    "    * VWAP retest from above after a breakout\n"
+    "    * Fibonacci retracement of the recent rally: 38.2%, 50%, or 61.8% pullback levels\n"
+    "- **Entry distance**: target levels within 0.5–1.5 × ATR of current price. Farther than 1.5 ATR rarely fills in normal conditions.\n"
+    "- **Volume check**: the target level is stronger when it coincides with a prior high-volume node (POC or VAH/VAL from volume profile).\n"
+    "- **Rejection confirmation**: for shorts, prefer entry at resistance only when you also see bearish RSI divergence or RSI > 65. "
+    "For longs, prefer pullback entries when RSI < 40 or bullish divergence is present.\n"
+    "- If current price is ALREADY at the optimal level (within ~0.2%), the limit tool will reject — use place_market_order instead.\n"
+    "- NEVER set entry_price at or worse than the current price for a new entry "
+    "(do NOT short at current price when price just dumped — wait for the bounce to resistance).\n\n"
+
     "**Entry signal — trade when the 1h trend_bias is clear (bullish or bearish):**\n"
     "- Strong setup (trade full size): 1h AND 15m both agree on direction, RSI 40–65, MACD confirms, catalyst from news.\n"
     "- Normal setup (trade reduced size, 50–70% of normal): 1h is clear, 15m mixed, OR 1h mixed but strong news catalyst.\n"
@@ -3438,7 +3883,9 @@ def run_trading_agent(
     "ALWAYS give the SL more room than the TP — crypto wicks frequently sweep tight stops before "
     "reversing to your target. A wider stop with a smaller position keeps dollar risk the same but avoids noise stopouts.\n"
     "- Take-profit: RR >= 1.0 (minimum). Aim for 1.5–2.0 when momentum is strong.\n"
-    "- Place stops immediately after entry using place_spot_stop_order or the stop/TP params on place_futures_market_order.\n"
+    "- For limit entries: pass stop_price and take_profit_price into the limit order tool. "
+    "The system records them as pendingProtection. On the next run after the limit fills, "
+    "place bracket orders with place_spot_stop_order / place_futures_stop_order.\n"
     + (
     "- FOR RANGE TRADES: TP at BB midline (mean). SL at BB band + 1 ATR. "
     "RR may be as low as 1.0 for range trades (the high win rate compensates). "
@@ -3609,6 +4056,8 @@ def run_trading_agent(
       transfer_funds,
       fetch_account_state,
       refresh_fee_rates,
+      place_limit_order,
+      place_futures_limit_order,
       place_futures_market_order,
       place_market_order,
       place_spot_stop_order,
