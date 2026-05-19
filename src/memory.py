@@ -18,7 +18,8 @@ MAX_TRIGGERS = 5
 MAX_COINS = 50
 MAX_TRADES = 100
 MAX_SENTIMENTS = 10
-MAX_DECISIONS = 50
+MAX_DECISIONS = 50       # entry/decline decisions (pnl=None)
+MAX_CLOSED_TRADES = 200  # closed-trade outcomes (pnl != None) — kept separately
 MAX_FEES = 3
 MAX_TEMPORARY_NOTES = 20
 MAX_PERMANENT_NOTES = 10
@@ -130,6 +131,8 @@ class MemoryStore:
             "paper": d.get("paper", False),
             "ts": d.get("ts") or int(time.time()),
             "day": d.get("day"),
+            "peakPnl": d.get("peakPnl"),
+            "troughPnl": d.get("troughPnl"),
           }
           for d in data.get("decisions", [])
           if isinstance(d, dict) and d.get("symbol") and d.get("ts") is not None
@@ -203,7 +206,21 @@ class MemoryStore:
     _cap_list("coins", MAX_COINS)
     _cap_list("trades", MAX_TRADES)
     _cap_list("sentiments", MAX_SENTIMENTS)
-    _cap_list("decisions", MAX_DECISIONS)
+    # Two-tier cap: trade outcomes (pnl != None) get a larger cap so losses are never
+    # evicted by high-volume entry/decline decisions (pnl=None).
+    pnl_decisions = [d for d in (data.get("decisions") or []) if d.get("pnl") is not None]
+    null_decisions = [d for d in (data.get("decisions") or []) if d.get("pnl") is None]
+    if len(pnl_decisions) > MAX_CLOSED_TRADES:
+      try:
+        pnl_decisions = sorted(pnl_decisions, key=lambda x: x.get("ts", 0))[-MAX_CLOSED_TRADES:]
+      except Exception:
+        pnl_decisions = pnl_decisions[-MAX_CLOSED_TRADES:]
+    if len(null_decisions) > MAX_DECISIONS:
+      try:
+        null_decisions = sorted(null_decisions, key=lambda x: x.get("ts", 0))[-MAX_DECISIONS:]
+      except Exception:
+        null_decisions = null_decisions[-MAX_DECISIONS:]
+    data["decisions"] = sorted(pnl_decisions + null_decisions, key=lambda x: x.get("ts", 0))
     _cap_list("fees", MAX_FEES)
     _cap_list("supervisor_notes_temporary", MAX_TEMPORARY_NOTES)
     _cap_list("supervisor_notes_permanent", MAX_PERMANENT_NOTES)
