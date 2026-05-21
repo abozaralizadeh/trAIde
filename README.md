@@ -18,12 +18,12 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
     |   Agent    |    |   Agent   |    | Spot+Fut  |
     +-----------+    +-----------+    +-----------+
          |                |                |
-     Web Search     42 Tool Calls     Order Exec
+     Web Search     45 Tool Calls     Order Exec
      News Fetch     Risk Checks       Positions
      Source Mgmt    Memory I/O        Balances
 ```
 
-**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 44 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
+**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 45 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
 
 **Research Agent** -- Runs concurrently while the Trading Agent executes. Searches CoinDesk, The Block, Cointelegraph, exchange blogs, X/Twitter, and macro news. Analyzes strategy patterns (missed profits, repeated losses). Logs findings for the Trading Agent to consume.
 
@@ -51,7 +51,8 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 
 ### Order Execution
 - **Spot + Futures**: Full support for both KuCoin spot and futures markets
-- **Target-price limit entries**: New `place_limit_order` / `place_futures_limit_order` tools place orders at a technically derived price level (EMA, Bollinger Band, swing high/low, VWAP) and wait for price to come to the order — preventing the worst-case timing of shorting into dumps or buying into pumps. Market orders are reserved for closes and emergency exits.
+- **Target-price limit entries**: `place_limit_order` / `place_futures_limit_order` place orders at a technically derived price level (EMA, Bollinger Band, swing high/low, VWAP, Fibonacci) and wait for price to come to the order — preventing the worst-case timing of shorting into dumps or buying into pumps. Market orders are reserved for closes and emergency exits.
+- **Pending order visibility**: Every agent run includes `pendingLimitOrders` in its input (both spot and futures), so the agent always knows which limit entries are still waiting to fill, can place bracket TP/SL immediately after a fill, and cancels stale orders older than `ENTRY_LIMIT_EXPIRY_MINUTES` via `cancel_spot_limit_order` or `cancel_futures_order`.
 - **Limit order fee saving**: Separate `PREFER_LIMIT_ORDERS` mode places spot buys at best ask instead of market to save on taker fees
 - **Leverage control**: Configurable max leverage (up to 125x) with automatic margin mode management
 - **Fund transfers**: Move USDT between spot, futures, and financial/Earn accounts
@@ -288,7 +289,7 @@ The backtester uses EMA crossover + RSI + MACD histogram for entries, ATR-based 
 
 Each polling cycle (`POLL_INTERVAL_SEC` seconds):
 
-1. **Snapshot** -- Fetches tickers, spot/futures/financial balances, open positions, stop orders, recent fills, closed positions, and fee rates from KuCoin
+1. **Snapshot** -- Fetches tickers, spot/futures/financial balances, open positions, stop orders, pending limit orders, recent fills, closed positions, and fee rates from KuCoin
 2. **Reconciliation** -- Sums USDT across all accounts, tracks daily drawdown per venue
 3. **Price detection** -- Compares last known prices; triggers on moves >= `PRICE_CHANGE_TRIGGER_PCT`
 4. **Position extremes** -- Updates peak/trough unrealized PnL for open positions
@@ -303,7 +304,7 @@ Trigger types: `initial:SYMBOL` (first snapshot), `price_move:SYMBOL:X.XX%` (pri
 
 ```
 src/
-  agent.py             Trading + Research agent definitions, 44 tools, system prompts
+  agent.py             Trading + Research agent definitions, 45 tools, system prompts
   analytics.py         Technical indicators, regime detection, volume profile, multi-TF scoring
   backtest.py          Strategy backtester with parameter sweeps
   config.py            Configuration dataclasses, env var loading, validation

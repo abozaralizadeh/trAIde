@@ -127,6 +127,8 @@ class TradingSnapshot:
   all_accounts: List[KucoinAccount] = field(default_factory=list)
   spot_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
   futures_stop_orders: List[Dict[str, Any]] = field(default_factory=list)
+  spot_pending_orders: List[Dict[str, Any]] = field(default_factory=list)
+  futures_pending_orders: List[Dict[str, Any]] = field(default_factory=list)
   financial_accounts: List[KucoinAccount] = field(default_factory=list)
   fees: Dict[str, Any] = field(default_factory=dict)
   trading_restricted: bool = False
@@ -412,6 +414,10 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "stops": {
       "spot": snapshot.spot_stop_orders,
       "futures": snapshot.futures_stop_orders,
+    },
+    "pendingLimitOrders": {
+      "spot": snapshot.spot_pending_orders,
+      "futures": snapshot.futures_pending_orders,
     },
     "fees": snapshot.fees if hasattr(snapshot, "fees") else {},
     "tradingRestricted": snapshot.trading_restricted,
@@ -1467,6 +1473,17 @@ def run_trading_agent(
       return {"cancelled": res, "orderId": order_id, "clientOid": client_oid}
     except Exception as exc:
       return {"error": str(exc), "orderId": order_id, "clientOid": client_oid}
+
+  @function_tool
+  async def cancel_spot_limit_order(order_id: str) -> Dict[str, Any]:
+    """Cancel a pending spot limit order (non-stop) by orderId."""
+    if snapshot.paper_trading:
+      return {"paper": True, "cancelled": {"orderId": order_id}}
+    try:
+      res = kucoin.cancel_order(order_id)
+      return {"cancelled": res, "orderId": order_id}
+    except Exception as exc:
+      return {"error": str(exc), "orderId": order_id}
 
   @function_tool
   async def list_spot_stop_orders(status: str = "active", symbol: str | None = None) -> Dict[str, Any]:
@@ -3722,7 +3739,13 @@ def run_trading_agent(
     "to add the bracket BEFORE looking for new trades.\n"
     "- Cancel stale stop orders (stop exists but no position) via cancel_spot_stop_order.\n"
     "- Check the 'staleStops' field: if any stop order has its price far above/below market "
-    "(e.g., stop-loss above current price), cancel it and replace with a proper stop based on current support/ATR.\n\n"
+    "(e.g., stop-loss above current price), cancel it and replace with a proper stop based on current support/ATR.\n"
+    "- Check 'pendingLimitOrders' in your input for any limit entries still waiting to fill:\n"
+    "  * If a pending order's symbol now appears in open positions (it filled): immediately place bracket TP/SL via "
+    "set_spot_position_protection or set_futures_position_protection.\n"
+    "  * If a pending order was placed more than ~30 minutes ago and has not filled: cancel it via "
+    "cancel_spot_limit_order (spot) or cancel_futures_order (futures) and reassess the setup.\n"
+    "  * If a pending order is still within its expiry window: leave it open.\n\n"
 
     "## STEP 1b — Review protection on existing positions:\n"
     "- Check the 'positions' field in your input — it lists every coin you hold in spot with netSize, avgEntry, "
@@ -4065,6 +4088,7 @@ def run_trading_agent(
       place_spot_stop_order,
       set_spot_position_protection,
       cancel_spot_stop_order,
+      cancel_spot_limit_order,
       list_spot_stop_orders,
       place_futures_stop_order,
       set_futures_position_protection,

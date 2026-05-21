@@ -580,6 +580,23 @@ class KucoinClient:
       return data.get("items") or []
     return data or []
 
+  def list_orders(self, status: str = "active", symbol: Optional[str] = None, side: Optional[str] = None) -> list[Dict[str, Any]]:
+    """List spot limit orders. status: 'active' (pending) or 'done' (filled/cancelled)."""
+    query: Dict[str, Any] = {"status": status}
+    if symbol:
+      query["symbol"] = symbol
+    if side:
+      query["side"] = side
+    data = self._request("GET", "/api/v1/orders", auth=True, query=query)
+    if isinstance(data, dict) and "items" in data:
+      return data.get("items") or []
+    return data or []
+
+  def cancel_order(self, order_id: str) -> Dict[str, Any]:
+    """Cancel a spot limit order by orderId."""
+    data = self._request("DELETE", f"/api/v1/orders/{order_id}", auth=True)
+    return data or {}
+
   def get_fills(self, symbol: Optional[str] = None, order_id: Optional[str] = None, side: Optional[str] = None, page: int = 1, page_size: int = 50) -> list[Dict[str, Any]]:
     """Get recent spot fills (up to 7 days). Returns trade executions including those from triggered stops."""
     query: Dict[str, Any] = {"currentPage": page, "pageSize": page_size}

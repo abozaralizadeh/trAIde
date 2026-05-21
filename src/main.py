@@ -201,6 +201,19 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
   except Exception as exc:
     logger.warning("Unable to fetch spot stop orders: %s", exc)
 
+  spot_pending: list[dict] = []
+  try:
+    spot_pending = kucoin.list_orders(status="active")
+  except Exception as exc:
+    logger.warning("Unable to fetch spot pending orders: %s", exc)
+
+  futures_pending: list[dict] = []
+  if cfg.kucoin_futures.enabled and kucoin_futures:
+    try:
+      futures_pending = kucoin_futures.list_orders(status="open")
+    except Exception as exc:
+      logger.warning("Unable to fetch futures pending orders: %s", exc)
+
   fees = _fetch_fees(kucoin)
 
   balances = list(spot_accounts)
@@ -238,6 +251,8 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
     all_accounts=all_accounts,
     spot_stop_orders=spot_stops,
     futures_stop_orders=futures_stops,
+    spot_pending_orders=spot_pending,
+    futures_pending_orders=futures_pending,
     financial_accounts=financial_accounts,
     fees=fees,
   )
