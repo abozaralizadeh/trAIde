@@ -712,8 +712,8 @@ class KucoinFuturesClient:
       query=query,
     )
 
-  def list_orders(self, status: str = "open", symbol: Optional[str] = None, side: Optional[str] = None) -> list[Dict[str, Any]]:
-    """List futures orders; status may include 'open', 'done', 'active' etc."""
+  def list_orders(self, status: str = "active", symbol: Optional[str] = None, side: Optional[str] = None) -> list[Dict[str, Any]]:
+    """List futures orders. status: 'active' (pending) or 'done' (filled/cancelled)."""
     query: Dict[str, str] = {"status": status}
     if symbol:
       query["symbol"] = symbol

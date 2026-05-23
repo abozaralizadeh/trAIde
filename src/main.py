@@ -210,7 +210,7 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
   futures_pending: list[dict] = []
   if cfg.kucoin_futures.enabled and kucoin_futures:
     try:
-      futures_pending = kucoin_futures.list_orders(status="open")
+      futures_pending = kucoin_futures.list_orders(status="active")
     except Exception as exc:
       logger.warning("Unable to fetch futures pending orders: %s", exc)
 
