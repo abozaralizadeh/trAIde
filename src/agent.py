@@ -3692,6 +3692,38 @@ def run_trading_agent(
       return {"error": f"parse_failed: {exc}"}
 
   @function_tool
+  async def fetch_coindesk_news(limit: int = 10) -> Dict[str, Any]:
+    """Fetch latest CoinDesk news via RSS. Returns list of {title, link, pubDate, description}."""
+    url = "https://www.coindesk.com/arc/outboundfeeds/rss"
+    try:
+      resp = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+      resp.raise_for_status()
+    except Exception as exc:
+      return {"error": f"fetch_failed: {exc}"}
+
+    try:
+      import xml.etree.ElementTree as ET
+
+      root = ET.fromstring(resp.content)
+      items: List[Dict[str, Any]] = []
+      for item in root.findall(".//item")[: max(1, min(int(limit or 0), 20))]:
+        title_el = item.find("title")
+        link_el = item.find("link")
+        date_el = item.find("pubDate")
+        desc_el = item.find("description")
+        items.append(
+          {
+            "title": (title_el.text or "").strip() if title_el is not None else "",
+            "link": (link_el.text or "").strip() if link_el is not None else "",
+            "pubDate": (date_el.text or "").strip() if date_el is not None else "",
+            "description": (desc_el.text or "").strip() if desc_el is not None else "",
+          }
+        )
+      return {"items": items}
+    except Exception as exc:
+      return {"error": f"parse_failed: {exc}"}
+
+  @function_tool
   async def log_research(topic: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Record a research note/strategy idea (persists in memory)."""
     if not topic or not summary:
@@ -3793,7 +3825,7 @@ def run_trading_agent(
     "  - For mean-reversion: enter near VAL (longs) or VAH (shorts), target POC.\n"
     "  - For trend-following: use POC as pullback entry level; target VAH (bullish) or VAL (bearish).\n"
     "- Call fetch_recent_candles if you need raw price detail to set precise TP/SL levels.\n"
-    "- Call web_search for news, sentiment, and catalysts. Call fetch_kucoin_news for exchange-specific events.\n"
+    "- Call web_search for news, sentiment, and catalysts. Call fetch_kucoin_news for exchange-specific events. Call fetch_coindesk_news for broader crypto market news and macro context.\n"
     "- Use fetch_orderbook when you need microstructure (depth, imbalance) to time entry or set tight stops.\n"
     "- Assign a sentiment score 0–1 from news. If sentiment_filter_enabled and score < sentiment_min_score, skip buys.\n\n"
 
@@ -3955,7 +3987,7 @@ def run_trading_agent(
     "Do NOT keep retrying the same symbol.\n"
     "- NEVER output 'If you want, I can scout...' or 'Would you like me to...' — just DO it. You are autonomous.\n"
     "- The coin list is a starting point, not a boundary. Better opportunities may exist outside it.\n"
-    "- Use web_search and fetch_kucoin_news every run to scan for market-moving events: new listings, breakouts, "
+    "- Use web_search, fetch_kucoin_news, and fetch_coindesk_news every run to scan for market-moving events: new listings, breakouts, "
     "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"
     "- If you spot a coin with a stronger setup than anything in your current list, hand off to Research Agent "
     "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it.\n"
@@ -4059,6 +4091,7 @@ def run_trading_agent(
       fetch_futures_candles,
       fetch_contract_details,
       fetch_kucoin_news,
+      fetch_coindesk_news,
       log_research,
       latest_items,
       add_source,
@@ -4114,6 +4147,7 @@ def run_trading_agent(
       clear_plans,
       decline_trade,
       fetch_kucoin_news,
+      fetch_coindesk_news,
       log_research,
       add_source,
       remove_source,

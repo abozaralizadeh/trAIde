@@ -18,12 +18,12 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
     |   Agent    |    |   Agent   |    | Spot+Fut  |
     +-----------+    +-----------+    +-----------+
          |                |                |
-     Web Search     45 Tool Calls     Order Exec
+     Web Search     46 Tool Calls     Order Exec
      News Fetch     Risk Checks       Positions
      Source Mgmt    Memory I/O        Balances
 ```
 
-**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 45 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
+**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 46 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
 
 **Research Agent** -- Runs concurrently while the Trading Agent executes. Searches CoinDesk, The Block, Cointelegraph, exchange blogs, X/Twitter, and macro news. Analyzes strategy patterns (missed profits, repeated losses). Logs findings for the Trading Agent to consume.
 
@@ -304,7 +304,7 @@ Trigger types: `initial:SYMBOL` (first snapshot), `price_move:SYMBOL:X.XX%` (pri
 
 ```
 src/
-  agent.py             Trading + Research agent definitions, 45 tools, system prompts
+  agent.py             Trading + Research agent definitions, 46 tools, system prompts
   analytics.py         Technical indicators, regime detection, volume profile, multi-TF scoring
   backtest.py          Strategy backtester with parameter sweeps
   config.py            Configuration dataclasses, env var loading, validation
@@ -383,6 +383,10 @@ Logs: `journalctl -u traide.service -f`
 
 ```bash
 sudo SERVICE_USER=$(whoami) ./setup_service.sh
+```
+or
+```bash
+sudo bash setup_service.sh
 ```
 
 Environment overrides: `SERVICE_NAME`, `SERVICE_USER`, `SERVICE_GROUP`, `WORKDIR`, `VENV_PATH`, `BIND_ADDR`.
