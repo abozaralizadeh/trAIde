@@ -751,13 +751,18 @@ def run_trading_agent(
         logger.warning("DAILY GATE BLOCK: spot buy %s rejected — 1D trend is bearish", symbol)
         return {"rejected": True, "reason": f"Daily gate: 1D trend is bearish — spot buy blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe is bearish. Spot buys are blocked until the daily trend turns neutral or bullish."}
 
-    # Volatility filter: block spot buys on highly volatile symbols
+    # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
+    _atr_scale_m = 1.0
     if (side or "").lower() == "buy" and symbol in _daily_gate_state:
       gate = _daily_gate_state[symbol]
       daily_atr_pct = gate.get("daily_atr_pct")
       if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
-        logger.warning("VOLATILITY BLOCK: spot buy %s rejected — daily ATR=%.2f%% exceeds max %.2f%%", symbol, daily_atr_pct, cfg.trading.max_atr_pct_for_entry)
-        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max", "hint": "This symbol is too volatile for the current strategy. Pick a less volatile coin or wait for volatility to settle."}
+        hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
+        if daily_atr_pct > hard_limit:
+          logger.warning("VOLATILITY BLOCK: spot buy %s rejected — ATR=%.2f%% exceeds hard limit %.2f%%", symbol, daily_atr_pct, hard_limit)
+          return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
+        _atr_scale_m = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        logger.info("VOLATILITY SOFT GATE: spot buy %s ATR=%.2f%% — scaling position to %.0f%%", symbol, daily_atr_pct, _atr_scale_m * 100)
 
     # Confidence enforcement: reject buys below minimum confidence
     if (side or "").lower() == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
@@ -767,6 +772,7 @@ def run_trading_agent(
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
       funds_val = 0.0
+    funds_val = funds_val * _atr_scale_m
     if funds_val <= 0 or not symbol:
       return {"error": "Invalid funds or symbol"}
     fee_rate = fees.get("spot_taker", 0.001)
@@ -1274,11 +1280,16 @@ def run_trading_agent(
       if gate.get("daily_bias") == "bearish" and not gate.get("daily_exhausted", False):
         return {"rejected": True, "reason": "Daily gate: 1D trend is bearish — spot buy blocked", "hint": "Trade with the daily trend or switch symbol."}
 
+    _atr_scale_l = 1.0
     if side_lower == "buy" and symbol in _daily_gate_state:
       gate = _daily_gate_state[symbol]
       daily_atr_pct = gate.get("daily_atr_pct")
       if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
-        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max"}
+        hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
+        if daily_atr_pct > hard_limit:
+          return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
+        _atr_scale_l = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        logger.info("VOLATILITY SOFT GATE: spot limit %s ATR=%.2f%% — scaling position to %.0f%%", symbol, daily_atr_pct, _atr_scale_l * 100)
 
     if side_lower == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
       return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
@@ -1287,6 +1298,7 @@ def run_trading_agent(
       funds_val = float(funds or 0)
     except (TypeError, ValueError):
       funds_val = 0.0
+    funds_val = funds_val * _atr_scale_l
     if funds_val <= 0 or not symbol:
       return {"error": "Invalid funds or symbol"}
     if funds_val > snapshot.max_position_usd:
@@ -1982,13 +1994,18 @@ def run_trading_agent(
           logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
           return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend or wait for it to turn neutral."}
 
-    # Volatility filter: block entries on highly volatile symbols (pump/dump risk)
+    # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
+    _atr_scale_fm = 1.0
     if is_entry and spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_atr_pct = gate.get("daily_atr_pct")
       if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
-        logger.warning("VOLATILITY BLOCK: %s rejected — daily ATR=%.2f%% exceeds max %.2f%%", spot_symbol, daily_atr_pct, cfg.trading.max_atr_pct_for_entry)
-        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max", "hint": "This symbol is too volatile for the current strategy. Pick a less volatile coin or wait for volatility to settle."}
+        hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
+        if daily_atr_pct > hard_limit:
+          logger.warning("VOLATILITY BLOCK: %s rejected — ATR=%.2f%% exceeds hard limit %.2f%%", spot_symbol, daily_atr_pct, hard_limit)
+          return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
+        _atr_scale_fm = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        logger.info("VOLATILITY SOFT GATE: futures %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fm * 100)
 
     # Confidence enforcement: reject entries below minimum confidence
     if is_entry and confidence is not None and confidence < cfg.trading.min_confidence:
@@ -2010,7 +2027,7 @@ def run_trading_agent(
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
     try:
-      notional_input = float(notional_usd or 0)
+      notional_input = float(notional_usd or 0) * _atr_scale_fm
       lev_requested = float(leverage or 0)
     except (TypeError, ValueError):
       return {"error": "Invalid notional or leverage"}
@@ -2605,11 +2622,16 @@ def run_trading_agent(
         if opposing:
           return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend or switch symbol."}
 
+    _atr_scale_fl = 1.0
     if spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_atr_pct = gate.get("daily_atr_pct")
       if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
-        return {"rejected": True, "reason": f"Daily volatility too high: ATR={daily_atr_pct:.2f}% > {cfg.trading.max_atr_pct_for_entry}% max"}
+        hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
+        if daily_atr_pct > hard_limit:
+          return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
+        _atr_scale_fl = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fl * 100)
 
     if confidence is not None and confidence < cfg.trading.min_confidence:
       return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
@@ -2666,7 +2688,7 @@ def run_trading_agent(
     lev = min(max(1.0, lev_requested), max_leverage_cap)
     leverage_clamped = lev < lev_requested - 1e-9
 
-    notional_input = float(notional_usd or 0)
+    notional_input = float(notional_usd or 0) * _atr_scale_fl
     try:
       base_size = float(size_override) if size_override is not None else notional_input / entry_price_val
     except (TypeError, ValueError):

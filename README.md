@@ -125,6 +125,8 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `LIMIT_ORDER_TIMEOUT_SEC` | `20` | Timeout before falling back to market order (fee-saving path) |
 | `ENTRY_LIMIT_EXPIRY_MINUTES` | `30` | Cancel unfilled target-price entry limit orders after this many minutes |
 | `MIN_ENTRY_DEVIATION_PCT` | `0.002` | Minimum distance (0.2%) from current price to use a target-price limit order |
+| `MAX_ATR_PCT_FOR_ENTRY` | `8` | Soft volatility gate: above this daily ATR %, position size is scaled down proportionally. Above 1.5× this value (12% default), entry is hard-blocked. |
+| `MAX_24H_VOLATILITY_PCT` | `25` | Hard block when 24h price range exceeds this % (separate from ATR gate) |
 | `POST_LOSS_COOLDOWN_MINUTES` | `45` | Block new entries on a symbol after a loss |
 
 ### Circuit Breakers

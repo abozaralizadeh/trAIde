@@ -660,12 +660,26 @@ class MemoryStore:
     return extremes
 
   @staticmethod
+  def _is_realized_close(action: str) -> bool:
+    """Return True if the action represents a realized trade close, not a hold/manage snapshot."""
+    a = action.lower()
+    return (
+      "triggered" in a
+      or "cut" in a
+      or "close" in a
+      or "reduce" in a
+      or a in ("futures_sell", "futures_buy", "spot_sell")
+    )
+
+  @staticmethod
   def _pnl_stats(decisions: list[Dict[str, Any]]) -> Dict[str, Any]:
-    """Compute win/loss stats from a list of decision dicts."""
+    """Compute win/loss stats from a list of decision dicts (realized closes only)."""
     realized: list[float] = []
     missed_profits: list[float] = []
     unnecessary_losses: list[float] = []
     for d in decisions:
+      if not MemoryStore._is_realized_close(d.get("action") or ""):
+        continue
       pnl = d.get("pnl")
       if pnl is not None:
         try:
@@ -896,11 +910,7 @@ class MemoryStore:
     for d in decisions:
       action = (d.get("action") or "").lower()
       # Only count realized closes — skip manage/hold/decline regardless of pnl
-      is_realized_close = (
-        "triggered" in action
-        or action in ("futures_sell", "futures_buy", "spot_sell")
-      )
-      if not is_realized_close:
+      if not MemoryStore._is_realized_close(action):
         continue
       pnl = d.get("pnl")
       if pnl is None:
@@ -939,11 +949,7 @@ class MemoryStore:
       if d.get("symbol") != sym:
         continue
       action = (d.get("action") or "").lower()
-      is_realized_close = (
-        "triggered" in action
-        or action in ("futures_sell", "futures_buy", "spot_sell")
-      )
-      if not is_realized_close:
+      if not MemoryStore._is_realized_close(action):
         continue
       pnl = d.get("pnl")
       if pnl is None:

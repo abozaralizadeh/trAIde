@@ -184,7 +184,7 @@ def load_config() -> AppConfig:
       max_entry_leverage=float(os.getenv("MAX_ENTRY_LEVERAGE", "3")),
       min_trade_interval_minutes=float(os.getenv("MIN_TRADE_INTERVAL_MINUTES", "5")),
       max_24h_volatility_pct=float(os.getenv("MAX_24H_VOLATILITY_PCT", "25")),
-      max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "5")),
+      max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "8")),
       entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
       min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
     ),
