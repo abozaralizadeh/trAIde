@@ -403,6 +403,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
 
   # Daily gate: if 1D bias opposes the intraday bias, downgrade; if it agrees, boost
   daily_bias = "neutral"
+  daily_bias_raw = "neutral"
   daily_gate_applied = False
   daily_exhausted = False
   if daily_snap:
@@ -418,6 +419,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     elif daily_adx is not None and daily_adx < 18:
       # Weak/choppy daily trend — gate would force trades into chop
       daily_exhausted = True
+    daily_bias_raw = daily_bias
     if daily_exhausted:
       daily_bias = "neutral"
     if daily_bias != "neutral" and overall_bias != "neutral" and daily_bias != overall_bias:
@@ -501,7 +503,10 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     entry_hint = "No clear directional bias; consider range-bound strategies or reduce size significantly."
 
   if daily_exhausted:
-    entry_hint += " DAILY EXHAUSTED: 1D RSI extreme or ADX weak — daily trend gate disabled. Trade with caution, prefer mean-reversion."
+    if daily_bias_raw in ("bullish", "bearish"):
+      entry_hint += f" DAILY EXHAUSTED: 1D {daily_bias_raw} RSI extreme — do NOT open continuation trades. Counter-trend only with a strong reversal signal."
+    else:
+      entry_hint += " DAILY EXHAUSTED: 1D ADX weak/choppy — prefer mean-reversion, avoid trend-continuation entries."
   elif daily_gate_applied:
     entry_hint += f" DAILY GATE: 1D trend is {daily_bias} — opposing intraday bias was overridden to neutral. Do NOT open counter-daily trades."
   elif daily_bias != "neutral":
@@ -521,6 +526,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "strength": strength,
     "weighted_score": _round(normalized_score, 3),
     "daily_bias": daily_bias,
+    "daily_bias_raw": daily_bias_raw,
     "daily_gate_applied": daily_gate_applied,
     "daily_exhausted": daily_exhausted,
     "timeframe_conflict": tf_conflict,

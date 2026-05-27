@@ -44,6 +44,9 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 - **Staged take-profit**: Splits TP into 2 tranches (60%/40%) to lock in partial gains
 - **Kelly criterion sizing**: Quarter-Kelly position sizing from rolling trade performance (requires minimum trade history)
 - **Post-loss cooldown**: Blocks new entries on a symbol for a configurable period after a loss
+- **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed.
+- **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
+- **Volatility soft-gate**: Above `MAX_ATR_PCT_FOR_ENTRY`, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× the threshold, the entry is hard-blocked.
 - **Mandatory TP/SL**: Every position must have stop-loss and take-profit (no naked positions)
 - **ATR-based stops**: Stop distance computed from Average True Range for volatility-adaptive risk
 - **Daily trade limits**: Per-symbol and total daily trade caps
@@ -125,7 +128,7 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `LIMIT_ORDER_TIMEOUT_SEC` | `20` | Timeout before falling back to market order (fee-saving path) |
 | `ENTRY_LIMIT_EXPIRY_MINUTES` | `30` | Cancel unfilled target-price entry limit orders after this many minutes |
 | `MIN_ENTRY_DEVIATION_PCT` | `0.002` | Minimum distance (0.2%) from current price to use a target-price limit order |
-| `MAX_ATR_PCT_FOR_ENTRY` | `8` | Soft volatility gate: above this daily ATR %, position size is scaled down proportionally. Above 1.5× this value (12% default), entry is hard-blocked. |
+| `MAX_ATR_PCT_FOR_ENTRY` | `6` | Soft volatility gate: above this daily ATR %, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× this value (9% default), entry is hard-blocked. |
 | `MAX_24H_VOLATILITY_PCT` | `25` | Hard block when 24h price range exceeds this % (separate from ATR gate) |
 | `POST_LOSS_COOLDOWN_MINUTES` | `45` | Block new entries on a symbol after a loss |
 

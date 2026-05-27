@@ -746,7 +746,11 @@ def run_trading_agent(
     if (side or "").lower() == "buy" and symbol in _daily_gate_state:
       gate = _daily_gate_state[symbol]
       daily_bias = gate.get("daily_bias", "neutral")
+      daily_bias_raw = gate.get("daily_bias_raw", daily_bias)
       daily_exhausted = gate.get("daily_exhausted", False)
+      if daily_exhausted and daily_bias_raw == "bullish":
+        logger.warning("ANTI-FOMO BLOCK: spot buy %s rejected — daily bullish exhausted (RSI extreme)", symbol)
+        return {"rejected": True, "reason": "Daily exhaustion: bullish trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme high. Wait for the pullback or trade counter-trend with a clear reversal signal."}
       if daily_bias == "bearish" and not daily_exhausted:
         logger.warning("DAILY GATE BLOCK: spot buy %s rejected — 1D trend is bearish", symbol)
         return {"rejected": True, "reason": f"Daily gate: 1D trend is bearish — spot buy blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe is bearish. Spot buys are blocked until the daily trend turns neutral or bullish."}
@@ -761,7 +765,7 @@ def run_trading_agent(
         if daily_atr_pct > hard_limit:
           logger.warning("VOLATILITY BLOCK: spot buy %s rejected — ATR=%.2f%% exceeds hard limit %.2f%%", symbol, daily_atr_pct, hard_limit)
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
-        _atr_scale_m = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        _atr_scale_m = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: spot buy %s ATR=%.2f%% — scaling position to %.0f%%", symbol, daily_atr_pct, _atr_scale_m * 100)
 
     # Confidence enforcement: reject buys below minimum confidence
@@ -1277,7 +1281,12 @@ def run_trading_agent(
 
     if side_lower == "buy" and symbol in _daily_gate_state:
       gate = _daily_gate_state[symbol]
-      if gate.get("daily_bias") == "bearish" and not gate.get("daily_exhausted", False):
+      daily_exhausted_l = gate.get("daily_exhausted", False)
+      daily_bias_raw_l = gate.get("daily_bias_raw", gate.get("daily_bias", "neutral"))
+      if daily_exhausted_l and daily_bias_raw_l == "bullish":
+        logger.warning("ANTI-FOMO BLOCK: spot limit buy %s rejected — daily bullish exhausted", symbol)
+        return {"rejected": True, "reason": "Daily exhaustion: bullish trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme high. Wait for the pullback or trade counter-trend."}
+      if gate.get("daily_bias") == "bearish" and not daily_exhausted_l:
         return {"rejected": True, "reason": "Daily gate: 1D trend is bearish — spot buy blocked", "hint": "Trade with the daily trend or switch symbol."}
 
     _atr_scale_l = 1.0
@@ -1288,7 +1297,7 @@ def run_trading_agent(
         hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
         if daily_atr_pct > hard_limit:
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
-        _atr_scale_l = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        _atr_scale_l = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: spot limit %s ATR=%.2f%% — scaling position to %.0f%%", symbol, daily_atr_pct, _atr_scale_l * 100)
 
     if side_lower == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
@@ -1740,6 +1749,7 @@ def run_trading_agent(
         intraday_atr_pct = atr_pct
     _daily_gate_state[symbol] = {
       "daily_bias": summary.get("daily_bias", "neutral"),
+      "daily_bias_raw": summary.get("daily_bias_raw", summary.get("daily_bias", "neutral")),
       "daily_gate_applied": summary.get("daily_gate_applied", False),
       "daily_exhausted": summary.get("daily_exhausted", False),
       "overall_bias": summary.get("overall_bias", "neutral"),
@@ -1986,9 +1996,18 @@ def run_trading_agent(
     if is_entry and spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_bias = gate.get("daily_bias", "neutral")
+      daily_bias_raw = gate.get("daily_bias_raw", daily_bias)
       daily_exhausted = gate.get("daily_exhausted", False)
+      side_lower = (side or "").lower()
+      if daily_exhausted and daily_bias_raw in ("bullish", "bearish"):
+        is_continuation = (
+          (daily_bias_raw == "bullish" and side_lower == "buy") or
+          (daily_bias_raw == "bearish" and side_lower == "sell")
+        )
+        if is_continuation:
+          logger.warning("ANTI-FOMO BLOCK: %s %s rejected — daily %s exhausted (RSI extreme)", side, spot_symbol, daily_bias_raw)
+          return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend with a clear reversal signal."}
       if daily_bias != "neutral" and not daily_exhausted:
-        side_lower = (side or "").lower()
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
           logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
@@ -2004,7 +2023,7 @@ def run_trading_agent(
         if daily_atr_pct > hard_limit:
           logger.warning("VOLATILITY BLOCK: %s rejected — ATR=%.2f%% exceeds hard limit %.2f%%", spot_symbol, daily_atr_pct, hard_limit)
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
-        _atr_scale_fm = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        _atr_scale_fm = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: futures %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fm * 100)
 
     # Confidence enforcement: reject entries below minimum confidence
@@ -2023,6 +2042,15 @@ def run_trading_agent(
           if same_direction and unrealized < 0:
             logger.warning("ANTI-STACKING: %s %s add-on rejected — existing position unrealizedPnl=%.4f", side, spot_symbol, unrealized)
             return {"rejected": True, "reason": f"Cannot add to losing {spot_symbol} position (unrealizedPnl={unrealized:.4f})", "hint": "Do NOT add to losing positions. Wait for the position to recover or close it first, then trade a different symbol."}
+          # Anti-FOMO stacking: block adds when daily is exhausted in same direction (any PnL)
+          if same_direction and spot_symbol in _daily_gate_state:
+            stack_gate = _daily_gate_state[spot_symbol]
+            if stack_gate.get("daily_exhausted", False):
+              stack_bias_raw = stack_gate.get("daily_bias_raw", "neutral")
+              chasing_top = (stack_bias_raw == "bullish" and pos_qty > 0) or (stack_bias_raw == "bearish" and pos_qty < 0)
+              if chasing_top:
+                logger.warning("ANTI-FOMO STACKING: %s %s add-on rejected — daily %s exhausted", side, spot_symbol, stack_bias_raw)
+                return {"rejected": True, "reason": f"No adds when daily {stack_bias_raw} is exhausted (RSI extreme)", "hint": "Protect the existing position with TP/SL; do not chase the top/bottom."}
 
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"paper": True, "reason": "Futures disabled in config"}
@@ -2616,7 +2644,16 @@ def run_trading_agent(
     if spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_bias = gate.get("daily_bias", "neutral")
+      daily_bias_raw = gate.get("daily_bias_raw", daily_bias)
       daily_exhausted = gate.get("daily_exhausted", False)
+      if daily_exhausted and daily_bias_raw in ("bullish", "bearish"):
+        is_continuation = (
+          (daily_bias_raw == "bullish" and side_lower == "buy") or
+          (daily_bias_raw == "bearish" and side_lower == "sell")
+        )
+        if is_continuation:
+          logger.warning("ANTI-FOMO BLOCK: futures limit %s %s rejected — daily %s exhausted", side_lower, spot_symbol, daily_bias_raw)
+          return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend."}
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
@@ -2630,7 +2667,7 @@ def run_trading_agent(
         hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
         if daily_atr_pct > hard_limit:
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
-        _atr_scale_fl = max(0.30, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        _atr_scale_fl = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fl * 100)
 
     if confidence is not None and confidence < cfg.trading.min_confidence:

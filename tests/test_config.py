@@ -31,6 +31,8 @@ def _make_valid_config(**overrides) -> AppConfig:
         min_trade_interval_minutes=5.0,
         max_24h_volatility_pct=25.0,
         max_atr_pct_for_entry=5.0,
+        entry_limit_expiry_minutes=30.0,
+        min_entry_deviation_pct=0.002,
     )
     trading_kwargs.update(overrides)
     return AppConfig(
