@@ -1755,6 +1755,7 @@ def run_trading_agent(
       "overall_bias": summary.get("overall_bias", "neutral"),
       "daily_atr_pct": daily_atr_pct,
       "intraday_atr_pct": intraday_atr_pct,
+      "squeeze_breakout": summary.get("squeeze_breakout"),
     }
     result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
 
@@ -1911,7 +1912,14 @@ def run_trading_agent(
     notional_with_fee = notional * (1 + fee_rate)
     size = notional / price if price else 0
     stop_price = max(0.0, price - stop_distance)
-    target_price = price + stop_distance * target_rr
+
+    daily_atr_pct = _daily_gate_state.get(symbol, {}).get("daily_atr_pct")
+    if daily_atr_pct is not None and daily_atr_pct >= 4.0:
+      vol_rr_multiplier = min(2.0, 1.0 + (daily_atr_pct - 4.0) / 6.0)
+    else:
+      vol_rr_multiplier = 1.0
+    effective_rr = target_rr * vol_rr_multiplier
+    target_price = price + stop_distance * effective_rr
 
     trades_today = memory.trades_today(symbol)
 
@@ -1934,7 +1942,10 @@ def run_trading_agent(
       "stopDistance": stop_distance,
       "stopPrice": stop_price,
       "targetPrice": target_price,
-      "rr": target_rr,
+      "rr": effective_rr,
+      "rrBase": target_rr,
+      "volRrMultiplier": vol_rr_multiplier,
+      "dailyAtrPct": daily_atr_pct,
       "size": size,
       "notionalUsd": notional,
       "notionalUsdWithFee": notional_with_fee,
@@ -3925,6 +3936,17 @@ def run_trading_agent(
     "- Tighten stops on existing positions. Reduce size on any new entries.\n"
     "- When the squeeze resolves (BBW expands AND ADX rises above 25), enter in the breakout direction.\n\n"
 
+    "**When summary.squeeze_breakout is set (structured breakout signal):**\n"
+    "- summary.squeeze_breakout = 'long' or 'short' fires only on the FRESH transition out of a 1h squeeze "
+    "(BBW expanding ≥25% off the floor, ADX>20, price beyond BB band, RSI confirming).\n"
+    "- This is a high-EV setup (backtested PF ~1.59 on ETH D1). Take it at FULL size (1.0×, not range-trade size).\n"
+    "- REQUIRED CONFIRMATION: volume on the breakout candle ≥ 1.5× the 20-candle average. "
+    "If volume is weak, decline_trade — false breakouts ('head fakes') are common.\n"
+    "- TP: rely on plan_spot_position's volatility-scaled rr (or set futures TP at 2-3× stop_distance in high vol). "
+    "Squeezes resolve in extended moves; do NOT use a tight RR=1.5 TP.\n"
+    "- The anti-FOMO daily-exhaustion block still wins: if 1D is exhausted in the same direction, the entry is rejected "
+    "(squeezes near tops are statistically more likely to be head fakes).\n\n"
+
     "**When market_regime is 'trending':**\n"
     "- Use your standard trend-following strategy (STEP 3 below). The regime confirms your edge.\n"
     "- Do NOT mean-revert against a confirmed trend. Do NOT short rallies or buy dips against the trend.\n"
@@ -3991,6 +4013,9 @@ def run_trading_agent(
 
     "**Sizing:**\n"
     "- Call plan_spot_position to compute ATR-based stop distance, size, and TP for spot trades.\n"
+    "  Note: plan_spot_position now returns a volatility-scaled `rr` — the effective RR widens up to 2× the "
+    "base when daily ATR >= 4% (cap at daily ATR 10%). This lets winners run further in volatile coins to "
+    "compensate for the smaller position size enforced by the ATR soft-gate.\n"
     f"- For futures: size so margin required is 20–40% of available futures USDT (up to maxPositionUsd={snapshot.max_position_usd}).\n"
     "- Keep at least 10% USDT reserve across all venues combined.\n\n"
 

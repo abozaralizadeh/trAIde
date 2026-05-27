@@ -225,6 +225,7 @@ def classify_regime(
 def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
   enriched = compute_indicators(df)
   latest = enriched.iloc[-1]
+  prev = enriched.iloc[-2] if len(enriched) >= 2 else None
 
   close = float(latest["close"])
   atr = float(latest["atr"]) if pd.notna(latest["atr"]) else None
@@ -233,6 +234,7 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
   vwap = latest["vwap"] if pd.notna(latest["vwap"]) else None
   adx = float(latest["adx"]) if pd.notna(latest.get("adx")) else None
   bbw = float(latest["bbw"]) if pd.notna(latest.get("bbw")) else None
+  bbw_prev = float(prev["bbw"]) if prev is not None and pd.notna(prev.get("bbw")) else None
   plus_di = float(latest["plus_di"]) if pd.notna(latest.get("plus_di")) else None
   minus_di = float(latest["minus_di"]) if pd.notna(latest.get("minus_di")) else None
   stoch_k = float(latest["stoch_k"]) if pd.notna(latest.get("stoch_k")) else None
@@ -315,6 +317,7 @@ def summarize_interval(df: pd.DataFrame, interval: str) -> Dict[str, Any]:
     "bb_lower": _round(latest["bb_lower"]),
     "bb_mid": _round(bb_mid),
     "bbw": _round(bbw, 3),
+    "bbw_prev": _round(bbw_prev, 3) if bbw_prev is not None else None,
     "vwap": _round(vwap),
     "adx": _round(adx),
     "plus_di": _round(plus_di),
@@ -521,6 +524,32 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
   if volatility == "elevated":
     entry_hint += " Volatility elevated — widen stops and reduce size."
 
+  squeeze_breakout: str | None = None
+  h1 = next((s for s in snapshots if s.get("interval") == "1hour"), None)
+  if h1:
+    bbw_now = h1.get("bbw")
+    bbw_prev_h1 = h1.get("bbw_prev")
+    adx_now = h1.get("adx")
+    rsi_now = h1.get("rsi")
+    close_now = h1.get("close")
+    bb_upper = h1.get("bb_upper")
+    bb_lower = h1.get("bb_lower")
+    if (
+      bbw_prev_h1 is not None and bbw_now is not None
+      and bbw_prev_h1 < 2.0 and bbw_now > bbw_prev_h1 * 1.25
+      and adx_now is not None and adx_now > 20
+      and close_now is not None and rsi_now is not None
+    ):
+      if bb_upper is not None and close_now > bb_upper and rsi_now > 55:
+        squeeze_breakout = "long"
+      elif bb_lower is not None and close_now < bb_lower and rsi_now < 45:
+        squeeze_breakout = "short"
+  if squeeze_breakout:
+    entry_hint += (
+      f" SQUEEZE BREAKOUT ({squeeze_breakout.upper()}): 1h BBW expanded off the floor with ADX>20 and price beyond BB band. "
+      "Confirm with volume ≥ 1.5× 20-candle average before entering."
+    )
+
   return {
     "overall_bias": overall_bias,
     "strength": strength,
@@ -535,6 +564,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "regime_confidence": _round(regime_confidence, 3),
     "primary_regime": primary.get("market_regime"),
     "secondary_regime": secondary.get("market_regime") if secondary else None,
+    "squeeze_breakout": squeeze_breakout,
     "entry_hint": entry_hint,
     "primary_interval": primary.get("interval"),
     "secondary_interval": secondary.get("interval") if secondary else None,
