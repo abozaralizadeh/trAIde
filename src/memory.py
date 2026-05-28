@@ -189,7 +189,9 @@ class MemoryStore:
     data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
     data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
     data["supervisor_notes_temporary"] = [n for n in data.get("supervisor_notes_temporary", []) if (n.get("ts") or now) >= cutoff]
-    data["supervisor_notes_permanent"] = [n for n in data.get("supervisor_notes_permanent", []) if (n.get("ts") or now) >= cutoff]
+    # Permanent notes are exempt from the retention-days cutoff by design — they persist
+    # until manually deleted. Only the count cap (MAX_PERMANENT_NOTES) applies below.
+    data.setdefault("supervisor_notes_permanent", [])
 
     def _cap_list(key: str, max_items: int) -> None:
       items = data.get(key) or []

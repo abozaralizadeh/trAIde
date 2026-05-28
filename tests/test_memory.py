@@ -139,6 +139,32 @@ def test_cross_instance_permanent_notes_survive(tmp_path):
     assert "BTC dominance" in notes[0]["content"]
 
 
+def test_permanent_notes_exempt_from_retention_prune(tmp_path):
+    """Permanent notes must persist past retention_days — they are designed to live forever."""
+    import json
+    path = tmp_path / "memory.json"
+    now = int(time.time())
+    very_old_ts = now - 365 * 86400  # 1 year ago, far beyond any retention window
+    payload = {
+      "plans": [], "triggers": [], "coins": [], "trades": [], "limits": {},
+      "sentiments": [], "decisions": [], "fees": [],
+      "supervisor_notes_temporary": [
+        {"content": "old temporary note", "ts": very_old_ts, "author": "Supervisor"},
+      ],
+      "supervisor_notes_permanent": [
+        {"content": "always check BTC dominance", "ts": very_old_ts, "author": "Supervisor"},
+      ],
+    }
+    path.write_text(json.dumps(payload))
+    store = MemoryStore(str(path), retention_days=7)
+    perm = store.get_permanent_notes()
+    assert len(perm) == 1, "permanent note older than retention_days was incorrectly pruned"
+    assert "BTC dominance" in perm[0]["content"]
+    # Temporary note from a year ago should be pruned — sanity check the asymmetry
+    notes = store.list_all_notes()
+    assert notes["temporary"] == [], "old temporary note should have been pruned"
+
+
 def test_performance_summary_empty(store):
     summary = store.performance_summary()
     assert summary["totalTrades"] == 0
