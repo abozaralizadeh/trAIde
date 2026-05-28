@@ -550,6 +550,13 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
       "Confirm with volume ≥ 1.5× 20-candle average before entering."
     )
 
+  intraday_bias_15m = _direction(
+    next((s.get("trend_bias", "neutral") for s in snapshots if s.get("interval") == "15min"), "neutral")
+  )
+  intraday_bias_1h = _direction(
+    next((s.get("trend_bias", "neutral") for s in snapshots if s.get("interval") == "1hour"), "neutral")
+  )
+
   return {
     "overall_bias": overall_bias,
     "strength": strength,
@@ -559,6 +566,8 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "daily_gate_applied": daily_gate_applied,
     "daily_exhausted": daily_exhausted,
     "timeframe_conflict": tf_conflict,
+    "intraday_bias_15m": intraday_bias_15m,
+    "intraday_bias_1h": intraday_bias_1h,
     "volatility": volatility,
     "market_regime": overall_regime,
     "regime_confidence": _round(regime_confidence, 3),

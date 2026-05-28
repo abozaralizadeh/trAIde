@@ -754,6 +754,17 @@ def run_trading_agent(
       if daily_bias == "bearish" and not daily_exhausted:
         logger.warning("DAILY GATE BLOCK: spot buy %s rejected — 1D trend is bearish", symbol)
         return {"rejected": True, "reason": f"Daily gate: 1D trend is bearish — spot buy blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe is bearish. Spot buys are blocked until the daily trend turns neutral or bullish."}
+      # 1h alignment: block longs when 1h is bearish (catches buying bounces in confirmed corrections)
+      intraday_bias_1h = gate.get("intraday_bias_1h", "neutral")
+      if intraday_bias_1h == "bearish":
+        logger.warning("1H ALIGN BLOCK: spot buy %s rejected — 1h bias is bearish", symbol)
+        return {"rejected": True, "reason": "1h trend is bearish — long entry blocked", "hint": "1h timeframe is in a downtrend. The daily uptrend is in correction, not a healthy pullback. Wait for 1h to turn neutral/bullish or pick a different symbol."}
+      # Timeframe-conflict gate: catches 15m vs higher-TF disagreement not already blocked by 1h alignment
+      tf_conflict = gate.get("timeframe_conflict", False)
+      intraday_bias_15m = gate.get("intraday_bias_15m", "neutral")
+      if tf_conflict and intraday_bias_15m == "bearish":
+        logger.warning("TF CONFLICT BLOCK: spot buy %s rejected — daily/intraday split, 15m bearish opposes buy", symbol)
+        return {"rejected": True, "reason": "Timeframe conflict: 15m bearish opposes proposed buy", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
     # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
     _atr_scale_m = 1.0
@@ -1288,6 +1299,15 @@ def run_trading_agent(
         return {"rejected": True, "reason": "Daily exhaustion: bullish trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme high. Wait for the pullback or trade counter-trend."}
       if gate.get("daily_bias") == "bearish" and not daily_exhausted_l:
         return {"rejected": True, "reason": "Daily gate: 1D trend is bearish — spot buy blocked", "hint": "Trade with the daily trend or switch symbol."}
+      intraday_bias_1h_l = gate.get("intraday_bias_1h", "neutral")
+      if intraday_bias_1h_l == "bearish":
+        logger.warning("1H ALIGN BLOCK: spot limit buy %s rejected — 1h bias is bearish", symbol)
+        return {"rejected": True, "reason": "1h trend is bearish — long entry blocked", "hint": "1h timeframe is in a downtrend. The daily uptrend is in correction. Wait for 1h to turn neutral/bullish."}
+      tf_conflict_l = gate.get("timeframe_conflict", False)
+      intraday_bias_15m_l = gate.get("intraday_bias_15m", "neutral")
+      if tf_conflict_l and intraday_bias_15m_l == "bearish":
+        logger.warning("TF CONFLICT BLOCK: spot limit buy %s rejected — daily/intraday split, 15m bearish opposes buy", symbol)
+        return {"rejected": True, "reason": "Timeframe conflict: 15m bearish opposes proposed buy", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
     _atr_scale_l = 1.0
     if side_lower == "buy" and symbol in _daily_gate_state:
@@ -1756,6 +1776,9 @@ def run_trading_agent(
       "daily_atr_pct": daily_atr_pct,
       "intraday_atr_pct": intraday_atr_pct,
       "squeeze_breakout": summary.get("squeeze_breakout"),
+      "timeframe_conflict": summary.get("timeframe_conflict", False),
+      "intraday_bias_15m": summary.get("intraday_bias_15m", "neutral"),
+      "intraday_bias_1h": summary.get("intraday_bias_1h", "neutral"),
     }
     result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
 
@@ -1816,7 +1839,11 @@ def run_trading_agent(
                 futures_data["oiPriceHint"] = "Rising price + flat/falling OI = short covering rally. Exit longs cautiously, don't add."
               elif price_dir == "down" and oi_trend == "up":
                 futures_data["oiPriceSignal"] = "aggressive_shorts"
-                futures_data["oiPriceHint"] = "Falling price + rising OI = aggressive short building. Stay short or enter short."
+                futures_data["oiPriceHint"] = (
+                  "Falling price + rising OI = aggressive short BUILDING. Trend likely continues lower. "
+                  "Do NOT enter contrarian longs hoping for a squeeze unless price reclaims a clear structural level "
+                  "(prior swing high or daily EMA cross). Stay short, exit longs, or stand aside."
+                )
               else:
                 futures_data["oiPriceSignal"] = "long_capitulation"
                 futures_data["oiPriceHint"] = "Falling price + flat/falling OI = long capitulation. Potential reversal zone for contrarian long."
@@ -2023,6 +2050,26 @@ def run_trading_agent(
         if opposing:
           logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
           return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend or wait for it to turn neutral."}
+      # 1h alignment: block entries when 1h bias opposes the proposed side (catches bounces in confirmed corrections)
+      intraday_bias_1h = gate.get("intraday_bias_1h", "neutral")
+      intraday_1h_opposes = (
+        (intraday_bias_1h == "bearish" and side_lower == "buy") or
+        (intraday_bias_1h == "bullish" and side_lower == "sell")
+      )
+      if intraday_1h_opposes:
+        logger.warning("1H ALIGN BLOCK: %s %s rejected — 1h bias %s opposes %s", side, spot_symbol, intraday_bias_1h, side_lower)
+        return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction, not a healthy pullback. Do NOT enter against the 1h trajectory even when daily aligns."}
+      # Timeframe-conflict gate: catches 15m vs higher-TF disagreement not already blocked by 1h alignment
+      tf_conflict = gate.get("timeframe_conflict", False)
+      intraday_bias_15m = gate.get("intraday_bias_15m", "neutral")
+      if tf_conflict and intraday_bias_15m != "neutral":
+        intraday_opposes = (
+          (intraday_bias_15m == "bearish" and side_lower == "buy") or
+          (intraday_bias_15m == "bullish" and side_lower == "sell")
+        )
+        if intraday_opposes:
+          logger.warning("TF CONFLICT BLOCK: %s %s rejected — daily/intraday split, 15m %s opposes %s", side, spot_symbol, intraday_bias_15m, side_lower)
+          return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
     # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
     _atr_scale_fm = 1.0
@@ -2669,6 +2716,24 @@ def run_trading_agent(
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
           return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend or switch symbol."}
+      intraday_bias_1h_fl = gate.get("intraday_bias_1h", "neutral")
+      intraday_1h_opposes_fl = (
+        (intraday_bias_1h_fl == "bearish" and side_lower == "buy") or
+        (intraday_bias_1h_fl == "bullish" and side_lower == "sell")
+      )
+      if intraday_1h_opposes_fl:
+        logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)
+        return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction. Wait for 1h alignment."}
+      tf_conflict_fl = gate.get("timeframe_conflict", False)
+      intraday_bias_15m_fl = gate.get("intraday_bias_15m", "neutral")
+      if tf_conflict_fl and intraday_bias_15m_fl != "neutral":
+        intraday_opposes_fl = (
+          (intraday_bias_15m_fl == "bearish" and side_lower == "buy") or
+          (intraday_bias_15m_fl == "bullish" and side_lower == "sell")
+        )
+        if intraday_opposes_fl:
+          logger.warning("TF CONFLICT BLOCK: futures limit %s %s rejected — daily/intraday split, 15m %s opposes %s", side_lower, spot_symbol, intraday_bias_15m_fl, side_lower)
+          return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
     _atr_scale_fl = 1.0
     if spot_symbol in _daily_gate_state:
