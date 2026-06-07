@@ -276,7 +276,10 @@ async def trading_loop() -> None:
   notifier.notify_startup(cfg)
   dashboard = DashboardPublisher(cfg)
   if dashboard.enabled:
-    logger.info("Public dashboard publishing enabled (disclosure=%s).", cfg.dashboard.disclosure)
+    logger.info("Public dashboard publishing enabled (disclosure=%s, table=%s, container=%s).",
+                cfg.dashboard.disclosure, cfg.dashboard.table_name, cfg.dashboard.container_name)
+  elif cfg.dashboard.enabled:
+    logger.warning("Dashboard publishing requested but DISABLED: %s", dashboard.disabled_reason())
 
   logger.info("Starting trading loop...")
   while True:

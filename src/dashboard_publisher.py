@@ -81,16 +81,25 @@ class DashboardPublisher:
 
   # ----- lifecycle ---------------------------------------------------------
 
+  def disabled_reason(self) -> Optional[str]:
+    """Human-readable reason the publisher won't run, or None when it is good to go."""
+    c = self.cfg
+    if not c.enabled:
+      return "DASHBOARD_PUBLISH_ENABLED is not 'true'"
+    if not _AZURE_AVAILABLE:
+      return ("azure SDK not importable — run `pip install -r requirements.txt` "
+              "(needs azure-data-tables + azure-storage-blob) in the deployed venv, then restart")
+    if not c.connection_string:
+      return "the `connection_string` env var is empty (set it in the deployed .env / service env)"
+    if not c.table_name:
+      return "TRAIDE_TABLE_NAME is empty"
+    if not c.container_name:
+      return "TRAIDE_BLOB_NAME is empty"
+    return None
+
   @property
   def enabled(self) -> bool:
-    c = self.cfg
-    return bool(
-      _AZURE_AVAILABLE
-      and c.enabled
-      and c.connection_string
-      and c.table_name
-      and c.container_name
-    )
+    return self.disabled_reason() is None
 
   def _ensure_clients(self) -> bool:
     """Lazily create the table + container clients (auto-create both). Never raises."""
