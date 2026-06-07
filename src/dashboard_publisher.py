@@ -36,9 +36,18 @@ try:
 except Exception:  # azure SDK not installed
   _AZURE_AVAILABLE = False
 
-# The Azure SDK logs every HTTP request/response at INFO via its http_logging_policy, which floods
-# the trading logs. Keep the whole azure.* logger hierarchy at WARNING so only real problems surface.
-logging.getLogger("azure").setLevel(logging.WARNING)
+# The Azure SDK logs every HTTP request/response (status, headers, body markers) at INFO via its
+# http_logging_policy, which floods the trading logs. Force the whole azure.* hierarchy — and the
+# HTTP policy specifically — to WARNING so these never appear (real azure errors still surface).
+for _azure_logger in (
+  "azure",
+  "azure.core.pipeline.policies.http_logging_policy",
+  "azure.storage",
+  "azure.data.tables",
+  "azure.identity",
+  "azure.core",
+):
+  logging.getLogger(_azure_logger).setLevel(logging.WARNING)
 
 # Azure Table caps a single string property at 64 KiB / 32 K chars; stay comfortably under.
 MAX_TABLE_PROPERTY_CHARS = 30000
