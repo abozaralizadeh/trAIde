@@ -441,8 +441,9 @@ async def trading_loop() -> None:
       logger.info("No triggers. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)
 
     # Publish a sanitized public-safe snapshot for the read-only spectator dashboard.
-    # Self-throttled and never raises, so it is safe to call every poll.
-    dashboard.publish(memory, last_prices, cfg)
+    # Self-throttled and never raises, so it is safe to call every poll. Open positions are
+    # read from `snapshot` (live exchange truth), not MemoryStore (which lingers after TP/SL).
+    dashboard.publish(memory, snapshot, last_prices, cfg)
 
     await asyncio.sleep(cfg.trading.poll_interval_sec)
 

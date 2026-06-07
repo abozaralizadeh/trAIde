@@ -128,9 +128,13 @@ class DashboardPublisher:
       self._init_failed = True
       return False
 
-  def publish(self, memory: MemoryStore, last_prices: Dict[str, float], cfg) -> None:
+  def publish(self, memory: MemoryStore, snapshot, last_prices: Dict[str, float], cfg) -> None:
     """Top-level entry point called from the trading loop. NEVER raises; silent at INFO level
-    (failures log at DEBUG only, so steady-state logs stay clean)."""
+    (failures log at DEBUG only, so steady-state logs stay clean).
+
+    `snapshot` is the current TradingSnapshot — open positions are taken from it (the exchange's
+    live truth) rather than from MemoryStore, which only synthesizes positions from recorded
+    trades and would keep showing a position after a TP/SL trigger closes it on the exchange."""
     try:
       if not self.enabled:
         return
@@ -140,7 +144,7 @@ class DashboardPublisher:
       if not self._ensure_clients():
         return
 
-      payload = self._build_payload(memory, last_prices or {}, cfg)
+      payload = self._build_payload(memory, snapshot, last_prices or {}, cfg)
       self._write_tables(payload)
       series = self._read_equity_series()
       payload["equityPoints"] = series[-90:]
@@ -151,9 +155,8 @@ class DashboardPublisher:
 
   # ----- payload build -----------------------------------------------------
 
-  def _build_payload(self, memory: MemoryStore, last_prices: Dict[str, float], cfg) -> Dict[str, Any]:
+  def _build_payload(self, memory: MemoryStore, snapshot, last_prices: Dict[str, float], cfg) -> Dict[str, Any]:
     perf = memory.performance_summary()
-    positions = memory.positions(last_prices)
     decisions = memory.latest_items("decisions", limit=self.cfg.feed_limit).get("items", [])
     closed = self._closed_trades(memory)
     notes_all = memory.list_all_notes()
@@ -164,7 +167,8 @@ class DashboardPublisher:
     raw_limits = self._read_limits(memory)
     today = int(time.time() // 86400)
 
-    pos_list = [sp for sp in (self._sanitize_position(s, p) for s, p in positions.items()) if sp]
+    # Open positions come from the live exchange snapshot (truth), not from MemoryStore.
+    pos_list = self._build_positions(snapshot, memory)
     dd_total = round(_f((raw_limits.get("total") or {}).get("drawdownPct")) or 0.0, 3)
 
     return {
@@ -223,32 +227,97 @@ class DashboardPublisher:
     return round((cp / ae - 1.0) * sign * 100.0, 4)
 
   @staticmethod
-  def _pnl_to_pct(pnl: Any, cost: Any) -> Optional[float]:
-    """Express a $ PnL as a % of the (undisclosed) entry notional — privacy-safe."""
-    p, c = _f(pnl), _f(cost)
-    if p is None or not c:
-      return None
-    return round(p / abs(c) * 100.0, 4)
+  def _futures_to_display(fsym: str) -> str:
+    """Map a KuCoin futures contract symbol (e.g. XBTUSDTM) to a display symbol (BTC-USDT)."""
+    s = (fsym or "").upper()
+    if not s:
+      return ""
+    if s.endswith("M"):
+      s = s[:-1]
+    if s.endswith("USDT"):
+      base, quote = s[:-4], "USDT"
+    elif s.endswith("USDC"):
+      base, quote = s[:-4], "USDC"
+    elif s.endswith("USD"):
+      base, quote = s[:-3], "USD"
+    else:
+      base, quote = s, "USDT"
+    if base == "XBT":
+      base = "BTC"
+    return f"{base}-{quote}" if base else (fsym or "")
 
-  def _sanitize_position(self, symbol: str, p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    net = _f(p.get("netSize")) or 0.0
-    if not net:
-      return None
-    cost = p.get("cost")
-    out: Dict[str, Any] = {
-      "symbol": symbol,
-      "side": "long" if net > 0 else "short",
-      "venue": p.get("venue", "spot"),
-      "avgEntry": _round(p.get("avgEntry")),
-      "currentPrice": _round(p.get("currentPrice")),
-      "returnPct": self._return_pct(p.get("avgEntry"), p.get("currentPrice"), net),
-      "peakPnlPct": self._pnl_to_pct(p.get("peakPnl"), cost),
-      "troughPnlPct": self._pnl_to_pct(p.get("troughPnl"), cost),
-      "lastTs": p.get("lastTs"),
-    }
-    if self._allow_usd():
-      out["unrealizedPnl"] = _round(p.get("unrealizedPnl"))
-      out["realizedPnl"] = _round(p.get("realizedPnl"))
+  def _build_positions(self, snapshot, memory: MemoryStore) -> list:
+    """Open positions from the LIVE exchange snapshot (truth) — not MemoryStore, which only
+    synthesizes positions from recorded trades and lingers after a TP/SL trigger closes one.
+    Privacy-safe: symbol, side, venue, entry/mark price and return % only — never size,
+    quantity, or notional."""
+    out: list = []
+    if snapshot is None:
+      return out
+
+    # --- Futures: signed currentQty straight from the exchange ---
+    for p in (getattr(snapshot, "futures_positions", None) or []):
+      qty = _f(p.get("currentQty")) or 0.0
+      if not qty:
+        continue  # closed positions report currentQty == 0
+      entry = _f(p.get("avgEntryPrice"))
+      mark = _f(p.get("markPrice"))
+      rec: Dict[str, Any] = {
+        "symbol": self._futures_to_display(p.get("symbol") or ""),
+        "side": "long" if qty > 0 else "short",
+        "venue": "futures",
+        "avgEntry": _round(entry),
+        "currentPrice": _round(mark),
+        "returnPct": self._return_pct(entry, mark, qty),
+        "peakPnlPct": None,
+        "troughPnlPct": None,
+        "lastTs": None,
+      }
+      if self._allow_usd():
+        upnl = p.get("unrealisedPnl")
+        if upnl is None:
+          upnl = p.get("unrealizedPnl")
+        rec["unrealizedPnl"] = _round(upnl)
+      out.append(rec)
+
+    # --- Spot: actual coin balances above a dust threshold, priced via tickers ---
+    try:
+      spot_mem = memory.positions(venue="spot")
+    except Exception:
+      spot_mem = {}
+    tickers = getattr(snapshot, "tickers", None) or {}
+    seen: set = set()
+    for acct in (getattr(snapshot, "spot_accounts", None) or []):
+      cur = (getattr(acct, "currency", "") or "").upper()
+      if not cur or cur in ("USDT", "USDC", "USD", "DAI"):
+        continue
+      sym = f"{cur}-USDT"
+      if sym in seen:
+        continue
+      try:
+        bal = float(getattr(acct, "balance", 0) or 0)
+      except (TypeError, ValueError):
+        bal = 0.0
+      if bal <= 0:
+        continue
+      tk = tickers.get(sym)
+      price = _f(getattr(tk, "price", None)) if tk is not None else None
+      if not price or bal * price < 1.0:
+        continue  # skip dust (< $1) — value used only to filter, never published
+      seen.add(sym)
+      entry = _f((spot_mem.get(sym) or {}).get("avgEntry"))
+      out.append({
+        "symbol": sym,
+        "side": "long",
+        "venue": "spot",
+        "avgEntry": _round(entry),
+        "currentPrice": _round(price),
+        "returnPct": self._return_pct(entry, price, 1.0),
+        "peakPnlPct": None,
+        "troughPnlPct": None,
+        "lastTs": None,
+      })
+
     return out
 
   def _sanitize_decision(self, d: Dict[str, Any]) -> Dict[str, Any]:
