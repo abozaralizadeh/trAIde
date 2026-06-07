@@ -124,12 +124,13 @@ class DashboardPublisher:
       self._container_client = cc
       return True
     except Exception as exc:
-      logger.warning("Dashboard Azure init failed, disabling publisher for this process: %s", exc)
+      logger.debug("Dashboard Azure init failed, disabling publisher for this process: %s", exc)
       self._init_failed = True
       return False
 
   def publish(self, memory: MemoryStore, last_prices: Dict[str, float], cfg) -> None:
-    """Top-level entry point called from the trading loop. NEVER raises; logs warnings only."""
+    """Top-level entry point called from the trading loop. NEVER raises; silent at INFO level
+    (failures log at DEBUG only, so steady-state logs stay clean)."""
     try:
       if not self.enabled:
         return
@@ -145,13 +146,8 @@ class DashboardPublisher:
       payload["equityPoints"] = series[-90:]
       self._write_blobs(payload, series)
       self._last_publish_ts = now
-      logger.info(
-        "Dashboard published: %d positions, %d feed, %d equity points (disclosure=%s)",
-        len(payload.get("positions", [])), len(payload.get("feed", [])),
-        len(series), self.cfg.disclosure,
-      )
     except Exception as exc:
-      logger.warning("Dashboard publish failed (continuing trading loop): %s", exc)
+      logger.debug("Dashboard publish failed (continuing trading loop): %s", exc)
 
   # ----- payload build -----------------------------------------------------
 
