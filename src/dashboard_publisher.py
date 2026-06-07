@@ -36,6 +36,10 @@ try:
 except Exception:  # azure SDK not installed
   _AZURE_AVAILABLE = False
 
+# The Azure SDK logs every HTTP request/response at INFO via its http_logging_policy, which floods
+# the trading logs. Keep the whole azure.* logger hierarchy at WARNING so only real problems surface.
+logging.getLogger("azure").setLevel(logging.WARNING)
+
 # Azure Table caps a single string property at 64 KiB / 32 K chars; stay comfortably under.
 MAX_TABLE_PROPERTY_CHARS = 30000
 
