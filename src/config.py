@@ -110,6 +110,18 @@ class LangsmithConfig:
 
 
 @dataclass
+class DashboardConfig:
+  enabled: bool
+  connection_string: str
+  table_name: str
+  container_name: str
+  publish_interval_sec: float
+  disclosure: str          # "normalized" (default) | "absolute" | "both"
+  feed_limit: int
+  index_base: float        # equity index start (default 100.0)
+
+
+@dataclass
 class AppConfig:
   azure: AzureConfig
   apim: ApimConfig
@@ -120,6 +132,7 @@ class AppConfig:
   langsmith: LangsmithConfig
   telegram: TelegramConfig
   supervisor: SupervisorConfig
+  dashboard: DashboardConfig
   tracing_enabled: bool
   console_tracing: bool
   openai_trace_api_key: Optional[str]
@@ -212,6 +225,16 @@ def load_config() -> AppConfig:
       log_file=os.getenv("LOG_FILE", "traide.log"),
       log_max_bytes=int(os.getenv("LOG_MAX_BYTES", "5242880")),
       log_backup_count=int(os.getenv("LOG_BACKUP_COUNT", "3")),
+    ),
+    dashboard=DashboardConfig(
+      enabled=_as_bool(os.getenv("DASHBOARD_PUBLISH_ENABLED"), False),
+      connection_string=os.getenv("connection_string", ""),
+      table_name=os.getenv("TRAIDE_TABLE_NAME", "traidedashboard"),
+      container_name=os.getenv("TRAIDE_BLOB_NAME", "traide-dashboard"),
+      publish_interval_sec=float(os.getenv("DASHBOARD_PUBLISH_INTERVAL_SEC", "300")),
+      disclosure=os.getenv("DASHBOARD_DISCLOSURE", "normalized").strip().lower(),
+      feed_limit=int(os.getenv("DASHBOARD_FEED_LIMIT", "30")),
+      index_base=float(os.getenv("DASHBOARD_INDEX_BASE", "100")),
     ),
     tracing_enabled=_as_bool(os.getenv("ENABLE_TRACING"), False),
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),

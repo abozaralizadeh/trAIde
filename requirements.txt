@@ -6,3 +6,5 @@ gunicorn>=22.0.0
 pandas>=2.2.3
 langsmith[openai-agents]
 langsmith
+azure-data-tables>=12.5.0
+azure-storage-blob>=12.19.0

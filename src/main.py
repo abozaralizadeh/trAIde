@@ -13,6 +13,7 @@ from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
 from .agent import TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client
 from .config import load_config
+from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
 from .telegram import TelegramNotifier
@@ -273,6 +274,9 @@ async def trading_loop() -> None:
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   notifier = TelegramNotifier(cfg)
   notifier.notify_startup(cfg)
+  dashboard = DashboardPublisher(cfg)
+  if dashboard.enabled:
+    logger.info("Public dashboard publishing enabled (disclosure=%s).", cfg.dashboard.disclosure)
 
   logger.info("Starting trading loop...")
   while True:
@@ -432,6 +436,10 @@ async def trading_loop() -> None:
     else:
       idle_polls += 1
       logger.info("No triggers. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)
+
+    # Publish a sanitized public-safe snapshot for the read-only spectator dashboard.
+    # Self-throttled and never raises, so it is safe to call every poll.
+    dashboard.publish(memory, last_prices, cfg)
 
     await asyncio.sleep(cfg.trading.poll_interval_sec)
 
