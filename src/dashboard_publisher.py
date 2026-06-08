@@ -292,16 +292,21 @@ class DashboardPublisher:
         continue  # closed positions report currentQty == 0
       entry = _f(p.get("avgEntryPrice"))
       mark = _f(p.get("markPrice"))
+      disp = self._futures_to_display(p.get("symbol") or "")
+      side = "long" if qty > 0 else "short"
+      tp, sl = self._bracket_for(getattr(snapshot, "futures_stop_orders", None), disp, side, mark)
       rec: Dict[str, Any] = {
-        "symbol": self._futures_to_display(p.get("symbol") or ""),
-        "side": "long" if qty > 0 else "short",
+        "symbol": disp,
+        "side": side,
         "venue": "futures",
         "avgEntry": _round(entry),
         "currentPrice": _round(mark),
         "returnPct": self._return_pct(entry, mark, qty),
+        "tpPrice": _round(tp),
+        "slPrice": _round(sl),
         "peakPnlPct": None,
         "troughPnlPct": None,
-        "lastTs": None,
+        "lastTs": int(time.time()),
       }
       if self._allow_usd():
         upnl = p.get("unrealisedPnl")
@@ -336,6 +341,7 @@ class DashboardPublisher:
         continue  # skip dust (< $1) — value used only to filter, never published
       seen.add(sym)
       entry = _f((spot_mem.get(sym) or {}).get("avgEntry"))
+      tp, sl = self._bracket_for(getattr(snapshot, "spot_stop_orders", None), sym, "long", price)
       out.append({
         "symbol": sym,
         "side": "long",
@@ -343,12 +349,53 @@ class DashboardPublisher:
         "avgEntry": _round(entry),
         "currentPrice": _round(price),
         "returnPct": self._return_pct(entry, price, 1.0),
+        "tpPrice": _round(tp),
+        "slPrice": _round(sl),
         "peakPnlPct": None,
         "troughPnlPct": None,
-        "lastTs": None,
+        "lastTs": int(time.time()),
       })
 
     return out
+
+  def _bracket_for(self, stop_orders, display_symbol, side, mark):
+    """Pick the nearest take-profit and stop-loss trigger prices for one position from its active
+    reduce-only stop orders on the exchange. Returns (tp_price, sl_price); either may be None.
+
+    KuCoin futures stops carry a `stop` direction ('up'/'down'); for a long, an up-trigger is the
+    take-profit and a down-trigger the stop-loss (reversed for a short). When the direction is
+    absent (e.g. spot), fall back to classifying by where the trigger sits relative to mark. Only
+    prices are exposed — never size — so this stays within the normalized disclosure policy."""
+    m = _f(mark)
+    tps: List[float] = []
+    sls: List[float] = []
+    for s in (stop_orders or []):
+      if not isinstance(s, dict):
+        continue
+      raw = s.get("symbol") or ""
+      # Futures stops use a contract symbol (XBTUSDTM -> BTC-USDT); spot stops already use the
+      # display form (SOL-USDT). Accept either so both venues match their position.
+      if raw != display_symbol and self._futures_to_display(raw) != display_symbol:
+        continue
+      sp = _f(s.get("stopPrice"))
+      if sp is None or sp <= 0:
+        continue
+      direction = str(s.get("stop") or "").lower()
+      if direction in ("up", "down"):
+        is_tp = (direction == "up") if side == "long" else (direction == "down")
+      elif m:
+        above = sp >= m
+        is_tp = above if side == "long" else (not above)
+      else:
+        continue
+      (tps if is_tp else sls).append(sp)
+
+    def nearest(vals: List[float]) -> Optional[float]:
+      if not vals:
+        return None
+      return min(vals, key=lambda v: abs(v - m)) if m else vals[0]
+
+    return nearest(tps), nearest(sls)
 
   def _sanitize_decision(self, d: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
@@ -366,6 +413,14 @@ class DashboardPublisher:
       out["win"] = bool(_f(pnl) and _f(pnl) > 0)
       if self._allow_usd():
         out["pnl"] = _round(pnl, 4)
+    # Closed futures positions report a return-on-equity % in the reason string (e.g.
+    # "TP/SL triggered (CLOSE_LONG, ROE -1.81%)"). ROE is a percentage — safe under the normalized
+    # policy — and gives the trade-outcome chart a real magnitude instead of the always-0 confidence.
+    if d.get("closeType"):
+      out["closeType"] = str(d.get("closeType"))
+    m = re.search(r"ROE\s*(-?\d+(?:\.\d+)?)\s*%", d.get("reason") or "")
+    if m:
+      out["roePct"] = round(float(m.group(1)), 4)
     return out
 
   def _sanitize_notes(self, notes: Any) -> List[Dict[str, Any]]:
