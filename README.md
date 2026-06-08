@@ -4,30 +4,177 @@ Autonomous multi-agent AI crypto trader powered by Azure OpenAI and KuCoin APIs.
 
 Three specialized agents collaborate in a continuous loop: a **Trading Agent** that executes orders with full risk management, a **Research Agent** that scouts opportunities and market intelligence in parallel, and a **Supervisor Agent** you can talk to via Telegram to monitor and control the system.
 
+## Contents
+
+- [Architecture](#architecture) — five views: components, runtime loop, risk gates, position lifecycle, data flow
+- [Features](#features) — technical analysis, risk management, execution, memory, coin universe
+- [Setup](#setup)
+- [Configuration](#configuration) — all environment variables
+- [Telegram Notifications](#telegram-notifications)
+- [Supervisor Agent](#supervisor-agent-interactive-telegram-bot)
+- [Backtesting](#backtesting)
+- [How the Main Loop Works](#how-the-main-loop-works)
+- [Project Structure](#project-structure)
+- [Running Tests](#running-tests)
+- [Deployment](#deployment)
+
 ## Architecture
 
-```
-                        Telegram
-                           |
-                    Supervisor Agent
-                     (read-only +
-                      note injection)
-                           |
-    +-----------+    +-----+-----+    +-----------+
-    |  Research  |--->|  Trading  |--->|  KuCoin   |
-    |   Agent    |    |   Agent   |    | Spot+Fut  |
-    +-----------+    +-----------+    +-----------+
-         |                |                |
-     Web Search     46 Tool Calls     Order Exec
-     News Fetch     Risk Checks       Positions
-     Source Mgmt    Memory I/O        Balances
+trAIde runs as a single Python process: a continuous **poll loop** drives a **Trading Agent** and a **Research Agent** (both backed by Azure OpenAI), a code-driven **ProtectionManager**, and a sanitized public **dashboard** — while an interactive **Supervisor Agent** lets you steer the system from Telegram. The diagrams below show the same system from five angles.
+
+### System components
+
+```mermaid
+flowchart TB
+    operator(["Operator"]) <-->|Telegram| sup["Supervisor Agent<br/>(read-only + note injection)"]
+
+    subgraph core["trAIde process"]
+        direction TB
+        mainloop["Main Loop<br/>(polls every POLL_INTERVAL_SEC)"]
+        trade["Trading Agent<br/>(46 tools)"]
+        research["Research Agent<br/>(web + news scout)"]
+        prot["ProtectionManager<br/>(code-driven profit-lock)"]
+        mem[("MemoryStore<br/>.agent_memory.json")]
+        dash["Dashboard Publisher"]
+    end
+
+    subgraph azure["Azure"]
+        aoai["Azure OpenAI<br/>(LLM inference)"]
+        blob[("Blob + Table storage")]
+    end
+
+    kucoin["KuCoin<br/>Spot + Futures API"]
+    sandbox["SandBox web app<br/>(read-only dashboard)"]
+    spectators(["Public spectators"])
+
+    mainloop --> trade
+    mainloop --> prot
+    mainloop --> dash
+    trade <--> aoai
+    research <--> aoai
+    research -->|notes| mem
+    trade <-->|orders, positions| kucoin
+    prot -->|breakeven, close| kucoin
+    trade <-->|context, outcomes| mem
+    sup -->|inject notes| mem
+    sup -. read-only .-> kucoin
+    dash -->|sanitized %| blob
+    blob --> sandbox
+    sandbox --> spectators
 ```
 
 **Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 46 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
 
-**Research Agent** -- Runs concurrently while the Trading Agent executes. Searches CoinDesk, The Block, Cointelegraph, exchange blogs, X/Twitter, and macro news. Analyzes strategy patterns (missed profits, repeated losses). Logs findings for the Trading Agent to consume.
+**Research Agent** -- Runs concurrently while the Trading Agent executes. Searches CoinDesk, The Block, Cointelegraph, exchange blogs, X/Twitter, and macro news. Analyzes strategy patterns (missed profits, repeated losses). Logs findings to memory for the Trading Agent to consume.
 
 **Supervisor Agent** -- Interactive Telegram bot with read access to the entire system. Can query positions, balances, performance, logs, source code, and config. Can inject temporary (one-shot, highest priority) or permanent notes into the Trading Agent's system prompt to influence its behavior.
+
+### Runtime: the poll loop
+
+Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and — only when a trigger fires or the idle threshold is reached — invokes the agents.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant L as Main Loop
+    participant K as KuCoin
+    participant M as MemoryStore
+    participant P as ProtectionManager
+    participant A as Trading + Research Agents
+    participant D as Dashboard
+
+    loop Every POLL_INTERVAL_SEC
+        L->>K: build snapshot (tickers, balances, positions, stops, fills)
+        L->>M: update drawdown + position extremes (peak/trough PnL)
+        L->>P: run(snapshot)
+        P->>K: ratchet stop to breakeven / close on give-back
+        L->>M: record triggered TP/SL closes (with exit price)
+        L->>L: check circuit breakers (drawdown, losses, heat)
+        alt triggers fired OR idle threshold reached
+            L->>A: run agents
+            A->>K: place / cancel / bracket orders
+            A->>M: log decisions, trades, research notes
+        else otherwise
+            L->>L: idle_polls++
+        end
+        L->>D: publish sanitized snapshot (throttled)
+        L-->>L: sleep until next cycle
+    end
+```
+
+### Entry decision & risk gates
+
+Every proposed entry runs a fixed gauntlet of code-enforced gates before any order reaches the exchange. Position management (manage / hold / protect / close) bypasses the entry gates.
+
+```mermaid
+flowchart TD
+    propose(["Agent proposes an entry"]) --> cb{"Circuit breaker active?"}
+    cb -->|yes| reject["Rejected<br/>(no new entry)"]
+    cb -->|no| pl{"Post-loss cooldown?"}
+    pl -->|yes| reject
+    pl -->|no| nc{"No-chase: same direction at a<br/>worse price than a recent win?"}
+    nc -->|yes| reject
+    nc -->|no| ti{"Trade-interval cooldown?"}
+    ti -->|yes| reject
+    ti -->|no| dg{"Daily gate / anti-FOMO /<br/>1h-alignment / TF-conflict?"}
+    dg -->|blocked| reject
+    dg -->|ok| vol{"Volatility gate<br/>(ATR + 24h range)"}
+    vol -->|hard block| reject
+    vol -->|soft| scale["Scale size down<br/>(quadratic)"]
+    vol -->|ok| conf{"Confidence &ge; MIN_CONFIDENCE<br/>and net profit after fees?"}
+    scale --> conf
+    conf -->|no| reject
+    conf -->|yes| exec["Place order +<br/>mandatory TP/SL bracket"]
+    exec --> openpos(["Position open"])
+```
+
+### Position lifecycle & profit protection
+
+Once open, a position is protected in code on every poll: the stop ratchets to breakeven at +1R, and a give-back of the peak run closes it to lock gains — independent of the LLM.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Flat
+    Flat --> PendingEntry: limit order placed
+    PendingEntry --> Flat: expired or cancelled
+    PendingEntry --> Open: filled
+    Flat --> Open: market entry filled
+    Open --> Open: manage bracket, scale-in if gates pass
+    Open --> Protected: reached +1R, stop ratcheted to breakeven
+    Protected --> Protected: give-back below threshold
+    Open --> Closed: TP, SL, or agent close
+    Protected --> Closed: gave back 35% of peak, market close
+    Protected --> Closed: TP or breakeven stop hit
+    Closed --> Cooldown: post-loss or post-win no-chase
+    Cooldown --> Flat: cooldown expires
+    Closed --> [*]
+```
+
+### Memory & dashboard data flow
+
+The local `MemoryStore` is the agent's working memory (auto-pruned by `RETENTION_DAYS`). A whitelist sanitizer publishes a **normalized, dollar-free** projection to Azure, which a separate SandBox web app renders for public spectators.
+
+```mermaid
+flowchart LR
+    subgraph mem["MemoryStore — .agent_memory.json"]
+        direction TB
+        m1["trades"]
+        m2["decisions<br/>entries cap 50 / outcomes cap 200"]
+        m3["plans + research notes"]
+        m4["sentiments / triggers / coins"]
+        m5["position_extremes<br/>(peak/trough PnL)"]
+        m6["supervisor notes<br/>temporary / permanent"]
+        m7["limits<br/>(per-venue drawdown)"]
+    end
+
+    agents["Trading + Research agents"] -->|context in, outcomes out| mem
+    mainloop["Main Loop"] -->|extremes, triggered closes| mem
+    sup["Supervisor"] -->|inject notes| mem
+
+    mem --> pub["DashboardPublisher<br/>(whitelist sanitize — never $)"]
+    pub -->|normalized % only| az[("Azure Blob + Table")]
+    az --> sandbox["SandBox web app<br/>(ECharts terminal UI)"]
+```
 
 ## Features
 
@@ -68,6 +215,7 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 
 ### Memory & Learning
 - **Trade memory**: Records all trades, decisions, plans, sentiments, triggers, and fee snapshots
+- **Two-tier decision retention**: realized closed-trade outcomes (those with a PnL) are kept far longer (cap 200) than routine entry/decline decisions (cap 50), so win/loss history — and the exit prices the no-chase guard relies on — is never crowded out by no-trade decisions
 - **Performance tracking**: Win rate, PnL, trade counts split by venue (spot/futures) and mode (paper/live)
 - **Position extremes**: Tracks peak and trough unrealized PnL during position lifetime for post-trade analysis
 - **Drawdown tracking**: Per-venue daily drawdown percentage
@@ -136,7 +284,8 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `MIN_ENTRY_DEVIATION_PCT` | `0.002` | Minimum distance (0.2%) from current price to use a target-price limit order |
 | `MAX_ATR_PCT_FOR_ENTRY` | `6` | Soft volatility gate: above this daily ATR %, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× this value (9% default), entry is hard-blocked. |
 | `MAX_24H_VOLATILITY_PCT` | `25` | Hard block when 24h price range exceeds this % (separate from ATR gate) |
-| `POST_LOSS_COOLDOWN_MINUTES` | `45` | Block new entries on a symbol after a loss |
+| `POST_LOSS_COOLDOWN_MINUTES` | `30` | Block new entries on a symbol after a loss |
+| `MIN_TRADE_INTERVAL_MINUTES` | `5` | Minimum interval between trades on the same symbol (anti-overtrading) |
 
 ### Circuit Breakers
 
