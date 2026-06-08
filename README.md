@@ -44,6 +44,8 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 - **Staged take-profit**: Splits TP into 2 tranches (60%/40%) to lock in partial gains
 - **Kelly criterion sizing**: Quarter-Kelly position sizing from rolling trade performance (requires minimum trade history)
 - **Post-loss cooldown**: Blocks new entries on a symbol for a configurable period after a loss
+- **Profit-lock (breakeven ratchet + give-back cap)**: Enforced in code every poll, independent of the LLM (`src/protection.py`). Once a position's favorable excursion reaches `PROFIT_LOCK_BREAKEVEN_TRIGGER_R`× its initial risk, the stop is ratcheted to a fee-adjusted breakeven so the trade can no longer turn into a loss. If price then gives back ≥ `PROFIT_LOCK_GIVEBACK_PCT` of its peak run, the position is market-closed (reduce-only) to lock the remaining gain. Stops a profitable trade from round-tripping into a loss when the agent fails to tighten protection itself. Set `PROFIT_LOCK_DRY_RUN=true` to log intended actions without placing orders.
+- **No-chase after a win**: Blocks re-entering the *same direction* at a *worse* price than a recent winning exit (within `POST_WIN_COOLDOWN_MINUTES`). Stops the "take profit, then immediately re-buy the top" pattern; a genuine pullback (better price than the exit) is still allowed.
 - **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed.
 - **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
 - **Volatility soft-gate**: Above `MAX_ATR_PCT_FOR_ENTRY`, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× the threshold, the entry is hard-blocked.
@@ -146,6 +148,24 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `CB_COOLDOWN_MINUTES` | `120` | Cooldown duration after consecutive loss trigger |
 
 When a circuit breaker fires, the agent enters close-only mode: it can adjust stops, close positions, and manage risk, but cannot open new positions. A Telegram notification is sent.
+
+### Profit Protection
+
+Code-driven guards enforced outside the LLM (`src/protection.py`). They run every poll regardless of whether the agent runs, so a profitable trade can't quietly round-trip into a loss while the agent is idle.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PROFIT_LOCK_ENABLED` | `true` | Enable the breakeven ratchet + give-back cap |
+| `PROFIT_LOCK_DRY_RUN` | `false` | Log intended actions without placing orders (observe before arming on live funds) |
+| `PROFIT_LOCK_BREAKEVEN_TRIGGER_R` | `1.0` | Move the stop to breakeven once favorable excursion reaches this multiple of initial risk (≥1R is the consensus floor; paired here with partial-TP + the give-back trail) |
+| `PROFIT_LOCK_BREAKEVEN_FEE_PCT` | `0.0015` | Round-trip cost buffer (KuCoin futures taker 0.06%×2 + slippage) so the breakeven stop nets ≥0 |
+| `PROFIT_LOCK_GIVEBACK_PCT` | `0.35` | Close after price retraces this fraction of the peak run; `0.35` retains ~65% of peak profit, mid-band of the 60–70% best-practice range (`0` disables the give-back close) |
+| `PROFIT_LOCK_MIN_FE_PCT` | `0.005` | Minimum run (fraction of entry) before the give-back cap can act — filters noise |
+| `NO_CHASE_ENABLED` | `true` | Block same-direction re-entry at a worse price after a recent winning close |
+| `POST_WIN_COOLDOWN_MINUTES` | `45` | Window after a winning close during which re-entry at a worse price is blocked |
+| `NO_CHASE_BUFFER_PCT` | `0.001` | Tolerance band around the prior exit price |
+
+Every automatic action (stop moved to breakeven, position closed, or a dry-run preview) is logged and sent as a Telegram alert.
 
 ### Loop & Polling
 
@@ -302,10 +322,11 @@ Each polling cycle (`POLL_INTERVAL_SEC` seconds):
 2. **Reconciliation** -- Sums USDT across all accounts, tracks daily drawdown per venue
 3. **Price detection** -- Compares last known prices; triggers on moves >= `PRICE_CHANGE_TRIGGER_PCT`
 4. **Position extremes** -- Updates peak/trough unrealized PnL for open positions
-5. **Event tracking** -- Logs triggered futures TP/SL closes as decisions
-6. **Circuit breakers** -- Checks drawdown and consecutive losses against thresholds
-7. **Agent run** -- If triggers exist or idle threshold reached, runs Trading + Research agents concurrently
-8. **Wait** -- Sleeps until next cycle
+5. **Profit protection** -- Ratchets stops to breakeven and caps give-back on live futures positions (code-driven, independent of the agent)
+6. **Event tracking** -- Logs triggered futures TP/SL closes as decisions (with exit price, for the no-chase guard)
+7. **Circuit breakers** -- Checks drawdown and consecutive losses against thresholds
+8. **Agent run** -- If triggers exist or idle threshold reached, runs Trading + Research agents concurrently
+9. **Wait** -- Sleeps until next cycle
 
 Trigger types: `initial:SYMBOL` (first snapshot), `price_move:SYMBOL:X.XX%` (price change), `idle_threshold` (forced run after max idle polls).
 
@@ -321,6 +342,7 @@ src/
   kucoin.py            KuCoin spot + futures API client (HMAC auth, retries, error handling)
   main.py              Main trading loop, snapshot building, circuit breakers, trigger detection
   memory.py            Agent memory store (trades, decisions, plans, Kelly, cooldowns)
+  protection.py        Code-driven profit guards: breakeven ratchet, give-back cap, no-chase (runs every poll)
   supervisor.py        Supervisor agent tools (read logs, memory, config, write notes)
   telegram.py          Telegram notification sender (async, background thread)
   telegram_bot.py      Telegram long-polling bot for Supervisor Agent
@@ -331,6 +353,7 @@ tests/
   test_config.py       Configuration validation tests
   test_conversation_memory.py  Conversation memory tests
   test_memory.py       Memory store tests
+  test_protection.py   Profit-lock decision + no-chase guard tests
   test_telegram.py     Telegram notification tests
   test_utils.py        Utility function tests
 ```

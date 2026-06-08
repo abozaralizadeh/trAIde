@@ -16,6 +16,7 @@ from .config import load_config
 from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
 from .memory import MemoryStore
+from .protection import ProtectionManager
 from .telegram import TelegramNotifier
 from .utils import normalize_symbol
 
@@ -281,6 +282,15 @@ async def trading_loop() -> None:
   elif cfg.dashboard.enabled:
     logger.warning("Dashboard publishing requested but DISABLED: %s", dashboard.disabled_reason())
 
+  protection = ProtectionManager(cfg.profit_protection, kucoin_futures, notifier=notifier)
+  if cfg.profit_protection.enabled:
+    logger.info(
+      "Profit-lock enabled (dry_run=%s, breakeven@%.1fR, giveback=%.0f%%, no_chase=%s/%.0fmin).",
+      cfg.profit_protection.dry_run, cfg.profit_protection.breakeven_trigger_r,
+      cfg.profit_protection.giveback_pct * 100, cfg.profit_protection.no_chase_enabled,
+      cfg.profit_protection.post_win_cooldown_minutes,
+    )
+
   logger.info("Starting trading loop...")
   while True:
     try:
@@ -355,6 +365,15 @@ async def trading_loop() -> None:
     except Exception as exc:
       logger.warning("Failed to update position extremes: %s", exc)
 
+    # Code-driven profit protection: ratchet stops to breakeven and cap give-back on
+    # live futures positions every poll, independent of whether the agent runs. Never raises.
+    try:
+      protection_actions = protection.run(snapshot)
+      if protection_actions:
+        logger.info("Profit-lock actions taken: %s", protection_actions)
+    except Exception as exc:
+      logger.warning("Profit-lock run failed: %s", exc)
+
     should_run = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
 
     recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=30)
@@ -373,6 +392,18 @@ async def trading_loop() -> None:
         roe = float(cp.get("roe") or 0)
         close_type = cp.get("type") or "unknown"
         side = "sell" if "LONG" in close_type.upper() else "buy"
+        # Capture the exit price so the no-chase guard knows where we sold/covered.
+        exit_price = None
+        for _k in ("closePrice", "avgExitPrice", "settleClosePrice", "markPrice", "lastPrice"):
+          _v = cp.get(_k)
+          if _v not in (None, "", 0, "0"):
+            try:
+              exit_price = float(_v)
+              break
+            except (TypeError, ValueError):
+              continue
+        if exit_price is None:
+          exit_price = last_prices.get(sym)  # fallback: latest poll price ≈ exit
         memory.log_decision(
           sym,
           f"futures_{side}_triggered",
@@ -380,6 +411,8 @@ async def trading_loop() -> None:
           reason=f"TP/SL triggered ({close_type}, ROE {roe:.2%})",
           pnl=pnl,
           paper=False,
+          exit_price=exit_price,
+          close_type=close_type,
         )
         logged_closed_position_ids.add(cp_id)
         logger.info("Recorded triggered close for %s: PnL=%.4f (%s)", sym, pnl, close_type)

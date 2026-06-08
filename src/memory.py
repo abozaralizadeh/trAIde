@@ -473,6 +473,8 @@ class MemoryStore:
     paper: bool = False,
     peak_pnl: Optional[float] = None,
     trough_pnl: Optional[float] = None,
+    exit_price: Optional[float] = None,
+    close_type: Optional[str] = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -500,6 +502,13 @@ class MemoryStore:
         entry["peakPnl"] = round(float(peak_pnl), 4)
       if trough_pnl is not None:
         entry["troughPnl"] = round(float(trough_pnl), 4)
+      if exit_price is not None:
+        try:
+          entry["exitPrice"] = float(exit_price)
+        except (TypeError, ValueError):
+          pass
+      if close_type:
+        entry["closeType"] = str(close_type)
       data.setdefault("decisions", [])
       data["decisions"].append(entry)
       self._write(data)
@@ -963,6 +972,36 @@ class MemoryStore:
           return None
       except (TypeError, ValueError):
         continue
+    return None
+
+  def recent_win_close(self, symbol: str, within_minutes: float) -> Optional[Dict[str, Any]]:
+    """Most recent realized *winning* close for a symbol within the window, or None.
+
+    Powers the no-chase guard: after taking profit, re-entering the same direction at a
+    worse price is blocked for a cooldown. Returns {ts, pnl, exitPrice, closeType}.
+    """
+    sym = _normalize_symbol(symbol)
+    cutoff = int(time.time()) - int(max(0.0, within_minutes) * 60)
+    with self._lock:
+      data = self._prune(self._read())
+      decisions = data.get("decisions", [])
+    for d in sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True):
+      ts = d.get("ts") or 0
+      if ts < cutoff:
+        break  # sorted newest-first: nothing else is within the window
+      if d.get("symbol") != sym:
+        continue
+      if not MemoryStore._is_realized_close((d.get("action") or "").lower()):
+        continue
+      pnl = d.get("pnl")
+      if pnl is None:
+        continue
+      try:
+        if float(pnl) <= 0:
+          continue
+      except (TypeError, ValueError):
+        continue
+      return {"ts": ts, "pnl": float(pnl), "exitPrice": d.get("exitPrice"), "closeType": d.get("closeType")}
     return None
 
   def portfolio_heat(self, stop_distances: Dict[str, float], total_equity: float) -> float:

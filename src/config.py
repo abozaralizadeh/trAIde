@@ -85,6 +85,20 @@ class CircuitBreakerConfig:
 
 
 @dataclass
+class ProfitProtectionConfig:
+  """Code-driven profit guards enforced outside the LLM (see src/protection.py)."""
+  enabled: bool
+  dry_run: bool
+  breakeven_trigger_r: float
+  breakeven_fee_pct: float
+  giveback_pct: float
+  min_favorable_excursion_pct: float
+  no_chase_enabled: bool
+  post_win_cooldown_minutes: float
+  no_chase_buffer_pct: float
+
+
+@dataclass
 class TelegramConfig:
   enabled: bool
   bot_token: str
@@ -129,6 +143,7 @@ class AppConfig:
   kucoin_futures: KucoinFuturesConfig
   trading: TradingConfig
   circuit_breaker: CircuitBreakerConfig
+  profit_protection: ProfitProtectionConfig
   langsmith: LangsmithConfig
   telegram: TelegramConfig
   supervisor: SupervisorConfig
@@ -206,6 +221,17 @@ def load_config() -> AppConfig:
       max_consecutive_losses=int(os.getenv("CB_MAX_CONSECUTIVE_LOSSES", "3")),
       max_portfolio_heat_pct=float(os.getenv("CB_MAX_PORTFOLIO_HEAT_PCT", "20.0")),
       cooldown_minutes=float(os.getenv("CB_COOLDOWN_MINUTES", "120")),
+    ),
+    profit_protection=ProfitProtectionConfig(
+      enabled=_as_bool(os.getenv("PROFIT_LOCK_ENABLED"), True),
+      dry_run=_as_bool(os.getenv("PROFIT_LOCK_DRY_RUN"), False),
+      breakeven_trigger_r=float(os.getenv("PROFIT_LOCK_BREAKEVEN_TRIGGER_R", "1.0")),
+      breakeven_fee_pct=float(os.getenv("PROFIT_LOCK_BREAKEVEN_FEE_PCT", "0.0015")),
+      giveback_pct=float(os.getenv("PROFIT_LOCK_GIVEBACK_PCT", "0.35")),
+      min_favorable_excursion_pct=float(os.getenv("PROFIT_LOCK_MIN_FE_PCT", "0.005")),
+      no_chase_enabled=_as_bool(os.getenv("NO_CHASE_ENABLED"), True),
+      post_win_cooldown_minutes=float(os.getenv("POST_WIN_COOLDOWN_MINUTES", "45")),
+      no_chase_buffer_pct=float(os.getenv("NO_CHASE_BUFFER_PCT", "0.001")),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

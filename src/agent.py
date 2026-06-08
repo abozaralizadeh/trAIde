@@ -52,6 +52,7 @@ from .kucoin import (
   KucoinTicker,
 )
 from .memory import MemoryStore
+from .protection import should_block_chase
 from .utils import normalize_symbol as _normalize_symbol
 
 
@@ -732,6 +733,20 @@ def run_trading_agent(
         if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
           remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
           return {"rejected": True, "reason": f"Post-loss cooldown active for {symbol} ({remaining}min remaining)", "hint": "Prevents revenge trading after a stop-loss. Try a different symbol or wait for cooldown to expire."}
+
+    # No-chase after a win: don't re-buy a symbol at a worse price right after taking profit.
+    if (side or "").lower() == "buy" and cfg.profit_protection.no_chase_enabled:
+      win = memory.recent_win_close(symbol, cfg.profit_protection.post_win_cooldown_minutes)
+      ref_ticker = snapshot.tickers.get(symbol)
+      ref_px = float(ref_ticker.price) if ref_ticker else 0.0
+      if win and win.get("exitPrice") and ref_px > 0 and should_block_chase(
+        close_type=win.get("closeType") or "",
+        exit_price=float(win["exitPrice"]),
+        new_side=side,
+        new_price=ref_px,
+        buffer_pct=cfg.profit_protection.no_chase_buffer_pct,
+      ):
+        return {"rejected": True, "reason": f"No-chase: just took profit on {symbol} near {float(win['exitPrice']):.6g}; not re-buying at a worse price ({ref_px:.6g})", "hint": "You recently closed this in profit. Re-enter only on a genuine pullback (better than your exit) or after the post-win cooldown expires."}
 
     # Post-trade cooldown: minimum interval between trades on same symbol
     if (side or "").lower() == "buy" and cfg.trading.min_trade_interval_minutes > 0:
@@ -2020,6 +2035,20 @@ def run_trading_agent(
         if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
           remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
           return {"rejected": True, "reason": f"Post-loss cooldown active for {spot_symbol} ({remaining}min remaining)", "hint": "Prevents revenge trading after a stop-loss. Try a different symbol or wait for cooldown to expire."}
+
+    # No-chase after a win: don't re-enter the same direction at a worse price than a recent profit-take.
+    if is_entry and cfg.profit_protection.no_chase_enabled:
+      win = memory.recent_win_close(spot_symbol, cfg.profit_protection.post_win_cooldown_minutes)
+      ref_ticker = snapshot.tickers.get(spot_symbol)
+      ref_px = float(ref_ticker.price) if ref_ticker else 0.0
+      if win and win.get("exitPrice") and ref_px > 0 and should_block_chase(
+        close_type=win.get("closeType") or "",
+        exit_price=float(win["exitPrice"]),
+        new_side=side,
+        new_price=ref_px,
+        buffer_pct=cfg.profit_protection.no_chase_buffer_pct,
+      ):
+        return {"rejected": True, "reason": f"No-chase: just took profit on {spot_symbol} near {float(win['exitPrice']):.6g}; not re-entering {side} at a worse price ({ref_px:.6g})", "hint": "You recently closed this in profit. Re-enter only on a genuine pullback (better than your exit) or after the post-win cooldown expires."}
 
     # Post-trade cooldown: minimum interval between trades on same symbol
     if is_entry and cfg.trading.min_trade_interval_minutes > 0:
