@@ -718,12 +718,18 @@ class MemoryStore:
             unnecessary_losses.append(round(pnl_f - trough_f, 4))
     wins = [p for p in realized if p > 0]
     losses = [p for p in realized if p < 0]
+    breakeven = [p for p in realized if p == 0]
     total = sum(realized)
-    wr = len(wins) / len(realized) if realized else 0.0
+    # Win rate is over decided closes only — break-even (pnl == 0) trades are neither wins nor
+    # losses, so counting them in the denominator understates the rate. closedWithPnl keeps its
+    # original meaning (every realized close, break-evens included) for the trading loop.
+    decided = len(wins) + len(losses)
+    wr = len(wins) / decided if decided else 0.0
     stats: Dict[str, Any] = {
       "closedWithPnl": len(realized),
       "wins": len(wins),
       "losses": len(losses),
+      "breakeven": len(breakeven),
       "winRate": round(wr, 3),
       "totalRealizedPnl": round(total, 4),
       "avgWin": round(sum(wins) / len(wins), 4) if wins else 0.0,

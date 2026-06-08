@@ -160,6 +160,11 @@ class DashboardPublisher:
       payload = self._build_payload(memory, snapshot, last_prices or {}, cfg)
       self._write_tables(payload)
       series = self._read_equity_series()
+      # The equity table is the durable record, but a concurrent publisher (or read-after-write
+      # skew) can leave today's row stale relative to the equityToday we just computed in this
+      # payload. equityToday is the authoritative latest point, so splice it over today's slot to
+      # keep the blob's equityPoints + rollups internally consistent with the headline drawdownPct.
+      series = self._merge_today_point(series, payload.get("equityToday"))
       payload["equityPoints"] = series[-90:]
       self._write_blobs(payload, series)
       self._last_publish_ts = now
@@ -218,7 +223,7 @@ class DashboardPublisher:
     def block(b: Any) -> Dict[str, Any]:
       if not isinstance(b, dict):
         return {}
-      out = {k: b.get(k) for k in ("closedWithPnl", "wins", "losses", "winRate", "totalTrades") if k in b}
+      out = {k: b.get(k) for k in ("closedWithPnl", "wins", "losses", "breakeven", "winRate", "totalTrades") if k in b}
       if allow:
         for k in ("totalRealizedPnl", "avgWin", "avgLoss", "bestTrade", "worstTrade"):
           if k in b:
@@ -229,6 +234,18 @@ class DashboardPublisher:
     for venue in ("spot", "futures"):
       vb = perf.get(venue) or {}
       top[venue] = {**block(vb), "live": block(vb.get("live", {})), "paper": block(vb.get("paper", {}))}
+
+    # Reconcile the public headline counts with the spot+futures breakdown shown on the page. The
+    # raw overall classifies closes by action prefix, so a venue-less advisory close (e.g.
+    # "close/stand-aside") lands in the overall but in no venue block — leaving wins/closedWithPnl
+    # that don't sum to spot+futures. Recompute the headline from the venues so the dashboard is
+    # internally consistent. totalTrades stays the true overall count.
+    sw = (top["spot"].get("wins") or 0) + (top["futures"].get("wins") or 0)
+    sl = (top["spot"].get("losses") or 0) + (top["futures"].get("losses") or 0)
+    sb = (top["spot"].get("breakeven") or 0) + (top["futures"].get("breakeven") or 0)
+    top["wins"], top["losses"], top["breakeven"] = sw, sl, sb
+    top["closedWithPnl"] = sw + sl + sb
+    top["winRate"] = round(sw / (sw + sl), 3) if (sw + sl) else 0.0
     return top
 
   @staticmethod
@@ -488,6 +505,27 @@ class DashboardPublisher:
       return series
     except Exception:
       return []
+
+  @staticmethod
+  def _merge_today_point(series: List[Dict[str, Any]], today_point: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return `series` (ascending by day) with today's slot replaced by the authoritative
+    `today_point`. The durable table can lag the freshly-computed equityToday under concurrent
+    publishes; this guarantees equityPoints[-1] == equityToday so the blob never contradicts the
+    headline drawdown. No-op when today_point is missing or has no indexClose."""
+    if not today_point or today_point.get("indexClose") is None or today_point.get("day") is None:
+      return series
+    day = int(today_point["day"])
+    point: Dict[str, Any] = {
+      "day": day,
+      "indexClose": _f(today_point.get("indexClose")),
+      "drawdownPct": _f(today_point.get("drawdownPct")) or 0.0,
+    }
+    if "dayRealizedPnl" in today_point:
+      point["dayRealizedPnl"] = _f(today_point.get("dayRealizedPnl"))
+    merged = [p for p in series if p.get("day") != day]
+    merged.append(point)
+    merged.sort(key=lambda p: p["day"])
+    return merged
 
   # ----- writers -----------------------------------------------------------
 
