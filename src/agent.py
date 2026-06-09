@@ -53,6 +53,7 @@ from .kucoin import (
 )
 from .memory import MemoryStore
 from .protection import should_block_chase
+from .regime import allow_trend_aligned_short, effective_min_confidence, regime_size_factor
 from .utils import normalize_symbol as _normalize_symbol
 
 
@@ -2072,8 +2073,15 @@ def run_trading_agent(
           (daily_bias_raw == "bearish" and side_lower == "sell")
         )
         if is_continuation:
-          logger.warning("ANTI-FOMO BLOCK: %s %s rejected — daily %s exhausted (RSI extreme)", side, spot_symbol, daily_bias_raw)
-          return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend with a clear reversal signal."}
+          if allow_trend_aligned_short(
+            daily_exhausted=daily_exhausted, daily_bias_raw=daily_bias_raw, side=side_lower,
+            bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
+            confidence=confidence, cfg=cfg.regime,
+          ):
+            logger.info("TREND-SHORT ALLOWED: %s %s — exhausted-bearish daily but 1h/15m confirm downtrend resumption (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+          else:
+            logger.warning("ANTI-FOMO BLOCK: %s %s rejected — daily %s exhausted (RSI extreme)", side, spot_symbol, daily_bias_raw)
+            return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend with a clear reversal signal."}
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
@@ -2113,9 +2121,16 @@ def run_trading_agent(
         _atr_scale_fm = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: futures %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fm * 100)
 
-    # Confidence enforcement: reject entries below minimum confidence
-    if is_entry and confidence is not None and confidence < cfg.trading.min_confidence:
-      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}", "hint": "Only enter trades with sufficient conviction. Analyze another coin or wait for a better setup."}
+    # Regime throttle (B): shrink size + raise the confidence bar in a hostile (bearish/exhausted) daily.
+    _g_fm = _daily_gate_state.get(spot_symbol, {})
+    if is_entry:
+      _atr_scale_fm = max(0.30, _atr_scale_fm * regime_size_factor(_g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime))
+
+    # Confidence enforcement: reject entries below the (regime-adjusted) minimum confidence
+    if is_entry and confidence is not None:
+      _eff_min_fm = effective_min_confidence(cfg.trading.min_confidence, _g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime)
+      if confidence < _eff_min_fm:
+        return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fm:.2f}", "hint": "Only enter with sufficient conviction; the bar is raised in a bearish/exhausted regime. Analyze another coin or wait for a better setup."}
 
     # Anti-stacking: block add-on entries when existing position is losing
     if is_entry and snapshot.futures_positions:
@@ -2739,8 +2754,15 @@ def run_trading_agent(
           (daily_bias_raw == "bearish" and side_lower == "sell")
         )
         if is_continuation:
-          logger.warning("ANTI-FOMO BLOCK: futures limit %s %s rejected — daily %s exhausted", side_lower, spot_symbol, daily_bias_raw)
-          return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend."}
+          if allow_trend_aligned_short(
+            daily_exhausted=daily_exhausted, daily_bias_raw=daily_bias_raw, side=side_lower,
+            bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
+            confidence=confidence, cfg=cfg.regime,
+          ):
+            logger.info("TREND-SHORT ALLOWED: futures limit %s %s — exhausted-bearish daily but 1h/15m confirm downtrend resumption (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+          else:
+            logger.warning("ANTI-FOMO BLOCK: futures limit %s %s rejected — daily %s exhausted", side_lower, spot_symbol, daily_bias_raw)
+            return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend."}
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
@@ -2775,8 +2797,14 @@ def run_trading_agent(
         _atr_scale_fl = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fl * 100)
 
-    if confidence is not None and confidence < cfg.trading.min_confidence:
-      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
+    # Regime throttle (B): shrink size + raise the confidence bar in a hostile (bearish/exhausted) daily.
+    _g_fl = _daily_gate_state.get(spot_symbol, {})
+    _atr_scale_fl = max(0.30, _atr_scale_fl * regime_size_factor(_g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime))
+
+    if confidence is not None:
+      _eff_min_fl = effective_min_confidence(cfg.trading.min_confidence, _g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)
+      if confidence < _eff_min_fl:
+        return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fl:.2f}"}
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:

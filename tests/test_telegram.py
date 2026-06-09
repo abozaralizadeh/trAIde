@@ -5,7 +5,7 @@ import pytest
 
 from src.config import (
   AppConfig, AzureConfig, ApimConfig, KucoinConfig, KucoinFuturesConfig,
-  TradingConfig, CircuitBreakerConfig, ProfitProtectionConfig, LangsmithConfig,
+  TradingConfig, CircuitBreakerConfig, ProfitProtectionConfig, RegimeConfig, LangsmithConfig,
   TelegramConfig, SupervisorConfig, DashboardConfig,
 )
 from src.telegram import TelegramNotifier, _esc, _fmt_price, _format_orders, _split_message, MAX_MESSAGE_LENGTH
@@ -51,6 +51,7 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     trading=TradingConfig(**trading_kwargs),
     circuit_breaker=CircuitBreakerConfig(max_daily_drawdown_pct=8.0, max_consecutive_losses=4, max_portfolio_heat_pct=20.0, cooldown_minutes=120.0),
     profit_protection=ProfitProtectionConfig(enabled=True, dry_run=False, breakeven_trigger_r=1.0, breakeven_fee_pct=0.0015, giveback_pct=0.35, min_favorable_excursion_pct=0.005, no_chase_enabled=True, post_win_cooldown_minutes=45.0, no_chase_buffer_pct=0.001),
+    regime=RegimeConfig(throttle_enabled=True, caution_min_confidence=0.75, caution_size_factor=0.6, trend_shorts_enabled=True, trend_short_min_confidence=0.78, trend_short_require_15m=True),
     langsmith=LangsmithConfig(enabled=False, api_key=None, project=None, api_url=None, tracing=False),
     telegram=TelegramConfig(enabled=telegram_enabled, bot_token=bot_token, chat_id=chat_id, silent=silent),
     supervisor=SupervisorConfig(enabled=False, log_file="traide.log", log_max_bytes=5242880, log_backup_count=3),

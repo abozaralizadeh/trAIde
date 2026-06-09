@@ -185,6 +185,39 @@ def _fetch_fees(kucoin: KucoinClient) -> dict:
   return {}
 
 
+def _live_extremes_map(snapshot) -> Dict[str, dict]:
+  """Active-position map from live exchange truth (futures) for peak/trough PnL tracking.
+
+  Driving `update_position_extremes` off live positions makes a symbol's extremes reset when its
+  position actually closes — instead of lingering forever on a memory-reconstructed phantom long
+  (futures triggered-closes are logged as decisions, not written to the trades ledger, so the
+  ledger only ever accumulates buys). Futures-only: the bot trades futures exclusively; add spot
+  positions here if spot trading resumes.
+  """
+  out: Dict[str, dict] = {}
+  for p in getattr(snapshot, "futures_positions", None) or []:
+    if not isinstance(p, dict):
+      continue
+    try:
+      qty = float(p.get("currentQty") or 0)
+    except (TypeError, ValueError):
+      continue
+    if not qty:
+      continue
+    sym = normalize_symbol(p.get("symbol") or "")
+    if not sym:
+      continue
+    upnl = p.get("unrealisedPnl")
+    if upnl is None:
+      upnl = p.get("unrealizedPnl")
+    try:
+      upnl = float(upnl) if upnl is not None else None
+    except (TypeError, ValueError):
+      upnl = None
+    out[sym] = {"netSize": qty, "unrealizedPnl": upnl}
+  return out
+
+
 def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
   raw_coins = _load_active_coins(cfg, memory)
   coins, tickers = _fetch_tickers(cfg, kucoin, raw_coins, memory)
@@ -360,8 +393,8 @@ async def trading_loop() -> None:
       last_prices[symbol] = price
 
     try:
-      current_positions = memory.positions(last_prices)
-      memory.update_position_extremes(current_positions)
+      # Drive extremes off live exchange positions so peak/trough reset when a position closes.
+      memory.update_position_extremes(_live_extremes_map(snapshot))
     except Exception as exc:
       logger.warning("Failed to update position extremes: %s", exc)
 

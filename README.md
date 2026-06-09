@@ -104,7 +104,7 @@ sequenceDiagram
 
 ### Entry decision & risk gates
 
-Every proposed entry runs a fixed gauntlet of code-enforced gates before any order reaches the exchange. Position management (manage / hold / protect / close) bypasses the entry gates.
+Every proposed entry runs a fixed gauntlet of code-enforced gates before any order reaches the exchange. Position management (manage / hold / protect / close) bypasses the entry gates. In a hostile (bearish / RSI-exhausted) regime the confidence bar is raised and size shrunk, and a confirmed trend-aligned short can pass the anti-FOMO gate.
 
 ```mermaid
 flowchart TD
@@ -121,7 +121,7 @@ flowchart TD
     dg -->|ok| vol{"Volatility gate<br/>(ATR + 24h range)"}
     vol -->|hard block| reject
     vol -->|soft| scale["Scale size down<br/>(quadratic)"]
-    vol -->|ok| conf{"Confidence &ge; MIN_CONFIDENCE<br/>and net profit after fees?"}
+    vol -->|ok| conf{"Confidence &ge; regime-adjusted MIN_CONFIDENCE<br/>and net profit after fees?"}
     scale --> conf
     conf -->|no| reject
     conf -->|yes| exec["Place order +<br/>mandatory TP/SL bracket"]
@@ -193,7 +193,9 @@ flowchart LR
 - **Post-loss cooldown**: Blocks new entries on a symbol for a configurable period after a loss
 - **Profit-lock (breakeven ratchet + give-back cap)**: Enforced in code every poll, independent of the LLM (`src/protection.py`). Once a position's favorable excursion reaches `PROFIT_LOCK_BREAKEVEN_TRIGGER_R`× its initial risk, the stop is ratcheted to a fee-adjusted breakeven so the trade can no longer turn into a loss. If price then gives back ≥ `PROFIT_LOCK_GIVEBACK_PCT` of its peak run, the position is market-closed (reduce-only) to lock the remaining gain. Stops a profitable trade from round-tripping into a loss when the agent fails to tighten protection itself. Set `PROFIT_LOCK_DRY_RUN=true` to log intended actions without placing orders.
 - **No-chase after a win**: Blocks re-entering the *same direction* at a *worse* price than a recent winning exit (within `POST_WIN_COOLDOWN_MINUTES`). Stops the "take profit, then immediately re-buy the top" pattern; a genuine pullback (better price than the exit) is still allowed.
-- **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed.
+- **Regime throttle**: In a hostile regime (bearish or RSI-exhausted daily) the confidence bar is raised (`REGIME_CAUTION_MIN_CONFIDENCE`) and position size shrunk (`REGIME_CAUTION_SIZE_FACTOR`), so the bot trades less and more selectively instead of churning low-conviction bounce-scalps in a downtrend.
+- **Trend-aligned shorts**: In a confirmed downtrend the anti-FOMO gate would otherwise force the bot to only ever long oversold bounces. With `TREND_ALIGNED_SHORTS_ENABLED`, a short into an exhausted-bearish daily is permitted **when 1h and 15m both confirm** the downtrend is resuming and confidence clears a higher bar (`TREND_SHORT_MIN_CONFIDENCE`) — letting the bot trade *with* the trend, not only against bounces.
+- **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed, and a confirmed trend-aligned short can be re-permitted (see above).
 - **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
 - **Volatility soft-gate**: Above `MAX_ATR_PCT_FOR_ENTRY`, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× the threshold, the entry is hard-blocked.
 - **Squeeze-breakout signal**: Structured `squeeze_breakout` field (`long` / `short` / `None`) surfaced in `analyze_market_context`. Fires only on the fresh transition out of a 1h Bollinger squeeze (BBW expanding ≥25% off the floor, ADX>20, price beyond BB band, RSI confirming). Takes the asymmetric upside after coiled-volatility periods; volume ≥1.5× 20-candle average is required confirmation. Anti-FOMO block still wins if daily is exhausted in the same direction.
@@ -260,10 +262,10 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 |----------|---------|-------------|
 | `PAPER_TRADING` | `true` | Simulate orders without real execution |
 | `MAX_POSITION_USD` | `500` | Maximum spend per trade |
-| `RISK_PER_TRADE_PCT` | `0.10` | Risk per trade as fraction of equity (10%) |
+| `RISK_PER_TRADE_PCT` | `0.02` | Risk per trade as fraction of equity (2%). Best-practice survival rule is 1–2%; high-frequency bots lean to the low end |
 | `MIN_CONFIDENCE` | `0.65` | Minimum confidence score (0-1) to place a trade |
 | `MAX_LEVERAGE` | `3` | Maximum futures leverage (1-125) |
-| `MAX_TRADES_PER_SYMBOL_PER_DAY` | `10` | Daily trade cap per symbol |
+| `MAX_TRADES_PER_SYMBOL_PER_DAY` | `6` | Daily trade cap per symbol (curbs fee churn and loss streaks) |
 | `MIN_NET_PROFIT_USD` | `0.50` | Minimum net profit target after fees |
 | `MIN_PROFIT_ROI_PCT` | `0.008` | Minimum ROI target (0.8%) after fees |
 | `ESTIMATED_SLIPPAGE_PCT` | `0.001` | Estimated slippage (0.1%) for profit calculations |
@@ -285,15 +287,15 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `MAX_ATR_PCT_FOR_ENTRY` | `6` | Soft volatility gate: above this daily ATR %, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× this value (9% default), entry is hard-blocked. |
 | `MAX_24H_VOLATILITY_PCT` | `25` | Hard block when 24h price range exceeds this % (separate from ATR gate) |
 | `POST_LOSS_COOLDOWN_MINUTES` | `30` | Block new entries on a symbol after a loss |
-| `MIN_TRADE_INTERVAL_MINUTES` | `5` | Minimum interval between trades on the same symbol (anti-overtrading) |
+| `MIN_TRADE_INTERVAL_MINUTES` | `10` | Minimum interval between trades on the same symbol (anti-overtrading) |
 
 ### Circuit Breakers
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CB_MAX_DAILY_DRAWDOWN_PCT` | `10.0` | Restrict trading when daily drawdown exceeds this % |
+| `CB_MAX_DAILY_DRAWDOWN_PCT` | `5.0` | Restrict trading when daily drawdown exceeds this % (daily loss limit ≈ 2–3× per-trade risk) |
 | `CB_MAX_CONSECUTIVE_LOSSES` | `3` | Restrict trading after N consecutive losses |
-| `CB_MAX_PORTFOLIO_HEAT_PCT` | `20.0` | Maximum total capital at risk % |
+| `CB_MAX_PORTFOLIO_HEAT_PCT` | `6.0` | Maximum total capital at risk % across open positions (the "6% rule") |
 | `CB_COOLDOWN_MINUTES` | `120` | Cooldown duration after consecutive loss trigger |
 
 When a circuit breaker fires, the agent enters close-only mode: it can adjust stops, close positions, and manage risk, but cannot open new positions. A Telegram notification is sent.
@@ -315,6 +317,19 @@ Code-driven guards enforced outside the LLM (`src/protection.py`). They run ever
 | `NO_CHASE_BUFFER_PCT` | `0.001` | Tolerance band around the prior exit price |
 
 Every automatic action (stop moved to breakeven, position closed, or a dry-run preview) is logged and sent as a Telegram alert.
+
+### Regime-Aware Entries
+
+Code-enforced entry adjustments that work alongside the daily gate (`src/regime.py`): be more selective in hostile regimes, and trade *with* a confirmed downtrend instead of only longing bounces.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `REGIME_THROTTLE_ENABLED` | `true` | Raise the confidence bar + shrink size in a hostile (bearish / RSI-exhausted) daily |
+| `REGIME_CAUTION_MIN_CONFIDENCE` | `0.75` | Elevated confidence floor in a hostile regime (base is `MIN_CONFIDENCE`) |
+| `REGIME_CAUTION_SIZE_FACTOR` | `0.6` | Position-size multiplier applied in a hostile regime |
+| `TREND_ALIGNED_SHORTS_ENABLED` | `true` | Permit a trend-aligned short past the anti-FOMO gate in an exhausted-bearish daily |
+| `TREND_SHORT_MIN_CONFIDENCE` | `0.78` | Higher confidence bar specifically for a counter-bounce short |
+| `TREND_SHORT_REQUIRE_15M` | `true` | Require 15m (not just 1h) bearish confirmation before allowing the short |
 
 ### Loop & Polling
 

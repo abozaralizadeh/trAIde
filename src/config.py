@@ -99,6 +99,17 @@ class ProfitProtectionConfig:
 
 
 @dataclass
+class RegimeConfig:
+  """Regime-aware entry throttle + trend-aligned shorts (see src/regime.py)."""
+  throttle_enabled: bool            # raise confidence bar + shrink size in a hostile regime
+  caution_min_confidence: float     # elevated confidence floor when daily is bearish/exhausted
+  caution_size_factor: float        # position-size multiplier in a hostile regime
+  trend_shorts_enabled: bool        # permit trend-aligned shorts past the anti-FOMO gate
+  trend_short_min_confidence: float # confidence bar specifically for a counter-bounce short
+  trend_short_require_15m: bool     # require 15m (not just 1h) bearish confirmation for the short
+
+
+@dataclass
 class TelegramConfig:
   enabled: bool
   bot_token: str
@@ -144,6 +155,7 @@ class AppConfig:
   trading: TradingConfig
   circuit_breaker: CircuitBreakerConfig
   profit_protection: ProfitProtectionConfig
+  regime: RegimeConfig
   langsmith: LangsmithConfig
   telegram: TelegramConfig
   supervisor: SupervisorConfig
@@ -190,7 +202,7 @@ def load_config() -> AppConfig:
       flexible_coins_enabled=_as_bool(os.getenv("FLEXIBLE_COINS_ENABLED"), True),
       paper_trading=_as_bool(os.getenv("PAPER_TRADING"), True),
       max_position_usd=float(os.getenv("MAX_POSITION_USD", "500")),
-      risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.10")),
+      risk_per_trade_pct=float(os.getenv("RISK_PER_TRADE_PCT", "0.02")),
       min_confidence=float(os.getenv("MIN_CONFIDENCE", "0.65")),
       sentiment_filter_enabled=_as_bool(os.getenv("SENTIMENT_FILTER_ENABLED"), False),
       sentiment_min_score=float(os.getenv("SENTIMENT_MIN_SCORE", "0.55")),
@@ -198,7 +210,7 @@ def load_config() -> AppConfig:
       price_change_trigger_pct=float(os.getenv("PRICE_CHANGE_TRIGGER_PCT", "0.5")),
       max_idle_polls=int(os.getenv("MAX_IDLE_POLLS", "10")),
       max_leverage=float(os.getenv("MAX_LEVERAGE", "3")),
-      max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "10")),
+      max_trades_per_symbol_per_day=int(os.getenv("MAX_TRADES_PER_SYMBOL_PER_DAY", "6")),
       min_net_profit_usd=float(os.getenv("MIN_NET_PROFIT_USD", "0.5")),
       min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.008")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.001")),
@@ -210,16 +222,16 @@ def load_config() -> AppConfig:
       limit_order_timeout_sec=float(os.getenv("LIMIT_ORDER_TIMEOUT_SEC", "20")),
       post_loss_cooldown_minutes=float(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "30")),
       max_entry_leverage=float(os.getenv("MAX_ENTRY_LEVERAGE", "3")),
-      min_trade_interval_minutes=float(os.getenv("MIN_TRADE_INTERVAL_MINUTES", "5")),
+      min_trade_interval_minutes=float(os.getenv("MIN_TRADE_INTERVAL_MINUTES", "10")),
       max_24h_volatility_pct=float(os.getenv("MAX_24H_VOLATILITY_PCT", "25")),
       max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "6")),
       entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
       min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
     ),
     circuit_breaker=CircuitBreakerConfig(
-      max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "10.0")),
+      max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),
       max_consecutive_losses=int(os.getenv("CB_MAX_CONSECUTIVE_LOSSES", "3")),
-      max_portfolio_heat_pct=float(os.getenv("CB_MAX_PORTFOLIO_HEAT_PCT", "20.0")),
+      max_portfolio_heat_pct=float(os.getenv("CB_MAX_PORTFOLIO_HEAT_PCT", "6.0")),
       cooldown_minutes=float(os.getenv("CB_COOLDOWN_MINUTES", "120")),
     ),
     profit_protection=ProfitProtectionConfig(
@@ -232,6 +244,14 @@ def load_config() -> AppConfig:
       no_chase_enabled=_as_bool(os.getenv("NO_CHASE_ENABLED"), True),
       post_win_cooldown_minutes=float(os.getenv("POST_WIN_COOLDOWN_MINUTES", "45")),
       no_chase_buffer_pct=float(os.getenv("NO_CHASE_BUFFER_PCT", "0.001")),
+    ),
+    regime=RegimeConfig(
+      throttle_enabled=_as_bool(os.getenv("REGIME_THROTTLE_ENABLED"), True),
+      caution_min_confidence=float(os.getenv("REGIME_CAUTION_MIN_CONFIDENCE", "0.75")),
+      caution_size_factor=float(os.getenv("REGIME_CAUTION_SIZE_FACTOR", "0.6")),
+      trend_shorts_enabled=_as_bool(os.getenv("TREND_ALIGNED_SHORTS_ENABLED"), True),
+      trend_short_min_confidence=float(os.getenv("TREND_SHORT_MIN_CONFIDENCE", "0.78")),
+      trend_short_require_15m=_as_bool(os.getenv("TREND_SHORT_REQUIRE_15M"), True),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),
