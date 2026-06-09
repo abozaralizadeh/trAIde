@@ -55,6 +55,7 @@ MAX_TABLE_PROPERTY_CHARS = 30000
 PK_EQUITY = "equity"      # durable daily index series  (RowKey = {day:08d})
 PK_DECISION = "decision"  # append-only decision feed   (RowKey = {ts:010d}-{symbol})
 PK_TRADE = "trade"        # append-only closed outcomes (RowKey = {day:08d}-{ts}-{symbol}-{action})
+PK_PLAN = "plan"          # durable research-plan log    (RowKey = {ts:010d}-{title})
 PK_META = "meta"          # singleton state             (RowKey = "state")
 
 _BAD_KEY_CHARS = re.compile(r"[\\/#?]")
@@ -619,6 +620,22 @@ class DashboardPublisher:
       tc.upsert_entity(
         entity={"PartitionKey": PK_TRADE, "RowKey": rk, "ts": int(ts),
                 "data": json.dumps(d)[:MAX_TABLE_PROPERTY_CHARS]},
+        mode=UpdateMode.MERGE,
+      )
+
+    # Research plans: the local store hard-caps at MAX_PLANS (3), so without durable accumulation
+    # the dashboard could only ever show the last three. Write each published plan to its own
+    # partition (idempotent by ts+title) before the cap evicts it — the same way equity/trades
+    # survive the local prune — so the dashboard can show several days of research history.
+    for p in (payload.get("research") or {}).get("plans", []):
+      ts = p.get("ts")
+      if ts is None:
+        continue
+      day = int(int(ts) // 86400)
+      rk = f"{int(ts):010d}-{_safe_key((p.get('title') or '')[:24])}"
+      tc.upsert_entity(
+        entity={"PartitionKey": PK_PLAN, "RowKey": rk, "ts": int(ts), "day": day,
+                "data": json.dumps(p)[:MAX_TABLE_PROPERTY_CHARS]},
         mode=UpdateMode.MERGE,
       )
 
