@@ -218,6 +218,23 @@ def _live_extremes_map(snapshot) -> Dict[str, dict]:
   return out
 
 
+def _agent_made_a_move(result: Dict) -> bool:
+  """True if the agent placed any order this run (entry, close, or protective stop).
+
+  Used to detect the 'stuck declining' state: when the agent makes no move for several
+  consecutive runs, the loop forces a Research Agent handoff to refresh the coin universe.
+  Pure declines/rejections and bare fund transfers do NOT count as a move.
+  """
+  for out in result.get("tool_results") or []:
+    if not isinstance(out, dict):
+      continue
+    if out.get("rejected") or out.get("skipped") or out.get("error"):
+      continue
+    if out.get("orderId") or out.get("orderRequest"):
+      return True
+  return False
+
+
 def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
   raw_coins = _load_active_coins(cfg, memory)
   coins, tickers = _fetch_tickers(cfg, kucoin, raw_coins, memory)
@@ -304,6 +321,8 @@ async def trading_loop() -> None:
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
   last_prices: Dict[str, float] = {}
   idle_polls = 0
+  consecutive_no_trade_runs = 0  # runs where the agent placed no order (drives forced research)
+  force_research = False         # when True, next agent run must hand off to Research first
   logged_closed_position_ids: set[str] = set()
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   notifier = TelegramNotifier(cfg)
@@ -493,11 +512,31 @@ async def trading_loop() -> None:
         result = await asyncio.to_thread(
           run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client,
           recent_fills=recent_fills if new_events_count else None,
+          force_research=force_research,
         )
         logger.info("--- Agent Decision Narrative ---\n%s", result["narrative"])
         if result.get("decisions"):
           logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
         notifier.notify_agent_run(triggers or ["idle_threshold"], result)
+
+        # Stuck-state detection: when the agent makes no move for several consecutive runs,
+        # force a Research Agent handoff next run to refresh the coin universe. Forcing resets
+        # the counter so research is re-triggered only after another `threshold` quiet runs
+        # (rate-limits the costly web research instead of firing every poll).
+        threshold = cfg.trading.research_handoff_after_no_trade_runs
+        if force_research:
+          consecutive_no_trade_runs = 0
+          force_research = False
+        elif _agent_made_a_move(result):
+          consecutive_no_trade_runs = 0
+        else:
+          consecutive_no_trade_runs += 1
+        if threshold > 0 and consecutive_no_trade_runs >= threshold:
+          force_research = True
+          logger.info(
+            "No trade for %d consecutive runs — forcing Research Agent handoff next run.",
+            consecutive_no_trade_runs,
+          )
       except Exception as exc:
         # Keep the loop alive across restarts and transient errors.
         logger.error("Agent run failed: %s", exc)

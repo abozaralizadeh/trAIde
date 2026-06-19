@@ -210,6 +210,10 @@ class DashboardPublisher:
         "plans": self._sanitize_plans(plans),
         "triggers": self._sanitize_triggers(triggers),
         "sentiments": self._sanitize_sentiments(sentiments),
+        "handoffs": [
+          self._sanitize_decision(d) for d in decisions
+          if (d.get("action") or "").startswith("handoff")
+        ],
       },
     }
 
@@ -399,15 +403,24 @@ class DashboardPublisher:
     return nearest(tps), nearest(sls)
 
   def _sanitize_decision(self, d: Dict[str, Any]) -> Dict[str, Any]:
+    action = d.get("action") or ""
     out: Dict[str, Any] = {
       "symbol": d.get("symbol"),
-      "action": d.get("action"),
+      "action": action,
       "confidence": _round(d.get("confidence"), 4),
       "reason": (d.get("reason") or "")[:500],
       "paper": bool(d.get("paper")),
       "ts": d.get("ts"),
       "day": d.get("day"),
     }
+    # Attribute each feed item to an agent and flag handoffs so the dashboard can show when the
+    # baton passed to the Research Agent instead of rendering only Trading Agent decisions.
+    if action.startswith("handoff"):
+      out["isHandoff"] = True
+      out["agent"] = "research" if "research" in action else "trading"
+      out["handoffTo"] = "research" if "research" in action else "trading"
+    else:
+      out["agent"] = "trading"
     pnl = d.get("pnl")
     if pnl is not None:
       # The WIN/LOSS outcome is safe to reveal (win rate is already public); the $ amount is not.

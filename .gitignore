@@ -187,3 +187,4 @@ cython_debug/
 .cursorindexingignore
 .agent_memory.json
 .env.local
+.claude

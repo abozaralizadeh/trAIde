@@ -33,6 +33,7 @@ def _make_valid_config(**overrides) -> AppConfig:
         max_atr_pct_for_entry=5.0,
         entry_limit_expiry_minutes=30.0,
         min_entry_deviation_pct=0.002,
+        research_handoff_after_no_trade_runs=3,
     )
     trading_kwargs.update(overrides)
     return AppConfig(

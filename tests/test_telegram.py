@@ -8,7 +8,10 @@ from src.config import (
   TradingConfig, CircuitBreakerConfig, ProfitProtectionConfig, RegimeConfig, LangsmithConfig,
   TelegramConfig, SupervisorConfig, DashboardConfig,
 )
-from src.telegram import TelegramNotifier, _esc, _fmt_price, _format_orders, _split_message, MAX_MESSAGE_LENGTH
+from src.telegram import (
+  TelegramNotifier, _esc, _fmt_price, _format_orders, _split_message, _strip_tags,
+  markdown_to_telegram_html, MAX_MESSAGE_LENGTH,
+)
 
 
 def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=False, **overrides) -> AppConfig:
@@ -42,6 +45,7 @@ def _make_cfg(telegram_enabled=False, bot_token="tok123", chat_id="456", silent=
     max_atr_pct_for_entry=5.0,
     entry_limit_expiry_minutes=30.0,
     min_entry_deviation_pct=0.002,
+    research_handoff_after_no_trade_runs=3,
   )
   return AppConfig(
     azure=AzureConfig(endpoint="https://x.openai.azure.com/", deployment="gpt-5.2", api_version="2024-10-01-preview", api_key="key"),
@@ -169,6 +173,54 @@ class TestFormatOrders:
     assert len(msgs) == 0
 
 
+class TestMarkdownToTelegramHtml:
+  def test_bold_and_italic(self):
+    assert markdown_to_telegram_html("**big** and *small*") == "<b>big</b> and <i>small</i>"
+
+  def test_underscore_bold_and_strike(self):
+    assert markdown_to_telegram_html("__b__ ~~gone~~") == "<b>b</b> <s>gone</s>"
+
+  def test_heading_becomes_bold_line(self):
+    assert markdown_to_telegram_html("## STEP 3 — Trade") == "<b>STEP 3 — Trade</b>"
+
+  def test_bullets_become_dots(self):
+    out = markdown_to_telegram_html("- one\n- two")
+    assert out == "• one\n• two"
+
+  def test_inline_code(self):
+    assert markdown_to_telegram_html("set TP at `68,800`") == "set TP at <code>68,800</code>"
+
+  def test_html_special_chars_escaped(self):
+    # RSI <20 & >80 must be escaped so Telegram does not choke on the entities.
+    out = markdown_to_telegram_html("RSI <20 & >80")
+    assert out == "RSI &lt;20 &amp; &gt;80"
+
+  def test_snake_case_not_italicized(self):
+    # Tool names with underscores must survive untouched (a common false-italic trap).
+    assert markdown_to_telegram_html("call place_market_order now") == "call place_market_order now"
+
+  def test_arithmetic_asterisks_untouched(self):
+    assert markdown_to_telegram_html("5*3=15 and a*b*c") == "5*3=15 and a*b*c"
+
+  def test_link_conversion(self):
+    out = markdown_to_telegram_html("see [CoinDesk](https://x.io/a)")
+    assert out == 'see <a href="https://x.io/a">CoinDesk</a>'
+
+  def test_code_fence_no_newline_spanning_tag(self):
+    # Each code line is wrapped on its own so message-splitting can never break a tag.
+    out = markdown_to_telegram_html("```\nfoo()\nbar()\n```")
+    assert out == "<code>foo()</code>\n<code>bar()</code>"
+
+  def test_empty(self):
+    assert markdown_to_telegram_html("") == ""
+
+  def test_strip_tags_roundtrip(self):
+    html = markdown_to_telegram_html("## Title\n**bold** with `code` and RSI <20")
+    plain = _strip_tags(html)
+    assert "<" not in plain.replace("<20", "X")  # only the literal <20 remains, no tags
+    assert "Title" in plain and "bold" in plain and "code" in plain
+
+
 class TestNotifierMessages:
   def test_notify_startup_format(self):
     cfg = _make_cfg(telegram_enabled=False)
@@ -211,6 +263,37 @@ class TestNotifierMessages:
     assert "price_move" in msg
     assert "Decisions" in msg
     assert "Narrative" in msg
+
+  def test_notify_agent_run_renders_handoffs_and_research(self):
+    cfg = _make_cfg(telegram_enabled=False)
+    notifier = TelegramNotifier(cfg)
+    notifier.enabled = True
+    messages = []
+    notifier.send = lambda text: messages.append(text)
+
+    result = {
+      "narrative": "## Summary\n**Refreshed** the coin list and entered ETH.",
+      "decisions": ["live order: long ETH-USDT (orderId=z9)"],
+      "tool_results": [],
+      "handoffs": [
+        {"from": "Trading Agent", "to": "Research Agent"},
+        {"from": "Research Agent", "to": "Trading Agent"},
+      ],
+      "research": ["added coin AVAX-USDT — fresh breakout", "removed coin DOGE-USDT — no catalyst"],
+      "agentsUsed": ["Research Agent", "Trading Agent"],
+    }
+    notifier.notify_agent_run(["idle_threshold"], result)
+    assert len(messages) == 1
+    msg = messages[0]
+    assert "Handoffs" in msg
+    assert "Trading Agent → Research Agent" in msg
+    assert "Research Agent" in msg
+    assert "AVAX-USDT" in msg
+    assert "removed coin DOGE-USDT" in msg
+    # The markdown narrative is converted to HTML, not shown with literal ## / **.
+    assert "<b>Summary</b>" in msg
+    assert "<b>Refreshed</b>" in msg
+    assert "## Summary" not in msg
 
   def test_notify_error_format(self):
     cfg = _make_cfg(telegram_enabled=False)

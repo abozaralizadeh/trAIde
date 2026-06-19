@@ -74,6 +74,7 @@ class TradingConfig:
   max_atr_pct_for_entry: float
   entry_limit_expiry_minutes: float
   min_entry_deviation_pct: float
+  research_handoff_after_no_trade_runs: int  # force a Research handoff after N no-trade runs (0=off)
 
 
 @dataclass
@@ -227,6 +228,7 @@ def load_config() -> AppConfig:
       max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "6")),
       entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
       min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
+      research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "3")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),
