@@ -27,7 +27,7 @@ from agents import (
   set_tracing_export_api_key,
   gen_trace_id,
   gen_span_id)
-from agents.items import ToolCallOutputItem
+from agents.items import HandoffOutputItem, ToolCallItem, ToolCallOutputItem
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
 from agents.tracing.setup import get_trace_provider
@@ -450,6 +450,92 @@ async def _run_agent_with_tracing(
         logger.warning("Trace cleanup failed: %s", exc)
 
 
+# Tool calls whose outputs are bulky/uninteresting market data — never surfaced as research activity.
+_RESEARCH_NOISY_TOOLS = {
+  "analyze_market_context", "fetch_recent_candles", "fetch_orderbook", "fetch_futures_candles",
+  "fetch_futures_orderbook", "fetch_futures_mark_price", "fetch_funding_rate",
+  "fetch_open_interest", "fetch_contract_details", "latest_items", "list_coins",
+}
+
+
+def _summarize_research(tool_name: str, output: Any) -> str | None:
+  """One-line summary of a Research Agent tool result for Telegram/dashboard surfacing."""
+  if not isinstance(output, dict) or output.get("error"):
+    return None
+  title = output.get("title")  # log_research returns the plan entry directly
+  if title:
+    summ = (output.get("summary") or "").strip()
+    return (f"{title} — {summ}" if summ else str(title))[:220]
+  added = output.get("added")
+  if isinstance(added, dict) and added.get("symbol"):
+    reason = (added.get("reason") or "").strip()
+    return f"added coin {added['symbol']}" + (f" — {reason}" if reason else "")
+  removed = output.get("removed")
+  if isinstance(removed, dict):
+    if removed.get("symbol") and not removed.get("title"):  # remove_coin
+      reason = (removed.get("reason") or "").strip()
+      return f"removed coin {removed['symbol']}" + (f" — {reason}" if reason else "")
+    if removed.get("title"):  # remove_source
+      return str(removed["title"])[:220]
+  source = output.get("source")
+  if isinstance(source, dict) and source.get("title"):
+    return str(source["title"])[:220]
+  sentiment = output.get("sentiment")
+  if isinstance(sentiment, dict) and sentiment.get("symbol"):
+    return f"sentiment {sentiment['symbol']}={sentiment.get('score')}"
+  if tool_name and tool_name not in _RESEARCH_NOISY_TOOLS:
+    return tool_name.replace("_", " ")
+  return None
+
+
+def _collect_run_artifacts(new_items: List[Any]) -> Dict[str, Any]:
+  """Extract tool outputs, agent handoffs, per-agent attribution, and Research Agent activity
+  from a Runner result's items.
+
+  Single forward pass: a ToolCallItem always precedes its ToolCallOutputItem, so the
+  call_id -> tool name map is populated before we need it. Defensive throughout — a SDK shape
+  change must never break the trading loop.
+  """
+  tool_outputs: List[Any] = []
+  handoff_events: List[Dict[str, str]] = []
+  research_activity: List[str] = []
+  agents_used: set[str] = set()
+  call_tool_names: Dict[str, str] = {}
+
+  for item in new_items:
+    try:
+      agent_name = getattr(getattr(item, "agent", None), "name", "") or ""
+      if agent_name:
+        agents_used.add(agent_name)
+      if isinstance(item, ToolCallItem):
+        raw = getattr(item, "raw_item", None)
+        cid = getattr(raw, "call_id", None) or (raw.get("call_id") if isinstance(raw, dict) else None)
+        tname = getattr(raw, "name", None) or (raw.get("name") if isinstance(raw, dict) else None)
+        if cid and tname:
+          call_tool_names[cid] = tname
+      elif isinstance(item, HandoffOutputItem):
+        src = getattr(getattr(item, "source_agent", None), "name", "") or "?"
+        tgt = getattr(getattr(item, "target_agent", None), "name", "") or "?"
+        handoff_events.append({"from": src, "to": tgt})
+      elif isinstance(item, ToolCallOutputItem):
+        tool_outputs.append(item.output)
+        raw = getattr(item, "raw_item", None)
+        cid = raw.get("call_id") if isinstance(raw, dict) else getattr(raw, "call_id", None)
+        if agent_name == "Research Agent":
+          summary = _summarize_research(call_tool_names.get(cid, ""), item.output)
+          if summary:
+            research_activity.append(summary)
+    except Exception as exc:
+      logger.debug("Run-item inspection skipped an item: %s", exc)
+
+  return {
+    "tool_outputs": tool_outputs,
+    "handoffs": handoff_events,
+    "research": research_activity,
+    "agents_used": agents_used,
+  }
+
+
 def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
@@ -458,6 +544,7 @@ def run_trading_agent(
   openai_client: AsyncAzureOpenAI | None = None,
   langsmith_client: Any | None = None,
   recent_fills: Dict[str, Any] | None = None,
+  force_research: bool = False,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   if openai_client is None:
@@ -4248,6 +4335,21 @@ def run_trading_agent(
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, simulate orders via the tool.\n"
   )
 
+  if force_research:
+    # The trading loop detected several consecutive runs with no executed trade. Force a
+    # research handoff up front so the Research Agent refreshes the coin universe instead of
+    # the Trading Agent declining yet again. Prepended so it is the first thing the model reads.
+    instructions = (
+      "## 🚨 STUCK STATE — RESEARCH HANDOFF REQUIRED THIS RUN (highest priority):\n"
+      "You have completed several consecutive runs WITHOUT placing a single trade. The current coin "
+      "universe is not producing actionable setups. BEFORE analyzing or declining anything else this run, "
+      "you MUST hand off to the Research Agent and instruct it to OVERHAUL the coin list: remove stale, "
+      "illiquid, or no-catalyst symbols and add fresh, liquid, high-opportunity coins with real catalysts. "
+      "After the Research Agent hands control back to you, re-audit the refreshed universe and find a trade. "
+      "Do NOT simply decline again — a stale coin list is the problem, so fix it via research first.\n\n"
+      + instructions
+    )
+
   if temporary_notes:
     temp_text = "\n".join(f"- {n['content']}" for n in temporary_notes)
     instructions += (
@@ -4274,16 +4376,22 @@ def run_trading_agent(
       "- Sources to prioritize when using web_search: CoinDesk/The Block/Cointelegraph for news; exchange blogs (Binance/Coinbase/OKX/Bybit) for listings/delistings/rule changes; X/Twitter lists (founders, analysts, journalists) for real-time signals; macro outlets (Bloomberg/Reuters/FT) when relevant; on-chain sentiment/flows when available.\n"
       "- Tasks: gather news, sentiment, liquidity, catalysts, and narrative strength; highlight listings/delistings, hacks, regulatory moves, funding rounds, and smart-money activity.\n"
       "- Output: concise recommendations with evidence (why this beats current options), liquidity check, and confidence. Prefer liquid, tradable pairs; avoid illiquid/obscure tokens.\n"
-      "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n"
-      "- NEVER place orders or change the coin list yourself; propose candidates only.\n"
+      "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n\n"
+      "## COIN-LIST CURATION (your core job — act, don't just suggest):\n"
+      "- You OWN the active coin list. Call list_coins to see it, then RESHAPE it so the Trading Agent always has tradable opportunities:\n"
+      "  - add_coin(symbol, reason) for fresh, LIQUID pairs with a real catalyst or strong technical setup. Verify liquidity with analyze_market_context/fetch_orderbook before adding.\n"
+      "  - remove_coin(symbol, reason, exit_plan) for stale symbols: no volatility, no catalyst, repeated losses, or chronically blocked by the daily/regime gates.\n"
+      "- When you are handed off because the Trading Agent is STUCK (declining run after run), remove the dead weight and add genuinely new opportunities so the next trading run has something to work with.\n"
+      "- You must still NEVER place orders or set TP/SL — that is the Trading Agent's job. You only curate the list and log research.\n\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
       "- **Strategy review**: Use latest_items('decisions') to review recent trades. Look for patterns:\n"
       "  - Trades with high peakPnl but low/negative final pnl = greedy TP targets (suggest tighter TPs).\n"
       "  - Trades with deep troughPnl = poor entries or wide stops (suggest better entry timing).\n"
-      "  - Repeated losses on the same coin = bad coin choice (suggest removal).\n"
-      "  - Log strategy improvement suggestions via log_research so the Trading Agent can adapt.\n"
-      "- When handing off, remind the Trading Agent to read the saved note via latest_plan/latest_items so your research is used.\n"
-      "- Always handoff to the main Trading Agent after your research is done passing the new coins to be added to the coin list or the ones that should be deleted."
+      "  - Repeated losses on the same coin = bad coin choice (remove it via remove_coin).\n"
+      "  - Log strategy improvement suggestions via log_research so the Trading Agent can adapt.\n\n"
+      "## MANDATORY FINAL STEP — always hand back:\n"
+      "- You MUST finish EVERY turn by handing control back to the Trading Agent. Never end your turn without handing off.\n"
+      "- Before handing off, log a research note (log_research) summarizing what you found and exactly which coins you added/removed, and remind the Trading Agent to read it via latest_plan/latest_items and to trade the refreshed universe.\n"
     ),
     tools=[
       WebSearchTool(search_context_size="high"),
@@ -4300,6 +4408,9 @@ def run_trading_agent(
       fetch_coindesk_news,
       log_research,
       latest_items,
+      list_coins,
+      add_coin,
+      remove_coin,
       add_source,
       remove_source,
       log_sentiment,
@@ -4479,10 +4590,23 @@ def run_trading_agent(
     total_input, total_output, total_cached, cache_pct, len(result.raw_responses),
   )
 
-  tool_outputs: List[Any] = []
-  for item in result.new_items:
-    if isinstance(item, ToolCallOutputItem):
-      tool_outputs.append(item.output)
+  artifacts = _collect_run_artifacts(result.new_items)
+  tool_outputs: List[Any] = artifacts["tool_outputs"]
+  handoff_events: List[Dict[str, str]] = artifacts["handoffs"]
+  research_activity: List[str] = artifacts["research"]
+  agents_used: set[str] = artifacts["agents_used"]
+
+  # Record handoffs in memory so they surface in the dashboard decision feed (marked as
+  # handoff_* actions). pnl stays None so they never count toward win/loss stats.
+  for h in handoff_events:
+    direction = "research" if h.get("to") == "Research Agent" else "trading"
+    try:
+      memory.log_decision(
+        "ALL", f"handoff_to_{direction}", 0.0,
+        f"{h.get('from')} → {h.get('to')}", paper=snapshot.paper_trading,
+      )
+    except Exception as exc:
+      logger.debug("Failed to log handoff decision: %s", exc)
 
   decisions: list[str] = []
 
@@ -4516,4 +4640,16 @@ def run_trading_agent(
     if summary:
       decisions.append(summary)
 
-  return {"narrative": narrative, "tool_results": tool_outputs, "decisions": decisions}
+  if handoff_events:
+    logger.info("Agent handoffs this run: %s", " | ".join(f"{h['from']}→{h['to']}" for h in handoff_events))
+  if research_activity:
+    logger.info("Research Agent activity: %s", " | ".join(research_activity))
+
+  return {
+    "narrative": narrative,
+    "tool_results": tool_outputs,
+    "decisions": decisions,
+    "handoffs": handoff_events,
+    "research": research_activity,
+    "agentsUsed": sorted(agents_used),
+  }
