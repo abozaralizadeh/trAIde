@@ -323,6 +323,7 @@ async def trading_loop() -> None:
   idle_polls = 0
   consecutive_no_trade_runs = 0  # runs where the agent placed no order (drives forced research)
   force_research = False         # when True, next agent run must hand off to Research first
+  last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
   logged_closed_position_ids: set[str] = set()
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   notifier = TelegramNotifier(cfg)
@@ -524,19 +525,26 @@ async def trading_loop() -> None:
         # the counter so research is re-triggered only after another `threshold` quiet runs
         # (rate-limits the costly web research instead of firing every poll).
         threshold = cfg.trading.research_handoff_after_no_trade_runs
+        cooldown_sec = cfg.trading.research_handoff_cooldown_min * 60
         if force_research:
           consecutive_no_trade_runs = 0
           force_research = False
+          last_forced_research_ts = time.time()
         elif _agent_made_a_move(result):
           consecutive_no_trade_runs = 0
         else:
           consecutive_no_trade_runs += 1
+        # Force a research handoff once the no-trade streak crosses the threshold, but not more
+        # often than the cooldown — forced research runs an expensive high-context web sweep, and
+        # in a genuine no-setup tape hammering it every few minutes just burns tokens.
         if threshold > 0 and consecutive_no_trade_runs >= threshold:
-          force_research = True
-          logger.info(
-            "No trade for %d consecutive runs — forcing Research Agent handoff next run.",
-            consecutive_no_trade_runs,
-          )
+          elapsed = time.time() - last_forced_research_ts
+          if elapsed >= cooldown_sec:
+            force_research = True
+            logger.info("No trade for %d consecutive runs — forcing Research Agent handoff next run.", consecutive_no_trade_runs)
+          else:
+            logger.info("Stuck %d runs but research cooldown active (%dmin left) — not forcing yet.",
+                        consecutive_no_trade_runs, int((cooldown_sec - elapsed) / 60))
       except Exception as exc:
         # Keep the loop alive across restarts and transient errors.
         logger.error("Agent run failed: %s", exc)

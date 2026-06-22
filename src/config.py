@@ -41,6 +41,9 @@ class KucoinConfig:
 class KucoinFuturesConfig:
   enabled: bool
   base_url: str
+  # "cross" | "isolated" | "auto". The bot's set_leverage uses the cross endpoint, so the
+  # cross-leverage call is only issued in cross mode (avoids "switch to cross margin" errors).
+  margin_mode: str = "cross"
 
 
 @dataclass
@@ -75,6 +78,10 @@ class TradingConfig:
   entry_limit_expiry_minutes: float
   min_entry_deviation_pct: float
   research_handoff_after_no_trade_runs: int  # force a Research handoff after N no-trade runs (0=off)
+  # Risk guardrails (added after the RE-USDT concentration blowup, 2026-06-21):
+  max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
+  min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
+  research_handoff_cooldown_min: float = 30.0 # min minutes between forced Research handoffs (0=off)
 
 
 @dataclass
@@ -108,6 +115,10 @@ class RegimeConfig:
   trend_shorts_enabled: bool        # permit trend-aligned shorts past the anti-FOMO gate
   trend_short_min_confidence: float # confidence bar specifically for a counter-bounce short
   trend_short_require_15m: bool     # require 15m (not just 1h) bearish confirmation for the short
+  # Correlation gate: block LONGs on non-major alts while BTC's daily regime is bearish (alts are
+  # high-beta to BTC; longing them into a BTC downtrend is what blew up on RE-USDT, 2026-06-21).
+  alt_long_block_enabled: bool = True
+  alt_majors: tuple = ("BTC", "ETH")  # symbols exempt from the alt-long gate (they have their own daily gate)
 
 
 @dataclass
@@ -133,6 +144,7 @@ class LangsmithConfig:
   project: Optional[str]
   api_url: Optional[str]
   tracing: bool
+  sample_rate: float = 0.1  # head-sampling fraction of runs sent to LangSmith (avoids monthly trace limit)
 
 
 @dataclass
@@ -197,6 +209,7 @@ def load_config() -> AppConfig:
     kucoin_futures=KucoinFuturesConfig(
       enabled=_as_bool(os.getenv("KUCOIN_FUTURES_ENABLED"), True),
       base_url=kucoin_futures_base_url,
+      margin_mode=os.getenv("KUCOIN_FUTURES_MARGIN_MODE", "cross").strip().lower(),
     ),
     trading=TradingConfig(
       coins=coins,
@@ -229,6 +242,9 @@ def load_config() -> AppConfig:
       entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
       min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
       research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "3")),
+      max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
+      min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
+      research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),
@@ -254,6 +270,8 @@ def load_config() -> AppConfig:
       trend_shorts_enabled=_as_bool(os.getenv("TREND_ALIGNED_SHORTS_ENABLED"), True),
       trend_short_min_confidence=float(os.getenv("TREND_SHORT_MIN_CONFIDENCE", "0.78")),
       trend_short_require_15m=_as_bool(os.getenv("TREND_SHORT_REQUIRE_15M"), True),
+      alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
+      alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),
@@ -261,6 +279,7 @@ def load_config() -> AppConfig:
       project=os.getenv("LANGSMITH_PROJECT"),
       api_url=os.getenv("LANGSMITH_API_URL"),
       tracing=_as_bool(os.getenv("LANGSMITH_TRACING"), False),
+      sample_rate=float(os.getenv("LANGSMITH_SAMPLE_RATE", "0.1")),
     ),
     telegram=TelegramConfig(
       enabled=_as_bool(os.getenv("TELEGRAM_ENABLED"), False),

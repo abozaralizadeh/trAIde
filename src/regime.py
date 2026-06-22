@@ -41,6 +41,49 @@ def regime_size_factor(daily_bias: str, daily_exhausted: bool, cfg: RegimeConfig
   return 1.0
 
 
+def block_alt_long_in_btc_downtrend(
+  *,
+  symbol: str,
+  side: str,
+  btc_daily_bias: str,
+  cfg: RegimeConfig,
+) -> bool:
+  """True if a LONG on a non-major altcoin should be blocked because BTC's daily regime is bearish.
+
+  Alts are high-beta to BTC: longing them while the market leader is in a confirmed daily
+  downtrend is the setup that blew up on RE-USDT. Majors (cfg.alt_majors) are exempt — they have
+  their own per-symbol daily gate. Only fires on a strict bearish BTC daily read.
+  """
+  if not cfg.alt_long_block_enabled:
+    return False
+  if (side or "").lower() not in ("buy", "long"):
+    return False
+  base = (symbol or "").split("-")[0].strip().upper()
+  if not base or base in {m.upper() for m in (cfg.alt_majors or ())}:
+    return False
+  return str(btc_daily_bias or "").strip().lower() == "bearish"
+
+
+def concentration_scale(notional_usd: float, total_equity_usd: float, max_pct: float) -> float:
+  """Scale factor (<=1.0) that shrinks a position's notional to at most `max_pct` of equity.
+
+  Returns 1.0 when the cap is disabled (max_pct<=0), equity is unknown (<=0), or the position is
+  already within the cap. Caps the per-position blast radius regardless of leverage.
+  """
+  try:
+    notional = float(notional_usd)
+    equity = float(total_equity_usd)
+    pct = float(max_pct)
+  except (TypeError, ValueError):
+    return 1.0
+  if pct <= 0 or equity <= 0 or notional <= 0:
+    return 1.0
+  cap = pct * equity
+  if notional <= cap:
+    return 1.0
+  return max(0.0, cap / notional)
+
+
 def allow_trend_aligned_short(
   *,
   daily_exhausted: bool,

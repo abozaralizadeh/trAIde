@@ -8,6 +8,23 @@ def store(tmp_path):
     return MemoryStore(str(tmp_path / "memory.json"), retention_days=7)
 
 
+def test_handoff_decisions_survive_decline_flood(store):
+    """Handoffs live in their own retention bucket, so a flood of declines (far exceeding
+    MAX_DECISIONS) cannot evict them — without the fix the two oldest entries (the handoffs)
+    would be dropped by the 50-slot null-decision cap."""
+    # Log the handoffs FIRST (oldest), then bury them under a decline flood.
+    store.log_decision("ALL", "handoff_to_research", 0.0, "Trading Agent -> Research Agent")
+    store.log_decision("ALL", "handoff_to_trading", 0.0, "Research Agent -> Trading Agent")
+    for i in range(120):
+        store.log_decision("BTC-USDT", "decline", 0.5, f"no setup {i}")
+    stored_actions = [d.get("action") for d in store._read().get("decisions", [])]
+    assert "handoff_to_research" in stored_actions
+    assert "handoff_to_trading" in stored_actions
+    # The high-volume declines are still capped (≈MAX_DECISIONS; +1 because log_decision prunes
+    # then appends one), so memory stays bounded instead of growing to the 120 we logged.
+    assert stored_actions.count("decline") <= 51
+
+
 def test_set_and_get_coins(store):
     store.set_coins(["BTC-USDT", "ETH-USDT"], reason="test")
     coins = store.get_coins()

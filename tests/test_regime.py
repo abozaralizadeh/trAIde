@@ -8,6 +8,8 @@ from src.regime import (
     effective_min_confidence,
     regime_size_factor,
     allow_trend_aligned_short,
+    block_alt_long_in_btc_downtrend,
+    concentration_scale,
 )
 from src.memory import MemoryStore
 
@@ -23,6 +25,63 @@ def _cfg(**overrides) -> RegimeConfig:
     )
     base.update(overrides)
     return RegimeConfig(**base)
+
+
+# ── Correlation gate: block alt longs while BTC daily is bearish ────────────────
+
+
+def test_alt_long_blocked_when_btc_bearish():
+    cfg = _cfg()
+    assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is True
+    assert block_alt_long_in_btc_downtrend(symbol="XION-USDT", side="long", btc_daily_bias="bearish", cfg=cfg) is True
+
+
+def test_alt_long_allowed_when_btc_not_bearish():
+    cfg = _cfg()
+    assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="buy", btc_daily_bias="bullish", cfg=cfg) is False
+    assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="buy", btc_daily_bias="neutral", cfg=cfg) is False
+
+
+def test_alt_short_never_blocked():
+    cfg = _cfg()
+    assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="sell", btc_daily_bias="bearish", cfg=cfg) is False
+
+
+def test_majors_exempt_from_alt_gate():
+    cfg = _cfg()
+    # BTC/ETH have their own per-symbol daily gate; the alt gate must not touch them.
+    assert block_alt_long_in_btc_downtrend(symbol="BTC-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is False
+    assert block_alt_long_in_btc_downtrend(symbol="ETH-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is False
+
+
+def test_alt_gate_respects_disable_flag():
+    cfg = _cfg(alt_long_block_enabled=False)
+    assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is False
+
+
+def test_alt_gate_custom_majors():
+    cfg = _cfg(alt_majors=("BTC", "ETH", "SOL"))
+    assert block_alt_long_in_btc_downtrend(symbol="SOL-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is False
+    assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is True
+
+
+# ── Concentration cap ───────────────────────────────────────────────────────────
+
+
+def test_concentration_scale_shrinks_oversized_position():
+    # RE-USDT: $52 notional on a $70 account, cap 50% -> scale to $35 (0.5*70/52).
+    scale = concentration_scale(52.0, 70.0, 0.5)
+    assert abs(52.0 * scale - 35.0) < 1e-6
+
+
+def test_concentration_scale_noop_within_cap():
+    assert concentration_scale(20.0, 70.0, 0.5) == 1.0
+
+
+def test_concentration_scale_disabled_or_unknown_equity():
+    assert concentration_scale(52.0, 70.0, 0.0) == 1.0   # cap disabled
+    assert concentration_scale(52.0, 0.0, 0.5) == 1.0    # equity unknown
+    assert concentration_scale(0.0, 70.0, 0.5) == 1.0    # no notional
 
 
 # ── B: hostile regime detection + throttle ──────────────────────────────────────

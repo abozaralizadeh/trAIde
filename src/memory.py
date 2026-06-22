@@ -19,6 +19,8 @@ MAX_COINS = 50
 MAX_TRADES = 100
 MAX_SENTIMENTS = 10
 MAX_DECISIONS = 50       # entry/decline decisions (pnl=None)
+MAX_HANDOFF_DECISIONS = 30  # agent handoff markers (pnl=None) — kept in their own bucket so the
+                            # high-volume decline/hold snapshots don't evict them from the feed
 MAX_CLOSED_TRADES = 200  # closed-trade outcomes (pnl != None) — kept separately
 MAX_FEES = 3
 MAX_TEMPORARY_NOTES = 20
@@ -210,8 +212,15 @@ class MemoryStore:
     _cap_list("sentiments", MAX_SENTIMENTS)
     # Two-tier cap: trade outcomes (pnl != None) get a larger cap so losses are never
     # evicted by high-volume entry/decline decisions (pnl=None).
+    def _is_handoff(d: Dict[str, Any]) -> bool:
+      return str(d.get("action") or "").startswith("handoff")
+
     pnl_decisions = [d for d in (data.get("decisions") or []) if d.get("pnl") is not None]
-    null_decisions = [d for d in (data.get("decisions") or []) if d.get("pnl") is None]
+    null_all = [d for d in (data.get("decisions") or []) if d.get("pnl") is None]
+    # Handoff markers get their own bucket so the high-volume decline/hold snapshots (capped at
+    # MAX_DECISIONS) can't evict them — the dashboard surfaces handoffs from the recent feed.
+    handoff_decisions = [d for d in null_all if _is_handoff(d)]
+    null_decisions = [d for d in null_all if not _is_handoff(d)]
     if len(pnl_decisions) > MAX_CLOSED_TRADES:
       try:
         pnl_decisions = sorted(pnl_decisions, key=lambda x: x.get("ts", 0))[-MAX_CLOSED_TRADES:]
@@ -222,7 +231,12 @@ class MemoryStore:
         null_decisions = sorted(null_decisions, key=lambda x: x.get("ts", 0))[-MAX_DECISIONS:]
       except Exception:
         null_decisions = null_decisions[-MAX_DECISIONS:]
-    data["decisions"] = sorted(pnl_decisions + null_decisions, key=lambda x: x.get("ts", 0))
+    if len(handoff_decisions) > MAX_HANDOFF_DECISIONS:
+      try:
+        handoff_decisions = sorted(handoff_decisions, key=lambda x: x.get("ts", 0))[-MAX_HANDOFF_DECISIONS:]
+      except Exception:
+        handoff_decisions = handoff_decisions[-MAX_HANDOFF_DECISIONS:]
+    data["decisions"] = sorted(pnl_decisions + null_decisions + handoff_decisions, key=lambda x: x.get("ts", 0))
     _cap_list("fees", MAX_FEES)
     _cap_list("supervisor_notes_temporary", MAX_TEMPORARY_NOTES)
     _cap_list("supervisor_notes_permanent", MAX_PERMANENT_NOTES)

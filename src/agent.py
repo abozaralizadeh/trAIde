@@ -53,7 +53,13 @@ from .kucoin import (
 )
 from .memory import MemoryStore
 from .protection import should_block_chase
-from .regime import allow_trend_aligned_short, effective_min_confidence, regime_size_factor
+from .regime import (
+  allow_trend_aligned_short,
+  block_alt_long_in_btc_downtrend,
+  concentration_scale,
+  effective_min_confidence,
+  regime_size_factor,
+)
 from .utils import normalize_symbol as _normalize_symbol
 
 
@@ -93,10 +99,15 @@ def setup_lstracing(cfg: AppConfig):
       from langsmith import Client as LangsmithClient
       from langsmith.integrations.openai_agents_sdk import OpenAIAgentsTracingProcessor
 
+      # Head-sample runs so we stay under the LangSmith monthly unique-trace cap (the processor
+      # was previously 429-ing on every run). 0.0–1.0; the client applies sampling to all exports.
+      sample_rate = min(1.0, max(0.0, float(getattr(cfg.langsmith, "sample_rate", 1.0))))
       ls_client = LangsmithClient(
         api_key=cfg.langsmith.api_key,
         api_url=cfg.langsmith.api_url or None,
+        tracing_sampling_rate=sample_rate,
       )
+      logger.info("LangSmith tracing sample rate set to %.2f", sample_rate)
       processor = OpenAIAgentsTracingProcessor(
         client=ls_client,
         project_name=cfg.langsmith.project or None,
@@ -585,6 +596,54 @@ def run_trading_agent(
   # read by order functions to hard-block counter-daily-trend entries.
   _daily_gate_state: Dict[str, Dict[str, Any]] = {}
 
+  # BTC daily regime, computed at most once per run (cached). Drives the correlation gate that
+  # blocks alt longs while BTC is in a confirmed daily downtrend.
+  _btc_bias_cache: Dict[str, str] = {}
+
+  def _btc_daily_bias() -> str:
+    """Return BTC's daily bias ('bullish'|'bearish'|'neutral'), cached per run.
+
+    Prefers the value analyze_market_context already computed this run; otherwise fetches BTC 1D
+    candles once and derives it. Never raises — defaults to 'neutral' on any failure (so the gate
+    fails open and never blocks trading because of a data hiccup)."""
+    if "v" in _btc_bias_cache:
+      return _btc_bias_cache["v"]
+    bias = "neutral"
+    gate = _daily_gate_state.get("BTC-USDT")
+    if gate and gate.get("daily_bias"):
+      bias = str(gate.get("daily_bias"))
+    else:
+      try:
+        end_at = int(time.time())
+        start_at = end_at - 60 * 86400
+        candles = kucoin.get_candles("BTC-USDT", interval="1day", start_at=start_at, end_at=end_at)
+        if candles:
+          snap = summarize_interval(candles_to_dataframe(candles), "1day")
+          tb = str(snap.get("trend_bias") or "neutral")
+          bias = "bearish" if tb == "bearish" else ("bullish" if tb == "bullish" else "neutral")
+      except Exception as exc:
+        logger.debug("BTC daily bias computation failed (correlation gate fails open): %s", exc)
+    _btc_bias_cache["v"] = bias
+    return bias
+
+  # Configured futures margin mode. The bot manages leverage via the CROSS leverage endpoint, so
+  # the cross-leverage call is only issued in cross mode — in isolated mode the order's own
+  # `leverage` field applies and calling the cross endpoint just errors ("switch to cross margin").
+  _futures_margin_mode = (cfg.kucoin_futures.margin_mode or "cross").strip().lower()
+
+  def _apply_cross_leverage(fsym: str, lev: float, mode: str | None, *, context: str = "") -> None:
+    """Set cross leverage only when the order's margin mode is cross; no-op (never raises) otherwise.
+
+    KuCoin's leverage endpoint is cross-only, so calling it in isolated mode just errors with
+    'switch to cross margin' — and it is unnecessary there because the order carries its own
+    `leverage` field. Keyed on the order's actual mode (not config) so fallback paths stay correct."""
+    if not kucoin_futures or (mode or "").strip().lower() != "cross":
+      return
+    try:
+      kucoin_futures.set_leverage(fsym, lev)
+    except Exception as exc:
+      logger.warning("set_leverage failed%s (continuing): %s", f" for {context}" if context else "", exc)
+
   def _repair_allowed_symbol(requested_symbol: str) -> str | None:
     candidate = _normalize_symbol(requested_symbol)
     if not candidate:
@@ -885,6 +944,11 @@ def run_trading_agent(
     # Confidence enforcement: reject buys below minimum confidence
     if (side or "").lower() == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
       return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}", "hint": "Only enter trades with sufficient conviction. Analyze another coin or wait for a better setup."}
+
+    # Correlation gate: block alt spot BUYS while BTC's daily regime is bearish (high-beta blowup guard).
+    if block_alt_long_in_btc_downtrend(symbol=symbol, side=side, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+      logger.warning("CORRELATION GATE BLOCK: spot buy %s rejected — BTC daily regime is bearish", symbol)
+      return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — spot buy on alt {symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT buy an altcoin while BTC's daily trend is down. Wait for BTC's daily to turn or trade a major."}
 
     try:
       funds_val = float(funds or 0)
@@ -1425,6 +1489,11 @@ def run_trading_agent(
 
     if side_lower == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
       return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
+
+    # Correlation gate: block alt spot BUYS while BTC's daily regime is bearish (high-beta blowup guard).
+    if block_alt_long_in_btc_downtrend(symbol=symbol, side=side_lower, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+      logger.warning("CORRELATION GATE BLOCK: spot limit buy %s rejected — BTC daily regime is bearish", symbol)
+      return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — spot buy on alt {symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT buy an altcoin while BTC's daily trend is down. Wait for BTC's daily to turn or trade a major."}
 
     try:
       funds_val = float(funds or 0)
@@ -2195,6 +2264,12 @@ def run_trading_agent(
           logger.warning("TF CONFLICT BLOCK: %s %s rejected — daily/intraday split, 15m %s opposes %s", side, spot_symbol, intraday_bias_15m, side_lower)
           return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
+    # Correlation gate: block alt LONGs while BTC's daily regime is bearish (alts are high-beta to
+    # BTC; longing them into a BTC downtrend is the RE-USDT failure mode).
+    if is_entry and block_alt_long_in_btc_downtrend(symbol=spot_symbol, side=side, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+      logger.warning("CORRELATION GATE BLOCK: long %s rejected — BTC daily regime is bearish", spot_symbol)
+      return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
+
     # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
     _atr_scale_fm = 1.0
     if is_entry and spot_symbol in _daily_gate_state:
@@ -2250,6 +2325,14 @@ def run_trading_agent(
       return {"error": "Invalid notional or leverage"}
     if notional_input <= 0 or lev_requested <= 0:
       return {"error": "Invalid notional or leverage"}
+    # Concentration cap: shrink a single position's notional to <= max_position_equity_pct of total
+    # equity regardless of leverage — bounds blast radius (RE-USDT was ~74% of equity in one name).
+    if is_entry:
+      _conc_scale = concentration_scale(notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct)
+      if _conc_scale < 1.0:
+        logger.info("CONCENTRATION CAP: futures %s notional %.2f → %.2f (<= %.0f%% of equity %.2f)",
+                    spot_symbol, notional_input, notional_input * _conc_scale, cfg.trading.max_position_equity_pct * 100, snapshot.total_usdt)
+        notional_input *= _conc_scale
     rationale_norm = (rationale or "").lower() if rationale else ""
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
@@ -2279,6 +2362,16 @@ def run_trading_agent(
     contract = _get_contract_spec(futures_symbol)
     if not contract:
       return {"error": "Futures contract spec unavailable", "futuresSymbol": futures_symbol}
+
+    # New-listing guard: skip freshly-listed, thin, ultra-volatile contracts (the RE-USDT trap).
+    if is_entry and cfg.trading.min_futures_listing_age_days > 0:
+      _first_open = _to_float(contract.get("firstOpenDate"))
+      _first_open_s = _first_open / 1000.0 if _first_open > 1e12 else _first_open
+      if _first_open_s > 0:
+        _age_days = (time.time() - _first_open_s) / 86400.0
+        if _age_days < cfg.trading.min_futures_listing_age_days:
+          logger.warning("NEW-LISTING BLOCK: %s rejected — contract age %.1fd < %.1fd minimum", futures_symbol, _age_days, cfg.trading.min_futures_listing_age_days)
+          return {"rejected": True, "reason": f"New-listing guard: {futures_symbol} is {_age_days:.1f}d old (< {cfg.trading.min_futures_listing_age_days:.0f}d minimum)", "hint": "Freshly-listed perps are thin and ultra-volatile (this is how RE-USDT blew up). Wait for a real price history, or trade an established contract."}
 
     price = float(snapshot.tickers[spot_symbol].price)
     if price <= 0:
@@ -2503,7 +2596,10 @@ def run_trading_agent(
         margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception as exc:
       logger.warning("Futures position lookup failed; margin mode unknown: %s", exc)
-    if margin_mode is None:
+    # Honor the configured margin mode (default cross); "auto" preserves the existing position's mode.
+    if _futures_margin_mode in ("cross", "isolated"):
+      margin_mode = _futures_margin_mode
+    elif margin_mode is None:
       margin_mode = "cross"
     if kucoin_futures:
       try:
@@ -2680,10 +2776,7 @@ def run_trading_agent(
       kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"))
     except Exception as exc:
       logger.warning("set_margin_mode failed (continuing): %s", exc)
-    try:
-      kucoin_futures.set_leverage(futures_symbol, lev)
-    except Exception as exc:
-      logger.warning("set_leverage failed (continuing): %s", exc)
+    _apply_cross_leverage(futures_symbol, lev, margin_mode)
     try:
       res = kucoin_futures.place_order(order_req).__dict__
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
@@ -2727,10 +2820,7 @@ def run_trading_agent(
       kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
     except Exception as exc:
       logger.warning("set_margin_mode fallback failed (continuing): %s", exc)
-    try:
-      kucoin_futures.set_leverage(futures_symbol, lev)
-    except Exception as exc:
-      logger.warning("set_leverage fallback failed (continuing): %s", exc)
+    _apply_cross_leverage(futures_symbol, lev, opposite_mode, context="fallback")
     try:
       res = kucoin_futures.place_order(order_req).__dict__
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
@@ -2873,6 +2963,11 @@ def run_trading_agent(
           logger.warning("TF CONFLICT BLOCK: futures limit %s %s rejected — daily/intraday split, 15m %s opposes %s", side_lower, spot_symbol, intraday_bias_15m_fl, side_lower)
           return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
+    # Correlation gate: block alt LONGs while BTC's daily regime is bearish (the RE-USDT failure mode).
+    if block_alt_long_in_btc_downtrend(symbol=spot_symbol, side=side_lower, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+      logger.warning("CORRELATION GATE BLOCK: futures limit long %s rejected — BTC daily regime is bearish", spot_symbol)
+      return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
+
     _atr_scale_fl = 1.0
     if spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
@@ -2912,6 +3007,16 @@ def run_trading_agent(
     if not contract:
       return {"error": "Futures contract spec unavailable", "futuresSymbol": futures_symbol}
 
+    # New-listing guard: skip freshly-listed, thin, ultra-volatile contracts (the RE-USDT trap).
+    if cfg.trading.min_futures_listing_age_days > 0:
+      _first_open = _to_float(contract.get("firstOpenDate"))
+      _first_open_s = _first_open / 1000.0 if _first_open > 1e12 else _first_open
+      if _first_open_s > 0:
+        _age_days = (time.time() - _first_open_s) / 86400.0
+        if _age_days < cfg.trading.min_futures_listing_age_days:
+          logger.warning("NEW-LISTING BLOCK: %s rejected — contract age %.1fd < %.1fd minimum", futures_symbol, _age_days, cfg.trading.min_futures_listing_age_days)
+          return {"rejected": True, "reason": f"New-listing guard: {futures_symbol} is {_age_days:.1f}d old (< {cfg.trading.min_futures_listing_age_days:.0f}d minimum)", "hint": "Freshly-listed perps are thin and ultra-volatile (this is how RE-USDT blew up). Wait for a real price history, or trade an established contract."}
+
     try:
       current_price = float(snapshot.tickers[spot_symbol].price)
     except Exception:
@@ -2946,6 +3051,12 @@ def run_trading_agent(
     leverage_clamped = lev < lev_requested - 1e-9
 
     notional_input = float(notional_usd or 0) * _atr_scale_fl
+    # Concentration cap: shrink notional to <= max_position_equity_pct of total equity (blast-radius guard).
+    _conc_scale = concentration_scale(notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct)
+    if _conc_scale < 1.0:
+      logger.info("CONCENTRATION CAP: futures limit %s notional %.2f → %.2f (<= %.0f%% of equity %.2f)",
+                  spot_symbol, notional_input, notional_input * _conc_scale, cfg.trading.max_position_equity_pct * 100, snapshot.total_usdt)
+      notional_input *= _conc_scale
     try:
       base_size = float(size_override) if size_override is not None else notional_input / entry_price_val
     except (TypeError, ValueError):
@@ -3025,7 +3136,10 @@ def run_trading_agent(
         margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception:
       pass
-    if margin_mode is None:
+    # Honor the configured margin mode (default cross); "auto" preserves the existing position's mode.
+    if _futures_margin_mode in ("cross", "isolated"):
+      margin_mode = _futures_margin_mode
+    elif margin_mode is None:
       margin_mode = "cross"
 
     order_req = _build_limit_order(margin_mode)
@@ -3033,10 +3147,7 @@ def run_trading_agent(
       kucoin_futures.set_margin_mode(futures_symbol, margin_mode)
     except Exception as exc:
       logger.warning("set_margin_mode failed (continuing): %s", exc)
-    try:
-      kucoin_futures.set_leverage(futures_symbol, lev)
-    except Exception as exc:
-      logger.warning("set_leverage failed (continuing): %s", exc)
+    _apply_cross_leverage(futures_symbol, lev, margin_mode)
     try:
       res = kucoin_futures.place_order(order_req).__dict__
       if confidence is not None:
@@ -3059,7 +3170,7 @@ def run_trading_agent(
       order_req = _build_limit_order(opposite_mode)
       try:
         kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
-        kucoin_futures.set_leverage(futures_symbol, lev)
+        _apply_cross_leverage(futures_symbol, lev, opposite_mode, context="fallback")
         res = kucoin_futures.place_order(order_req).__dict__
         if confidence is not None:
           res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
@@ -3137,16 +3248,15 @@ def run_trading_agent(
         margin_mode = "cross" if position_info.get("crossMode") else "isolated"
     except Exception as exc:
       logger.warning("Futures position lookup failed for stop order; margin mode unknown: %s", exc)
+    if _futures_margin_mode in ("cross", "isolated"):
+      margin_mode = _futures_margin_mode
 
     margin_mode_norm = margin_mode.upper() if margin_mode else None
     try:
       kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS")
     except Exception as exc:
       logger.warning("set_margin_mode failed for stop order (continuing): %s", exc)
-    try:
-      kucoin_futures.set_leverage(futures_symbol, lev)
-    except Exception as exc:
-      logger.warning("set_leverage failed for stop order (continuing): %s", exc)
+    _apply_cross_leverage(futures_symbol, lev, margin_mode, context="stop order")
     order_req = KucoinFuturesOrderRequest(
       symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",
@@ -4041,7 +4151,12 @@ def run_trading_agent(
     "- You are FULLY AUTONOMOUS. NEVER write 'If you want...', 'Would you like...', or 'Do you want...'. "
     "Just execute. No one is reading your output interactively.\n"
     "- DIVERSIFY: analyze multiple coins every run. If one coin is blocked or has no edge, move to the next. "
-    "Do NOT spend the entire run on a single symbol.\n\n"
+    "Do NOT spend the entire run on a single symbol.\n"
+    "- EXCEPTION (no-setup tape): when the majors (BTC/ETH) are gated in BOTH directions — daily blocks one side, "
+    "intraday blocks the other — and no liquid, established coin offers a clean setup, then STANDING ASIDE IS THE "
+    "CORRECT ACTION, not a failure. Do NOT reach for low-liquidity, freshly-listed, or high-beta altcoins (especially "
+    "longs while BTC's daily is bearish) just to manufacture a trade — that is how the account took its worst loss. "
+    "Forcing a low-quality trade in a no-setup tape is worse than declining.\n\n"
 
     "## STEP 1 — Account audit (always first):\n"
     "- Call fetch_account_state to confirm live balances across spot, funding, financial, and futures.\n"
@@ -4176,7 +4291,11 @@ def run_trading_agent(
     "- Use place_limit_order (spot) or place_futures_limit_order (futures) for ALL new entries.\n"
     "- Reserve place_market_order / place_futures_market_order ONLY for closing positions or emergency exits.\n"
     "- Why: market orders execute at current price regardless of chart structure. Limit orders let price "
-    "come TO you at a better level — avoiding the worst timing failures (shorting into a dump, buying into a pump).\n\n"
+    "come TO you at a better level — avoiding the worst timing failures (shorting into a dump, buying into a pump).\n"
+    "- FEE EDGE: limit (maker) fills are ~3x cheaper than market (taker) fills. Round-trip taker fees + slippage "
+    "are ~0.14%, so a TP only ~0.1-0.3% away barely beats costs — those are the pennies-in-front-of-the-steamroller "
+    "scalps that bled the account. Only take a setup whose TP clears total round-trip cost by a comfortable margin "
+    "(aim for net edge >= 2-3x fees); otherwise skip it.\n\n"
 
     "**How to pick entry_price (REQUIRED for limit order tools):**\n"
     "Choose a level where MULTIPLE reference points converge (confluence of 2+ levels is far more reliable than any single one):\n"
@@ -4379,9 +4498,14 @@ def run_trading_agent(
       "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n\n"
       "## COIN-LIST CURATION (your core job — act, don't just suggest):\n"
       "- You OWN the active coin list. Call list_coins to see it, then RESHAPE it so the Trading Agent always has tradable opportunities:\n"
-      "  - add_coin(symbol, reason) for fresh, LIQUID pairs with a real catalyst or strong technical setup. Verify liquidity with analyze_market_context/fetch_orderbook before adding.\n"
+      "  - add_coin(symbol, reason) for LIQUID, ESTABLISHED pairs with a real catalyst or strong technical setup. Verify liquidity with analyze_market_context/fetch_orderbook before adding.\n"
       "  - remove_coin(symbol, reason, exit_plan) for stale symbols: no volatility, no catalyst, repeated losses, or chronically blocked by the daily/regime gates.\n"
-      "- When you are handed off because the Trading Agent is STUCK (declining run after run), remove the dead weight and add genuinely new opportunities so the next trading run has something to work with.\n"
+      "- HARD QUALITY BARS for any coin you add (they mirror code-level gates — adding a coin that violates them just wastes the Trading Agent's run):\n"
+      "  * LIQUIDITY: deep book + meaningful 24h volume. Reject thin micro-caps.\n"
+      "  * MATURITY: do NOT add freshly-listed perpetuals (< ~7 days old). New listings are thin and swing 50-100% intraday — exactly how the RE-USDT position blew up.\n"
+      "  * CORRELATION: when BTC's daily trend is bearish, do NOT add altcoins as LONG candidates (alts are high-beta to BTC; longing them into a BTC downtrend loses). Surface only SHORT candidates or majors in a bearish BTC regime.\n"
+      "- NEVER add a coin just to give the Trading Agent 'something to trade'. A narrow list with no setup is fine — standing aside beats forcing a low-quality trade.\n"
+      "- When you are handed off because the Trading Agent is STUCK (declining run after run), prune the dead weight and add new opportunities ONLY if they clear every bar above; if nothing qualifies, say so plainly in your research note and hand back.\n"
       "- You must still NEVER place orders or set TP/SL — that is the Trading Agent's job. You only curate the list and log research.\n\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
       "- **Strategy review**: Use latest_items('decisions') to review recent trades. Look for patterns:\n"
