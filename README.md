@@ -104,7 +104,7 @@ sequenceDiagram
 
 ### Entry decision & risk gates
 
-Every proposed entry runs a fixed gauntlet of code-enforced gates before any order reaches the exchange. Position management (manage / hold / protect / close) bypasses the entry gates. In a hostile (bearish / RSI-exhausted) regime the confidence bar is raised and size shrunk, and a confirmed trend-aligned short can pass the anti-FOMO gate.
+Every proposed entry runs a fixed gauntlet of code-enforced gates before any order reaches the exchange. Position management (manage / hold / protect / close) bypasses the entry gates. In a hostile (bearish / RSI-exhausted) regime the confidence bar is raised and size shrunk; size also scales down with conviction (how far confidence clears the floor). A confirmed trend-aligned short can pass the anti-FOMO gate, and a daily-aligned entry can break the daily-vs-1h deadlock when a counter-bounce is stalling.
 
 ```mermaid
 flowchart TD
@@ -124,7 +124,8 @@ flowchart TD
     vol -->|ok| conf{"Confidence &ge; regime-adjusted MIN_CONFIDENCE<br/>and net profit after fees?"}
     scale --> conf
     conf -->|no| reject
-    conf -->|yes| exec["Place order +<br/>mandatory TP/SL bracket"]
+    conf -->|yes| convsize["Scale size by conviction +<br/>concentration cap (&le; equity %)"]
+    convsize --> exec["Place order +<br/>mandatory TP/SL bracket"]
     exec --> openpos(["Position open"])
 ```
 
@@ -194,6 +195,10 @@ flowchart LR
 - **Profit-lock (breakeven ratchet + give-back cap)**: Enforced in code every poll, independent of the LLM (`src/protection.py`). Once a position's favorable excursion reaches `PROFIT_LOCK_BREAKEVEN_TRIGGER_R`× its initial risk, the stop is ratcheted to a fee-adjusted breakeven so the trade can no longer turn into a loss. If price then gives back ≥ `PROFIT_LOCK_GIVEBACK_PCT` of its peak run, the position is market-closed (reduce-only) to lock the remaining gain. Stops a profitable trade from round-tripping into a loss when the agent fails to tighten protection itself. Set `PROFIT_LOCK_DRY_RUN=true` to log intended actions without placing orders.
 - **No-chase after a win**: Blocks re-entering the *same direction* at a *worse* price than a recent winning exit (within `POST_WIN_COOLDOWN_MINUTES`). Stops the "take profit, then immediately re-buy the top" pattern; a genuine pullback (better price than the exit) is still allowed.
 - **Regime throttle**: In a hostile regime (bearish or RSI-exhausted daily) the confidence bar is raised (`REGIME_CAUTION_MIN_CONFIDENCE`) and position size shrunk (`REGIME_CAUTION_SIZE_FACTOR`), so the bot trades less and more selectively instead of churning low-conviction bounce-scalps in a downtrend.
+- **Conviction-scaled sizing**: Position size scales with how far the entry's confidence clears the (regime-adjusted) floor — a trade that barely clears it gets `CONVICTION_MIN_SIZE_FACTOR` of full size, ramping linearly to full size at `CONVICTION_FULL_CONFIDENCE`. Targets the failure mode where the agent takes a *full-size* position on a setup it itself reads as "mixed / low-conviction" (the pattern behind the SOL drawdown); only ever shrinks, never enlarges, and is floored by the 30% volatility floor.
+- **Concentration cap**: Shrinks any single position's notional to ≤ `MAX_POSITION_EQUITY_PCT` of total equity, regardless of leverage — bounds the per-name blast radius (the RE-USDT blowup was one name at ~74% of the account). Applied after every other size scaler, just before the order is placed.
+- **Correlation gate**: Blocks **longs on non-major alts while BTC's daily regime is bearish** (`ALT_LONG_BLOCK_WHEN_BTC_BEARISH`). Alts are high-beta to BTC; longing them into a confirmed BTC downtrend is the exact setup that blew up on RE-USDT. Majors in `ALT_MAJORS` are exempt (they have their own per-symbol daily gate); shorts are never blocked by this gate.
+- **New-listing guard**: Blocks futures entries on contracts younger than `MIN_FUTURES_LISTING_AGE_DAYS` (via the contract's first-open date). Freshly-listed perps are thin and ultra-volatile — RE-USDT had a ~100% intraday range on day one.
 - **Trend-aligned shorts**: In a confirmed downtrend the anti-FOMO gate would otherwise force the bot to only ever long oversold bounces. With `TREND_ALIGNED_SHORTS_ENABLED`, a short into an exhausted-bearish daily is permitted **when 1h and 15m both confirm** the downtrend is resuming and confidence clears a higher bar (`TREND_SHORT_MIN_CONFIDENCE`) — letting the bot trade *with* the trend, not only against bounces.
 - **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed, and a confirmed trend-aligned short can be re-permitted (see above).
 - **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
@@ -201,6 +206,7 @@ flowchart LR
 - **Squeeze-breakout signal**: Structured `squeeze_breakout` field (`long` / `short` / `None`) surfaced in `analyze_market_context`. Fires only on the fresh transition out of a 1h Bollinger squeeze (BBW expanding ≥25% off the floor, ADX>20, price beyond BB band, RSI confirming). Takes the asymmetric upside after coiled-volatility periods; volume ≥1.5× 20-candle average is required confirmation. Anti-FOMO block still wins if daily is exhausted in the same direction.
 - **Volatility-scaled take-profit**: `plan_spot_position` widens the effective RR up to 2× the base when daily ATR ≥ 4% (capped at daily ATR 10%). Lets winners run further in volatile coins to recover the EV that the ATR soft-gate trims off entry size. Pairs naturally with staged take-profit (TP1 books guaranteed profit, runner rides the wider TP2).
 - **1h alignment requirement**: Blocks new entries and add-ons when the 1h bias opposes the proposed side, regardless of what the daily trend says. The 1h timeframe captures the multi-hour trajectory — when daily EMAs are still bullish but 1h is bearish, the daily uptrend is in correction (not a healthy pullback) and buying bounces gets stopped out repeatedly. Catches the failure mode where 15m briefly turns bullish on a dead-cat bounce while the actual correction is still in progress.
+- **Deadlock break**: The daily gate (blocks the counter-trend direction) and the 1h-alignment gate (blocks the daily-aligned direction during a counter-bounce) can together strand the bot flat in both directions in a clean trend. With `DEADLOCK_BREAK_ENABLED`, the *daily-aligned* entry (short in a bearish daily, long in a bullish daily) is allowed past the 1h gate **only when the counter-bounce is stalling** — 15m no longer confirms it — and confidence clears `DEADLOCK_MIN_CONFIDENCE`. Takes the trend-continuation trade instead of standing aside, without knife-catching a live bounce. Disjoint from trend-aligned shorts (which covers the *exhausted*-daily case).
 - **Timeframe-conflict gate**: Secondary check on top of 1h alignment — blocks new entries when `analyze_market_context` reports `timeframe_conflict=True` AND the 15m bias opposes the proposed direction. Catches lower-TF disagreement that slips past 1h alignment (e.g., 15m bearish while 1h is neutral). Position management (manage/hold/protect) is unaffected by both gates.
 - **Mandatory TP/SL**: Every position must have stop-loss and take-profit (no naked positions)
 - **ATR-based stops**: Stop distance computed from Average True Range for volatility-adaptive risk
@@ -228,6 +234,7 @@ flowchart LR
 - Seed with `COINS` env var; agent can dynamically add/remove coins with reasons and exit plans when `FLEXIBLE_COINS_ENABLED=true`
 - Auto-discovers unlisted holdings in spot account (worth >= $0.50) and adds them to the active list
 - Removes coins after 3 consecutive ticker fetch failures (flexible mode only)
+- **Forced research handoff**: after `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` consecutive no-trade runs (stuck / declining), the Trading Agent is forced to hand off to the Research Agent to overhaul the coin list and surface fresh opportunities — rate-limited by `RESEARCH_HANDOFF_COOLDOWN_MIN` so the costly web-research sweep can't fire every cycle
 
 ## Setup
 
@@ -318,9 +325,22 @@ Code-driven guards enforced outside the LLM (`src/protection.py`). They run ever
 
 Every automatic action (stop moved to breakeven, position closed, or a dry-run preview) is logged and sent as a Telegram alert.
 
+### Risk Guardrails
+
+Blast-radius and selection guards added after the RE-USDT concentration blowup (one freshly-listed micro-cap alt at ~74% of equity, longed into a BTC downtrend).
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_POSITION_EQUITY_PCT` | `0.5` | Cap a single position's notional at this fraction of total equity, regardless of leverage (`0` = off) |
+| `MIN_FUTURES_LISTING_AGE_DAYS` | `7` | Block futures entries on contracts younger than this many days — thin/volatile fresh listings (`0` = off) |
+| `ALT_LONG_BLOCK_WHEN_BTC_BEARISH` | `true` | Block longs on non-major alts while BTC's daily regime is bearish (alts are high-beta to BTC) |
+| `ALT_MAJORS` | `BTC,ETH` | Symbols exempt from the alt-long gate (they have their own per-symbol daily gate) |
+| `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `3` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |
+| `RESEARCH_HANDOFF_COOLDOWN_MIN` | `30` | Minimum minutes between forced Research handoffs — rate-limits the costly web sweep (`0` = off) |
+
 ### Regime-Aware Entries
 
-Code-enforced entry adjustments that work alongside the daily gate (`src/regime.py`): be more selective in hostile regimes, and trade *with* a confirmed downtrend instead of only longing bounces.
+Code-enforced entry adjustments that work alongside the daily gate (`src/regime.py`): be more selective in hostile regimes, size by conviction, trade *with* a confirmed downtrend instead of only longing bounces, and break the daily-vs-1h gate deadlock.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -330,6 +350,11 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `TREND_ALIGNED_SHORTS_ENABLED` | `true` | Permit a trend-aligned short past the anti-FOMO gate in an exhausted-bearish daily |
 | `TREND_SHORT_MIN_CONFIDENCE` | `0.78` | Higher confidence bar specifically for a counter-bounce short |
 | `TREND_SHORT_REQUIRE_15M` | `true` | Require 15m (not just 1h) bearish confirmation before allowing the short |
+| `CONVICTION_SIZING_ENABLED` | `true` | Scale position size by how far confidence clears the floor (low-conviction → smaller) |
+| `CONVICTION_FULL_CONFIDENCE` | `0.85` | Confidence at/above which full size is used (linear ramp from the floor) |
+| `CONVICTION_MIN_SIZE_FACTOR` | `0.5` | Size multiplier at the confidence floor |
+| `DEADLOCK_BREAK_ENABLED` | `true` | Allow the daily-aligned entry past the 1h gate when a 1h counter-bounce is stalling (15m no longer confirms it) |
+| `DEADLOCK_MIN_CONFIDENCE` | `0.72` | Raised confidence bar to take the trend-continuation entry |
 
 ### Loop & Polling
 
@@ -347,6 +372,7 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `KUCOIN_BASE_URL` | `https://api.kucoin.com` | Spot API endpoint |
 | `KUCOIN_FUTURES_ENABLED` | `true` | Enable futures trading |
 | `KUCOIN_FUTURES_BASE_URL` | `https://api-futures.kucoin.com` | Futures API endpoint |
+| `KUCOIN_FUTURES_MARGIN_MODE` | `cross` | Futures margin mode (`cross` / `isolated` / `auto`); the cross-leverage call is only issued in cross mode |
 | `FLEXIBLE_COINS_ENABLED` | `true` | Allow agent to add/remove coins dynamically |
 
 ### Azure APIM (Optional)
@@ -376,7 +402,10 @@ If `AZURE_APIM_OPENAI_SUBSCRIPTION_KEY` is set, the client uses APIM endpoint/de
 | `OPENAI_TRACE_API_KEY` | — | Export spans to OpenAI traces endpoint |
 | `LANGSMITH_ENABLED` | `false` | Enable LangSmith tracing |
 | `LANGSMITH_API_KEY` | — | LangSmith API key |
-| `LANGSMITH_PROJECT` | — | LangSmith project name |
+| `LANGSMITH_PROJECT` | `trAIde` | LangSmith project name |
+| `LANGSMITH_API_URL` | `https://api.smith.langchain.com` | LangSmith API endpoint |
+| `LANGSMITH_TRACING` | `true` | Send agent runs to LangSmith when enabled |
+| `LANGSMITH_SAMPLE_RATE` | `0.1` | Head-sampling fraction of runs traced to LangSmith (avoids the monthly unique-trace cap) |
 
 OTLP export for Azure Monitor is supported via `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`.
 

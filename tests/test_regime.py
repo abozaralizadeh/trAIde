@@ -10,6 +10,8 @@ from src.regime import (
     allow_trend_aligned_short,
     block_alt_long_in_btc_downtrend,
     concentration_scale,
+    conviction_size_factor,
+    resolve_gate_deadlock,
 )
 from src.memory import MemoryStore
 
@@ -82,6 +84,122 @@ def test_concentration_scale_disabled_or_unknown_equity():
     assert concentration_scale(52.0, 70.0, 0.0) == 1.0   # cap disabled
     assert concentration_scale(52.0, 0.0, 0.5) == 1.0    # equity unknown
     assert concentration_scale(0.0, 70.0, 0.5) == 1.0    # no notional
+
+
+# ── Conviction sizing: scale size by how far confidence clears the floor ─────────
+
+
+def test_conviction_full_size_at_or_above_full_confidence():
+    cfg = _cfg()
+    assert conviction_size_factor(0.85, 0.65, cfg) == 1.0
+    assert conviction_size_factor(0.92, 0.65, cfg) == 1.0
+
+
+def test_conviction_min_size_at_floor():
+    cfg = _cfg()  # full=0.85, min_factor=0.5
+    assert conviction_size_factor(0.65, 0.65, cfg) == 0.5
+    # below the floor still clamps to the min factor (defensive — caller already rejected these)
+    assert conviction_size_factor(0.60, 0.65, cfg) == 0.5
+
+
+def test_conviction_ramps_linearly_between_floor_and_full():
+    cfg = _cfg()  # floor 0.65 -> full 0.85 maps to 0.5 -> 1.0
+    # midpoint confidence 0.75 -> midpoint factor 0.75
+    assert abs(conviction_size_factor(0.75, 0.65, cfg) - 0.75) < 1e-9
+    # the band tracks the *passed* floor, not a fixed value: floor 0.75 -> 0.85, conf 0.80 -> 0.75
+    assert abs(conviction_size_factor(0.80, 0.75, cfg) - 0.75) < 1e-9
+
+
+def test_conviction_respects_disable_flag():
+    cfg = _cfg(conviction_sizing_enabled=False)
+    assert conviction_size_factor(0.65, 0.65, cfg) == 1.0
+
+
+def test_conviction_fails_open_on_unknown_confidence():
+    cfg = _cfg()
+    assert conviction_size_factor(None, 0.65, cfg) == 1.0
+
+
+def test_conviction_noop_when_floor_above_full():
+    # Misconfig / hostile floor above full: an admitted trade (conf >= floor) gets full size.
+    cfg = _cfg(conviction_full_confidence=0.70)
+    assert conviction_size_factor(0.80, 0.75, cfg) == 1.0
+
+
+def test_conviction_custom_min_factor():
+    cfg = _cfg(conviction_min_size_factor=0.25)
+    assert conviction_size_factor(0.65, 0.65, cfg) == 0.25
+    assert abs(conviction_size_factor(0.75, 0.65, cfg) - 0.625) < 1e-9  # midpoint of 0.25..1.0
+
+
+# ── Deadlock break: allow a daily-aligned entry past the 1h counter-bounce gate ──
+
+
+def test_deadlock_break_short_in_bearish_daily():
+    # The exact stall: bearish daily blocks longs, 1h-bullish bounce blocks the short. With the
+    # bounce stalling (15m bearish) and high conviction, take the trend-aligned short.
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="sell",
+        bias_1h="bullish", bias_15m="bearish", confidence=0.80, cfg=_cfg(),
+    ) is True
+    # 15m neutral (bounce no longer pushing up) is also enough.
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="sell",
+        bias_1h="bullish", bias_15m="neutral", confidence=0.80, cfg=_cfg(),
+    ) is True
+
+
+def test_deadlock_break_long_in_bullish_daily_symmetric():
+    assert resolve_gate_deadlock(
+        daily_bias="bullish", daily_exhausted=False, side="buy",
+        bias_1h="bearish", bias_15m="bullish", confidence=0.80, cfg=_cfg(),
+    ) is True
+
+
+def test_deadlock_break_blocked_when_15m_still_counter():
+    # 15m still confirms the 1h bounce -> the bounce is alive, do NOT knife-catch it.
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="sell",
+        bias_1h="bullish", bias_15m="bullish", confidence=0.85, cfg=_cfg(),
+    ) is False
+
+
+def test_deadlock_break_blocked_low_confidence():
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="sell",
+        bias_1h="bullish", bias_15m="bearish", confidence=0.70, cfg=_cfg(),
+    ) is False
+
+
+def test_deadlock_break_not_for_counter_trend_side():
+    # A long in a bearish daily is counter-trend (the daily gate kills it earlier); never resolved here.
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="buy",
+        bias_1h="bullish", bias_15m="bearish", confidence=0.90, cfg=_cfg(),
+    ) is False
+
+
+def test_deadlock_break_requires_opposing_1h():
+    # If 1h already agrees with the daily-aligned side there's no 1h block to resolve -> False.
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="sell",
+        bias_1h="bearish", bias_15m="bearish", confidence=0.85, cfg=_cfg(),
+    ) is False
+
+
+def test_deadlock_break_only_clean_trend():
+    base = dict(side="sell", bias_1h="bullish", bias_15m="bearish", confidence=0.85, cfg=_cfg())
+    # exhausted daily is the allow_trend_aligned_short path, not this one
+    assert resolve_gate_deadlock(daily_bias="bearish", daily_exhausted=True, **base) is False
+    # neutral daily -> no deadlock (a direction is open), leave the 1h gate intact
+    assert resolve_gate_deadlock(daily_bias="neutral", daily_exhausted=False, **base) is False
+
+
+def test_deadlock_break_respects_disable_flag():
+    assert resolve_gate_deadlock(
+        daily_bias="bearish", daily_exhausted=False, side="sell",
+        bias_1h="bullish", bias_15m="bearish", confidence=0.90, cfg=_cfg(deadlock_break_enabled=False),
+    ) is False
 
 
 # ── B: hostile regime detection + throttle ──────────────────────────────────────

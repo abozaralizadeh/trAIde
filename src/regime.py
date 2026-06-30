@@ -41,6 +41,77 @@ def regime_size_factor(daily_bias: str, daily_exhausted: bool, cfg: RegimeConfig
   return 1.0
 
 
+def conviction_size_factor(confidence, min_confidence, cfg: RegimeConfig) -> float:
+  """Position-size multiplier (<= 1.0) scaled by how far confidence clears the floor.
+
+  An entry whose confidence barely clears the admission floor is low-conviction and gets
+  `cfg.conviction_min_size_factor` of full size; size then ramps linearly to 1.0 as confidence
+  approaches `cfg.conviction_full_confidence`. This shrinks exactly the low-conviction full-size
+  trades that drove the SOL drawdown (the agent's own "mixed/low-conviction" read should size down,
+  not in/out). Fails open to 1.0 when disabled or confidence/floor are unknown.
+  """
+  if not cfg.conviction_sizing_enabled:
+    return 1.0
+  try:
+    conf = float(confidence)
+    floor = float(min_confidence)
+    full = float(cfg.conviction_full_confidence)
+  except (TypeError, ValueError):
+    return 1.0
+  min_factor = min(1.0, max(0.0, float(cfg.conviction_min_size_factor)))
+  if conf >= full:
+    return 1.0
+  if conf <= floor or full <= floor:
+    return min_factor
+  frac = (conf - floor) / (full - floor)
+  return min_factor + frac * (1.0 - min_factor)
+
+
+def resolve_gate_deadlock(
+  *,
+  daily_bias: str,
+  daily_exhausted: bool,
+  side: str,
+  bias_1h: str,
+  bias_15m: str,
+  confidence,
+  cfg: RegimeConfig,
+) -> bool:
+  """True if a daily-aligned entry should pass the 1h-alignment gate to break a both-blocked deadlock.
+
+  The deadlock the audit flagged: in a clean (non-exhausted) daily trend, the daily gate blocks the
+  counter-trend direction while the 1h gate — reacting to a counter-trend *bounce* within that daily
+  trend — blocks the daily-aligned direction, stranding the agent flat in both directions. This
+  re-permits the daily-aligned trade (a short in a bearish daily, a long in a bullish daily) past the
+  1h gate, but only when the bounce is stalling (15m no longer confirms the 1h counter-move) and
+  confidence clears a raised bar — so it takes the trend-continuation trade rather than knife-catching
+  a live bounce. Disjoint from `allow_trend_aligned_short` (which handles the exhausted-daily case).
+  """
+  if not cfg.deadlock_break_enabled:
+    return False
+  bias = str(daily_bias or "").strip().lower()
+  s = (side or "").lower()
+  if daily_exhausted or bias not in ("bullish", "bearish"):
+    return False
+  daily_aligned = (bias == "bearish" and s == "sell") or (bias == "bullish" and s == "buy")
+  if not daily_aligned:
+    return False
+  one_h = str(bias_1h or "").strip().lower()
+  one_h_opposes = (one_h == "bullish" and s == "sell") or (one_h == "bearish" and s == "buy")
+  if not one_h_opposes:
+    return False
+  fifteen = str(bias_15m or "").strip().lower()
+  fifteen_still_counter = (fifteen == "bullish" and s == "sell") or (fifteen == "bearish" and s == "buy")
+  if fifteen_still_counter:
+    return False
+  try:
+    if float(confidence or 0.0) < cfg.deadlock_min_confidence:
+      return False
+  except (TypeError, ValueError):
+    return False
+  return True
+
+
 def block_alt_long_in_btc_downtrend(
   *,
   symbol: str,

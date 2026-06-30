@@ -57,8 +57,10 @@ from .regime import (
   allow_trend_aligned_short,
   block_alt_long_in_btc_downtrend,
   concentration_scale,
+  conviction_size_factor,
   effective_min_confidence,
   regime_size_factor,
+  resolve_gate_deadlock,
 )
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -2250,8 +2252,15 @@ def run_trading_agent(
         (intraday_bias_1h == "bullish" and side_lower == "sell")
       )
       if intraday_1h_opposes:
-        logger.warning("1H ALIGN BLOCK: %s %s rejected — 1h bias %s opposes %s", side, spot_symbol, intraday_bias_1h, side_lower)
-        return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction, not a healthy pullback. Do NOT enter against the 1h trajectory even when daily aligns."}
+        if resolve_gate_deadlock(
+          daily_bias=daily_bias, daily_exhausted=daily_exhausted, side=side_lower,
+          bias_1h=intraday_bias_1h, bias_15m=gate.get("intraday_bias_15m", "neutral"),
+          confidence=confidence, cfg=cfg.regime,
+        ):
+          logger.info("DEADLOCK BREAK: %s %s — daily-aligned entry allowed past stalling 1h counter-bounce (daily=%s, 1h=%s, conf=%.2f)", side, spot_symbol, daily_bias, intraday_bias_1h, confidence or 0.0)
+        else:
+          logger.warning("1H ALIGN BLOCK: %s %s rejected — 1h bias %s opposes %s", side, spot_symbol, intraday_bias_1h, side_lower)
+          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction, not a healthy pullback. Do NOT enter against the 1h trajectory even when daily aligns."}
       # Timeframe-conflict gate: catches 15m vs higher-TF disagreement not already blocked by 1h alignment
       tf_conflict = gate.get("timeframe_conflict", False)
       intraday_bias_15m = gate.get("intraday_bias_15m", "neutral")
@@ -2293,6 +2302,12 @@ def run_trading_agent(
       _eff_min_fm = effective_min_confidence(cfg.trading.min_confidence, _g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime)
       if confidence < _eff_min_fm:
         return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fm:.2f}", "hint": "Only enter with sufficient conviction; the bar is raised in a bearish/exhausted regime. Analyze another coin or wait for a better setup."}
+      # Conviction sizing: shrink low-conviction entries (confidence barely above the floor), ramping
+      # to full size as conviction rises — targets the full-size low-conviction shorts that drained SOL.
+      _conv_scale_fm = conviction_size_factor(confidence, _eff_min_fm, cfg.regime)
+      if _conv_scale_fm < 1.0:
+        logger.info("CONVICTION SIZING: futures %s conf=%.2f (floor %.2f) — scaling position to %.0f%%", spot_symbol, confidence, _eff_min_fm, _conv_scale_fm * 100)
+        _atr_scale_fm = max(0.30, _atr_scale_fm * _conv_scale_fm)
 
     # Anti-stacking: block add-on entries when existing position is losing
     if is_entry and snapshot.futures_positions:
@@ -2950,8 +2965,15 @@ def run_trading_agent(
         (intraday_bias_1h_fl == "bullish" and side_lower == "sell")
       )
       if intraday_1h_opposes_fl:
-        logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)
-        return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction. Wait for 1h alignment."}
+        if resolve_gate_deadlock(
+          daily_bias=daily_bias, daily_exhausted=daily_exhausted, side=side_lower,
+          bias_1h=intraday_bias_1h_fl, bias_15m=gate.get("intraday_bias_15m", "neutral"),
+          confidence=confidence, cfg=cfg.regime,
+        ):
+          logger.info("DEADLOCK BREAK: futures limit %s %s — daily-aligned entry allowed past stalling 1h counter-bounce (daily=%s, 1h=%s, conf=%.2f)", side_lower, spot_symbol, daily_bias, intraday_bias_1h_fl, confidence or 0.0)
+        else:
+          logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)
+          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction. Wait for 1h alignment."}
       tf_conflict_fl = gate.get("timeframe_conflict", False)
       intraday_bias_15m_fl = gate.get("intraday_bias_15m", "neutral")
       if tf_conflict_fl and intraday_bias_15m_fl != "neutral":
@@ -2987,6 +3009,11 @@ def run_trading_agent(
       _eff_min_fl = effective_min_confidence(cfg.trading.min_confidence, _g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)
       if confidence < _eff_min_fl:
         return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fl:.2f}"}
+      # Conviction sizing: shrink low-conviction entries, ramping to full size as conviction rises.
+      _conv_scale_fl = conviction_size_factor(confidence, _eff_min_fl, cfg.regime)
+      if _conv_scale_fl < 1.0:
+        logger.info("CONVICTION SIZING: futures limit %s conf=%.2f (floor %.2f) — scaling position to %.0f%%", spot_symbol, confidence, _eff_min_fl, _conv_scale_fl * 100)
+        _atr_scale_fl = max(0.30, _atr_scale_fl * _conv_scale_fl)
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:

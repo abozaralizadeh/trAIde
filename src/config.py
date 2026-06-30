@@ -119,6 +119,15 @@ class RegimeConfig:
   # high-beta to BTC; longing them into a BTC downtrend is what blew up on RE-USDT, 2026-06-21).
   alt_long_block_enabled: bool = True
   alt_majors: tuple = ("BTC", "ETH")  # symbols exempt from the alt-long gate (they have their own daily gate)
+  # Conviction sizing: scale position size by how far confidence clears the floor, so low-conviction
+  # entries size down instead of taking full size (the SOL drawdown was full-size low-conviction shorts).
+  conviction_sizing_enabled: bool = True
+  conviction_full_confidence: float = 0.85   # confidence at/above which full size is used
+  conviction_min_size_factor: float = 0.5    # size multiplier at the confidence floor
+  # Deadlock break: in a clean daily trend, allow the daily-aligned entry past the 1h gate when a 1h
+  # counter-bounce is stalling (15m no longer confirms it) — fixes the both-directions-blocked stall.
+  deadlock_break_enabled: bool = True
+  deadlock_min_confidence: float = 0.72      # raised confidence bar to take the trend-continuation entry
 
 
 @dataclass
@@ -272,6 +281,11 @@ def load_config() -> AppConfig:
       trend_short_require_15m=_as_bool(os.getenv("TREND_SHORT_REQUIRE_15M"), True),
       alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
       alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
+      conviction_sizing_enabled=_as_bool(os.getenv("CONVICTION_SIZING_ENABLED"), True),
+      conviction_full_confidence=float(os.getenv("CONVICTION_FULL_CONFIDENCE", "0.85")),
+      conviction_min_size_factor=float(os.getenv("CONVICTION_MIN_SIZE_FACTOR", "0.5")),
+      deadlock_break_enabled=_as_bool(os.getenv("DEADLOCK_BREAK_ENABLED"), True),
+      deadlock_min_confidence=float(os.getenv("DEADLOCK_MIN_CONFIDENCE", "0.72")),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),
