@@ -12,6 +12,7 @@ from src.regime import (
     concentration_scale,
     conviction_size_factor,
     resolve_gate_deadlock,
+    reward_risk_ratio,
 )
 from src.memory import MemoryStore
 
@@ -84,6 +85,48 @@ def test_concentration_scale_disabled_or_unknown_equity():
     assert concentration_scale(52.0, 70.0, 0.0) == 1.0   # cap disabled
     assert concentration_scale(52.0, 0.0, 0.5) == 1.0    # equity unknown
     assert concentration_scale(0.0, 70.0, 0.5) == 1.0    # no notional
+
+
+# ── Reward:risk ratio (futures bracket) ─────────────────────────────────────────
+
+
+def test_rr_long_basic():
+    # entry 100, TP 110 (+10), SL 95 (-5) -> RR 2.0
+    assert reward_risk_ratio("buy", 100, 110, 95) == 2.0
+    assert reward_risk_ratio("long", 100, 110, 95) == 2.0
+
+
+def test_rr_short_basic():
+    # short entry 100, TP 90 (+10 reward), SL 105 (-5 risk) -> RR 2.0
+    assert reward_risk_ratio("sell", 100, 90, 105) == 2.0
+    assert reward_risk_ratio("short", 100, 90, 105) == 2.0
+
+
+def test_rr_inverted_bracket_is_below_one():
+    # the observed failure: short with TP close (+2) and SL wide (-6) -> RR 0.33
+    rr = reward_risk_ratio("sell", 100, 98, 106)
+    assert abs(rr - (2.0 / 6.0)) < 1e-9
+    assert rr < 1.0
+
+
+def test_rr_none_when_tp_wrong_side():
+    # long with TP below entry -> reward negative -> None (caller rejects)
+    assert reward_risk_ratio("buy", 100, 95, 90) is None
+    # short with TP above entry -> None
+    assert reward_risk_ratio("sell", 100, 110, 120) is None
+
+
+def test_rr_none_when_sl_wrong_side_or_zero_risk():
+    # long with SL above entry -> risk negative -> None
+    assert reward_risk_ratio("buy", 100, 110, 105) is None
+    # SL at entry -> zero risk -> None (no divide-by-zero)
+    assert reward_risk_ratio("buy", 100, 110, 100) is None
+
+
+def test_rr_none_on_bad_input_or_side():
+    assert reward_risk_ratio("buy", None, 110, 95) is None
+    assert reward_risk_ratio("hold", 100, 110, 95) is None
+    assert reward_risk_ratio("", 100, 110, 95) is None
 
 
 # ── Conviction sizing: scale size by how far confidence clears the floor ─────────

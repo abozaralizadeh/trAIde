@@ -61,6 +61,7 @@ from .regime import (
   effective_min_confidence,
   regime_size_factor,
   resolve_gate_deadlock,
+  reward_risk_ratio,
 )
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -2561,6 +2562,17 @@ def run_trading_agent(
             "feeRate": fee_rate,
             "hint": f"Widen TP to at least {min_tp:.2f} and SL to at least {min_sl:.2f} (>{min_edge_pct*100:.2f}% from entry), then retry.",
           }
+      # Reward:risk floor — don't take entries that risk more than they aim to make. Futures had no
+      # RR check (only spot did), which is why losses ran ~4x the wins. Enforced when TP+SL are both set.
+      _rr_stop_fm = sl_val or trigger_stop_val
+      if cfg.trading.min_futures_rr > 0 and tp_val and _rr_stop_fm:
+        _rr_fm = reward_risk_ratio(side, price, tp_val, _rr_stop_fm)
+        if _rr_fm is None:
+          logger.warning("RR BLOCK: futures %s %s rejected — TP/SL on the wrong side of entry", side, spot_symbol)
+          return {"rejected": True, "reason": "TP/SL on the wrong side of entry — cannot form a valid bracket", "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": "For a long, TP must be above and SL below entry; reverse for a short."}
+        if _rr_fm < cfg.trading.min_futures_rr:
+          logger.warning("RR BLOCK: futures %s %s rejected — reward:risk %.2f < %.2f", side, spot_symbol, _rr_fm, cfg.trading.min_futures_rr)
+          return {"rejected": True, "reason": f"Reward:risk {_rr_fm:.2f} below minimum {cfg.trading.min_futures_rr:.2f}", "rr": _rr_fm, "minRr": cfg.trading.min_futures_rr, "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {cfg.trading.min_futures_rr:.1f}x the stop distance. Skip setups that can't clear it."}
     base_size = contracts * multiplier
     expected_tp_pnl = None
     if tp_val and base_size > 0:
@@ -3102,6 +3114,17 @@ def run_trading_agent(
       return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty}
     if actual_notional > snapshot.max_position_usd * max_leverage_cap:
       return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd * max_leverage_cap}
+
+    # Reward:risk floor — when a bracket is supplied inline, reject entries that risk more than they
+    # aim to make (the futures asymmetry fix; the deferred-bracket path is steered by the prompt).
+    if cfg.trading.min_futures_rr > 0 and take_profit_price is not None and stop_loss_price is not None:
+      _rr_fl = reward_risk_ratio(side_lower, entry_price_val, take_profit_price, stop_loss_price)
+      if _rr_fl is None:
+        logger.warning("RR BLOCK: futures limit %s %s rejected — TP/SL on the wrong side of entry", side_lower, spot_symbol)
+        return {"rejected": True, "reason": "TP/SL on the wrong side of entry — cannot form a valid bracket", "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": "For a long, TP must be above and SL below entry; reverse for a short."}
+      if _rr_fl < cfg.trading.min_futures_rr:
+        logger.warning("RR BLOCK: futures limit %s %s rejected — reward:risk %.2f < %.2f", side_lower, spot_symbol, _rr_fl, cfg.trading.min_futures_rr)
+        return {"rejected": True, "reason": f"Reward:risk {_rr_fl:.2f} below minimum {cfg.trading.min_futures_rr:.2f}", "rr": _rr_fl, "minRr": cfg.trading.min_futures_rr, "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {cfg.trading.min_futures_rr:.1f}x the stop distance. Skip setups that can't clear it."}
 
     expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
     pending_protection = {"takeProfitPrice": take_profit_price, "stopLossPrice": stop_loss_price}
@@ -4294,7 +4317,7 @@ def run_trading_agent(
     "- REQUIRED CONFIRMATION: volume on the breakout candle ≥ 1.5× the 20-candle average. "
     "If volume is weak, decline_trade — false breakouts ('head fakes') are common.\n"
     "- TP: rely on plan_spot_position's volatility-scaled rr (or set futures TP at 2-3× stop_distance in high vol). "
-    "Squeezes resolve in extended moves; do NOT use a tight RR=1.5 TP.\n"
+    "Squeezes resolve in extended moves; don't cap the target at the minimum reward:risk — let it run to 2-3×.\n"
     "- The anti-FOMO daily-exhaustion block still wins: if 1D is exhausted in the same direction, the entry is rejected "
     "(squeezes near tops are statistically more likely to be head fakes).\n\n"
 
@@ -4375,17 +4398,19 @@ def run_trading_agent(
     "- Keep at least 10% USDT reserve across all venues combined.\n\n"
 
     "**TP/SL rules (mandatory on every new entry):**\n"
-    "- Stop-loss: ATR-based (1.5–2.5x ATR from entry) OR 1.0–2.0% if ATR is unavailable. "
-    "ALWAYS give the SL more room than the TP — crypto wicks frequently sweep tight stops before "
-    "reversing to your target. A wider stop with a smaller position keeps dollar risk the same but avoids noise stopouts.\n"
-    "- Take-profit: RR >= 1.0 (minimum). Aim for 1.5–2.0 when momentum is strong.\n"
+    "- Stop-loss: ATR-based (1.5–2.5x ATR from entry) OR 1.0–2.0% if ATR is unavailable. Place the SL where "
+    "your thesis is invalidated, then control dollar risk with SIZE — NOT by widening the stop past the target.\n"
+    f"- Take-profit: the TP distance MUST be at least {cfg.trading.min_futures_rr:.1f}x the SL distance "
+    f"(reward:risk >= {cfg.trading.min_futures_rr:.1f}). The system HARD-REJECTS futures entries below this "
+    "(losses were running ~4x the wins because stops sat wider than targets). Aim for 2.0+ when momentum is strong. "
+    "If a setup can't offer that much room to the target before the invalidation level, SKIP it — do not shrink the TP to force a fill.\n"
     "- For limit entries: pass stop_price and take_profit_price into the limit order tool. "
-    "The system records them as pendingProtection. On the next run after the limit fills, "
-    "place bracket orders with place_spot_stop_order / place_futures_stop_order.\n"
+    "The system records them as pendingProtection and checks reward:risk when both are supplied. On the next run "
+    "after the limit fills, place bracket orders with place_spot_stop_order / place_futures_stop_order at the SAME reward:risk.\n"
     + (
-    "- FOR RANGE TRADES: TP at BB midline (mean). SL at BB band + 1 ATR. "
-    "RR may be as low as 1.0 for range trades (the high win rate compensates). "
-    "Never set a range trade TP beyond the opposite BB band.\n\n"
+    f"- FOR RANGE TRADES: TP toward the BB midline (mean), SL beyond the BB band. Still respect the "
+    f"reward:risk >= {cfg.trading.min_futures_rr:.1f} floor — if the mean-reversion target is too close to justify the stop, "
+    "skip the trade. Never set a range trade TP beyond the opposite BB band.\n\n"
     if cfg.trading.range_trading_enabled else "\n") +
 
     "## STEP 4 — Log and save:\n"

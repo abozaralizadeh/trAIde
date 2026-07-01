@@ -82,6 +82,7 @@ class TradingConfig:
   max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
   research_handoff_cooldown_min: float = 30.0 # min minutes between forced Research handoffs (0=off)
+  min_futures_rr: float = 1.5                 # reject futures entries whose TP:SL reward:risk is below this (0=off)
 
 
 @dataclass
@@ -254,6 +255,7 @@ def load_config() -> AppConfig:
       max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
       research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
+      min_futures_rr=float(os.getenv("MIN_FUTURES_RR", "1.5")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),

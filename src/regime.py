@@ -135,6 +135,33 @@ def block_alt_long_in_btc_downtrend(
   return str(btc_daily_bias or "").strip().lower() == "bearish"
 
 
+def reward_risk_ratio(side: str, entry, take_profit, stop_loss):
+  """Reward:risk of an entry bracket — |TP - entry| / |entry - SL| — or None if it can't form.
+
+  Returns None when inputs are non-numeric, the stop distance is non-positive, or the TP/SL sit on
+  the wrong side of entry for the direction (a long needs TP above and SL below entry; a short the
+  reverse). Callers treat None as a reject: a bracket that can't be measured shouldn't be traded.
+  """
+  try:
+    e = float(entry)
+    tp = float(take_profit)
+    sl = float(stop_loss)
+  except (TypeError, ValueError):
+    return None
+  s = (side or "").lower()
+  if s in ("buy", "long"):
+    reward = tp - e
+    risk = e - sl
+  elif s in ("sell", "short"):
+    reward = e - tp
+    risk = sl - e
+  else:
+    return None
+  if risk <= 0 or reward <= 0:
+    return None
+  return reward / risk
+
+
 def concentration_scale(notional_usd: float, total_equity_usd: float, max_pct: float) -> float:
   """Scale factor (<=1.0) that shrinks a position's notional to at most `max_pct` of equity.
 
