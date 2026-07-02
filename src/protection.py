@@ -71,10 +71,20 @@ def decide_protection(
     return {"action": "none", "reason": "missing price data"}
 
   fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)
+  risk_dist = None
+  if sl_price is not None and sl_price > 0:
+    rd = (avg_entry - sl_price) if side_long else (sl_price - avg_entry)
+    if rd > 0:
+      risk_dist = rd
 
-  # P1a — give-back cap: lock the gain once a real run retraces too far.
+  # P1a — give-back cap: lock the gain once a real run retraces too far. Arming is tied to the
+  # trade's OWN risk when the stop is known (giveback_arm_r × stop distance): sub-1R wobble is
+  # noise the original SL owns, and closing there books fee-scale scratch "wins" while losses
+  # ride to the full stop — the asymmetry that kept the account net-negative.
   if cfg.giveback_pct and cfg.giveback_pct > 0:
     min_fe = cfg.min_favorable_excursion_pct * avg_entry
+    if cfg.giveback_arm_r and cfg.giveback_arm_r > 0 and risk_dist is not None:
+      min_fe = max(min_fe, cfg.giveback_arm_r * risk_dist)
     if peak_fe >= min_fe and fe_now <= (1.0 - cfg.giveback_pct) * peak_fe:
       return {
         "action": "close",
@@ -87,9 +97,8 @@ def decide_protection(
       }
 
   # P1b — breakeven ratchet: once +1R (configurable), the trade can't become a loss.
-  if sl_price is not None and sl_price > 0:
-    risk_dist = (avg_entry - sl_price) if side_long else (sl_price - avg_entry)
-    if risk_dist > 0 and peak_fe >= cfg.breakeven_trigger_r * risk_dist:
+  if risk_dist is not None:
+    if peak_fe >= cfg.breakeven_trigger_r * risk_dist:
       be = avg_entry * (1.0 + cfg.breakeven_fee_pct) if side_long else avg_entry * (1.0 - cfg.breakeven_fee_pct)
       already_protective = (sl_price >= be) if side_long else (sl_price <= be)
       if not already_protective:

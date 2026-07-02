@@ -324,8 +324,10 @@ async def trading_loop() -> None:
   consecutive_no_trade_runs = 0  # runs where the agent placed no order (drives forced research)
   force_research = False         # when True, next agent run must hand off to Research first
   last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
-  logged_closed_position_ids: set[str] = set()
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
+  # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
+  # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
+  logged_closed_position_ids: set[str] = set(memory.get_seen_close_ids())
   notifier = TelegramNotifier(cfg)
   notifier.notify_startup(cfg)
   dashboard = DashboardPublisher(cfg)
@@ -468,6 +470,7 @@ async def trading_loop() -> None:
           close_type=close_type,
         )
         logged_closed_position_ids.add(cp_id)
+        memory.record_seen_close_id(cp_id)
         logger.info("Recorded triggered close for %s: PnL=%.4f (%s)", sym, pnl, close_type)
       except Exception as exc:
         logger.warning("Failed to record triggered close: %s", exc)

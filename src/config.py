@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -86,6 +86,26 @@ class TradingConfig:
 
 
 @dataclass
+class EdgeConfig:
+  """Adaptive edge controller (src/edge.py) — risk posture derived from rolling realized results.
+
+  Self-tuning by design: when the last N trades are net-losing the bot demands more
+  reward per unit risk, benches symbols that keep losing, and shrinks size during loss
+  streaks — then relaxes back automatically once realized expectancy turns positive.
+  """
+  enabled: bool = True
+  lookback_trades: int = 30        # rolling window of realized closes the stats are computed over
+  min_trades: int = 8              # minimum closes before adaptive actions kick in (else static behavior)
+  rr_step: float = 0.5             # added to the futures RR floor while expectancy is negative
+  rr_cap: float = 2.5              # ceiling for the adaptive RR floor
+  bench_lookback: int = 5          # per-symbol recent closes examined for the bench
+  bench_min_losses: int = 3        # losses within that lookback (with negative net) that bench the symbol
+  bench_cooldown_hours: float = 12.0  # bench auto-lifts this long after the symbol's last close
+  streak_threshold: int = 2        # consecutive realized losses that trigger the size throttle
+  streak_size_factor: float = 0.5  # entry-size multiplier while on a losing streak
+
+
+@dataclass
 class CircuitBreakerConfig:
   max_daily_drawdown_pct: float
   max_consecutive_losses: int
@@ -105,6 +125,10 @@ class ProfitProtectionConfig:
   no_chase_enabled: bool
   post_win_cooldown_minutes: float
   no_chase_buffer_pct: float
+  # Give-back arming: don't let the give-back cap act until the run has reached this multiple of
+  # the trade's own initial risk (stop distance). Stops the cap from strangling winners at
+  # fee-scale (+0.3-0.5% ROE closes) while losses ride to the full stop. 0 = pct-arming only.
+  giveback_arm_r: float = 1.0
 
 
 @dataclass
@@ -189,6 +213,9 @@ class AppConfig:
   memory_file: str
   retention_days: int
   agent_max_turns: int
+  # Adaptive edge controller — defaulted so existing AppConfig constructions keep working;
+  # load_config wires env overrides explicitly.
+  edge: EdgeConfig = field(default_factory=EdgeConfig)
 
 
 def load_config() -> AppConfig:
@@ -273,6 +300,19 @@ def load_config() -> AppConfig:
       no_chase_enabled=_as_bool(os.getenv("NO_CHASE_ENABLED"), True),
       post_win_cooldown_minutes=float(os.getenv("POST_WIN_COOLDOWN_MINUTES", "45")),
       no_chase_buffer_pct=float(os.getenv("NO_CHASE_BUFFER_PCT", "0.001")),
+      giveback_arm_r=float(os.getenv("PROFIT_LOCK_GIVEBACK_ARM_R", "1.0")),
+    ),
+    edge=EdgeConfig(
+      enabled=_as_bool(os.getenv("ADAPTIVE_EDGE_ENABLED"), True),
+      lookback_trades=int(os.getenv("EDGE_LOOKBACK_TRADES", "30")),
+      min_trades=int(os.getenv("EDGE_MIN_TRADES", "8")),
+      rr_step=float(os.getenv("EDGE_RR_STEP", "0.5")),
+      rr_cap=float(os.getenv("EDGE_RR_CAP", "2.5")),
+      bench_lookback=int(os.getenv("EDGE_BENCH_LOOKBACK", "5")),
+      bench_min_losses=int(os.getenv("EDGE_BENCH_MIN_LOSSES", "3")),
+      bench_cooldown_hours=float(os.getenv("EDGE_BENCH_COOLDOWN_HOURS", "12")),
+      streak_threshold=int(os.getenv("EDGE_STREAK_THRESHOLD", "2")),
+      streak_size_factor=float(os.getenv("EDGE_STREAK_SIZE_FACTOR", "0.5")),
     ),
     regime=RegimeConfig(
       throttle_enabled=_as_bool(os.getenv("REGIME_THROTTLE_ENABLED"), True),

@@ -72,6 +72,34 @@ def test_giveback_disabled_when_pct_zero():
     assert d["action"] == "move_breakeven"
 
 
+# ── decide_protection: give-back arming at 1R (giveback_arm_r) ───────────────────
+
+
+def test_giveback_not_armed_below_one_r_run():
+    """Sub-1R wobble is the original SL's job — the cap must not book fee-scale scratch wins.
+    Risk = 5 px; peak ran only 2 px (0.4R, but > the 0.5% pct floor) then retraced fully."""
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.1, sl_price=95.0, peak_fe=2.0, cfg=_cfg())
+    assert d["action"] == "none"
+
+
+def test_giveback_armed_after_one_r_run():
+    # Risk = 5 px; ran to 6 px (1.2R) then gave back >35% → close.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=6.0, cfg=_cfg())
+    assert d["action"] == "close"
+
+
+def test_giveback_pct_arming_when_no_stop_known():
+    # Without a live stop the 1R arming can't be computed → falls back to pct arming (old behavior).
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.5, sl_price=None, peak_fe=2.0, cfg=_cfg())
+    assert d["action"] == "close"
+
+
+def test_giveback_arm_r_zero_reverts_to_pct_arming():
+    # arm_r=0 disables risk-based arming even with a stop present (legacy pct behavior).
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.1, sl_price=95.0, peak_fe=2.0, cfg=_cfg(giveback_arm_r=0.0))
+    assert d["action"] == "close"
+
+
 # ── Regression: the actual ETH incident (2026-06-07/08) ──────────────────────────
 
 

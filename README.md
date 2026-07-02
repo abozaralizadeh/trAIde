@@ -200,6 +200,8 @@ flowchart LR
 - **Correlation gate**: Blocks **longs on non-major alts while BTC's daily regime is bearish** (`ALT_LONG_BLOCK_WHEN_BTC_BEARISH`). Alts are high-beta to BTC; longing them into a confirmed BTC downtrend is the exact setup that blew up on RE-USDT. Majors in `ALT_MAJORS` are exempt (they have their own per-symbol daily gate); shorts are never blocked by this gate.
 - **New-listing guard**: Blocks futures entries on contracts younger than `MIN_FUTURES_LISTING_AGE_DAYS` (via the contract's first-open date). Freshly-listed perps are thin and ultra-volatile — RE-USDT had a ~100% intraday range on day one.
 - **Minimum reward:risk (futures)**: Rejects any futures entry whose take-profit distance is less than `MIN_FUTURES_RR` × the stop-loss distance (checked when both are supplied at entry). Previously the R:R floor existed only on the spot path, so futures brackets were being set with stops *wider* than targets — the direct cause of losses running ~4× the wins at a high win rate. Dollar risk is meant to be controlled by position size, not by widening the stop past the target.
+- **Adaptive edge controller** (`src/edge.py`): the bot's risk posture is derived from its own **rolling realized results** instead of static parameters, so it self-tightens when losing and relaxes when earning — no manual re-tuning as regimes change. Three code-enforced actions, each logged and surfaced to the agent in an `edgeReport`: (1) **adaptive R:R floor** — while the last N closes are net-losing, the futures reward:risk minimum rises by `EDGE_RR_STEP`; (2) **symbol bench** — a symbol with `EDGE_BENCH_MIN_LOSSES`+ losses (and negative net) in its recent closes is quarantined from new entries until a cooldown lifts, breaking the "re-take the same losing trade" loop; (3) **loss-streak throttle** — after `EDGE_STREAK_THRESHOLD` consecutive losses, entries are sized down by `EDGE_STREAK_SIZE_FACTOR` until a win (anti-martingale, a soft stage before the consecutive-loss circuit breaker).
+- **Give-back arming at 1R** (`PROFIT_LOCK_GIVEBACK_ARM_R`): the give-back cap only acts once a run has reached this multiple of the trade's *own* initial risk (stop distance) — sub-1R wobble belongs to the original stop. Stops the cap from strangling winners into fee-scale scratch closes while losses ride to the full stop.
 - **Trend-aligned shorts**: In a confirmed downtrend the anti-FOMO gate would otherwise force the bot to only ever long oversold bounces. With `TREND_ALIGNED_SHORTS_ENABLED`, a short into an exhausted-bearish daily is permitted **when 1h and 15m both confirm** the downtrend is resuming and confidence clears a higher bar (`TREND_SHORT_MIN_CONFIDENCE`) — letting the bot trade *with* the trend, not only against bounces.
 - **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed, and a confirmed trend-aligned short can be re-permitted (see above).
 - **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
@@ -320,6 +322,7 @@ Code-driven guards enforced outside the LLM (`src/protection.py`). They run ever
 | `PROFIT_LOCK_BREAKEVEN_FEE_PCT` | `0.0015` | Round-trip cost buffer (KuCoin futures taker 0.06%×2 + slippage) so the breakeven stop nets ≥0 |
 | `PROFIT_LOCK_GIVEBACK_PCT` | `0.35` | Close after price retraces this fraction of the peak run; `0.35` retains ~65% of peak profit, mid-band of the 60–70% best-practice range (`0` disables the give-back close) |
 | `PROFIT_LOCK_MIN_FE_PCT` | `0.005` | Minimum run (fraction of entry) before the give-back cap can act — filters noise |
+| `PROFIT_LOCK_GIVEBACK_ARM_R` | `1.0` | Also require the run to reach this multiple of the trade's own risk (stop distance) before give-back can act; `0` = pct-arming only |
 | `NO_CHASE_ENABLED` | `true` | Block same-direction re-entry at a worse price after a recent winning close |
 | `POST_WIN_COOLDOWN_MINUTES` | `45` | Window after a winning close during which re-entry at a worse price is blocked |
 | `NO_CHASE_BUFFER_PCT` | `0.001` | Tolerance band around the prior exit price |
@@ -335,6 +338,23 @@ Blast-radius and selection guards added after the RE-USDT concentration blowup (
 | `MAX_POSITION_EQUITY_PCT` | `0.5` | Cap a single position's notional at this fraction of total equity, regardless of leverage (`0` = off) |
 | `MIN_FUTURES_LISTING_AGE_DAYS` | `7` | Block futures entries on contracts younger than this many days — thin/volatile fresh listings (`0` = off) |
 | `MIN_FUTURES_RR` | `1.5` | Reject futures entries whose take-profit distance is below this × the stop distance (`0` = off) |
+
+### Adaptive Edge Controller
+
+Self-tuning risk (`src/edge.py`): posture derives from the rolling realized closes, tightens while losing, and relaxes back automatically when expectancy turns positive. The current stats, required R:R, benched symbols, and size factor are injected into the agent's context each run (`edgeReport`) so it proposes trades that pass the gates.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ADAPTIVE_EDGE_ENABLED` | `true` | Master switch for the adaptive edge controller |
+| `EDGE_LOOKBACK_TRADES` | `30` | Rolling window of realized closes the stats are computed over |
+| `EDGE_MIN_TRADES` | `8` | Minimum closes before adaptive actions kick in (below this, static behavior) |
+| `EDGE_RR_STEP` | `0.5` | Added to `MIN_FUTURES_RR` while rolling expectancy is negative |
+| `EDGE_RR_CAP` | `2.5` | Ceiling for the adaptive R:R floor |
+| `EDGE_BENCH_LOOKBACK` | `5` | Per-symbol recent closes examined for the bench |
+| `EDGE_BENCH_MIN_LOSSES` | `3` | Losses within that window (with negative net) that bench the symbol |
+| `EDGE_BENCH_COOLDOWN_HOURS` | `12` | Bench auto-lifts this long after the symbol's last close |
+| `EDGE_STREAK_THRESHOLD` | `2` | Consecutive realized losses that trigger the size throttle |
+| `EDGE_STREAK_SIZE_FACTOR` | `0.5` | Entry-size multiplier while on a losing streak |
 | `ALT_LONG_BLOCK_WHEN_BTC_BEARISH` | `true` | Block longs on non-major alts while BTC's daily regime is bearish (alts are high-beta to BTC) |
 | `ALT_MAJORS` | `BTC,ETH` | Symbols exempt from the alt-long gate (they have their own per-symbol daily gate) |
 | `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `3` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |

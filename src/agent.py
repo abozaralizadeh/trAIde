@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -51,6 +52,7 @@ from .kucoin import (
   KucoinOrderRequest,
   KucoinTicker,
 )
+from .edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_bench_until
 from .memory import MemoryStore
 from .protection import should_block_chase
 from .regime import (
@@ -354,6 +356,25 @@ def _base_currency(symbol: str) -> str:
   return symbol.split("-")[0].upper()
 
 
+_CITATION_PUA_RE = re.compile("[\ue000-\uf8ff]")  # private-use chars wrapping citation markers
+_CITATION_TOKEN_RE = re.compile(
+  r"\bcite(?:turn\d+\w*)+\b"                          # 'citeturn0search0' fused tokens
+  r"|\bturn\d+(?:search|news|view|fetch|image)\d+\b"  # bare 'turn0search0' fragments
+)
+
+
+def _strip_citation_tokens(text: str) -> str:
+  """Remove model citation artifacts ('citeturn0search0'-style tokens + their invisible wrappers).
+
+  The web-search tool wraps citation markers in Unicode private-use characters; logged or sent to
+  Telegram they render as literal 'citeturn0search0' noise. Two passes: dropping the invisible
+  wrappers first makes the token contiguous so the second pass can remove it whole.
+  """
+  if not text:
+    return text
+  return _CITATION_TOKEN_RE.sub("", _CITATION_PUA_RE.sub("", text)).strip()
+
+
 def _to_futures_symbol(spot_symbol: str) -> str | None:
   """Map spot symbol (e.g., BTC-USDT) to KuCoin futures contract symbol (e.g., XBTUSDTM)."""
   if not spot_symbol or "-" not in spot_symbol:
@@ -628,6 +649,49 @@ def run_trading_agent(
         logger.debug("BTC daily bias computation failed (correlation gate fails open): %s", exc)
     _btc_bias_cache["v"] = bias
     return bias
+
+  _edge_cache: Dict[str, Any] = {}
+
+  def _edge_state() -> Dict[str, Any]:
+    """Adaptive edge posture for this run, computed once from rolling realized closes.
+
+    Returns {stats, required_rr, size_factor, bench: {symbol: until_ts}}. Never raises —
+    on any failure it degrades to the static config behavior (base RR floor, full size,
+    nothing benched), so the edge controller can only tighten risk, never break trading.
+    """
+    if "v" in _edge_cache:
+      return _edge_cache["v"]
+    state: Dict[str, Any] = {
+      "stats": {},
+      "required_rr": cfg.trading.min_futures_rr,
+      "size_factor": 1.0,
+      "bench": {},
+    }
+    try:
+      if cfg.edge.enabled:
+        closes = memory.realized_closes(limit=max(cfg.edge.lookback_trades * 2, 50))
+        stats = edge_stats(closes, cfg.edge.lookback_trades)
+        state["stats"] = stats
+        state["required_rr"] = adaptive_min_rr(stats, cfg.trading.min_futures_rr, cfg.edge)
+        state["size_factor"] = loss_streak_size_factor(stats.get("loss_streak", 0), cfg.edge)
+        bench: Dict[str, int] = {}
+        now = int(time.time())
+        for sym in {c.get("symbol") for c in closes if c.get("symbol")}:
+          until = symbol_bench_until([c for c in closes if c.get("symbol") == sym], cfg.edge)
+          if until > now:
+            bench[sym] = until
+        state["bench"] = bench
+        if state["required_rr"] > cfg.trading.min_futures_rr:
+          logger.info("ADAPTIVE EDGE: rolling expectancy %.4f < 0 over %d closes — RR floor raised %.1f → %.1f",
+                      stats.get("expectancy", 0.0), stats.get("n", 0), cfg.trading.min_futures_rr, state["required_rr"])
+        if bench:
+          logger.info("ADAPTIVE EDGE: benched symbols: %s", ", ".join(f"{s} ({(u - now) / 3600:.1f}h left)" for s, u in bench.items()))
+        if state["size_factor"] < 1.0:
+          logger.info("ADAPTIVE EDGE: loss streak %d — entry size factor %.2f", stats.get("loss_streak", 0), state["size_factor"])
+    except Exception as exc:
+      logger.warning("Adaptive edge computation failed (falling back to static guards): %s", exc)
+    _edge_cache["v"] = state
+    return state
 
   # Configured futures margin mode. The bot manages leverage via the CROSS leverage endpoint, so
   # the cross-leverage call is only issued in cross mode — in isolated mode the order's own
@@ -2280,6 +2344,15 @@ def run_trading_agent(
       logger.warning("CORRELATION GATE BLOCK: long %s rejected — BTC daily regime is bearish", spot_symbol)
       return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
 
+    # Symbol bench: a symbol that keeps losing is quarantined until its cooldown lifts —
+    # stops the re-take-the-same-losing-trade loop (4 straight ETH short stop-outs, Jul 1-2).
+    if is_entry:
+      _bench_until = _edge_state()["bench"].get(spot_symbol, 0)
+      if _bench_until > int(time.time()):
+        _bench_hours = (_bench_until - int(time.time())) / 3600.0
+        logger.warning("SYMBOL BENCH BLOCK: %s %s rejected — repeated recent losses, benched %.1fh more", side, spot_symbol, _bench_hours)
+        return {"rejected": True, "reason": f"Symbol benched: {spot_symbol} lost repeatedly in its recent closes — no entries for {_bench_hours:.1f}h more", "symbol": spot_symbol, "hint": "This symbol keeps stopping out; the setup that looks compliant is not working in the current tape. Trade a different symbol or stand aside — the bench lifts automatically."}
+
     # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
     _atr_scale_fm = 1.0
     if is_entry and spot_symbol in _daily_gate_state:
@@ -2309,6 +2382,13 @@ def run_trading_agent(
       if _conv_scale_fm < 1.0:
         logger.info("CONVICTION SIZING: futures %s conf=%.2f (floor %.2f) — scaling position to %.0f%%", spot_symbol, confidence, _eff_min_fm, _conv_scale_fm * 100)
         _atr_scale_fm = max(0.30, _atr_scale_fm * _conv_scale_fm)
+
+    # Loss-streak throttle: consecutive realized losses shrink the next entry (anti-martingale).
+    if is_entry:
+      _streak_fm = _edge_state()["size_factor"]
+      if _streak_fm < 1.0:
+        logger.info("LOSS-STREAK THROTTLE: futures %s — sizing to %.0f%% after %d consecutive losses", spot_symbol, _streak_fm * 100, _edge_state()["stats"].get("loss_streak", 0))
+        _atr_scale_fm = max(0.30, _atr_scale_fm * _streak_fm)
 
     # Anti-stacking: block add-on entries when existing position is losing
     if is_entry and snapshot.futures_positions:
@@ -2566,13 +2646,14 @@ def run_trading_agent(
       # RR check (only spot did), which is why losses ran ~4x the wins. Enforced when TP+SL are both set.
       _rr_stop_fm = sl_val or trigger_stop_val
       if cfg.trading.min_futures_rr > 0 and tp_val and _rr_stop_fm:
+        _req_rr_fm = _edge_state()["required_rr"]
         _rr_fm = reward_risk_ratio(side, price, tp_val, _rr_stop_fm)
         if _rr_fm is None:
           logger.warning("RR BLOCK: futures %s %s rejected — TP/SL on the wrong side of entry", side, spot_symbol)
           return {"rejected": True, "reason": "TP/SL on the wrong side of entry — cannot form a valid bracket", "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": "For a long, TP must be above and SL below entry; reverse for a short."}
-        if _rr_fm < cfg.trading.min_futures_rr:
-          logger.warning("RR BLOCK: futures %s %s rejected — reward:risk %.2f < %.2f", side, spot_symbol, _rr_fm, cfg.trading.min_futures_rr)
-          return {"rejected": True, "reason": f"Reward:risk {_rr_fm:.2f} below minimum {cfg.trading.min_futures_rr:.2f}", "rr": _rr_fm, "minRr": cfg.trading.min_futures_rr, "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {cfg.trading.min_futures_rr:.1f}x the stop distance. Skip setups that can't clear it."}
+        if _rr_fm < _req_rr_fm:
+          logger.warning("RR BLOCK: futures %s %s rejected — reward:risk %.2f < %.2f", side, spot_symbol, _rr_fm, _req_rr_fm)
+          return {"rejected": True, "reason": f"Reward:risk {_rr_fm:.2f} below minimum {_req_rr_fm:.2f}", "rr": _rr_fm, "minRr": _req_rr_fm, "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {_req_rr_fm:.1f}x the stop distance (floor rises while recent trades are net-losing). Skip setups that can't clear it."}
     base_size = contracts * multiplier
     expected_tp_pnl = None
     if tp_val and base_size > 0:
@@ -3002,6 +3083,13 @@ def run_trading_agent(
       logger.warning("CORRELATION GATE BLOCK: futures limit long %s rejected — BTC daily regime is bearish", spot_symbol)
       return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
 
+    # Symbol bench: quarantine a repeatedly-losing symbol until its cooldown lifts.
+    _bench_until_fl = _edge_state()["bench"].get(spot_symbol, 0)
+    if _bench_until_fl > int(time.time()):
+      _bench_hours_fl = (_bench_until_fl - int(time.time())) / 3600.0
+      logger.warning("SYMBOL BENCH BLOCK: futures limit %s %s rejected — repeated recent losses, benched %.1fh more", side_lower, spot_symbol, _bench_hours_fl)
+      return {"rejected": True, "reason": f"Symbol benched: {spot_symbol} lost repeatedly in its recent closes — no entries for {_bench_hours_fl:.1f}h more", "symbol": spot_symbol, "hint": "This symbol keeps stopping out; the setup that looks compliant is not working in the current tape. Trade a different symbol or stand aside — the bench lifts automatically."}
+
     _atr_scale_fl = 1.0
     if spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
@@ -3026,6 +3114,12 @@ def run_trading_agent(
       if _conv_scale_fl < 1.0:
         logger.info("CONVICTION SIZING: futures limit %s conf=%.2f (floor %.2f) — scaling position to %.0f%%", spot_symbol, confidence, _eff_min_fl, _conv_scale_fl * 100)
         _atr_scale_fl = max(0.30, _atr_scale_fl * _conv_scale_fl)
+
+    # Loss-streak throttle: consecutive realized losses shrink the next entry (anti-martingale).
+    _streak_fl = _edge_state()["size_factor"]
+    if _streak_fl < 1.0:
+      logger.info("LOSS-STREAK THROTTLE: futures limit %s — sizing to %.0f%% after %d consecutive losses", spot_symbol, _streak_fl * 100, _edge_state()["stats"].get("loss_streak", 0))
+      _atr_scale_fl = max(0.30, _atr_scale_fl * _streak_fl)
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
@@ -3118,13 +3212,14 @@ def run_trading_agent(
     # Reward:risk floor — when a bracket is supplied inline, reject entries that risk more than they
     # aim to make (the futures asymmetry fix; the deferred-bracket path is steered by the prompt).
     if cfg.trading.min_futures_rr > 0 and take_profit_price is not None and stop_loss_price is not None:
+      _req_rr_fl = _edge_state()["required_rr"]
       _rr_fl = reward_risk_ratio(side_lower, entry_price_val, take_profit_price, stop_loss_price)
       if _rr_fl is None:
         logger.warning("RR BLOCK: futures limit %s %s rejected — TP/SL on the wrong side of entry", side_lower, spot_symbol)
         return {"rejected": True, "reason": "TP/SL on the wrong side of entry — cannot form a valid bracket", "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": "For a long, TP must be above and SL below entry; reverse for a short."}
-      if _rr_fl < cfg.trading.min_futures_rr:
-        logger.warning("RR BLOCK: futures limit %s %s rejected — reward:risk %.2f < %.2f", side_lower, spot_symbol, _rr_fl, cfg.trading.min_futures_rr)
-        return {"rejected": True, "reason": f"Reward:risk {_rr_fl:.2f} below minimum {cfg.trading.min_futures_rr:.2f}", "rr": _rr_fl, "minRr": cfg.trading.min_futures_rr, "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {cfg.trading.min_futures_rr:.1f}x the stop distance. Skip setups that can't clear it."}
+      if _rr_fl < _req_rr_fl:
+        logger.warning("RR BLOCK: futures limit %s %s rejected — reward:risk %.2f < %.2f", side_lower, spot_symbol, _rr_fl, _req_rr_fl)
+        return {"rejected": True, "reason": f"Reward:risk {_rr_fl:.2f} below minimum {_req_rr_fl:.2f}", "rr": _rr_fl, "minRr": _req_rr_fl, "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {_req_rr_fl:.1f}x the stop distance (floor rises while recent trades are net-losing). Skip setups that can't clear it."}
 
     expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
     pending_protection = {"takeProfitPrice": take_profit_price, "stopLossPrice": stop_loss_price}
@@ -3442,10 +3537,42 @@ def run_trading_agent(
     except Exception as exc:
       return {"error": str(exc)}
 
+  _active_contracts_cache: Dict[str, Any] = {"ts": 0.0, "symbols": None}
+
+  def _active_contract_symbols() -> set[str] | None:
+    """Set of live KuCoin perpetual symbols, cached 1h. None = lookup unavailable (fail open)."""
+    now = time.time()
+    if _active_contracts_cache["symbols"] is not None and now - _active_contracts_cache["ts"] < 3600:
+      return _active_contracts_cache["symbols"]
+    if not kucoin_futures:
+      return None
+    try:
+      contracts = kucoin_futures.list_active_contracts()
+      symbols = {str(c.get("symbol") or "").strip().upper() for c in contracts if isinstance(c, dict)}
+      symbols.discard("")
+      if symbols:
+        _active_contracts_cache["symbols"] = symbols
+        _active_contracts_cache["ts"] = now
+        return symbols
+    except Exception as exc:
+      logger.debug("Active-contract list unavailable (symbol validation fails open): %s", exc)
+    return _active_contracts_cache["symbols"]
+
   def _resolve_futures_symbol(symbol: str) -> tuple[str | None, str | None]:
-    """Resolve flexible symbol input to a futures contract symbol. Returns (futures_sym, error_msg)."""
-    upper = (symbol or "").upper().strip()
+    """Resolve flexible symbol input to a futures contract symbol. Returns (futures_sym, error_msg).
+
+    Raw '*USDTM' input used to be passed to the API verbatim, so malformed variants
+    ('SOL-USDTM', 'BTCUSDTM' — KuCoin's BTC perp is XBTUSDTM) burned doomed API calls that
+    surfaced as opaque '200003 Invalid symbol' / '404000' decision errors. Normalize first,
+    then validate against the live contract list (fail-open if the list is unavailable).
+    """
+    upper = (symbol or "").upper().strip().replace("-", "").replace("/", "").replace("_", "")
     if upper.endswith("USDTM"):
+      if upper.startswith("BTC"):
+        upper = "XBT" + upper[3:]
+      active = _active_contract_symbols()
+      if active is not None and upper not in active:
+        return None, f"No active KuCoin perpetual named '{upper}'"
       return upper, None
     spot = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not spot:
@@ -4661,6 +4788,27 @@ def run_trading_agent(
   user_state_obj["fees"] = fees
   user_state_obj["triggers"] = triggers
   user_state_obj["performanceSummary"] = memory.performance_summary()
+  # Adaptive edge posture — the CODE-ENFORCED risk stance derived from rolling realized results.
+  # Surfaced so the agent proposes trades that will pass the gates instead of burning turns on
+  # rejections, and so it explains the posture in its narrative.
+  try:
+    _edge_now = _edge_state()
+    _edge_stats_now = _edge_now.get("stats") or {}
+    user_state_obj["edgeReport"] = {
+      "rolling": {k: _edge_stats_now.get(k) for k in ("n", "wins", "losses", "win_rate", "avg_win", "avg_loss", "payoff", "profit_factor", "net", "expectancy", "loss_streak")},
+      "perSymbol": _edge_stats_now.get("per_symbol", {}),
+      "requiredRr": _edge_now.get("required_rr"),
+      "entrySizeFactor": _edge_now.get("size_factor"),
+      "benchedSymbols": {s: f"{max(0, u - int(time.time())) / 3600:.1f}h left" for s, u in (_edge_now.get("bench") or {}).items()},
+      "note": (
+        "These limits are ENFORCED IN CODE this run: futures entries below requiredRr are rejected, "
+        "benched symbols are rejected, and entry size is scaled by entrySizeFactor. They derive from "
+        "your own recent realized results and relax automatically when rolling expectancy turns positive. "
+        "If avg_loss exceeds avg_win, your priority is bigger targets and tighter invalidations — not more trades."
+      ),
+    }
+  except Exception as _edge_exc:
+    logger.debug("Edge report unavailable: %s", _edge_exc)
 
   if recent_fills:
     events: Dict[str, Any] = {}
@@ -4750,7 +4898,7 @@ def run_trading_agent(
       unique_trace_id,
     )
   )
-  narrative = str(result.final_output)
+  narrative = _strip_citation_tokens(str(result.final_output))
 
   # Log token usage and prompt cache stats
   total_input = sum(r.usage.input_tokens for r in result.raw_responses if r.usage)
@@ -4806,9 +4954,11 @@ def run_trading_agent(
       t = output.get("transfer", {})
       return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"
     if output.get("rejected"):
-      return f"rejected: {output.get('reason','unspecified')}"
+      sym = output.get("symbol") or output.get("requested") or output.get("futuresSymbol")
+      return f"rejected: {output.get('reason','unspecified')}" + (f" [{sym}]" if sym else "")
     if output.get("error"):
-      return f"error: {output.get('error')}"
+      sym = output.get("symbol") or output.get("requested") or output.get("futuresSymbol")
+      return f"error: {output.get('error')}" + (f" [{sym}]" if sym else "")
     return None
 
   for out in tool_outputs:

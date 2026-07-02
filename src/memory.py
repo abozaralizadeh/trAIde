@@ -685,6 +685,70 @@ class MemoryStore:
     return extremes
 
   @staticmethod
+  def _dedupe_realized(closes: list[Dict[str, Any]], window_sec: int = 1800) -> list[Dict[str, Any]]:
+    """Drop re-recorded duplicates of the same close (same symbol/closeType/pnl within a window).
+
+    The main loop's seen-ID set used to live only in process memory, so a restart within the
+    30-min fill lookback re-recorded the same close (observed: ETH -0.5007 at 13:48 and again
+    at 14:00 across a restart). IDs are persisted now; this read-time filter also heals data
+    recorded before the fix so rolling stats aren't skewed by phantom losses.
+    """
+    kept: list[Dict[str, Any]] = []
+    last_seen: Dict[tuple, int] = {}
+    for c in sorted(closes, key=lambda d: d.get("ts") or 0):
+      pnl = c.get("pnl")
+      try:
+        key = (c.get("symbol"), c.get("closeType") or "", round(float(pnl), 6))
+      except (TypeError, ValueError):
+        kept.append(c)
+        continue
+      ts = int(c.get("ts") or 0)
+      prev = last_seen.get(key)
+      if prev is not None and 0 <= ts - prev <= window_sec:
+        continue
+      last_seen[key] = ts
+      kept.append(c)
+    return kept
+
+  def realized_closes(self, limit: int = 100, symbol: str | None = None) -> list[Dict[str, Any]]:
+    """Recent realized closes (pnl-bearing 'triggered' decisions), deduped, oldest→newest.
+
+    The strict realized set (exchange-confirmed TP/SL closes) the adaptive edge controller
+    computes its rolling stats from — hold/manage snapshots are excluded.
+    """
+    with self._lock:
+      data = self._read()
+    sym = _normalize_symbol(symbol) if symbol else None
+    rows = [
+      d for d in (data.get("decisions") or [])
+      if isinstance(d, dict)
+      and "triggered" in str(d.get("action") or "").lower()
+      and d.get("pnl") is not None
+      and (sym is None or d.get("symbol") == sym)
+    ]
+    rows = self._dedupe_realized(rows)
+    return rows[-max(1, int(limit)):]
+
+  def get_seen_close_ids(self) -> list[str]:
+    """Exchange close-position IDs already recorded as decisions (persists across restarts)."""
+    with self._lock:
+      data = self._read()
+    return [str(x) for x in (data.get("seen_close_ids") or [])]
+
+  def record_seen_close_id(self, close_id: str, cap: int = 200) -> None:
+    """Persist a recorded close ID so a restart can't double-record the same close."""
+    cid = str(close_id or "").strip()
+    if not cid:
+      return
+    with self._lock:
+      data = self._read()
+      ids = [str(x) for x in (data.get("seen_close_ids") or [])]
+      if cid not in ids:
+        ids.append(cid)
+        data["seen_close_ids"] = ids[-cap:]
+        self._write(data)
+
+  @staticmethod
   def _is_realized_close(action: str) -> bool:
     """Return True if the action represents a realized trade close, not a hold/manage snapshot."""
     a = action.lower()
