@@ -7,6 +7,7 @@ from src.regime import (
     is_hostile_regime,
     effective_min_confidence,
     regime_size_factor,
+    allow_reversal_long,
     allow_trend_aligned_short,
     block_alt_long_in_btc_downtrend,
     concentration_scale,
@@ -28,6 +29,56 @@ def _cfg(**overrides) -> RegimeConfig:
     )
     base.update(overrides)
     return RegimeConfig(**base)
+
+
+# ── Reversal long: catch a confirmed turn against a lagging bearish daily ─────────
+
+
+def test_reversal_long_allowed_when_ltfs_confirm():
+    # The missed-bounce case: bearish daily, but 1h+15m have turned bullish and confidence is high.
+    assert allow_reversal_long(
+        daily_bias="bearish", side="buy", bias_1h="bullish", bias_15m="bullish",
+        confidence=0.82, cfg=_cfg(),
+    ) is True
+
+
+def test_reversal_long_blocked_without_full_ltf_confirmation():
+    # 15m not yet bullish -> not a confirmed turn
+    assert allow_reversal_long(
+        daily_bias="bearish", side="buy", bias_1h="bullish", bias_15m="neutral",
+        confidence=0.90, cfg=_cfg(),
+    ) is False
+    # 1h still bearish -> no turn
+    assert allow_reversal_long(
+        daily_bias="bearish", side="buy", bias_1h="bearish", bias_15m="bullish",
+        confidence=0.90, cfg=_cfg(),
+    ) is False
+
+
+def test_reversal_long_blocked_low_confidence():
+    assert allow_reversal_long(
+        daily_bias="bearish", side="buy", bias_1h="bullish", bias_15m="bullish",
+        confidence=0.70, cfg=_cfg(),
+    ) is False
+
+
+def test_reversal_long_only_for_buys_against_bearish_daily():
+    base = dict(bias_1h="bullish", bias_15m="bullish", confidence=0.9, cfg=_cfg())
+    # a sell is not a reversal long
+    assert allow_reversal_long(daily_bias="bearish", side="sell", **base) is False
+    # bullish daily is not the case this overrides (longs already allowed there)
+    assert allow_reversal_long(daily_bias="bullish", side="buy", **base) is False
+
+
+def test_reversal_long_15m_relaxable_and_disableable():
+    assert allow_reversal_long(
+        daily_bias="bearish", side="buy", bias_1h="bullish", bias_15m="neutral",
+        confidence=0.85, cfg=_cfg(reversal_long_require_15m=False),
+    ) is True
+    assert allow_reversal_long(
+        daily_bias="bearish", side="buy", bias_1h="bullish", bias_15m="bullish",
+        confidence=0.95, cfg=_cfg(reversal_longs_enabled=False),
+    ) is False
 
 
 # ── Correlation gate: block alt longs while BTC daily is bearish ────────────────

@@ -18,6 +18,7 @@ unit-tested in tests/test_edge.py. Call sites live in src/agent.py; config in Ed
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List
 
 from .config import EdgeConfig
@@ -68,6 +69,7 @@ def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
   win_rate = (len(wins) / decided) if decided else 0.0
   avg_win = (gross_win / len(wins)) if wins else 0.0
   avg_loss = (gross_loss / len(losses)) if losses else 0.0
+  last_close_ts = int(window[-1].get("ts") or 0) if window else 0
   return {
     "n": len(window),
     "wins": len(wins),
@@ -80,25 +82,38 @@ def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
     "net": round(sum(pnls), 4),
     "expectancy": round(sum(pnls) / len(pnls), 5) if pnls else 0.0,
     "loss_streak": streak,
+    "last_close_ts": last_close_ts,
     "per_symbol": per_symbol,
   }
 
 
-def adaptive_min_rr(stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig) -> float:
-  """Futures reward:risk floor, raised while the rolling expectancy is negative.
+def adaptive_min_rr(stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig, now: float | None = None) -> float:
+  """Futures reward:risk floor, raised while the rolling expectancy is *recently* negative.
 
-  With too little data (or the controller disabled) this is exactly `base_rr` — the
-  static guard keeps working. When the last `lookback` trades are net-losing, demand
-  `rr_step` more reward per unit risk (capped at `rr_cap`); it relaxes back to base
-  automatically once realized expectancy turns positive.
+  With too little data (or the controller disabled) this is exactly `base_rr` — the static guard
+  keeps working. When the last `lookback` trades are net-losing, demand `rr_step` more reward per
+  unit risk (capped at `rr_cap`); it relaxes back to base automatically once realized expectancy
+  turns positive.
+
+  Staleness guard (fixes a self-defeating doom loop): if the raised floor freezes trading — no
+  qualifying setup can clear it in a choppy tape — then no new closes arrive, so expectancy stays
+  negative on the *same old* losses and the floor would stay raised forever, preventing the very
+  wins that would lower it. So once the last close is older than `rr_stale_hours`, the negative
+  signal is treated as stale and the floor decays back to base to let the bot try again at the
+  (still-validated) base R:R.
   """
   if not cfg.enabled or base_rr <= 0:
     return base_rr
   if int(stats.get("n") or 0) < cfg.min_trades:
     return base_rr
-  if float(stats.get("expectancy") or 0.0) < 0:
-    return min(base_rr + cfg.rr_step, max(cfg.rr_cap, base_rr))
-  return base_rr
+  if float(stats.get("expectancy") or 0.0) >= 0:
+    return base_rr
+  last_ts = int(stats.get("last_close_ts") or 0)
+  if cfg.rr_stale_hours > 0 and last_ts > 0:
+    ref = now if now is not None else time.time()
+    if (ref - last_ts) > cfg.rr_stale_hours * 3600:
+      return base_rr
+  return min(base_rr + cfg.rr_step, max(cfg.rr_cap, base_rr))
 
 
 def symbol_bench_until(symbol_closes: List[Dict[str, Any]], cfg: EdgeConfig) -> int:

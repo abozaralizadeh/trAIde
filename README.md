@@ -203,6 +203,7 @@ flowchart LR
 - **Adaptive edge controller** (`src/edge.py`): the bot's risk posture is derived from its own **rolling realized results** instead of static parameters, so it self-tightens when losing and relaxes when earning — no manual re-tuning as regimes change. Three code-enforced actions, each logged and surfaced to the agent in an `edgeReport`: (1) **adaptive R:R floor** — while the last N closes are net-losing, the futures reward:risk minimum rises by `EDGE_RR_STEP`; (2) **symbol bench** — a symbol with `EDGE_BENCH_MIN_LOSSES`+ losses (and negative net) in its recent closes is quarantined from new entries until a cooldown lifts, breaking the "re-take the same losing trade" loop; (3) **loss-streak throttle** — after `EDGE_STREAK_THRESHOLD` consecutive losses, entries are sized down by `EDGE_STREAK_SIZE_FACTOR` until a win (anti-martingale, a soft stage before the consecutive-loss circuit breaker).
 - **Give-back arming at 1R** (`PROFIT_LOCK_GIVEBACK_ARM_R`): the give-back cap only acts once a run has reached this multiple of the trade's *own* initial risk (stop distance) — sub-1R wobble belongs to the original stop. Stops the cap from strangling winners into fee-scale scratch closes while losses ride to the full stop.
 - **Trend-aligned shorts**: In a confirmed downtrend the anti-FOMO gate would otherwise force the bot to only ever long oversold bounces. With `TREND_ALIGNED_SHORTS_ENABLED`, a short into an exhausted-bearish daily is permitted **when 1h and 15m both confirm** the downtrend is resuming and confidence clears a higher bar (`TREND_SHORT_MIN_CONFIDENCE`) — letting the bot trade *with* the trend, not only against bounces.
+- **Reversal longs**: The daily gate is a *lagging* signal — it reads bearish through the bottom of a move, so the bot is structurally forbidden from catching a reversal (in the Jul 2–5 2026 chop it sat out an +11% ETH bounce, blocked from every long). With `REVERSAL_LONGS_ENABLED`, a long against a bearish daily is permitted **only when 1h and 15m have both turned bullish** and confidence clears a high bar (`REVERSAL_LONG_MIN_CONFIDENCE`, default 0.80) — a confirmed turn, not knife-catching. Majors only (non-major alt longs stay blocked by the correlation gate), and the reward:risk floor still applies to whatever passes.
 - **Anti-FOMO daily-exhaustion block**: Refuses trend-continuation entries (long at bullish-overbought / short at bearish-oversold) when the 1D RSI is at an extreme (≥70 or ≤30). Counter-trend reversal setups remain allowed, and a confirmed trend-aligned short can be re-permitted (see above).
 - **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
 - **Volatility soft-gate**: Above `MAX_ATR_PCT_FOR_ENTRY`, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× the threshold, the entry is hard-blocked.
@@ -350,6 +351,7 @@ Self-tuning risk (`src/edge.py`): posture derives from the rolling realized clos
 | `EDGE_MIN_TRADES` | `8` | Minimum closes before adaptive actions kick in (below this, static behavior) |
 | `EDGE_RR_STEP` | `0.5` | Added to `MIN_FUTURES_RR` while rolling expectancy is negative |
 | `EDGE_RR_CAP` | `2.5` | Ceiling for the adaptive R:R floor |
+| `EDGE_RR_STALE_HOURS` | `18` | If no realized close in this long, the R:R raise decays back to base — prevents a losing streak from freezing recovery permanently (a raised floor that stops all trading gets no wins to lower itself) |
 | `EDGE_BENCH_LOOKBACK` | `5` | Per-symbol recent closes examined for the bench |
 | `EDGE_BENCH_MIN_LOSSES` | `3` | Losses within that window (with negative net) that bench the symbol |
 | `EDGE_BENCH_COOLDOWN_HOURS` | `12` | Bench auto-lifts this long after the symbol's last close |
@@ -372,6 +374,9 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `TREND_ALIGNED_SHORTS_ENABLED` | `true` | Permit a trend-aligned short past the anti-FOMO gate in an exhausted-bearish daily |
 | `TREND_SHORT_MIN_CONFIDENCE` | `0.78` | Higher confidence bar specifically for a counter-bounce short |
 | `TREND_SHORT_REQUIRE_15M` | `true` | Require 15m (not just 1h) bearish confirmation before allowing the short |
+| `REVERSAL_LONGS_ENABLED` | `true` | Allow a long past a bearish daily gate when 1h+15m have both turned bullish (catch confirmed reversals) |
+| `REVERSAL_LONG_MIN_CONFIDENCE` | `0.80` | High confidence bar for a counter-daily reversal long |
+| `REVERSAL_LONG_REQUIRE_15M` | `true` | Require 15m (not just 1h) bullish confirmation before allowing the reversal long |
 | `CONVICTION_SIZING_ENABLED` | `true` | Scale position size by how far confidence clears the floor (low-conviction → smaller) |
 | `CONVICTION_FULL_CONFIDENCE` | `0.85` | Confidence at/above which full size is used (linear ramp from the floor) |
 | `CONVICTION_MIN_SIZE_FACTOR` | `0.5` | Size multiplier at the confidence floor |

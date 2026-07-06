@@ -182,6 +182,40 @@ def concentration_scale(notional_usd: float, total_equity_usd: float, max_pct: f
   return max(0.0, cap / notional)
 
 
+def allow_reversal_long(
+  *,
+  daily_bias: str,
+  side: str,
+  bias_1h: str,
+  bias_15m: str,
+  confidence,
+  cfg: RegimeConfig,
+) -> bool:
+  """True if a LONG should be permitted past a bearish daily gate because a reversal is confirmed.
+
+  The daily gate hard-blocks longs while the 1D trend reads bearish — a lagging signal that stays
+  bearish through the *bottom* of a move, so the bot structurally cannot catch the reversal (it sat
+  out an +11% ETH bounce in the Jul 2-5 2026 chop, blocked from every long). This yields the gate ONLY
+  when the lower timeframes have clearly turned up (1h and 15m both bullish) and confidence clears a
+  high bar — so it fires on a confirmed turn, not on knife-catching a falling market. The R:R floor
+  still applies to whatever it lets through, and non-major alts remain blocked by the correlation gate.
+  """
+  if not cfg.reversal_longs_enabled:
+    return False
+  if str(daily_bias or "").strip().lower() != "bearish" or (side or "").lower() not in ("buy", "long"):
+    return False
+  if str(bias_1h or "").strip().lower() != "bullish":
+    return False
+  if cfg.reversal_long_require_15m and str(bias_15m or "").strip().lower() != "bullish":
+    return False
+  try:
+    if float(confidence or 0.0) < cfg.reversal_long_min_confidence:
+      return False
+  except (TypeError, ValueError):
+    return False
+  return True
+
+
 def allow_trend_aligned_short(
   *,
   daily_exhausted: bool,

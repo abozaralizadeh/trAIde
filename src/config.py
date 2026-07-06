@@ -98,6 +98,9 @@ class EdgeConfig:
   min_trades: int = 8              # minimum closes before adaptive actions kick in (else static behavior)
   rr_step: float = 0.5             # added to the futures RR floor while expectancy is negative
   rr_cap: float = 2.5              # ceiling for the adaptive RR floor
+  rr_stale_hours: float = 18.0     # if no realized close in this long, the raise decays back to base
+                                   # (a losing streak old enough to have frozen trading shouldn't keep
+                                   # the bar raised — that lockout prevents the wins that would lower it)
   bench_lookback: int = 5          # per-symbol recent closes examined for the bench
   bench_min_losses: int = 3        # losses within that lookback (with negative net) that bench the symbol
   bench_cooldown_hours: float = 12.0  # bench auto-lifts this long after the symbol's last close
@@ -153,6 +156,11 @@ class RegimeConfig:
   # counter-bounce is stalling (15m no longer confirms it) — fixes the both-directions-blocked stall.
   deadlock_break_enabled: bool = True
   deadlock_min_confidence: float = 0.72      # raised confidence bar to take the trend-continuation entry
+  # Reversal long: allow a LONG past a bearish daily gate when 1h+15m confirm a turn and confidence is
+  # high — the lagging daily gate otherwise forbids catching reversals (missed an +11% ETH bounce).
+  reversal_longs_enabled: bool = True
+  reversal_long_min_confidence: float = 0.80  # high bar — counter-daily longs are only for confirmed turns
+  reversal_long_require_15m: bool = True      # require 15m (not just 1h) bullish confirmation
 
 
 @dataclass
@@ -308,6 +316,7 @@ def load_config() -> AppConfig:
       min_trades=int(os.getenv("EDGE_MIN_TRADES", "8")),
       rr_step=float(os.getenv("EDGE_RR_STEP", "0.5")),
       rr_cap=float(os.getenv("EDGE_RR_CAP", "2.5")),
+      rr_stale_hours=float(os.getenv("EDGE_RR_STALE_HOURS", "18")),
       bench_lookback=int(os.getenv("EDGE_BENCH_LOOKBACK", "5")),
       bench_min_losses=int(os.getenv("EDGE_BENCH_MIN_LOSSES", "3")),
       bench_cooldown_hours=float(os.getenv("EDGE_BENCH_COOLDOWN_HOURS", "12")),
@@ -328,6 +337,9 @@ def load_config() -> AppConfig:
       conviction_min_size_factor=float(os.getenv("CONVICTION_MIN_SIZE_FACTOR", "0.5")),
       deadlock_break_enabled=_as_bool(os.getenv("DEADLOCK_BREAK_ENABLED"), True),
       deadlock_min_confidence=float(os.getenv("DEADLOCK_MIN_CONFIDENCE", "0.72")),
+      reversal_longs_enabled=_as_bool(os.getenv("REVERSAL_LONGS_ENABLED"), True),
+      reversal_long_min_confidence=float(os.getenv("REVERSAL_LONG_MIN_CONFIDENCE", "0.80")),
+      reversal_long_require_15m=_as_bool(os.getenv("REVERSAL_LONG_REQUIRE_15M"), True),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

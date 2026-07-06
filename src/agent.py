@@ -56,6 +56,7 @@ from .edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_b
 from .memory import MemoryStore
 from .protection import should_block_chase
 from .regime import (
+  allow_reversal_long,
   allow_trend_aligned_short,
   block_alt_long_in_btc_downtrend,
   concentration_scale,
@@ -2308,8 +2309,15 @@ def run_trading_agent(
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
-          logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
-          return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend or wait for it to turn neutral."}
+          if allow_reversal_long(
+            daily_bias=daily_bias, side=side_lower,
+            bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
+            confidence=confidence, cfg=cfg.regime,
+          ):
+            logger.info("REVERSAL LONG ALLOWED: %s %s — bearish daily but 1h/15m confirm a turn (conf=%.2f)", side, spot_symbol, confidence or 0.0)
+          else:
+            logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
+            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend, take a confirmed reversal (1h+15m turned, high confidence), or wait for it to turn neutral."}
       # 1h alignment: block entries when 1h bias opposes the proposed side (catches bounces in confirmed corrections)
       intraday_bias_1h = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes = (
@@ -3051,7 +3059,14 @@ def run_trading_agent(
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
-          return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend or switch symbol."}
+          if allow_reversal_long(
+            daily_bias=daily_bias, side=side_lower,
+            bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
+            confidence=confidence, cfg=cfg.regime,
+          ):
+            logger.info("REVERSAL LONG ALLOWED: futures limit %s %s — bearish daily but 1h/15m confirm a turn (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+          else:
+            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned, high confidence), or switch symbol."}
       intraday_bias_1h_fl = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes_fl = (
         (intraday_bias_1h_fl == "bearish" and side_lower == "buy") or
@@ -4387,6 +4402,10 @@ def run_trading_agent(
     "  The 4H timeframe has the highest intraday weight (40%). The 1D acts as a HARD REGIME GATE:\n"
     "  - Counter-daily trades are BLOCKED at the code level. If daily_bias='bearish', buy/long orders are rejected. "
     "If daily_bias='bullish', sell/short orders are rejected. This is NOT optional.\n"
+    "  - EXCEPTION — confirmed reversal: a LONG against a bearish daily is allowed IF the 1h AND 15m have "
+    "both turned bullish and your confidence is high (>=0.80). The daily trend lags at turning points; when "
+    "price has clearly bottomed and reclaimed structure, take the reversal long (majors only — alt longs "
+    "stay blocked by the correlation gate). This is how you catch the bounce instead of sitting out a rally.\n"
     "  - If the 1D confirms your intraday bias, strength is boosted (e.g., moderate -> strong).\n"
     "  - Check 'daily_bias' and 'daily_gate_applied' in the summary. Trade WITH the daily trend, not against it.\n"
     "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis, OI-price signal, and funding divergence.\n"

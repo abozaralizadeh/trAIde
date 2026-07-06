@@ -57,22 +57,35 @@ def test_rr_floor_raised_when_expectancy_negative():
     closes = [_close("ETH-USDT", 0.1, i) for i in range(6)] + [_close("ETH-USDT", -2.0, 10 + i) for i in range(2)]
     stats = edge_stats(closes, 30)
     assert stats["expectancy"] < 0 and stats["n"] == 8
-    assert adaptive_min_rr(stats, 1.5, _cfg()) == 2.0
+    assert adaptive_min_rr(stats, 1.5, _cfg(), now=12) == 2.0  # now near the closes → fresh
 
 
 def test_rr_floor_static_when_positive_or_insufficient_data():
     win_closes = [_close("ETH-USDT", 0.3, i) for i in range(10)]
-    assert adaptive_min_rr(edge_stats(win_closes, 30), 1.5, _cfg()) == 1.5
+    assert adaptive_min_rr(edge_stats(win_closes, 30), 1.5, _cfg(), now=12) == 1.5
     few = [_close("ETH-USDT", -1.0, i) for i in range(3)]  # n=3 < min_trades=8
-    assert adaptive_min_rr(edge_stats(few, 30), 1.5, _cfg()) == 1.5
+    assert adaptive_min_rr(edge_stats(few, 30), 1.5, _cfg(), now=12) == 1.5
+
+
+def test_rr_floor_decays_when_losses_are_stale():
+    # The doom loop: negative expectancy freezes trading, no new closes arrive, floor would stay
+    # raised forever. Once the last close is older than rr_stale_hours, revert to base so it can retry.
+    base_ts = 1_000_000
+    losing = [_close("ETH-USDT", -0.5, base_ts + i) for i in range(10)]
+    stats = edge_stats(losing, 30)
+    assert stats["expectancy"] < 0 and stats["last_close_ts"] == base_ts + 9
+    now_fresh = base_ts + 9 + 3600            # 1h later — still fresh
+    now_stale = base_ts + 9 + 30 * 3600       # 30h later — stale
+    assert adaptive_min_rr(stats, 1.5, _cfg(), now=now_fresh) == 2.0   # fresh losses → raised
+    assert adaptive_min_rr(stats, 1.5, _cfg(), now=now_stale) == 1.5   # stale → decays to base
 
 
 def test_rr_floor_capped_and_disableable():
     losing = [_close("ETH-USDT", -1.0, i) for i in range(10)]
     stats = edge_stats(losing, 30)
-    assert adaptive_min_rr(stats, 2.4, _cfg()) == 2.5  # capped at rr_cap
-    assert adaptive_min_rr(stats, 1.5, _cfg(enabled=False)) == 1.5
-    assert adaptive_min_rr(stats, 0.0, _cfg()) == 0.0  # base 0 = feature off, stays off
+    assert adaptive_min_rr(stats, 2.4, _cfg(), now=12) == 2.5  # capped at rr_cap
+    assert adaptive_min_rr(stats, 1.5, _cfg(enabled=False), now=12) == 1.5
+    assert adaptive_min_rr(stats, 0.0, _cfg(), now=12) == 0.0  # base 0 = feature off, stays off
 
 
 # ── symbol bench ─────────────────────────────────────────────────────────────────
