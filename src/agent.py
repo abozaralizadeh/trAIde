@@ -376,6 +376,75 @@ def _strip_citation_tokens(text: str) -> str:
   return _CITATION_TOKEN_RE.sub("", _CITATION_PUA_RE.sub("", text)).strip()
 
 
+def _screen_contracts(
+  contracts: list,
+  *,
+  min_turnover: float,
+  min_age_days: float,
+  now: float,
+  sort_by: str = "momentum",
+  side: str = "both",
+  top_n: int = 15,
+) -> Dict[str, Any]:
+  """Rank the full active-perp universe into a shortlist of tradable opportunities. Pure/testable.
+
+  Filters to USDT perps that clear the liquidity floor (24h turnover) and the listing-age bar (same
+  bar the entry guard enforces — no fresh micro-caps), then ranks by ``sort_by`` and optionally keeps
+  only one side. This is the market EYES the research scout was missing: it can only look at coins it
+  already names, so it never discovered the mover in a 500-coin field.
+  """
+  qualified: list[Dict[str, Any]] = []
+  scanned = 0
+  for c in contracts or []:
+    if not isinstance(c, dict):
+      continue
+    sym = str(c.get("symbol") or "").strip().upper()
+    if not sym.endswith("USDTM"):
+      continue
+    scanned += 1
+    if str(c.get("status") or "Open").lower() != "open":
+      continue
+    turnover = _to_float(c.get("turnoverOf24h")) or 0.0
+    if min_turnover > 0 and turnover < min_turnover:
+      continue
+    age_days = None
+    fo = _to_float(c.get("firstOpenDate"))
+    if fo:
+      fo_s = fo / 1000.0 if fo > 1e12 else fo
+      age_days = (now - fo_s) / 86400.0
+      if min_age_days > 0 and age_days < min_age_days:
+        continue
+    chg = _to_float(c.get("priceChgPct"))
+    qualified.append({
+      "symbol": _normalize_symbol(sym),
+      "futuresSymbol": sym,
+      "chgPct24h": round(chg * 100, 2) if chg is not None else None,
+      "turnover24hUsd": round(turnover),
+      "funding": _to_float(c.get("fundingFeeRate")),
+      "markPrice": _to_float(c.get("markPrice")) or _to_float(c.get("lastTradePrice")),
+      "ageDays": round(age_days, 1) if age_days is not None else None,
+    })
+
+  s = (side or "both").lower()
+  if s == "long":
+    qualified = [r for r in qualified if (r["chgPct24h"] or 0) > 0]
+  elif s == "short":
+    qualified = [r for r in qualified if (r["chgPct24h"] or 0) < 0]
+
+  sb = (sort_by or "momentum").lower()
+  if sb == "gainers":
+    qualified.sort(key=lambda r: r["chgPct24h"] or 0, reverse=True)
+  elif sb == "losers":
+    qualified.sort(key=lambda r: r["chgPct24h"] or 0)
+  elif sb == "volume":
+    qualified.sort(key=lambda r: r["turnover24hUsd"] or 0, reverse=True)
+  else:  # momentum = biggest absolute move, liquidity as tiebreak
+    qualified.sort(key=lambda r: (abs(r["chgPct24h"] or 0), r["turnover24hUsd"] or 0), reverse=True)
+
+  n = max(1, min(int(top_n or 15), 40))
+  return {"scanned": scanned, "qualified": len(qualified), "results": qualified[:n]}
+
+
 def _to_futures_symbol(spot_symbol: str) -> str | None:
   """Map spot symbol (e.g., BTC-USDT) to KuCoin futures contract symbol (e.g., XBTUSDTM)."""
   if not spot_symbol or "-" not in spot_symbol:
@@ -3646,6 +3715,51 @@ def run_trading_agent(
       return {"error": str(exc), "symbol": fsym}
 
   @function_tool
+  async def scan_futures_market(top_n: int = 15, sort_by: str = "momentum", side: str = "both") -> Dict[str, Any]:
+    """Screen the ENTIRE KuCoin USDT-perpetual universe for tradable opportunities RIGHT NOW.
+
+    DISCOVERY tool — the only one that sees the whole market instead of one named symbol. Ranks all
+    active perps so you can find the coin that is actually moving, beyond the current list. It pre-applies
+    the same code-level quality bars the entry gates enforce (a 24h-turnover liquidity floor and the
+    minimum listing age), so every result is liquid and mature enough to consider — no fresh micro-caps.
+    Use it every research run: scan, then validate the best candidates with analyze_market_context /
+    fetch_orderbook before add_coin.
+
+    Args:
+      top_n: how many to return (max 40).
+      sort_by: 'momentum' (largest absolute 24h move, default), 'gainers', 'losers', or 'volume'.
+      side: 'both' (default), 'long' (up movers only) or 'short' (down movers only). In a bearish BTC
+            daily, alt LONGs are still blocked by the correlation gate — prefer 'short' or majors then.
+    """
+    if not cfg.kucoin_futures.enabled or not kucoin_futures:
+      return {"error": "Futures disabled in config"}
+    try:
+      contracts = kucoin_futures.list_active_contracts()
+    except Exception as exc:
+      return {"error": f"Could not fetch active contracts: {exc}"}
+    screened = _screen_contracts(
+      contracts,
+      min_turnover=cfg.trading.screener_min_turnover_usd_24h,
+      min_age_days=cfg.trading.min_futures_listing_age_days,
+      now=time.time(),
+      sort_by=sort_by,
+      side=side,
+      top_n=top_n,
+    )
+    screened.update({
+      "minTurnoverUsd": cfg.trading.screener_min_turnover_usd_24h,
+      "minAgeDays": cfg.trading.min_futures_listing_age_days,
+      "sortBy": sort_by,
+      "side": side,
+      "note": (
+        "Results cleared the liquidity + listing-age bars. Validate a candidate with "
+        "analyze_market_context/fetch_orderbook before add_coin. Entry gates (daily/1h/RR/correlation) "
+        "still apply at trade time — in a bearish BTC daily, alt LONGs stay blocked, so prefer shorts or majors."
+      ),
+    })
+    return screened
+
+  @function_tool
   async def fetch_futures_orderbook(symbol: str, depth: int = 20) -> Dict[str, Any]:
     """Fetch futures level2 orderbook snapshot (depth 20 or 100). Use to assess futures-specific liquidity and support/resistance."""
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
@@ -4695,6 +4809,12 @@ def run_trading_agent(
       "- Output: concise recommendations with evidence (why this beats current options), liquidity check, and confidence. Prefer liquid, tradable pairs; avoid illiquid/obscure tokens.\n"
       "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n\n"
       "## COIN-LIST CURATION (your core job — act, don't just suggest):\n"
+      "- SCAN THE WHOLE MARKET FIRST, every run: call scan_futures_market (the ONLY tool that sees all ~500 "
+      "perps, not just named ones) to find what is actually moving. The current 2-3 coins are almost never the "
+      "only opportunity — even in a bad tape, some liquid coin is trending. Scan 'momentum' and, in a bearish "
+      "BTC daily, 'losers'/'short'; then deep-validate the top few with analyze_market_context + fetch_orderbook.\n"
+      "- Do NOT stay anchored to BTC/ETH/SOL out of habit. If the scan surfaces a more liquid, cleaner setup "
+      "(strong trend, catalyst, good structure) that clears the bars, ADD it and let the Trading Agent trade it.\n"
       "- You OWN the active coin list. Call list_coins to see it, then RESHAPE it so the Trading Agent always has tradable opportunities:\n"
       "  - add_coin(symbol, reason) for LIQUID, ESTABLISHED pairs with a real catalyst or strong technical setup. Verify liquidity with analyze_market_context/fetch_orderbook before adding.\n"
       "  - remove_coin(symbol, reason, exit_plan) for stale symbols: no volatility, no catalyst, repeated losses, or chronically blocked by the daily/regime gates.\n"
@@ -4726,6 +4846,7 @@ def run_trading_agent(
       fetch_futures_mark_price,
       fetch_futures_candles,
       fetch_contract_details,
+      scan_futures_market,
       fetch_kucoin_news,
       fetch_coindesk_news,
       log_research,
@@ -4775,6 +4896,7 @@ def run_trading_agent(
       fetch_futures_mark_price,
       fetch_futures_candles,
       fetch_contract_details,
+      scan_futures_market,
       save_trade_plan,
       latest_plan,
       latest_items,

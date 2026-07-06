@@ -235,6 +235,7 @@ flowchart LR
 - **Automatic retention**: Items older than configurable retention period are pruned
 
 ### Coin Universe Management
+- **Market screener** (`scan_futures_market`): the Research and Trading agents can screen the **entire** KuCoin USDT-perp universe (~500 contracts) ranked by momentum / gainers / losers / volume, instead of only looking at coins already on the list. Every result pre-clears the liquidity floor (`SCREENER_MIN_TURNOVER_USD_24H`) and the minimum listing age, so discovery stays liquid and mature (no fresh micro-caps). This closes the gap where the scout could only evaluate symbols it already knew by name and never discovered the coin that was actually moving. Entry gates (daily/1h/R:R/correlation) still apply at trade time.
 - Seed with `COINS` env var; agent can dynamically add/remove coins with reasons and exit plans when `FLEXIBLE_COINS_ENABLED=true`
 - Auto-discovers unlisted holdings in spot account (worth >= $0.50) and adds them to the active list
 - Removes coins after 3 consecutive ticker fetch failures (flexible mode only)
@@ -339,6 +340,7 @@ Blast-radius and selection guards added after the RE-USDT concentration blowup (
 | `MAX_POSITION_EQUITY_PCT` | `0.5` | Cap a single position's notional at this fraction of total equity, regardless of leverage (`0` = off) |
 | `MIN_FUTURES_LISTING_AGE_DAYS` | `7` | Block futures entries on contracts younger than this many days — thin/volatile fresh listings (`0` = off) |
 | `MIN_FUTURES_RR` | `1.5` | Reject futures entries whose take-profit distance is below this × the stop distance (`0` = off) |
+| `SCREENER_MIN_TURNOVER_USD_24H` | `5000000` | Market screener (`scan_futures_market`) liquidity floor: only surface perps with at least this 24h USDT turnover |
 
 ### Adaptive Edge Controller
 

@@ -83,6 +83,7 @@ class TradingConfig:
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
   research_handoff_cooldown_min: float = 30.0 # min minutes between forced Research handoffs (0=off)
   min_futures_rr: float = 1.5                 # reject futures entries whose TP:SL reward:risk is below this (0=off)
+  screener_min_turnover_usd_24h: float = 5_000_000.0  # market screener liquidity floor (24h USDT turnover)
 
 
 @dataclass
@@ -291,6 +292,7 @@ def load_config() -> AppConfig:
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
       research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
       min_futures_rr=float(os.getenv("MIN_FUTURES_RR", "1.5")),
+      screener_min_turnover_usd_24h=float(os.getenv("SCREENER_MIN_TURNOVER_USD_24H", "5000000")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),
