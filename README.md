@@ -556,7 +556,8 @@ Trigger types: `initial:SYMBOL` (first snapshot), `price_move:SYMBOL:X.XX%` (pri
 
 ```
 src/
-  agent.py             Trading + Research agent definitions, 46 tools, system prompts
+  agent.py             Trading + Research agent assembly, system prompts, per-run context & helpers
+  tools.py             All 47 agent tools (build_tools), organized by section: spot, futures, market data, screening, planning, news
   analytics.py         Technical indicators, regime detection, volume profile, multi-TF scoring
   backtest.py          Strategy backtester with parameter sweeps
   config.py            Configuration dataclasses, env var loading, validation
