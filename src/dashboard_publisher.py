@@ -183,6 +183,7 @@ class DashboardPublisher:
     triggers = memory.latest_triggers()
     sentiments = memory.latest_items("sentiments", limit=10).get("items", [])
     plans = memory.latest_items("plans", limit=5).get("items", [])
+    coins = memory.latest_items("coins", limit=30).get("items", [])
     raw_limits = self._read_limits(memory)
     today = int(time.time() // 86400)
 
@@ -199,6 +200,7 @@ class DashboardPublisher:
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
+      "coins": self._sanitize_coins(coins),
       "feed": [self._sanitize_decision(d) for d in decisions],
       "trades": [self._sanitize_decision(d) for d in closed],
       "equityToday": self._compute_today_equity(memory, raw_limits, today),
@@ -467,6 +469,24 @@ class DashboardPublisher:
       }
       for t in (triggers or []) if isinstance(t, dict)
     ]
+
+  def _sanitize_coins(self, coins: Any) -> List[Dict[str, Any]]:
+    """The curated coin universe (public-safe: symbols + status + rationale, no money).
+
+    Active coins first, then most-recently-touched, so the dashboard can show what the bot is
+    currently watching and why. Removed coins are kept (with their reason) for recent context.
+    """
+    rows = [
+      {
+        "symbol": c.get("symbol"),
+        "status": c.get("status", "active"),
+        "reason": (c.get("reason") or "")[:500],
+        "ts": c.get("ts"),
+      }
+      for c in (coins or []) if isinstance(c, dict) and c.get("symbol")
+    ]
+    rows.sort(key=lambda r: (0 if r["status"] == "active" else 1, -(r["ts"] or 0)))
+    return rows
 
   def _sanitize_sentiments(self, sentiments: Any) -> List[Dict[str, Any]]:
     return [
