@@ -116,13 +116,35 @@ def adaptive_min_rr(stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig, now:
   return min(base_rr + cfg.rr_step, max(cfg.rr_cap, base_rr))
 
 
+def symbol_adaptive_rr(symbol: str, stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig) -> float:
+  """Reward:risk floor for ONE symbol, raised only while THAT symbol is net-losing.
+
+  The old global floor punished every symbol for one symbol's losses — with ETH bleeding, even a
+  fresh, liquid screener find (ADA won) had to clear RR 2.0 and mostly got rejected, starving the
+  diversification that was actually working. This makes the penalty symbol-specific: a symbol whose
+  own recent net is negative (over ``symbol_rr_min_trades``+ closes) must clear ``base+rr_step``
+  (capped at ``rr_cap``); symbols with no bad history — including every new coin — trade at ``base_rr``.
+  So capital rotates toward what's working instead of being frozen out by the worst name.
+  """
+  if not cfg.enabled or base_rr <= 0:
+    return base_rr
+  row = (stats.get("per_symbol") or {}).get(symbol)
+  if not row or int(row.get("n") or 0) < cfg.symbol_rr_min_trades:
+    return base_rr
+  if float(row.get("net") or 0.0) < 0:
+    return min(base_rr + cfg.rr_step, max(cfg.rr_cap, base_rr))
+  return base_rr
+
+
 def symbol_bench_until(symbol_closes: List[Dict[str, Any]], cfg: EdgeConfig) -> int:
   """Timestamp until which a symbol is benched (0 = not benched). Pure — caller compares to now.
 
-  A symbol earns the bench when, over its last `bench_lookback` realized closes, it has
-  at least `bench_min_losses` losses AND a negative net — the "keeps re-taking the same
-  losing trade" pattern (ETH shorts into the July bounce). The bench auto-lifts
-  `bench_cooldown_hours` after the last close, so no one has to un-bench it manually.
+  A symbol earns the bench when, over its last `bench_lookback` realized closes, it has at least
+  `bench_min_losses` losses AND a negative net — the "keeps re-taking the same losing trade" pattern
+  (ETH whipsawing in the July chop: 9 trades, -1.61, both directions stopped out). The rest scales
+  with severity — `bench_cooldown_hours × min(losses, bench_cooldown_max_mult)` — so a symbol that
+  keeps bleeding sits out progressively longer (a fixed 12h let ETH straight back to lose again),
+  and it still auto-lifts, so no manual un-benching.
   """
   if not cfg.enabled:
     return 0
@@ -135,7 +157,8 @@ def symbol_bench_until(symbol_closes: List[Dict[str, Any]], cfg: EdgeConfig) -> 
   losses = len([p for p in pnls if p < 0])
   if losses >= cfg.bench_min_losses and sum(pnls) < 0:
     last_ts = int(recent[-1].get("ts") or 0)
-    return last_ts + int(cfg.bench_cooldown_hours * 3600)
+    mult = max(1, min(losses, cfg.bench_cooldown_max_mult))
+    return last_ts + int(cfg.bench_cooldown_hours * mult * 3600)
   return 0
 
 

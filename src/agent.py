@@ -53,7 +53,7 @@ from .kucoin import (
   KucoinOrderRequest,
   KucoinTicker,
 )
-from .edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_bench_until
+from .edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_adaptive_rr, symbol_bench_until
 from .memory import MemoryStore
 from .protection import should_block_chase
 from .regime import (
@@ -1552,17 +1552,24 @@ def run_trading_agent(
   try:
     _edge_now = _edge_state()
     _edge_stats_now = _edge_now.get("stats") or {}
+    _per_sym = _edge_stats_now.get("per_symbol", {})
+    # Per-symbol RR floor: a losing symbol must clear a higher bar; fresh/winning ones stay at base.
+    _rr_by_symbol = {s: symbol_adaptive_rr(s, _edge_stats_now, cfg.trading.min_futures_rr, cfg.edge) for s in _per_sym}
     user_state_obj["edgeReport"] = {
       "rolling": {k: _edge_stats_now.get(k) for k in ("n", "wins", "losses", "win_rate", "avg_win", "avg_loss", "payoff", "profit_factor", "net", "expectancy", "loss_streak")},
-      "perSymbol": _edge_stats_now.get("per_symbol", {}),
-      "requiredRr": _edge_now.get("required_rr"),
+      "perSymbol": _per_sym,
+      "requiredRrBySymbol": _rr_by_symbol,
+      "baseRr": cfg.trading.min_futures_rr,
       "entrySizeFactor": _edge_now.get("size_factor"),
       "benchedSymbols": {s: f"{max(0, u - int(time.time())) / 3600:.1f}h left" for s, u in (_edge_now.get("bench") or {}).items()},
       "note": (
-        "These limits are ENFORCED IN CODE this run: futures entries below requiredRr are rejected, "
-        "benched symbols are rejected, and entry size is scaled by entrySizeFactor. They derive from "
-        "your own recent realized results and relax automatically when rolling expectancy turns positive. "
-        "If avg_loss exceeds avg_win, your priority is bigger targets and tighter invalidations — not more trades."
+        "ENFORCED IN CODE this run, per symbol: a futures entry below that symbol's requiredRrBySymbol "
+        "is rejected, benched symbols are rejected outright, and entry size is scaled by entrySizeFactor. "
+        "The RR floor and bench are now SYMBOL-SPECIFIC — a symbol you keep losing on (negative net in perSymbol) "
+        "must clear a higher bar and gets rested longer, while fresh names default to baseRr. So DIVERSIFY: "
+        "rotate capital away from your losing/benched symbols toward the liquid movers scan_futures_market surfaces "
+        "(run it every research pass). Concentrating on one chopping symbol is what's been losing money. "
+        "If avg_loss exceeds avg_win, the fix is bigger targets and tighter invalidations — not more trades."
       ),
     }
   except Exception as _edge_exc:

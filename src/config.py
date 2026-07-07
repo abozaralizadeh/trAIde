@@ -102,9 +102,11 @@ class EdgeConfig:
   rr_stale_hours: float = 18.0     # if no realized close in this long, the raise decays back to base
                                    # (a losing streak old enough to have frozen trading shouldn't keep
                                    # the bar raised — that lockout prevents the wins that would lower it)
+  symbol_rr_min_trades: int = 2    # min closes ON A SYMBOL before its own RR floor is raised (per-symbol)
   bench_lookback: int = 5          # per-symbol recent closes examined for the bench
   bench_min_losses: int = 3        # losses within that lookback (with negative net) that bench the symbol
-  bench_cooldown_hours: float = 12.0  # bench auto-lifts this long after the symbol's last close
+  bench_cooldown_hours: float = 12.0  # base bench rest, scaled by loss count (see bench_cooldown_max_mult)
+  bench_cooldown_max_mult: int = 4    # max multiplier on the bench rest for a persistently-losing symbol
   streak_threshold: int = 2        # consecutive realized losses that trigger the size throttle
   streak_size_factor: float = 0.5  # entry-size multiplier while on a losing streak
 
@@ -319,9 +321,11 @@ def load_config() -> AppConfig:
       rr_step=float(os.getenv("EDGE_RR_STEP", "0.5")),
       rr_cap=float(os.getenv("EDGE_RR_CAP", "2.5")),
       rr_stale_hours=float(os.getenv("EDGE_RR_STALE_HOURS", "18")),
+      symbol_rr_min_trades=int(os.getenv("EDGE_SYMBOL_RR_MIN_TRADES", "2")),
       bench_lookback=int(os.getenv("EDGE_BENCH_LOOKBACK", "5")),
       bench_min_losses=int(os.getenv("EDGE_BENCH_MIN_LOSSES", "3")),
       bench_cooldown_hours=float(os.getenv("EDGE_BENCH_COOLDOWN_HOURS", "12")),
+      bench_cooldown_max_mult=int(os.getenv("EDGE_BENCH_COOLDOWN_MAX_MULT", "4")),
       streak_threshold=int(os.getenv("EDGE_STREAK_THRESHOLD", "2")),
       streak_size_factor=float(os.getenv("EDGE_STREAK_SIZE_FACTOR", "0.5")),
     ),

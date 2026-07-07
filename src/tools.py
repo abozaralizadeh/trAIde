@@ -28,6 +28,7 @@ from .analytics import (
   summarize_interval,
   summarize_multi_timeframe,
 )
+from .edge import symbol_adaptive_rr
 from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
@@ -1822,7 +1823,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       # RR check (only spot did), which is why losses ran ~4x the wins. Enforced when TP+SL are both set.
       _rr_stop_fm = sl_val or trigger_stop_val
       if cfg.trading.min_futures_rr > 0 and tp_val and _rr_stop_fm:
-        _req_rr_fm = _edge_state()["required_rr"]
+        _req_rr_fm = symbol_adaptive_rr(spot_symbol, _edge_state().get("stats", {}), cfg.trading.min_futures_rr, cfg.edge)
         _rr_fm = reward_risk_ratio(side, price, tp_val, _rr_stop_fm)
         if _rr_fm is None:
           logger.warning("RR BLOCK: futures %s %s rejected — TP/SL on the wrong side of entry", side, spot_symbol)
@@ -2395,7 +2396,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # Reward:risk floor — when a bracket is supplied inline, reject entries that risk more than they
     # aim to make (the futures asymmetry fix; the deferred-bracket path is steered by the prompt).
     if cfg.trading.min_futures_rr > 0 and take_profit_price is not None and stop_loss_price is not None:
-      _req_rr_fl = _edge_state()["required_rr"]
+      _req_rr_fl = symbol_adaptive_rr(spot_symbol, _edge_state().get("stats", {}), cfg.trading.min_futures_rr, cfg.edge)
       _rr_fl = reward_risk_ratio(side_lower, entry_price_val, take_profit_price, stop_loss_price)
       if _rr_fl is None:
         logger.warning("RR BLOCK: futures limit %s %s rejected — TP/SL on the wrong side of entry", side_lower, spot_symbol)

@@ -1,7 +1,7 @@
 """Tests for the adaptive edge controller (src/edge.py) and the close-dedup data hygiene."""
 
 from src.config import EdgeConfig
-from src.edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_bench_until
+from src.edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_adaptive_rr, symbol_bench_until
 from src.memory import MemoryStore
 
 
@@ -88,10 +88,36 @@ def test_rr_floor_capped_and_disableable():
     assert adaptive_min_rr(stats, 0.0, _cfg(), now=12) == 0.0  # base 0 = feature off, stays off
 
 
+# ── per-symbol adaptive RR (don't punish a fresh symbol for another's losses) ─────
+
+
+def test_symbol_rr_raised_only_for_the_losing_symbol():
+    # ETH bleeding, ADA fresh winner — ETH must clear a higher bar, ADA stays at base.
+    closes = ([_close("ETH-USDT", -0.6, i) for i in range(4)]
+              + [_close("ETH-USDT", 0.1, 100 + i) for i in range(2)]   # net still negative
+              + [_close("ADA-USDT", 0.2, 200 + i) for i in range(2)])
+    stats = edge_stats(closes, 30)
+    assert symbol_adaptive_rr("ETH-USDT", stats, 1.5, _cfg()) == 2.0   # net-negative symbol → raised
+    assert symbol_adaptive_rr("ADA-USDT", stats, 1.5, _cfg()) == 1.5   # winning symbol → base
+    assert symbol_adaptive_rr("XRP-USDT", stats, 1.5, _cfg()) == 1.5   # no history → base
+
+
+def test_symbol_rr_needs_min_trades():
+    # A single bad close shouldn't raise the floor on noise (symbol_rr_min_trades=2).
+    stats = edge_stats([_close("ADA-USDT", -0.5, 1)], 30)
+    assert symbol_adaptive_rr("ADA-USDT", stats, 1.5, _cfg()) == 1.5
+
+
+def test_symbol_rr_disabled_or_base_zero():
+    stats = edge_stats([_close("ETH-USDT", -0.5, i) for i in range(4)], 30)
+    assert symbol_adaptive_rr("ETH-USDT", stats, 1.5, _cfg(enabled=False)) == 1.5
+    assert symbol_adaptive_rr("ETH-USDT", stats, 0.0, _cfg()) == 0.0
+
+
 # ── symbol bench ─────────────────────────────────────────────────────────────────
 
 
-def test_symbol_benched_after_repeated_losses():
+def test_symbol_benched_after_repeated_losses_scales_with_severity():
     # The observed ETH pattern: wins interleaved but 3 losses in the last 5, net negative.
     closes = [
         _close("ETH-USDT", 0.099, 1000),
@@ -100,8 +126,16 @@ def test_symbol_benched_after_repeated_losses():
         _close("ETH-USDT", -0.501, 4000),
         _close("ETH-USDT", -0.694, 5000),
     ]
-    until = symbol_bench_until(closes, _cfg(bench_cooldown_hours=12))
-    assert until == 5000 + 12 * 3600
+    # 3 losses → cooldown scales 12h × min(3, max_mult=4) = 36h
+    until = symbol_bench_until(closes, _cfg(bench_cooldown_hours=12, bench_cooldown_max_mult=4))
+    assert until == 5000 + 12 * 3 * 3600
+
+
+def test_symbol_bench_severity_capped():
+    # 5 losses but max_mult caps the multiplier at 4 → 48h, not 60h
+    closes = [_close("ETH-USDT", -0.5, i * 1000) for i in range(1, 6)]
+    until = symbol_bench_until(closes, _cfg(bench_lookback=5, bench_cooldown_hours=12, bench_cooldown_max_mult=4))
+    assert until == 5000 + 12 * 4 * 3600
 
 
 def test_symbol_not_benched_when_net_positive_or_few_losses():
