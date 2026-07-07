@@ -2169,7 +2169,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
     Rejects if entry_price is too close to current price — use place_futures_market_order
     for closes or when price is already at the target level.
-    Bracket TP/SL are placed on the NEXT run after the limit fills."""
+    ALWAYS pass take_profit_price AND stop_loss_price: they are attached to the order and arm
+    automatically the instant it fills (KuCoin st-orders), so the position is never left unprotected
+    in the gap before your next run. Decide the best entry, TP and SL together, up front."""
     spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not spot_symbol:
       spot_symbol = _repair_allowed_symbol(symbol)
@@ -2407,11 +2409,33 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
     pending_protection = {"takeProfitPrice": take_profit_price, "stopLossPrice": stop_loss_price}
+    # Attach TP/SL to the entry itself (KuCoin st-orders) when both are supplied, so a limit fill that
+    # happens minutes later — between agent runs — is protected the instant it fills, not on the next run.
+    _use_bracket = (
+      cfg.trading.atomic_bracket_enabled
+      and take_profit_price is not None and stop_loss_price is not None
+    )
     note = (
       f"Futures limit {side_lower} placed at {entry_price_val} (current {current_price:.4f}, {deviation*100:.2f}% away). "
       f"Order expires in {cfg.trading.entry_limit_expiry_minutes:.0f}min if unfilled. "
-      "On next run: check open positions — if filled, place bracket TP/SL with place_futures_stop_order."
+      + ("TP/SL are ATTACHED to the order and arm automatically on fill — no action needed unless you want to revise them."
+         if _use_bracket else
+         "On next run: check open positions — if filled, place bracket TP/SL with place_futures_stop_order.")
     )
+
+    def _submit(oq: KucoinFuturesOrderRequest) -> Dict[str, Any]:
+      """Place the entry with an atomic TP/SL bracket when possible; fall back to a plain order
+      (poll-loop safety net then protects it) so a bracket-endpoint hiccup never blocks the trade."""
+      if _use_bracket:
+        try:
+          r = kucoin_futures.place_bracket_order(oq, take_profit_price, stop_loss_price, stop_price_type="MP").__dict__
+          r["bracketAttached"] = True
+          return r
+        except Exception as bexc:
+          logger.warning("Atomic bracket (st-orders) failed for %s — placing plain limit; safety net will protect on fill: %s", futures_symbol, bexc)
+      r = kucoin_futures.place_order(oq).__dict__
+      r["bracketAttached"] = False
+      return r
 
     def _build_limit_order(mode: str | None) -> KucoinFuturesOrderRequest:
       mode_norm = None
@@ -2478,7 +2502,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.warning("set_margin_mode failed (continuing): %s", exc)
     _apply_cross_leverage(futures_symbol, lev, margin_mode)
     try:
-      res = kucoin_futures.place_order(order_req).__dict__
+      res = _submit(order_req)
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
       res["pendingLimitEntry"] = True
@@ -2500,7 +2524,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       try:
         kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
         _apply_cross_leverage(futures_symbol, lev, opposite_mode, context="fallback")
-        res = kucoin_futures.place_order(order_req).__dict__
+        res = _submit(order_req)
         if confidence is not None:
           res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
         res["pendingLimitEntry"] = True

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -158,13 +159,23 @@ class ProtectionManager:
     cfg: ProfitProtectionConfig,
     kucoin_futures: Optional[KucoinFuturesClient],
     notifier: Any = None,
+    emergency_sl_pct: float = 0.0,
+    min_rr: float = 1.5,
   ) -> None:
     self.cfg = cfg
     self.kucoin_futures = kucoin_futures
     self.notifier = notifier
+    # Safety net: if an open position has NO loss-side stop (e.g. a limit filled between agent runs
+    # and the bracket wasn't attached), place an emergency SL this far from entry and a TP at min_rr×
+    # that distance — within one poll (<=60s), not the next agent run. 0 disables. The agent still
+    # refines the bracket later; this just guarantees no position is ever left naked.
+    self.emergency_sl_pct = float(emergency_sl_pct or 0.0)
+    self.min_rr = float(min_rr or 1.5)
     self._peak_fe: Dict[str, float] = {}      # futures symbol -> peak favourable excursion (px)
     self._peak_side: Dict[str, bool] = {}     # futures symbol -> side_long (to reset on flip)
     self._tick_cache: Dict[str, float] = {}   # futures symbol -> tick size
+    self._naked_since: Dict[str, float] = {}  # futures symbol -> ts first seen open with no stop
+    self._emergency_grace_sec: float = 90.0   # let an atomic/attached bracket appear before we add one
 
   # -- public -------------------------------------------------------------------
 
@@ -206,6 +217,21 @@ class ProtectionManager:
 
         sl_price = self._current_stop_price(fsym, side_long, stops)
 
+        # Safety net: never leave a filled position naked. If no loss-side stop exists, attach an
+        # emergency bracket — but only after a short grace so a just-attached (st-orders) bracket has
+        # a poll to appear, avoiding a duplicate stop. This closes the "unprotected between the fill
+        # and the next agent run" gap (positions were repeatedly found missing protection).
+        if sl_price is None and self.emergency_sl_pct > 0:
+          first = self._naked_since.setdefault(fsym, time.time())
+          if (time.time() - first) >= self._emergency_grace_sec:
+            res = self._ensure_emergency_bracket(fsym, pos, side_long, avg_entry)
+            self._naked_since.pop(fsym, None)
+            if res:
+              actions.append(res)
+            continue  # protected this poll; the agent refines the bracket on its next run
+        else:
+          self._naked_since.pop(fsym, None)
+
         decision = decide_protection(
           side_long=side_long,
           avg_entry=avg_entry,
@@ -222,11 +248,14 @@ class ProtectionManager:
         if result:
           actions.append(result)
 
-      # Drop peak state for positions that are no longer open (fresh peak next lifecycle).
+      # Drop per-position state for symbols no longer open (fresh peak / naked-timer next lifecycle).
       for sym in list(self._peak_fe.keys()):
         if sym not in open_symbols:
           self._peak_fe.pop(sym, None)
           self._peak_side.pop(sym, None)
+      for sym in list(self._naked_since.keys()):
+        if sym not in open_symbols:
+          self._naked_since.pop(sym, None)
     except Exception as exc:  # never break the poll loop
       logger.warning("ProtectionManager.run failed (continuing): %s", exc)
     return actions
@@ -288,6 +317,50 @@ class ProtectionManager:
         return None
     except Exception as exc:
       logger.warning("PROFIT-LOCK action %s failed for %s: %s", action, spot_symbol, exc)
+      record["error"] = str(exc)
+    return record
+
+  def _ensure_emergency_bracket(self, fsym: str, pos: Dict[str, Any], side_long: bool, avg_entry: float) -> Optional[Dict[str, Any]]:
+    """Attach a baseline SL (+TP at min_rr) to a position that has no protective stop.
+
+    A last-resort net, not the agent's considered bracket: it caps risk at ``emergency_sl_pct`` from
+    entry so an unbracketed fill can't run away, and the agent replaces it with structure-based levels
+    on its next run. Reduce-only close stops, same mechanism as the breakeven ratchet.
+    """
+    spot_symbol = normalize_symbol(fsym)
+    sl = avg_entry * (1 - self.emergency_sl_pct) if side_long else avg_entry * (1 + self.emergency_sl_pct)
+    tp = avg_entry * (1 + self.emergency_sl_pct * self.min_rr) if side_long else avg_entry * (1 - self.emergency_sl_pct * self.min_rr)
+    sl_r = self._round_to_tick(fsym, sl)
+    tp_r = self._round_to_tick(fsym, tp)
+    reason = f"position had no stop — emergency bracket ({self.emergency_sl_pct:.1%} SL, {self.min_rr:.1f}R TP)"
+    record = {"symbol": spot_symbol, "futuresSymbol": fsym, "action": "emergency_bracket", "stopLoss": sl_r, "takeProfit": tp_r, "reason": reason}
+
+    if self.cfg.dry_run:
+      logger.warning("PROFIT-LOCK [DRY-RUN] emergency bracket on %s — %s", spot_symbol, reason)
+      record["dryRun"] = True
+      self._notify(f"\U0001f9ea <b>Profit-lock (dry-run)</b>\n{spot_symbol}: would attach emergency bracket — {reason}")
+      return record
+
+    common = self._order_common(pos)
+    exit_side = "sell" if side_long else "buy"
+    loss_dir = "down" if side_long else "up"
+    tp_dir = "up" if side_long else "down"
+    try:
+      for label, sdir, sp in (("SL", loss_dir, sl_r), ("TP", tp_dir, tp_r)):
+        req = KucoinFuturesOrderRequest(
+          symbol=fsym, side=exit_side, type="market",
+          leverage=common["leverage"], size=common["size"],
+          clientOid=f"{fsym.lower()}-emrg{label.lower()}-{uuid.uuid4().hex[:10]}",
+          stop=sdir, stopPriceType="MP", stopPrice=f"{sp}",
+          reduceOnly=True, closeOrder=True, marginMode=common["marginMode"],
+          autoDeposit=False if common["marginMode"] == "ISOLATED" else None,
+        )
+        self.kucoin_futures.place_order(req)
+      logger.warning("PROFIT-LOCK attached EMERGENCY bracket on %s (no stop existed) — SL %s / TP %s", spot_symbol, sl_r, tp_r)
+      self._notify(f"\U0001f6e1 <b>Profit-lock</b>\n{spot_symbol}: emergency bracket attached (was unprotected)\nSL {sl_r} · TP {tp_r}")
+      record["result"] = "placed"
+    except Exception as exc:
+      logger.warning("Emergency bracket failed for %s: %s", spot_symbol, exc)
       record["error"] = str(exc)
     return record
 

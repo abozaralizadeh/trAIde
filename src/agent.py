@@ -1281,9 +1281,10 @@ def run_trading_agent(
     f"(reward:risk >= {cfg.trading.min_futures_rr:.1f}). The system HARD-REJECTS futures entries below this "
     "(losses were running ~4x the wins because stops sat wider than targets). Aim for 2.0+ when momentum is strong. "
     "If a setup can't offer that much room to the target before the invalidation level, SKIP it — do not shrink the TP to force a fill.\n"
-    "- For limit entries: pass stop_price and take_profit_price into the limit order tool. "
-    "The system records them as pendingProtection and checks reward:risk when both are supplied. On the next run "
-    "after the limit fills, place bracket orders with place_spot_stop_order / place_futures_stop_order at the SAME reward:risk.\n"
+    "- For FUTURES limit entries: ALWAYS pass BOTH take_profit_price and stop_loss_price in the SAME "
+    "place_futures_limit_order call. They are attached to the order (KuCoin bracket) and arm the instant "
+    "it fills — so decide entry + TP + SL together, up front. Do NOT defer protection to a later run; a "
+    "fill between runs would otherwise sit unprotected. (Spot limit entries still bracket on the next run.)\n"
     + (
     f"- FOR RANGE TRADES: TP toward the BB midline (mean), SL beyond the BB band. Still respect the "
     f"reward:risk >= {cfg.trading.min_futures_rr:.1f} floor — if the mean-reversion target is too close to justify the stop, "

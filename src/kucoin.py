@@ -86,6 +86,21 @@ class KucoinFuturesOrderResponse:
   clientOid: Optional[str] = None
 
 
+def bracket_trigger_prices(side: str, take_profit_price: float, stop_loss_price: float) -> dict:
+  """Map a TP/SL bracket to KuCoin st-orders trigger fields (direction-aware). Pure/testable.
+
+  KuCoin's st-orders endpoint arms `triggerStopUpPrice` (fires when price rises to it) and
+  `triggerStopDownPrice` (fires when price falls to it). Which is TP vs SL depends on side:
+    - LONG (buy):  TP is above entry (up trigger), SL is below entry (down trigger).
+    - SHORT (sell): TP is below entry (down trigger), SL is above entry (up trigger).
+  """
+  tp = float(take_profit_price)
+  sl = float(stop_loss_price)
+  if (side or "").lower() == "buy":  # long
+    return {"triggerStopUpPrice": tp, "triggerStopDownPrice": sl}
+  return {"triggerStopUpPrice": sl, "triggerStopDownPrice": tp}  # short
+
+
 class KucoinClient:
   def __init__(self, cfg: AppConfig) -> None:
     self.api_key = cfg.kucoin.api_key
@@ -698,6 +713,32 @@ class KucoinFuturesClient:
       auth=True,
       body=payload,
     )
+    order_id = data.get("orderId") if isinstance(data, dict) else None
+    client_oid = data.get("clientOid") if isinstance(data, dict) else None
+    return KucoinFuturesOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid", ""))
+
+  def place_bracket_order(
+    self,
+    order: KucoinFuturesOrderRequest,
+    take_profit_price: float,
+    stop_loss_price: float,
+    stop_price_type: str = "MP",
+  ) -> KucoinFuturesOrderResponse:
+    """Place an ENTRY order with TP/SL attached atomically via `/api/v1/st-orders`.
+
+    The exchange arms the take-profit and stop-loss the moment the entry fills — including a
+    limit order that fills minutes later between agent runs — so there is no window where the
+    position sits unprotected. Not for closes: reduceOnly/closeOrder are incompatible with
+    attached TP/SL and are stripped here.
+    """
+    payload = {k: v for k, v in order.__dict__.items() if v is not None}
+    for k in ("takeProfitPrice", "stopLossPrice", "stop", "stopPrice", "reduceOnly", "closeOrder"):
+      payload.pop(k, None)
+    payload.update(bracket_trigger_prices(order.side, take_profit_price, stop_loss_price))
+    payload["triggerStopUpPrice"] = str(payload["triggerStopUpPrice"])
+    payload["triggerStopDownPrice"] = str(payload["triggerStopDownPrice"])
+    payload["stopPriceType"] = stop_price_type
+    data = self._request("POST", "/api/v1/st-orders", auth=True, body=payload)
     order_id = data.get("orderId") if isinstance(data, dict) else None
     client_oid = data.get("clientOid") if isinstance(data, dict) else None
     return KucoinFuturesOrderResponse(orderId=order_id or "", clientOid=client_oid or payload.get("clientOid", ""))

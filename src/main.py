@@ -337,7 +337,10 @@ async def trading_loop() -> None:
   elif cfg.dashboard.enabled:
     logger.warning("Dashboard publishing requested but DISABLED: %s", dashboard.disabled_reason())
 
-  protection = ProtectionManager(cfg.profit_protection, kucoin_futures, notifier=notifier)
+  protection = ProtectionManager(
+    cfg.profit_protection, kucoin_futures, notifier=notifier,
+    emergency_sl_pct=cfg.trading.emergency_sl_pct, min_rr=cfg.trading.min_futures_rr,
+  )
   if cfg.profit_protection.enabled:
     logger.info(
       "Profit-lock enabled (dry_run=%s, breakeven@%.1fR, giveback=%.0f%%, no_chase=%s/%.0fmin).",

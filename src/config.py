@@ -84,6 +84,10 @@ class TradingConfig:
   research_handoff_cooldown_min: float = 30.0 # min minutes between forced Research handoffs (0=off)
   min_futures_rr: float = 1.5                 # reject futures entries whose TP:SL reward:risk is below this (0=off)
   screener_min_turnover_usd_24h: float = 5_000_000.0  # market screener liquidity floor (24h USDT turnover)
+  atomic_bracket_enabled: bool = True         # attach TP/SL to the entry order (KuCoin st-orders) so a limit
+                                              # fill is protected instantly, not on the next agent run
+  emergency_sl_pct: float = 0.02              # poll-loop safety net: SL distance for an unprotected open
+                                              # position (fraction of entry) until the agent sets a real one (0=off)
 
 
 @dataclass
@@ -295,6 +299,8 @@ def load_config() -> AppConfig:
       research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
       min_futures_rr=float(os.getenv("MIN_FUTURES_RR", "1.5")),
       screener_min_turnover_usd_24h=float(os.getenv("SCREENER_MIN_TURNOVER_USD_24H", "5000000")),
+      atomic_bracket_enabled=_as_bool(os.getenv("ATOMIC_BRACKET_ENABLED"), True),
+      emergency_sl_pct=float(os.getenv("EMERGENCY_SL_PCT", "0.02")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),

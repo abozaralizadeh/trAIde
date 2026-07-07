@@ -4,7 +4,7 @@ These cover the pure decision logic only — no network / order placement.
 """
 
 from src.config import ProfitProtectionConfig
-from src.protection import decide_protection, should_block_chase
+from src.protection import ProtectionManager, decide_protection, should_block_chase
 
 
 def _cfg(**overrides) -> ProfitProtectionConfig:
@@ -142,3 +142,39 @@ def test_no_block_on_opposite_direction():
 
 def test_no_block_on_missing_prices():
     assert should_block_chase(close_type="CLOSE_LONG", exit_price=0.0, new_side="buy", new_price=1711.0, buffer_pct=0.001) is False
+
+
+# ── Emergency bracket: never leave a filled position naked ───────────────────────
+
+
+def _mgr(dry_run=True):
+    cfg = _cfg(dry_run=dry_run)
+    return ProtectionManager(cfg, kucoin_futures=None, notifier=None, emergency_sl_pct=0.02, min_rr=1.5)
+
+
+def test_emergency_bracket_long_levels():
+    # Long entry 100, 2% SL / 1.5R TP → SL 98, TP 103. Dry-run so no order is placed.
+    mgr = _mgr(dry_run=True)
+    rec = mgr._ensure_emergency_bracket("ETHUSDTM", {"currentQty": 5, "realLeverage": 3}, side_long=True, avg_entry=100.0)
+    assert rec["dryRun"] is True
+    assert abs(rec["stopLoss"] - 98.0) < 1e-6
+    assert abs(rec["takeProfit"] - 103.0) < 1e-6
+
+
+def test_emergency_bracket_short_levels():
+    # Short entry 100 → SL above at 102, TP below at 97.
+    mgr = _mgr(dry_run=True)
+    rec = mgr._ensure_emergency_bracket("ETHUSDTM", {"currentQty": -5, "realLeverage": 3}, side_long=False, avg_entry=100.0)
+    assert abs(rec["stopLoss"] - 102.0) < 1e-6
+    assert abs(rec["takeProfit"] - 97.0) < 1e-6
+
+
+def test_emergency_bracket_debounce_grace():
+    # First poll seeing a naked position: it is NOT bracketed yet (grace lets an attached bracket appear).
+    mgr = ProtectionManager(_cfg(dry_run=True), kucoin_futures=object(), notifier=None, emergency_sl_pct=0.02, min_rr=1.5)
+    snap = type("S", (), {"futures_enabled": True,
+                          "futures_positions": [{"symbol": "ETHUSDTM", "currentQty": 5, "avgEntryPrice": 100.0, "markPrice": 100.0, "realLeverage": 3}],
+                          "futures_stop_orders": []})()
+    actions = mgr.run(snap)
+    assert not any(a.get("action") == "emergency_bracket" for a in actions)
+    assert "ETHUSDTM" in mgr._naked_since  # armed for next poll
