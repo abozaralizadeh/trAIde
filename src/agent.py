@@ -1556,21 +1556,30 @@ def run_trading_agent(
     _per_sym = _edge_stats_now.get("per_symbol", {})
     # Per-symbol RR floor: a losing symbol must clear a higher bar; fresh/winning ones stay at base.
     _rr_by_symbol = {s: symbol_adaptive_rr(s, _edge_stats_now, cfg.trading.min_futures_rr, cfg.edge) for s in _per_sym}
+    # Realized reward:risk actually achieved vs the RR you INTEND at entry. A big gap means your TPs
+    # aren't being reached — they're set too far for the tape while stops run full — so pull targets in.
+    _aw = float(_edge_stats_now.get("avg_win") or 0.0)
+    _al = abs(float(_edge_stats_now.get("avg_loss") or 0.0))
+    _realized_rr = round(_aw / _al, 2) if _al > 0 else None
     user_state_obj["edgeReport"] = {
       "rolling": {k: _edge_stats_now.get(k) for k in ("n", "wins", "losses", "win_rate", "avg_win", "avg_loss", "payoff", "profit_factor", "net", "expectancy", "loss_streak")},
       "perSymbol": _per_sym,
       "requiredRrBySymbol": _rr_by_symbol,
       "baseRr": cfg.trading.min_futures_rr,
+      "realizedRewardRisk": _realized_rr,
       "entrySizeFactor": _edge_now.get("size_factor"),
       "benchedSymbols": {s: f"{max(0, u - int(time.time())) / 3600:.1f}h left" for s, u in (_edge_now.get("bench") or {}).items()},
       "note": (
         "ENFORCED IN CODE this run, per symbol: a futures entry below that symbol's requiredRrBySymbol "
         "is rejected, benched symbols are rejected outright, and entry size is scaled by entrySizeFactor. "
-        "The RR floor and bench are now SYMBOL-SPECIFIC — a symbol you keep losing on (negative net in perSymbol) "
+        "The RR floor and bench are SYMBOL-SPECIFIC — a symbol you keep losing on (negative net in perSymbol) "
         "must clear a higher bar and gets rested longer, while fresh names default to baseRr. So DIVERSIFY: "
-        "rotate capital away from your losing/benched symbols toward the liquid movers scan_futures_market surfaces "
-        "(run it every research pass). Concentrating on one chopping symbol is what's been losing money. "
-        "If avg_loss exceeds avg_win, the fix is bigger targets and tighter invalidations — not more trades."
+        "rotate off losing/benched symbols toward the liquid movers scan_futures_market surfaces. "
+        "REALITY CHECK: realizedRewardRisk is what your closed trades ACTUALLY achieved (avg win / avg loss). "
+        "If it is far below baseRr (e.g. 0.3 vs 1.5), your TPs are set too far to reach in this tape while "
+        "stops run full — set the TAKE-PROFIT at the NEAREST realistic structural target (VWAP, POC, prior "
+        "swing, band mid) that price can actually hit, and TIGHTEN the stop to the true invalidation so the "
+        "RR floor still passes at a REACHABLE scale. A smaller target that fills beats a bigger one that never does."
       ),
     }
   except Exception as _edge_exc:

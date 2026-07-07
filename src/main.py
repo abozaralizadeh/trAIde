@@ -417,6 +417,10 @@ async def trading_loop() -> None:
           triggers.append(f"price_move:{symbol}:{change_pct:.2f}%")
       last_prices[symbol] = price
 
+    # Snapshot peak/trough BEFORE the update prunes just-closed positions — otherwise a position's
+    # MFE/MAE is reset before we record its close, and every close lands with peak/trough = None
+    # (which is why we can't tell whether TP targets were realistically reachable).
+    pre_close_extremes = memory.get_position_extremes()
     try:
       # Drive extremes off live exchange positions so peak/trough reset when a position closes.
       memory.update_position_extremes(_live_extremes_map(snapshot))
@@ -462,6 +466,9 @@ async def trading_loop() -> None:
               continue
         if exit_price is None:
           exit_price = last_prices.get(sym)  # fallback: latest poll price ≈ exit
+        # MFE/MAE from the pre-reset extremes: how far the trade ran in profit (peak) and underwater
+        # (trough) before closing — the data that tells us if TPs are set within realistic reach.
+        _ext = pre_close_extremes.get(sym, {}) if isinstance(pre_close_extremes, dict) else {}
         memory.log_decision(
           sym,
           f"futures_{side}_triggered",
@@ -471,6 +478,8 @@ async def trading_loop() -> None:
           paper=False,
           exit_price=exit_price,
           close_type=close_type,
+          peak_pnl=_ext.get("peakPnl"),
+          trough_pnl=_ext.get("troughPnl"),
         )
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)
