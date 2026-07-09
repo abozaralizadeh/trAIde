@@ -55,6 +55,7 @@ def decide_protection(
   sl_price: Optional[float],
   peak_fe: float,
   cfg: ProfitProtectionConfig,
+  opened_min_ago: Optional[float] = None,
 ) -> Dict[str, Any]:
   """Decide what protective action (if any) a position needs. Pure function.
 
@@ -65,6 +66,7 @@ def decide_protection(
     sl_price: current protective stop price, or None if no stop is live.
     peak_fe: peak favourable excursion in price terms (>=0 once the trade has been green).
     cfg: thresholds.
+    opened_min_ago: minutes since the position opened, for the early-invalidation cut (None skips it).
 
   Returns a dict with ``action`` in {"none", "move_breakeven", "close"} plus context.
   """
@@ -77,6 +79,28 @@ def decide_protection(
     rd = (avg_entry - sl_price) if side_long else (sl_price - avg_entry)
     if rd > 0:
       risk_dist = rd
+
+  # P1c — early invalidation: cut a trade that NEVER went meaningfully green and is now failing toward
+  # its stop. MFE/MAE data shows winners stay green from entry while losers go against immediately, so
+  # this shrinks the loser (and front-runs a stop that's likely to hit / gap through) without touching
+  # winners. Only fires past a grace, when the trade never worked, and it's already most of the way down.
+  if (
+    cfg.early_cut_enabled
+    and opened_min_ago is not None and opened_min_ago >= cfg.early_cut_grace_min
+    and risk_dist is not None
+  ):
+    never_worked = peak_fe < cfg.early_cut_min_favorable_pct * avg_entry
+    failing = fe_now <= -cfg.early_cut_mae_frac * risk_dist
+    if never_worked and failing:
+      return {
+        "action": "close",
+        "reason": (
+          f"early invalidation — never reached +{cfg.early_cut_min_favorable_pct:.1%} in {opened_min_ago:.0f}min "
+          f"and now {(-fe_now / risk_dist):.0%} to stop (winners work fast; this one didn't)"
+        ),
+        "feNow": fe_now,
+        "peakFe": peak_fe,
+      }
 
   # P1a — give-back cap: lock the gain once a real run retraces too far. Arming is tied to the
   # trade's OWN risk when the stop is known (giveback_arm_r × stop distance): sub-1R wobble is
@@ -176,6 +200,7 @@ class ProtectionManager:
     self._tick_cache: Dict[str, float] = {}   # futures symbol -> tick size
     self._naked_since: Dict[str, float] = {}  # futures symbol -> ts first seen open with no stop
     self._emergency_grace_sec: float = 90.0   # let an atomic/attached bracket appear before we add one
+    self._open_since: Dict[str, float] = {}   # futures symbol -> ts first seen open (for early-cut age)
 
   # -- public -------------------------------------------------------------------
 
@@ -205,11 +230,14 @@ class ProtectionManager:
           continue
         open_symbols.add(fsym)
         side_long = qty > 0
+        opened_min_ago = (time.time() - self._open_since.setdefault(fsym, time.time())) / 60.0
 
-        # Reset peak tracking if the position flipped direction since we last saw it.
+        # Reset peak/age tracking if the position flipped direction since we last saw it.
         if self._peak_side.get(fsym) != side_long:
           self._peak_side[fsym] = side_long
           self._peak_fe.pop(fsym, None)
+          self._open_since[fsym] = time.time()
+          opened_min_ago = 0.0
 
         fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)
         peak_fe = max(self._peak_fe.get(fsym, fe_now), fe_now)
@@ -239,6 +267,7 @@ class ProtectionManager:
           sl_price=sl_price,
           peak_fe=peak_fe,
           cfg=self.cfg,
+          opened_min_ago=opened_min_ago,
         )
         action = decision.get("action")
         if action == "none":
@@ -256,6 +285,9 @@ class ProtectionManager:
       for sym in list(self._naked_since.keys()):
         if sym not in open_symbols:
           self._naked_since.pop(sym, None)
+      for sym in list(self._open_since.keys()):
+        if sym not in open_symbols:
+          self._open_since.pop(sym, None)
     except Exception as exc:  # never break the poll loop
       logger.warning("ProtectionManager.run failed (continuing): %s", exc)
     return actions
@@ -311,8 +343,8 @@ class ProtectionManager:
         self._notify(f"\U0001f6e1 <b>Profit-lock</b>\n{spot_symbol}: stop moved to breakeven\n{reason}")
       elif action == "close":
         record["result"] = self._close_position(fsym, pos, side_long)
-        logger.warning("PROFIT-LOCK closed %s to lock gains — %s", spot_symbol, reason)
-        self._notify(f"\U0001f512 <b>Profit-lock</b>\n{spot_symbol}: position closed to lock gains\n{reason}")
+        logger.warning("PROFIT-LOCK closed %s — %s", spot_symbol, reason)
+        self._notify(f"\U0001f512 <b>Profit-lock</b>\n{spot_symbol}: position closed\n{reason}")
       else:
         return None
     except Exception as exc:

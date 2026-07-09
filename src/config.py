@@ -139,6 +139,14 @@ class ProfitProtectionConfig:
   # the trade's own initial risk (stop distance). Stops the cap from strangling winners at
   # fee-scale (+0.3-0.5% ROE closes) while losses ride to the full stop. 0 = pct-arming only.
   giveback_arm_r: float = 1.0
+  # Early invalidation: a trade that NEVER went meaningfully green and is failing toward its stop is
+  # cut early instead of riding to the full SL. The bot's MFE/MAE data shows winners work almost
+  # immediately (stay green from entry) while losers go against from the start — so this surgically
+  # shrinks losers without touching winners. Cuts avg loss, the side that's been > avg win.
+  early_cut_enabled: bool = True
+  early_cut_grace_min: float = 20.0        # give a fresh entry this long to work before it can be cut
+  early_cut_min_favorable_pct: float = 0.003  # if peak excursion never reached this (frac of entry), it "never worked"
+  early_cut_mae_frac: float = 0.6          # ...and it's this far toward the stop → cut the remaining distance
 
 
 @dataclass
@@ -323,6 +331,10 @@ def load_config() -> AppConfig:
       post_win_cooldown_minutes=float(os.getenv("POST_WIN_COOLDOWN_MINUTES", "45")),
       no_chase_buffer_pct=float(os.getenv("NO_CHASE_BUFFER_PCT", "0.001")),
       giveback_arm_r=float(os.getenv("PROFIT_LOCK_GIVEBACK_ARM_R", "1.0")),
+      early_cut_enabled=_as_bool(os.getenv("EARLY_CUT_ENABLED"), True),
+      early_cut_grace_min=float(os.getenv("EARLY_CUT_GRACE_MIN", "20")),
+      early_cut_min_favorable_pct=float(os.getenv("EARLY_CUT_MIN_FAVORABLE_PCT", "0.003")),
+      early_cut_mae_frac=float(os.getenv("EARLY_CUT_MAE_FRAC", "0.6")),
     ),
     edge=EdgeConfig(
       enabled=_as_bool(os.getenv("ADAPTIVE_EDGE_ENABLED"), True),
