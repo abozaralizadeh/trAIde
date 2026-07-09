@@ -33,6 +33,7 @@ from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
   allow_reversal_long,
+  allow_reversal_short,
   allow_trend_aligned_short,
   block_alt_long_in_btc_downtrend,
   concentration_scale,
@@ -1484,9 +1485,15 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("REVERSAL LONG ALLOWED: %s %s — bearish daily but 1h/15m confirm a turn (conf=%.2f)", side, spot_symbol, confidence or 0.0)
+          elif allow_reversal_short(
+            daily_bias=daily_bias, side=side_lower,
+            bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
+            confidence=confidence, cfg=cfg.regime,
+          ):
+            logger.info("REVERSAL SHORT ALLOWED: %s %s — bullish daily but 1h/15m confirm a roll-over (conf=%.2f)", side, spot_symbol, confidence or 0.0)
           else:
             logger.warning("DAILY GATE BLOCK: %s %s rejected — 1D trend is %s", side, spot_symbol, daily_bias)
-            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend, take a confirmed reversal (1h+15m turned, high confidence), or wait for it to turn neutral."}
+            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side} entry blocked", "daily_bias": daily_bias, "hint": "The 1D timeframe opposes this trade direction. Only trade WITH the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), or wait for it to turn neutral."}
       # 1h alignment: block entries when 1h bias opposes the proposed side (catches bounces in confirmed corrections)
       intraday_bias_1h = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes = (
@@ -2236,8 +2243,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("REVERSAL LONG ALLOWED: futures limit %s %s — bearish daily but 1h/15m confirm a turn (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+          elif allow_reversal_short(
+            daily_bias=daily_bias, side=side_lower,
+            bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
+            confidence=confidence, cfg=cfg.regime,
+          ):
+            logger.info("REVERSAL SHORT ALLOWED: futures limit %s %s — bullish daily but 1h/15m confirm a roll-over (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
           else:
-            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned, high confidence), or switch symbol."}
+            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), or switch symbol."}
       intraday_bias_1h_fl = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes_fl = (
         (intraday_bias_1h_fl == "bearish" and side_lower == "buy") or

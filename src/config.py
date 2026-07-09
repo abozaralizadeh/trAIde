@@ -168,6 +168,10 @@ class RegimeConfig:
   reversal_longs_enabled: bool = True
   reversal_long_min_confidence: float = 0.80  # high bar — counter-daily longs are only for confirmed turns
   reversal_long_require_15m: bool = True      # require 15m (not just 1h) bullish confirmation
+  # Mirror: allow a SHORT past a bullish daily gate when 1h+15m confirm a roll-over (regimes flip both ways).
+  reversal_shorts_enabled: bool = True
+  reversal_short_min_confidence: float = 0.80
+  reversal_short_require_15m: bool = True
 
 
 @dataclass
@@ -352,6 +356,9 @@ def load_config() -> AppConfig:
       reversal_longs_enabled=_as_bool(os.getenv("REVERSAL_LONGS_ENABLED"), True),
       reversal_long_min_confidence=float(os.getenv("REVERSAL_LONG_MIN_CONFIDENCE", "0.80")),
       reversal_long_require_15m=_as_bool(os.getenv("REVERSAL_LONG_REQUIRE_15M"), True),
+      reversal_shorts_enabled=_as_bool(os.getenv("REVERSAL_SHORTS_ENABLED"), True),
+      reversal_short_min_confidence=float(os.getenv("REVERSAL_SHORT_MIN_CONFIDENCE", "0.80")),
+      reversal_short_require_15m=_as_bool(os.getenv("REVERSAL_SHORT_REQUIRE_15M"), True),
     ),
     langsmith=LangsmithConfig(
       enabled=_as_bool(os.getenv("LANGSMITH_ENABLED"), False),

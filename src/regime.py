@@ -216,6 +216,40 @@ def allow_reversal_long(
   return True
 
 
+def allow_reversal_short(
+  *,
+  daily_bias: str,
+  side: str,
+  bias_1h: str,
+  bias_15m: str,
+  confidence,
+  cfg: RegimeConfig,
+) -> bool:
+  """True if a SHORT should be permitted past a bullish daily gate because a roll-over is confirmed.
+
+  Exact mirror of `allow_reversal_long`. When the market flipped to a bullish daily regime
+  (July 2026 recovery), the daily gate blocked every short while intraday had clearly turned down
+  (Jul 7-8 pullback: SOL -5%, ETH -2.3% with 'daily is bullish, shorts blocked' repeating in the
+  log) — the same lagging-daily straitjacket as before, mirrored. Yields the gate ONLY when 1h and
+  15m are both bearish and confidence clears a high bar: a confirmed turn, not fading strength.
+  The per-symbol R:R floor, bench, and sizing throttles still apply to whatever passes.
+  """
+  if not cfg.reversal_shorts_enabled:
+    return False
+  if str(daily_bias or "").strip().lower() != "bullish" or (side or "").lower() not in ("sell", "short"):
+    return False
+  if str(bias_1h or "").strip().lower() != "bearish":
+    return False
+  if cfg.reversal_short_require_15m and str(bias_15m or "").strip().lower() != "bearish":
+    return False
+  try:
+    if float(confidence or 0.0) < cfg.reversal_short_min_confidence:
+      return False
+  except (TypeError, ValueError):
+    return False
+  return True
+
+
 def allow_trend_aligned_short(
   *,
   daily_exhausted: bool,

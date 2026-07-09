@@ -8,6 +8,7 @@ from src.regime import (
     effective_min_confidence,
     regime_size_factor,
     allow_reversal_long,
+    allow_reversal_short,
     allow_trend_aligned_short,
     block_alt_long_in_btc_downtrend,
     concentration_scale,
@@ -410,3 +411,51 @@ def test_live_extremes_map_from_snapshot():
     assert set(out.keys()) == {"ETH-USDT", "BTC-USDT"}
     assert out["ETH-USDT"] == {"netSize": 5.0, "unrealizedPnl": 3.2}
     assert out["BTC-USDT"]["netSize"] == -2.0
+
+
+# ── Reversal short: catch a confirmed roll-over against a lagging bullish daily ───
+
+
+def test_reversal_short_allowed_when_ltfs_confirm():
+    # The Jul 7-8 2026 pattern: bullish daily, but 1h+15m turned bearish (pullback) + high confidence.
+    assert allow_reversal_short(
+        daily_bias="bullish", side="sell", bias_1h="bearish", bias_15m="bearish",
+        confidence=0.82, cfg=_cfg(),
+    ) is True
+
+
+def test_reversal_short_blocked_without_full_ltf_confirmation():
+    assert allow_reversal_short(
+        daily_bias="bullish", side="sell", bias_1h="bearish", bias_15m="neutral",
+        confidence=0.90, cfg=_cfg(),
+    ) is False
+    assert allow_reversal_short(
+        daily_bias="bullish", side="sell", bias_1h="bullish", bias_15m="bearish",
+        confidence=0.90, cfg=_cfg(),
+    ) is False
+
+
+def test_reversal_short_blocked_low_confidence():
+    assert allow_reversal_short(
+        daily_bias="bullish", side="sell", bias_1h="bearish", bias_15m="bearish",
+        confidence=0.70, cfg=_cfg(),
+    ) is False
+
+
+def test_reversal_short_only_for_sells_against_bullish_daily():
+    base = dict(bias_1h="bearish", bias_15m="bearish", confidence=0.9, cfg=_cfg())
+    # a buy is not a reversal short
+    assert allow_reversal_short(daily_bias="bullish", side="buy", **base) is False
+    # bearish daily is not the case this overrides (shorts already allowed there)
+    assert allow_reversal_short(daily_bias="bearish", side="sell", **base) is False
+
+
+def test_reversal_short_15m_relaxable_and_disableable():
+    assert allow_reversal_short(
+        daily_bias="bullish", side="sell", bias_1h="bearish", bias_15m="neutral",
+        confidence=0.85, cfg=_cfg(reversal_short_require_15m=False),
+    ) is True
+    assert allow_reversal_short(
+        daily_bias="bullish", side="sell", bias_1h="bearish", bias_15m="bearish",
+        confidence=0.95, cfg=_cfg(reversal_shorts_enabled=False),
+    ) is False
