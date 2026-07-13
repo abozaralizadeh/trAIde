@@ -11,8 +11,10 @@ from src.regime import (
     allow_reversal_short,
     allow_trend_aligned_short,
     block_alt_long_in_btc_downtrend,
+    bracket_risk_scale,
     concentration_scale,
     conviction_size_factor,
+    is_relative_strength_alt_long,
     resolve_gate_deadlock,
     reward_risk_ratio,
 )
@@ -120,6 +122,28 @@ def test_alt_gate_custom_majors():
     assert block_alt_long_in_btc_downtrend(symbol="RE-USDT", side="buy", btc_daily_bias="bearish", cfg=cfg) is True
 
 
+def test_relative_strength_leader_can_override_bearish_btc_at_reduced_risk():
+    cfg = _cfg()
+    context = dict(
+        symbol="ZEC-USDT", side="buy", btc_daily_bias="bearish",
+        local_daily_bias="bullish", bias_4h="bullish", bias_1h="bullish", bias_15m="bullish",
+        strength="strong", daily_exhausted=False, confidence=0.84, cfg=cfg,
+    )
+    assert is_relative_strength_alt_long(**context) is True
+    assert block_alt_long_in_btc_downtrend(**context) is False
+
+
+def test_relative_strength_exception_stays_blocked_when_incomplete_or_low_confidence():
+    base = dict(
+        symbol="ALT-USDT", side="buy", btc_daily_bias="bearish",
+        local_daily_bias="bullish", bias_4h="bullish", bias_1h="bullish", bias_15m="bullish",
+        strength="strong", daily_exhausted=False, confidence=0.84, cfg=_cfg(),
+    )
+    assert block_alt_long_in_btc_downtrend(**{**base, "bias_15m": "neutral"}) is True
+    assert block_alt_long_in_btc_downtrend(**{**base, "confidence": 0.80}) is True
+    assert block_alt_long_in_btc_downtrend(**{**base, "daily_exhausted": True}) is True
+
+
 # ── Concentration cap ───────────────────────────────────────────────────────────
 
 
@@ -137,6 +161,22 @@ def test_concentration_scale_disabled_or_unknown_equity():
     assert concentration_scale(52.0, 70.0, 0.0) == 1.0   # cap disabled
     assert concentration_scale(52.0, 0.0, 0.5) == 1.0    # equity unknown
     assert concentration_scale(0.0, 70.0, 0.5) == 1.0    # no notional
+
+
+def test_bracket_risk_scale_caps_stop_defined_loss():
+    # $1,000 notional with a 10% stop risks $100; a $50 budget scales it to half size.
+    assert bracket_risk_scale(entry=100, stop_loss=90, notional_usd=1000,
+                              equity_usd=1000, risk_fraction=0.05) == 0.5
+    # A position already inside budget is unchanged; this helper never sizes up.
+    assert bracket_risk_scale(entry=100, stop_loss=98, notional_usd=1000,
+                              equity_usd=1000, risk_fraction=0.05) == 1.0
+
+
+def test_bracket_risk_scale_fails_open_on_unusable_values():
+    assert bracket_risk_scale(entry=0, stop_loss=90, notional_usd=1000,
+                              equity_usd=1000, risk_fraction=0.05) == 1.0
+    assert bracket_risk_scale(entry=100, stop_loss=None, notional_usd=1000,
+                              equity_usd=1000, risk_fraction=0.05) == 1.0
 
 
 # ── Reward:risk ratio (futures bracket) ─────────────────────────────────────────

@@ -1,4 +1,4 @@
-from src.main import _agent_made_a_move
+from src.main import _agent_made_a_move, _expired_bot_entry_orders
 
 
 class TestAgentMadeAMove:
@@ -32,3 +32,22 @@ class TestAgentMadeAMove:
       {"orderId": "ok", "orderRequest": {"side": "sell"}},
     ]}
     assert _agent_made_a_move(res)
+
+
+class TestExpiredBotEntryOrders:
+  def test_only_expired_tagged_entries_are_selected(self):
+    now = 2_000_000_000
+    orders = [
+      {"id": "old", "clientOid": "traide-entry-old", "createdAt": (now - 31 * 60) * 1000},
+      {"id": "new", "clientOid": "traide-entry-new", "createdAt": (now - 5 * 60) * 1000},
+      {"id": "manual", "clientOid": "manual-order", "createdAt": (now - 60 * 60) * 1000},
+      {"id": "protect", "clientOid": "traide-entry-protect", "createdAt": (now - 60 * 60) * 1000,
+       "reduceOnly": True},
+    ]
+    assert [o["id"] for o in _expired_bot_entry_orders(orders, 30, now=now)] == ["old"]
+
+  def test_expiry_can_be_disabled_and_handles_seconds(self):
+    now = 2_000_000_000
+    order = {"id": "old", "clientOid": "traide-entry-old", "createdAt": now - 3600}
+    assert _expired_bot_entry_orders([order], 0, now=now) == []
+    assert _expired_bot_entry_orders([order], 30, now=now) == [order]

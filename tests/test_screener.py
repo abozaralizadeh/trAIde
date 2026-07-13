@@ -89,6 +89,14 @@ def test_turnover_floor_can_be_disabled():
     assert res["results"][0]["futuresSymbol"] == "THINUSDTM"
 
 
+def test_extreme_24h_movers_can_be_excluded_before_ranking():
+    # WILD is the top momentum name but its -18% move is beyond a 15% execution cap.
+    res = _screen(max_abs_change_pct=15)
+    syms = {r["futuresSymbol"] for r in res["results"]}
+    assert "WILDUSDTM" not in syms
+    assert res["results"][0]["futuresSymbol"] == "DOGEUSDTM"
+
+
 def test_empty_universe():
     res = _screen_contracts([], min_turnover=5_000_000, min_age_days=7, now=NOW)
     assert res["qualified"] == 0 and res["results"] == []

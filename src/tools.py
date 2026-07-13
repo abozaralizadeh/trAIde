@@ -36,9 +36,11 @@ from .regime import (
   allow_reversal_short,
   allow_trend_aligned_short,
   block_alt_long_in_btc_downtrend,
+  bracket_risk_scale,
   concentration_scale,
   conviction_size_factor,
   effective_min_confidence,
+  is_relative_strength_alt_long,
   regime_size_factor,
   resolve_gate_deadlock,
   reward_risk_ratio,
@@ -78,6 +80,138 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   _spot_position_info = ctx._spot_position_info
   _spot_position_size = ctx._spot_position_size
   _stop_distance_ok = ctx._stop_distance_ok
+
+  # Mutable per-agent-run view of regular futures orders.  The snapshot is otherwise frozen for
+  # the whole LLM run, which previously let repeated tool calls place many identical GTC entries
+  # before the next poll could see them.  Successful place/cancel calls update this map immediately.
+  _runtime_futures_pending: Dict[str, Dict[str, Any]] = {}
+  for _o in snapshot.futures_pending_orders or []:
+    if not isinstance(_o, dict):
+      continue
+    _oid = str(_o.get("id") or _o.get("orderId") or _o.get("clientOid") or "")
+    if _oid:
+      _runtime_futures_pending[_oid] = dict(_o)
+
+  def _order_flag(value: Any) -> bool:
+    return value is True or str(value or "").strip().lower() in {"1", "true", "yes"}
+
+  def _pending_entry_for(futures_symbol: str) -> Dict[str, Any] | None:
+    for order in _runtime_futures_pending.values():
+      if str(order.get("symbol") or "").upper() != futures_symbol.upper():
+        continue
+      if _order_flag(order.get("reduceOnly")) or _order_flag(order.get("closeOrder")):
+        continue
+      return order
+    return None
+
+  def _gate_for(symbol: str) -> Dict[str, Any]:
+    return _daily_gate_state.get(symbol, {})
+
+  def _relative_strength_exception(symbol: str, side: str, confidence) -> bool:
+    gate = _gate_for(symbol)
+    return is_relative_strength_alt_long(
+      symbol=symbol,
+      side=side,
+      btc_daily_bias=_btc_daily_bias(),
+      local_daily_bias=gate.get("daily_bias_raw", gate.get("daily_bias", "neutral")),
+      bias_4h=gate.get("intraday_bias_4h", "neutral"),
+      bias_1h=gate.get("intraday_bias_1h", "neutral"),
+      bias_15m=gate.get("intraday_bias_15m", "neutral"),
+      strength=gate.get("strength", "weak"),
+      daily_exhausted=bool(gate.get("daily_exhausted", False)),
+      confidence=confidence,
+      cfg=cfg.regime,
+    )
+
+  def _alt_long_is_blocked(symbol: str, side: str, confidence) -> bool:
+    gate = _gate_for(symbol)
+    return block_alt_long_in_btc_downtrend(
+      symbol=symbol,
+      side=side,
+      btc_daily_bias=_btc_daily_bias(),
+      local_daily_bias=gate.get("daily_bias_raw", gate.get("daily_bias", "neutral")),
+      bias_4h=gate.get("intraday_bias_4h", "neutral"),
+      bias_1h=gate.get("intraday_bias_1h", "neutral"),
+      bias_15m=gate.get("intraday_bias_15m", "neutral"),
+      strength=gate.get("strength", "weak"),
+      daily_exhausted=bool(gate.get("daily_exhausted", False)),
+      confidence=confidence,
+      cfg=cfg.regime,
+    )
+
+  def _extreme_24h_move(symbol: str) -> float | None:
+    value = _gate_for(symbol).get("price_change_24h_pct")
+    try:
+      move = float(value)
+    except (TypeError, ValueError):
+      return None
+    cap = float(cfg.trading.max_24h_volatility_pct or 0.0)
+    return move if cap > 0 and abs(move) > cap else None
+
+  def _risk_capped_contracts(contracts: int, lot: int, multiplier: float, entry: float, stop_loss: float) -> int:
+    """Final post-rounding risk cap; returns 0 when even one lot exceeds the budget."""
+    try:
+      risk_per_contract = float(multiplier) * abs(float(entry) - float(stop_loss))
+      budget = float(snapshot.total_usdt) * float(cfg.trading.risk_per_trade_pct)
+    except (TypeError, ValueError):
+      return contracts
+    if risk_per_contract <= 0 or budget <= 0:
+      return contracts
+    max_contracts = int(math.floor((budget / risk_per_contract) / lot) * lot)
+    return min(contracts, max_contracts)
+
+  def _existing_futures_risk_usd() -> float:
+    """Stop-defined open risk plus a conservative reservation for each pending entry."""
+    per_trade_budget = float(snapshot.total_usdt) * float(cfg.trading.risk_per_trade_pct)
+    total = 0.0
+    for pos in snapshot.futures_positions or []:
+      try:
+        qty = float(pos.get("currentQty") or 0.0)
+        entry = float(pos.get("avgEntryPrice") or 0.0)
+      except (TypeError, ValueError):
+        continue
+      if not qty or entry <= 0:
+        continue
+      fsym = str(pos.get("symbol") or "")
+      loss_dir = "down" if qty > 0 else "up"
+      stops = []
+      for order in snapshot.futures_stop_orders or []:
+        if str(order.get("symbol") or "") != fsym or str(order.get("stop") or "").lower() != loss_dir:
+          continue
+        try:
+          stops.append(float(order.get("stopPrice")))
+        except (TypeError, ValueError):
+          pass
+      if not stops:
+        total += per_trade_budget
+        continue
+      stop_price = min(stops) if qty > 0 else max(stops)
+      contract = _get_contract_spec(fsym) or {}
+      multiplier = _to_float(contract.get("multiplier"))
+      if multiplier <= 0:
+        total += per_trade_budget
+        continue
+      total += abs(qty) * multiplier * abs(entry - stop_price)
+    # A resting entry can fill before the next poll.  Its bracket is not consistently returned by
+    # KuCoin's active-order list, so reserve one configured risk unit rather than pretending it is 0.
+    total += sum(
+      per_trade_budget
+      for order in _runtime_futures_pending.values()
+      if not _order_flag(order.get("reduceOnly")) and not _order_flag(order.get("closeOrder"))
+    )
+    return total
+
+  def _heat_capped_contracts(contracts: int, lot: int, multiplier: float, entry: float, stop_loss: float) -> int:
+    heat_pct = float(cfg.circuit_breaker.max_portfolio_heat_pct or 0.0)
+    if heat_pct <= 0 or snapshot.total_usdt <= 0:
+      return contracts
+    heat_budget = float(snapshot.total_usdt) * heat_pct / 100.0
+    remaining = max(0.0, heat_budget - _existing_futures_risk_usd())
+    risk_per_contract = float(multiplier) * abs(float(entry) - float(stop_loss))
+    if risk_per_contract <= 0:
+      return contracts
+    max_contracts = int(math.floor((remaining / risk_per_contract) / lot) * lot)
+    return min(contracts, max_contracts)
 
 
   # ── Spot trading — market/limit orders, stops & position protection ─────────────────────────────
@@ -172,13 +306,15 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
         _atr_scale_m = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: spot buy %s ATR=%.2f%% — scaling position to %.0f%%", symbol, daily_atr_pct, _atr_scale_m * 100)
+    if _relative_strength_exception(symbol, side, confidence):
+      _atr_scale_m = max(0.30, _atr_scale_m * cfg.regime.relative_strength_size_factor)
 
     # Confidence enforcement: reject buys below minimum confidence
     if (side or "").lower() == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
       return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}", "hint": "Only enter trades with sufficient conviction. Analyze another coin or wait for a better setup."}
 
     # Correlation gate: block alt spot BUYS while BTC's daily regime is bearish (high-beta blowup guard).
-    if block_alt_long_in_btc_downtrend(symbol=symbol, side=side, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+    if _alt_long_is_blocked(symbol, side, confidence):
       logger.warning("CORRELATION GATE BLOCK: spot buy %s rejected — BTC daily regime is bearish", symbol)
       return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — spot buy on alt {symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT buy an altcoin while BTC's daily trend is down. Wait for BTC's daily to turn or trade a major."}
 
@@ -718,12 +854,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
         _atr_scale_l = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: spot limit %s ATR=%.2f%% — scaling position to %.0f%%", symbol, daily_atr_pct, _atr_scale_l * 100)
+    if _relative_strength_exception(symbol, side_lower, confidence):
+      _atr_scale_l = max(0.30, _atr_scale_l * cfg.regime.relative_strength_size_factor)
 
     if side_lower == "buy" and confidence is not None and confidence < cfg.trading.min_confidence:
       return {"rejected": True, "reason": f"Confidence {confidence:.2f} below minimum {cfg.trading.min_confidence}"}
 
     # Correlation gate: block alt spot BUYS while BTC's daily regime is bearish (high-beta blowup guard).
-    if block_alt_long_in_btc_downtrend(symbol=symbol, side=side_lower, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+    if _alt_long_is_blocked(symbol, side_lower, confidence):
       logger.warning("CORRELATION GATE BLOCK: spot limit buy %s rejected — BTC daily regime is bearish", symbol)
       return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — spot buy on alt {symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT buy an altcoin while BTC's daily trend is down. Wait for BTC's daily to turn or trade a major."}
 
@@ -1139,6 +1277,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     snapshots: list[Dict[str, Any]] = []
     end_at = int(time.time())
+    futures_granularity = {"1min": 1, "5min": 5, "15min": 15, "1hour": 60, "4hour": 240, "1day": 1440}
+    context_futures_symbol = _to_futures_symbol(symbol) if cfg.kucoin_futures.enabled and kucoin_futures else None
     for iv in interval_order:
       interval_sec = INTERVAL_SECONDS[iv]
       if iv == "1day":
@@ -1149,7 +1289,35 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         lookback_min = max(120, min(int(lookback_minutes or 0), 720))
       points = min(500, max(50, int(lookback_min * 60 / interval_sec)))
       start_at = end_at - points * interval_sec
-      candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
+      candles = None
+      market_source = "spot"
+      # Trade futures from futures price action.  Spot and perp histories can diverge around listings,
+      # migrations and squeezes; using spot-only candles also made valid perp-only scan results look
+      # "unsupported".  Fall back to spot if the futures endpoint is unavailable.
+      if context_futures_symbol and iv in futures_granularity:
+        try:
+          raw_futures = kucoin_futures.get_candles(
+            context_futures_symbol,
+            granularity=futures_granularity[iv],
+            start_at=start_at * 1000,
+            end_at=end_at * 1000,
+          )
+          if raw_futures:
+            candles = []
+            for row in raw_futures:
+              if not isinstance(row, (list, tuple)) or len(row) < 6:
+                continue
+              ts = float(row[0])
+              if ts > 1e12:
+                ts /= 1000.0
+              # Futures: [time, open, high, low, close, volume, turnover]
+              candles.append([ts, row[1], row[4], row[2], row[3], row[5], row[6] if len(row) > 6 else 0])
+            if candles:
+              market_source = "futures"
+        except Exception as exc:
+          logger.debug("Futures candles unavailable for %s %s; falling back to spot: %s", symbol, iv, exc)
+      if not candles:
+        candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
       if not candles:
         if iv in ("4hour", "1day"):
           continue
@@ -1158,6 +1326,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         df = candles_to_dataframe(candles)
         snapshot = summarize_interval(df, iv)
         snapshot["rows"] = len(df)
+        snapshot["source"] = market_source
         snapshots.append(snapshot)
       except Exception as exc:
         if iv in ("4hour", "1day"):
@@ -1187,6 +1356,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "timeframe_conflict": summary.get("timeframe_conflict", False),
       "intraday_bias_15m": summary.get("intraday_bias_15m", "neutral"),
       "intraday_bias_1h": summary.get("intraday_bias_1h", "neutral"),
+      "intraday_bias_4h": summary.get("intraday_bias_4h", "neutral"),
+      "strength": summary.get("strength", "weak"),
     }
     result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
 
@@ -1209,6 +1380,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           futures_data["openInterest"] = current_oi
           futures_data["volumeOf24h"] = contract.get("volumeOf24h")
           futures_data["turnoverOf24h"] = contract.get("turnoverOf24h")
+          _chg = _to_float(contract.get("priceChgPct"))
+          futures_data["priceChgPct24h"] = round(_chg * 100, 3) if _chg is not None else None
+          _daily_gate_state[symbol]["price_change_24h_pct"] = futures_data["priceChgPct24h"]
         except Exception:
           pass
         try:
@@ -1418,6 +1592,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
 
     is_entry = not reduce_only
+    _pre_futures_symbol = _to_futures_symbol(spot_symbol)
+    if is_entry and _pre_futures_symbol:
+      existing_pending = _pending_entry_for(_pre_futures_symbol)
+      if existing_pending:
+        return {
+          "rejected": True,
+          "reason": f"Pending entry already exists for {spot_symbol}; cancel or let it fill/expire before another entry",
+          "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
+          "hint": "Never stack a market entry on top of a resting entry; the old order could fill later and double exposure.",
+        }
+    if is_entry and (take_profit_price is None or (stop_loss_price is None and stop_price is None)):
+      return {
+        "rejected": True,
+        "reason": "Futures entries require both take-profit and stop-loss prices",
+        "hint": "Define the complete bracket up front so risk and reward can be measured before exposure is opened.",
+      }
     # Circuit breaker: block new entries when trading is restricted
     if is_entry and snapshot.trading_restricted:
       return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
@@ -1524,9 +1714,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     # Correlation gate: block alt LONGs while BTC's daily regime is bearish (alts are high-beta to
     # BTC; longing them into a BTC downtrend is the RE-USDT failure mode).
-    if is_entry and block_alt_long_in_btc_downtrend(symbol=spot_symbol, side=side, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+    if is_entry and _alt_long_is_blocked(spot_symbol, side, confidence):
       logger.warning("CORRELATION GATE BLOCK: long %s rejected — BTC daily regime is bearish", spot_symbol)
       return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
+
+    _move_24h_fm = _extreme_24h_move(spot_symbol) if is_entry else None
+    if _move_24h_fm is not None:
+      return {
+        "rejected": True,
+        "reason": f"24h move {_move_24h_fm:+.2f}% exceeds {cfg.trading.max_24h_volatility_pct:.1f}% safety cap",
+        "hint": "The move is already extreme. Rotate to the next screened liquid contract instead of chasing it.",
+      }
 
     # Symbol bench: a symbol that keeps losing is quarantined until its cooldown lifts —
     # stops the re-take-the-same-losing-trade loop (4 straight ETH short stop-outs, Jul 1-2).
@@ -1554,6 +1752,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     _g_fm = _daily_gate_state.get(spot_symbol, {})
     if is_entry:
       _atr_scale_fm = max(0.30, _atr_scale_fm * regime_size_factor(_g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime))
+      if _relative_strength_exception(spot_symbol, side, confidence):
+        _atr_scale_fm = max(0.30, _atr_scale_fm * cfg.regime.relative_strength_size_factor)
+        logger.info("RELATIVE-STRENGTH LONG: %s allowed against bearish BTC at %.0f%% size", spot_symbol, cfg.regime.relative_strength_size_factor * 100)
 
     # Confidence enforcement: reject entries below the (regime-adjusted) minimum confidence
     if is_entry and confidence is not None:
@@ -1657,6 +1858,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if price <= 0:
       return {"error": "Invalid or missing price"}
 
+    # Risk is defined by the bracket, not notional or leverage.  Shrink any model-requested size
+    # whose stop loss would exceed the configured fraction of account equity.
+    _risk_stop_fm = _to_float(stop_loss_price) or _to_float(stop_price)
+    _risk_scale_fm = bracket_risk_scale(
+      entry=price,
+      stop_loss=_risk_stop_fm,
+      notional_usd=notional_input,
+      equity_usd=snapshot.total_usdt,
+      risk_fraction=cfg.trading.risk_per_trade_pct,
+    )
+    if _risk_scale_fm < 1.0:
+      logger.info("RISK-BUDGET CAP: futures %s notional %.2f → %.2f (risk <= %.2f%% equity)",
+                  spot_symbol, notional_input, notional_input * _risk_scale_fm, cfg.trading.risk_per_trade_pct * 100)
+      notional_input *= _risk_scale_fm
+
     multiplier = _to_float(contract.get("multiplier"))
     lot_size = int(contract.get("lotSize") or 1)
     max_order_qty = contract.get("maxOrderQty")
@@ -1682,7 +1898,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.info("Entry leverage capped: requested %.1fx → applied %.1fx (max_entry_leverage=%.1f)", lev_requested, lev, cfg.trading.max_entry_leverage)
 
     try:
-      base_size = float(size_override) if size_override is not None else notional_input / price
+      base_size = (float(size_override) * _risk_scale_fm) if size_override is not None else notional_input / price
     except (TypeError, ValueError):
       return {"error": "Invalid size_override"}
     if base_size <= 0:
@@ -1770,6 +1986,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
     contracts = int(math.ceil(contracts_raw / lot) * lot)
+    if is_entry:
+      contracts = _risk_capped_contracts(contracts, lot, multiplier, price, _risk_stop_fm)
+      if contracts < lot:
+        return {
+          "rejected": True,
+          "reason": "Contract minimum exceeds the configured per-trade risk budget",
+          "riskBudgetUsd": snapshot.total_usdt * cfg.trading.risk_per_trade_pct,
+        }
+      contracts = _heat_capped_contracts(contracts, lot, multiplier, price, _risk_stop_fm)
+      if contracts < lot:
+        return {
+          "rejected": True,
+          "reason": "Portfolio heat limit reached; no risk budget remains for another entry",
+          "maxPortfolioHeatPct": cfg.circuit_breaker.max_portfolio_heat_pct,
+          "currentRiskUsd": _existing_futures_risk_usd(),
+        }
     actual_notional = contracts * multiplier * price
     min_notional = lot * multiplier * price
     if actual_notional < min_notional:
@@ -2184,6 +2416,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       spot_symbol = _repair_allowed_symbol(symbol)
     if not spot_symbol:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
+    _pre_futures_symbol_fl = _to_futures_symbol(spot_symbol)
+    if _pre_futures_symbol_fl:
+      existing_pending = _pending_entry_for(_pre_futures_symbol_fl)
+      if existing_pending:
+        return {
+          "rejected": True,
+          "reason": f"Pending entry already exists for {spot_symbol}; cancel or let it fill/expire before another entry",
+          "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
+          "hint": "Only one resting entry per symbol is allowed; stacking GTC orders can multiply exposure when they fill together.",
+        }
+    if take_profit_price is None or stop_loss_price is None:
+      return {
+        "rejected": True,
+        "reason": "Futures limit entries require both take-profit and stop-loss prices",
+        "hint": "Define the atomic bracket before placing the entry so risk is bounded from the instant it fills.",
+      }
 
     try:
       entry_price_val = float(entry_price)
@@ -2278,9 +2526,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
 
     # Correlation gate: block alt LONGs while BTC's daily regime is bearish (the RE-USDT failure mode).
-    if block_alt_long_in_btc_downtrend(symbol=spot_symbol, side=side_lower, btc_daily_bias=_btc_daily_bias(), cfg=cfg.regime):
+    if _alt_long_is_blocked(spot_symbol, side_lower, confidence):
       logger.warning("CORRELATION GATE BLOCK: futures limit long %s rejected — BTC daily regime is bearish", spot_symbol)
       return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
+
+    _move_24h_fl = _extreme_24h_move(spot_symbol)
+    if _move_24h_fl is not None:
+      return {
+        "rejected": True,
+        "reason": f"24h move {_move_24h_fl:+.2f}% exceeds {cfg.trading.max_24h_volatility_pct:.1f}% safety cap",
+        "hint": "The move is already extreme. Rotate to the next screened liquid contract instead of chasing it.",
+      }
 
     # Symbol bench: quarantine a repeatedly-losing symbol until its cooldown lifts.
     _bench_until_fl = _edge_state()["bench"].get(spot_symbol, 0)
@@ -2303,6 +2559,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # Regime throttle (B): shrink size + raise the confidence bar in a hostile (bearish/exhausted) daily.
     _g_fl = _daily_gate_state.get(spot_symbol, {})
     _atr_scale_fl = max(0.30, _atr_scale_fl * regime_size_factor(_g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime))
+    if _relative_strength_exception(spot_symbol, side_lower, confidence):
+      _atr_scale_fl = max(0.30, _atr_scale_fl * cfg.regime.relative_strength_size_factor)
+      logger.info("RELATIVE-STRENGTH LONG: futures limit %s allowed against bearish BTC at %.0f%% size", spot_symbol, cfg.regime.relative_strength_size_factor * 100)
 
     if confidence is not None:
       _eff_min_fl = effective_min_confidence(cfg.trading.min_confidence, _g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)
@@ -2383,6 +2642,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     leverage_clamped = lev < lev_requested - 1e-9
 
     notional_input = float(notional_usd or 0) * _atr_scale_fl
+    _risk_scale_fl = bracket_risk_scale(
+      entry=entry_price_val,
+      stop_loss=stop_loss_price,
+      notional_usd=notional_input,
+      equity_usd=snapshot.total_usdt,
+      risk_fraction=cfg.trading.risk_per_trade_pct,
+    )
+    if _risk_scale_fl < 1.0:
+      logger.info("RISK-BUDGET CAP: futures limit %s notional %.2f → %.2f (risk <= %.2f%% equity)",
+                  spot_symbol, notional_input, notional_input * _risk_scale_fl, cfg.trading.risk_per_trade_pct * 100)
+      notional_input *= _risk_scale_fl
     # Concentration cap: shrink notional to <= max_position_equity_pct of total equity (blast-radius guard).
     _conc_scale = concentration_scale(notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct)
     if _conc_scale < 1.0:
@@ -2390,7 +2660,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
                   spot_symbol, notional_input, notional_input * _conc_scale, cfg.trading.max_position_equity_pct * 100, snapshot.total_usdt)
       notional_input *= _conc_scale
     try:
-      base_size = float(size_override) if size_override is not None else notional_input / entry_price_val
+      base_size = (float(size_override) * _risk_scale_fl) if size_override is not None else notional_input / entry_price_val
     except (TypeError, ValueError):
       return {"error": "Invalid size_override"}
     if base_size <= 0:
@@ -2399,6 +2669,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
     contracts = int(math.ceil(contracts_raw / lot) * lot)
+    contracts = _risk_capped_contracts(contracts, lot, multiplier, entry_price_val, float(stop_loss_price))
+    if contracts < lot:
+      return {
+        "rejected": True,
+        "reason": "Contract minimum exceeds the configured per-trade risk budget",
+        "riskBudgetUsd": snapshot.total_usdt * cfg.trading.risk_per_trade_pct,
+      }
+    contracts = _heat_capped_contracts(contracts, lot, multiplier, entry_price_val, float(stop_loss_price))
+    if contracts < lot:
+      return {
+        "rejected": True,
+        "reason": "Portfolio heat limit reached; no risk budget remains for another entry",
+        "maxPortfolioHeatPct": cfg.circuit_breaker.max_portfolio_heat_pct,
+        "currentRiskUsd": _existing_futures_risk_usd(),
+      }
     actual_notional = contracts * multiplier * entry_price_val
     min_notional = lot * multiplier * entry_price_val
     if actual_notional < min_notional:
@@ -2464,7 +2749,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         leverage=str(int(lev)),
         size=str(contracts),
         price=str(entry_price_val),
-        clientOid=str(uuid.uuid4()),
+        clientOid=f"traide-entry-{uuid.uuid4().hex[:24]}",
         marginMode=mode_norm,
         autoDeposit=auto_deposit,
         reduceOnly=False,
@@ -2472,6 +2757,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     if snapshot.paper_trading:
       order_req = _build_limit_order(None)
+      _runtime_futures_pending[order_req.clientOid] = {
+        "orderId": order_req.clientOid, "clientOid": order_req.clientOid,
+        "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
+        "size": contracts, "reduceOnly": False,
+      }
       record = memory.record_trade(spot_symbol, side, actual_notional, paper=True, price=entry_price_val, size=contracts * multiplier, venue="futures")
       decision = None
       if confidence is not None:
@@ -2516,6 +2806,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     _apply_cross_leverage(futures_symbol, lev, margin_mode)
     try:
       res = _submit(order_req)
+      _runtime_oid = str(res.get("orderId") or res.get("clientOid") or order_req.clientOid)
+      _runtime_futures_pending[_runtime_oid] = {
+        "orderId": res.get("orderId"), "clientOid": res.get("clientOid") or order_req.clientOid,
+        "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
+        "size": contracts, "reduceOnly": False,
+      }
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
       res["pendingLimitEntry"] = True
@@ -2538,6 +2834,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
         _apply_cross_leverage(futures_symbol, lev, opposite_mode, context="fallback")
         res = _submit(order_req)
+        _runtime_oid = str(res.get("orderId") or res.get("clientOid") or order_req.clientOid)
+        _runtime_futures_pending[_runtime_oid] = {
+          "orderId": res.get("orderId"), "clientOid": res.get("clientOid") or order_req.clientOid,
+          "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
+          "size": contracts, "reduceOnly": False,
+        }
         if confidence is not None:
           res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
         res["pendingLimitEntry"] = True
@@ -2689,11 +2991,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   async def cancel_futures_order(order_id: str, symbol: str | None = None) -> Dict[str, Any]:
     """Cancel a futures order (stop or regular) by orderId."""
     if snapshot.paper_trading:
+      _runtime_futures_pending.pop(str(order_id), None)
       return {"paper": True, "cancelled": {"orderId": order_id, "symbol": symbol}}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"error": "Futures disabled in config"}
     try:
       res = kucoin_futures.cancel_order(order_id, symbol=symbol)
+      _runtime_futures_pending.pop(str(order_id), None)
+      # Some snapshots key an order by clientOid while cancellation uses exchange orderId.
+      for _key, _order in list(_runtime_futures_pending.items()):
+        if str(_order.get("id") or _order.get("orderId") or "") == str(order_id):
+          _runtime_futures_pending.pop(_key, None)
       return {"cancelled": res, "orderId": order_id, "symbol": symbol}
     except Exception as exc:
       return {"error": str(exc), "orderId": order_id, "symbol": symbol}
@@ -2886,10 +3194,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       sort_by=sort_by,
       side=side,
       top_n=top_n,
+      max_abs_change_pct=cfg.trading.max_24h_volatility_pct,
     )
     screened.update({
       "minTurnoverUsd": cfg.trading.screener_min_turnover_usd_24h,
       "minAgeDays": cfg.trading.min_futures_listing_age_days,
+      "maxAbsChangePct24h": cfg.trading.max_24h_volatility_pct,
       "sortBy": sort_by,
       "side": side,
       "note": (

@@ -71,7 +71,7 @@ flowchart TB
 
 ### Runtime: the poll loop
 
-Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and — only when a trigger fires or the idle threshold is reached — invokes the agents.
+Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and considers agent invocation when a trigger fires or the idle threshold is reached. Model calls are additionally throttled by book state (`FLAT_AGENT_COOLDOWN_SEC` / `ACTIVE_AGENT_COOLDOWN_SEC`); code-driven protection is never throttled.
 
 ```mermaid
 sequenceDiagram
@@ -197,7 +197,7 @@ flowchart LR
 - **Regime throttle**: In a hostile regime (bearish or RSI-exhausted daily) the confidence bar is raised (`REGIME_CAUTION_MIN_CONFIDENCE`) and position size shrunk (`REGIME_CAUTION_SIZE_FACTOR`), so the bot trades less and more selectively instead of churning low-conviction bounce-scalps in a downtrend.
 - **Conviction-scaled sizing**: Position size scales with how far the entry's confidence clears the (regime-adjusted) floor — a trade that barely clears it gets `CONVICTION_MIN_SIZE_FACTOR` of full size, ramping linearly to full size at `CONVICTION_FULL_CONFIDENCE`. Targets the failure mode where the agent takes a *full-size* position on a setup it itself reads as "mixed / low-conviction" (the pattern behind the SOL drawdown); only ever shrinks, never enlarges, and is floored by the 30% volatility floor.
 - **Concentration cap**: Shrinks any single position's notional to ≤ `MAX_POSITION_EQUITY_PCT` of total equity, regardless of leverage — bounds the per-name blast radius (the RE-USDT blowup was one name at ~74% of the account). Applied after every other size scaler, just before the order is placed.
-- **Correlation gate**: Blocks **longs on non-major alts while BTC's daily regime is bearish** (`ALT_LONG_BLOCK_WHEN_BTC_BEARISH`). Alts are high-beta to BTC; longing them into a confirmed BTC downtrend is the exact setup that blew up on RE-USDT. Majors in `ALT_MAJORS` are exempt (they have their own per-symbol daily gate); shorts are never blocked by this gate.
+- **Correlation gate + relative-strength exception**: Blocks ordinary non-major alt longs while BTC's daily regime is bearish. A rotating leader may pass only when its 1D/4H/1H/15M trends are all bullish, strength is high, and confidence clears `RELATIVE_STRENGTH_MIN_CONFIDENCE`; it is then reduced by `RELATIVE_STRENGTH_SIZE_FACTOR`. No symbol is hardcoded.
 - **New-listing guard**: Blocks futures entries on contracts younger than `MIN_FUTURES_LISTING_AGE_DAYS` (via the contract's first-open date). Freshly-listed perps are thin and ultra-volatile — RE-USDT had a ~100% intraday range on day one.
 - **Minimum reward:risk (futures)**: Rejects any futures entry whose take-profit distance is less than `MIN_FUTURES_RR` × the stop-loss distance (checked when both are supplied at entry). Previously the R:R floor existed only on the spot path, so futures brackets were being set with stops *wider* than targets — the direct cause of losses running ~4× the wins at a high win rate. Dollar risk is meant to be controlled by position size, not by widening the stop past the target.
 - **Adaptive edge controller** (`src/edge.py`): the bot's risk posture is derived from its own **rolling realized results** instead of static parameters, so it self-tightens when losing and relaxes when earning — no manual re-tuning as regimes change. Code-enforced actions, each logged and surfaced to the agent in an `edgeReport`: (1) **per-symbol R:R floor** — a symbol whose own recent net is negative must clear a higher reward:risk (`base + EDGE_RR_STEP`, capped at `EDGE_RR_CAP`), while fresh/winning symbols trade at the base floor. This is *per-symbol* so one losing name (e.g. a chopping ETH) can't starve the diversified trades a screener finds; (2) **severity-scaled symbol bench** — a symbol with `EDGE_BENCH_MIN_LOSSES`+ losses (and negative net) in its recent closes is quarantined from new entries, and the rest scales with loss count (`EDGE_BENCH_COOLDOWN_HOURS × min(losses, EDGE_BENCH_COOLDOWN_MAX_MULT)`) so a persistent loser sits out progressively longer, then auto-lifts — this rotates capital away from what's bleeding toward what's working; (3) **loss-streak throttle** — after `EDGE_STREAK_THRESHOLD` consecutive losses, entries are sized down by `EDGE_STREAK_SIZE_FACTOR` until a win (anti-martingale, a soft stage before the consecutive-loss circuit breaker).
@@ -225,7 +225,7 @@ flowchart LR
 ### Order Execution
 - **Spot + Futures**: Full support for both KuCoin spot and futures markets
 - **Target-price limit entries**: `place_limit_order` / `place_futures_limit_order` place orders at a technically derived price level (EMA, Bollinger Band, swing high/low, VWAP, Fibonacci) and wait for price to come to the order — preventing the worst-case timing of shorting into dumps or buying into pumps. Market orders are reserved for closes and emergency exits.
-- **Pending order visibility**: Every agent run includes `pendingLimitOrders` in its input (both spot and futures), so the agent always knows which limit entries are still waiting to fill, can place bracket TP/SL immediately after a fill, and cancels stale orders older than `ENTRY_LIMIT_EXPIRY_MINUTES` via `cancel_spot_limit_order` or `cancel_futures_order`.
+- **Pending order safety**: Every run includes pending orders; code permits only one futures entry per symbol per run/book, tags bot-created GTC entries, and automatically cancels tagged entries older than `ENTRY_LIMIT_EXPIRY_MINUTES`. Manual and protective orders are never auto-cancelled.
 - **Limit order fee saving**: Separate `PREFER_LIMIT_ORDERS` mode places spot buys at best ask instead of market to save on taker fees
 - **Leverage control**: Configurable max leverage (up to 125x) with automatic margin mode management
 - **Fund transfers**: Move USDT between spot, futures, and financial/Earn accounts
@@ -302,7 +302,7 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `ENTRY_LIMIT_EXPIRY_MINUTES` | `30` | Cancel unfilled target-price entry limit orders after this many minutes |
 | `MIN_ENTRY_DEVIATION_PCT` | `0.002` | Minimum distance (0.2%) from current price to use a target-price limit order |
 | `MAX_ATR_PCT_FOR_ENTRY` | `6` | Soft volatility gate: above this daily ATR %, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× this value (9% default), entry is hard-blocked. |
-| `MAX_24H_VOLATILITY_PCT` | `25` | Hard block when 24h price range exceeds this % (separate from ATR gate) |
+| `MAX_24H_VOLATILITY_PCT` | `25` | Exclude/hard-block contracts whose absolute 24h price change exceeds this % (separate from ATR gate) |
 | `POST_LOSS_COOLDOWN_MINUTES` | `30` | Block new entries on a symbol after a loss |
 | `MIN_TRADE_INTERVAL_MINUTES` | `10` | Minimum interval between trades on the same symbol (anti-overtrading) |
 
@@ -374,6 +374,9 @@ Self-tuning risk (`src/edge.py`): posture derives from the rolling realized clos
 | `EDGE_STREAK_SIZE_FACTOR` | `0.5` | Entry-size multiplier while on a losing streak |
 | `ALT_LONG_BLOCK_WHEN_BTC_BEARISH` | `true` | Block longs on non-major alts while BTC's daily regime is bearish (alts are high-beta to BTC) |
 | `ALT_MAJORS` | `BTC,ETH` | Symbols exempt from the alt-long gate (they have their own per-symbol daily gate) |
+| `RELATIVE_STRENGTH_LONGS_ENABLED` | `true` | Allow a narrow all-timeframe bullish exception to the bearish-BTC alt veto |
+| `RELATIVE_STRENGTH_MIN_CONFIDENCE` | `0.82` | Confidence required for that exception |
+| `RELATIVE_STRENGTH_SIZE_FACTOR` | `0.5` | Reduced size applied to an exception trade |
 | `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `3` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |
 | `RESEARCH_HANDOFF_COOLDOWN_MIN` | `30` | Minimum minutes between forced Research handoffs — rate-limits the costly web sweep (`0` = off) |
 
@@ -408,7 +411,9 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `POLL_INTERVAL_SEC` | `60` | Seconds between polling cycles |
 | `PRICE_CHANGE_TRIGGER_PCT` | `0.5` | Price move % that triggers an agent run |
 | `MAX_IDLE_POLLS` | `10` | Force agent run after N idle polls |
-| `AGENT_MAX_TURNS` | `100` | Max tool-call turns per agent run |
+| `FLAT_AGENT_COOLDOWN_SEC` | `3600` | Minimum interval between model runs while flat; poll-loop protection still runs continuously |
+| `ACTIVE_AGENT_COOLDOWN_SEC` | `300` | Minimum interval between model runs with an open/pending book or a recent event |
+| `AGENT_MAX_TURNS` | `30` | Max tool-call turns per agent run |
 
 ### KuCoin
 
@@ -436,7 +441,7 @@ If `AZURE_APIM_OPENAI_SUBSCRIPTION_KEY` is set, the client uses APIM endpoint/de
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MEMORY_FILE` | `.agent_memory.json` | Path to agent memory store |
-| `RETENTION_DAYS` | `14` | Auto-prune items older than this |
+| `RETENTION_DAYS` | `90` | Auto-prune items older than this; both main loop and agent use the same horizon |
 
 ### Tracing (Optional)
 

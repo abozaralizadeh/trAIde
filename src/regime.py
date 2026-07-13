@@ -118,6 +118,13 @@ def block_alt_long_in_btc_downtrend(
   side: str,
   btc_daily_bias: str,
   cfg: RegimeConfig,
+  local_daily_bias: str = "neutral",
+  bias_4h: str = "neutral",
+  bias_1h: str = "neutral",
+  bias_15m: str = "neutral",
+  strength: str = "weak",
+  daily_exhausted: bool = False,
+  confidence=None,
 ) -> bool:
   """True if a LONG on a non-major altcoin should be blocked because BTC's daily regime is bearish.
 
@@ -132,7 +139,97 @@ def block_alt_long_in_btc_downtrend(
   base = (symbol or "").split("-")[0].strip().upper()
   if not base or base in {m.upper() for m in (cfg.alt_majors or ())}:
     return False
-  return str(btc_daily_bias or "").strip().lower() == "bearish"
+  if str(btc_daily_bias or "").strip().lower() != "bearish":
+    return False
+  # Let a true relative-strength leader through at reduced size (the caller applies the factor).
+  # All four local timeframes must agree, the daily cannot be exhausted, and the model must clear
+  # a deliberately high bar.  Missing context therefore preserves the conservative block.
+  if is_relative_strength_alt_long(
+    symbol=symbol,
+    side=side,
+    btc_daily_bias=btc_daily_bias,
+    local_daily_bias=local_daily_bias,
+    bias_4h=bias_4h,
+    bias_1h=bias_1h,
+    bias_15m=bias_15m,
+    strength=strength,
+    daily_exhausted=daily_exhausted,
+    confidence=confidence,
+    cfg=cfg,
+  ):
+    return False
+  return True
+
+
+def is_relative_strength_alt_long(
+  *,
+  symbol: str,
+  side: str,
+  btc_daily_bias: str,
+  local_daily_bias: str,
+  bias_4h: str,
+  bias_1h: str,
+  bias_15m: str,
+  strength: str,
+  daily_exhausted: bool,
+  confidence,
+  cfg: RegimeConfig,
+) -> bool:
+  """Whether an alt long is strong enough to override a bearish-BTC correlation veto.
+
+  This captures rotating leadership without hardcoding yesterday's winning symbol.  The exception
+  is intentionally narrow and callers must still apply the configured reduced-size factor plus all
+  ordinary volatility, R:R, fee and concentration gates.
+  """
+  if not cfg.relative_strength_longs_enabled or daily_exhausted:
+    return False
+  if (side or "").lower() not in ("buy", "long"):
+    return False
+  base = (symbol or "").split("-")[0].strip().upper()
+  if not base or base in {m.upper() for m in (cfg.alt_majors or ())}:
+    return False
+  if str(btc_daily_bias or "").strip().lower() != "bearish":
+    return False
+  aligned = (local_daily_bias, bias_4h, bias_1h, bias_15m)
+  if any(str(v or "").strip().lower() != "bullish" for v in aligned):
+    return False
+  if str(strength or "").strip().lower() != "strong":
+    return False
+  try:
+    return float(confidence or 0.0) >= float(cfg.relative_strength_min_confidence)
+  except (TypeError, ValueError):
+    return False
+
+
+def bracket_risk_scale(
+  *,
+  entry,
+  stop_loss,
+  notional_usd,
+  equity_usd,
+  risk_fraction,
+) -> float:
+  """Scale an entry down so its stop-defined dollar loss stays within the equity risk budget.
+
+  This only shrinks; it never increases a model-requested position.  Unknown/invalid inputs fail
+  open because the entry call separately requires a valid bracket.
+  """
+  try:
+    e = float(entry)
+    sl = float(stop_loss)
+    notional = float(notional_usd)
+    equity = float(equity_usd)
+    fraction = float(risk_fraction)
+  except (TypeError, ValueError):
+    return 1.0
+  if e <= 0 or sl <= 0 or notional <= 0 or equity <= 0 or fraction <= 0:
+    return 1.0
+  stop_fraction = abs(e - sl) / e
+  if stop_fraction <= 0:
+    return 1.0
+  planned_risk = notional * stop_fraction
+  budget = equity * fraction
+  return min(1.0, max(0.0, budget / planned_risk))
 
 
 def reward_risk_ratio(side: str, entry, take_profit, stop_loss):

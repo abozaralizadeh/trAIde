@@ -135,6 +135,10 @@ class MemoryStore:
             "day": d.get("day"),
             "peakPnl": d.get("peakPnl"),
             "troughPnl": d.get("troughPnl"),
+            # These fields power the no-chase guard and close deduplication.  Dropping them while
+            # sanitizing on startup silently disabled both protections after every process restart.
+            "exitPrice": d.get("exitPrice"),
+            "closeType": d.get("closeType"),
           }
           for d in data.get("decisions", [])
           if isinstance(d, dict) and d.get("symbol") and d.get("ts") is not None
@@ -752,17 +756,21 @@ class MemoryStore:
   def _is_realized_close(action: str) -> bool:
     """Return True if the action represents a realized trade close, not a hold/manage snapshot."""
     a = action.lower()
-    return (
-      "triggered" in a
-      or "cut" in a
-      or "close" in a
-      or "reduce" in a
-      or a in ("futures_sell", "futures_buy", "spot_sell")
-    )
+    if "triggered" in a:
+      return True
+    # Exact execution actions only.  The old substring test counted labels such as
+    # "hold-close-only" as a closed trade and polluted win rate, streak and Kelly calculations.
+    if a in {
+      "futures_close", "spot_close", "futures_sell", "futures_buy", "spot_sell",
+      "cut_loss", "early_cut", "profit_lock_close", "reduce_position",
+    }:
+      return True
+    return a.startswith("close_") or a.endswith("_closed")
 
   @staticmethod
   def _pnl_stats(decisions: list[Dict[str, Any]]) -> Dict[str, Any]:
     """Compute win/loss stats from a list of decision dicts (realized closes only)."""
+    decisions = MemoryStore._authoritative_realized_rows(decisions)
     realized: list[float] = []
     missed_profits: list[float] = []
     unnecessary_losses: list[float] = []
@@ -823,6 +831,37 @@ class MemoryStore:
       stats["unnecessaryLossCount"] = len(unnecessary_losses)
       stats["totalUnnecessaryLoss"] = round(sum(unnecessary_losses), 4)
     return stats
+
+  @staticmethod
+  def _authoritative_realized_rows(decisions: list[Dict[str, Any]], window_sec: int = 1800) -> list[Dict[str, Any]]:
+    """Return realized rows without double-counting pre-close estimates and exchange final PnL.
+
+    A market close is logged immediately with an estimated PnL.  KuCoin then reports the closed
+    position with authoritative cumulative PnL (including earlier partial reductions).  Counting
+    both overstated the ZEC lifecycle by +0.5606 USDT.  When an exchange-triggered close for the
+    same symbol arrives shortly after a local futures close/reduction, keep only the exchange row.
+    """
+    rows = [
+      d for d in decisions
+      if isinstance(d, dict)
+      and MemoryStore._is_realized_close(str(d.get("action") or ""))
+      and d.get("pnl") is not None
+    ]
+    rows.sort(key=lambda d: d.get("ts") or 0)
+    triggered = [d for d in rows if "triggered" in str(d.get("action") or "").lower()]
+    kept: list[Dict[str, Any]] = []
+    for row in rows:
+      action = str(row.get("action") or "").lower()
+      if action.startswith("futures_") and "triggered" not in action:
+        ts = int(row.get("ts") or 0)
+        if any(
+          later.get("symbol") == row.get("symbol")
+          and 0 <= int(later.get("ts") or 0) - ts <= window_sec
+          for later in triggered
+        ):
+          continue
+      kept.append(row)
+    return MemoryStore._dedupe_realized(kept, window_sec=window_sec)
 
   def performance_summary(self) -> Dict[str, Any]:
     """Compute win/loss stats from recorded decisions, split by venue and paper/live."""
@@ -963,9 +1002,12 @@ class MemoryStore:
     if venue:
       prefix = f"{venue}_"
       decisions = [d for d in decisions if (d.get("action") or "").startswith(prefix)]
+    decisions = MemoryStore._authoritative_realized_rows(decisions)
     decisions = sorted(decisions, key=lambda d: d.get("ts", 0))[-lookback:]
     realized = []
     for d in decisions:
+      if not MemoryStore._is_realized_close(str(d.get("action") or "")):
+        continue
       pnl = d.get("pnl")
       if pnl is not None:
         try:
@@ -1000,6 +1042,7 @@ class MemoryStore:
     if venue:
       prefix = f"{venue}_"
       decisions = [d for d in decisions if (d.get("action") or "").startswith(prefix)]
+    decisions = MemoryStore._authoritative_realized_rows(decisions)
     decisions = sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True)
     streak = 0
     for d in decisions:
@@ -1040,6 +1083,7 @@ class MemoryStore:
     with self._lock:
       data = self._prune(self._read())
       decisions = data.get("decisions", [])
+    decisions = MemoryStore._authoritative_realized_rows(decisions)
     for d in sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True):
       if d.get("symbol") != sym:
         continue
@@ -1069,6 +1113,7 @@ class MemoryStore:
     with self._lock:
       data = self._prune(self._read())
       decisions = data.get("decisions", [])
+    decisions = MemoryStore._authoritative_realized_rows(decisions)
     for d in sorted(decisions, key=lambda d: d.get("ts", 0), reverse=True):
       ts = d.get("ts") or 0
       if ts < cutoff:

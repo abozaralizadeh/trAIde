@@ -88,6 +88,10 @@ class TradingConfig:
                                               # fill is protected instantly, not on the next agent run
   emergency_sl_pct: float = 0.02              # poll-loop safety net: SL distance for an unprotected open
                                               # position (fraction of entry) until the agent sets a real one (0=off)
+  # Model invocation budget: protection remains code-driven every poll, while expensive discretionary
+  # analysis runs less often when flat and more often when capital is exposed.
+  flat_agent_cooldown_sec: float = 3600.0
+  active_agent_cooldown_sec: float = 300.0
 
 
 @dataclass
@@ -162,6 +166,12 @@ class RegimeConfig:
   # high-beta to BTC; longing them into a BTC downtrend is what blew up on RE-USDT, 2026-06-21).
   alt_long_block_enabled: bool = True
   alt_majors: tuple = ("BTC", "ETH")  # symbols exempt from the alt-long gate (they have their own daily gate)
+  # A blanket BTC/alt veto misses genuine relative-strength leaders.  Permit only an alt whose own
+  # daily, 4h, 1h and 15m trends are all bullish at high confidence, then size it down.  This is a
+  # signal-based exception, not a symbol allow-list, so it adapts as leadership rotates.
+  relative_strength_longs_enabled: bool = True
+  relative_strength_min_confidence: float = 0.82
+  relative_strength_size_factor: float = 0.5
   # Conviction sizing: scale position size by how far confidence clears the floor, so low-conviction
   # entries size down instead of taking full size (the SOL drawdown was full-size low-conviction shorts).
   conviction_sizing_enabled: bool = True
@@ -313,6 +323,8 @@ def load_config() -> AppConfig:
       screener_min_turnover_usd_24h=float(os.getenv("SCREENER_MIN_TURNOVER_USD_24H", "5000000")),
       atomic_bracket_enabled=_as_bool(os.getenv("ATOMIC_BRACKET_ENABLED"), True),
       emergency_sl_pct=float(os.getenv("EMERGENCY_SL_PCT", "0.02")),
+      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "3600")),
+      active_agent_cooldown_sec=float(os.getenv("ACTIVE_AGENT_COOLDOWN_SEC", "300")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),
@@ -360,6 +372,9 @@ def load_config() -> AppConfig:
       trend_short_require_15m=_as_bool(os.getenv("TREND_SHORT_REQUIRE_15M"), True),
       alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
       alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
+      relative_strength_longs_enabled=_as_bool(os.getenv("RELATIVE_STRENGTH_LONGS_ENABLED"), True),
+      relative_strength_min_confidence=float(os.getenv("RELATIVE_STRENGTH_MIN_CONFIDENCE", "0.82")),
+      relative_strength_size_factor=float(os.getenv("RELATIVE_STRENGTH_SIZE_FACTOR", "0.5")),
       conviction_sizing_enabled=_as_bool(os.getenv("CONVICTION_SIZING_ENABLED"), True),
       conviction_full_confidence=float(os.getenv("CONVICTION_FULL_CONFIDENCE", "0.85")),
       conviction_min_size_factor=float(os.getenv("CONVICTION_MIN_SIZE_FACTOR", "0.5")),
@@ -406,8 +421,8 @@ def load_config() -> AppConfig:
     console_tracing=_as_bool(os.getenv("ENABLE_CONSOLE_TRACING"), False),
     openai_trace_api_key=os.getenv("OPENAI_TRACE_API_KEY"),
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
-    retention_days=int(os.getenv("RETENTION_DAYS", "14")),
-    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "100")),
+    retention_days=int(os.getenv("RETENTION_DAYS", "90")),
+    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "30")),
   )
 
   validate_config(config)
@@ -450,6 +465,16 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"POLL_INTERVAL_SEC={cfg.trading.poll_interval_sec} (must be >0)")
   if cfg.trading.max_position_usd <= 0:
     invalid.append(f"MAX_POSITION_USD={cfg.trading.max_position_usd} (must be >0)")
+  if not (0 < cfg.trading.risk_per_trade_pct <= 1.0):
+    invalid.append(f"RISK_PER_TRADE_PCT={cfg.trading.risk_per_trade_pct} (must be >0 and <=1.0)")
+  if cfg.trading.flat_agent_cooldown_sec < 0 or cfg.trading.active_agent_cooldown_sec < 0:
+    invalid.append("FLAT_AGENT_COOLDOWN_SEC and ACTIVE_AGENT_COOLDOWN_SEC must be >=0")
+  if not (0.0 <= cfg.regime.relative_strength_min_confidence <= 1.0):
+    invalid.append(f"RELATIVE_STRENGTH_MIN_CONFIDENCE={cfg.regime.relative_strength_min_confidence} (must be 0.0–1.0)")
+  if not (0.0 < cfg.regime.relative_strength_size_factor <= 1.0):
+    invalid.append(f"RELATIVE_STRENGTH_SIZE_FACTOR={cfg.regime.relative_strength_size_factor} (must be >0 and <=1.0)")
+  if not (0.0 <= cfg.circuit_breaker.max_portfolio_heat_pct <= 100.0):
+    invalid.append(f"CB_MAX_PORTFOLIO_HEAT_PCT={cfg.circuit_breaker.max_portfolio_heat_pct} (must be 0–100)")
 
   if invalid:
     raise ValueError(

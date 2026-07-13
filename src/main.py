@@ -235,6 +235,42 @@ def _agent_made_a_move(result: Dict) -> bool:
   return False
 
 
+def _expired_bot_entry_orders(pending_orders: list[dict], expiry_minutes: float, now: float | None = None) -> list[dict]:
+  """Select expired trAIde-created GTC futures entries. Pure/testable.
+
+  KuCoin has no client-side "expire in N minutes" behavior for the submitted GTC orders.  Only
+  orders tagged by this bot are eligible, so autonomous cleanup never cancels a manual/user order.
+  Protective/reduce-only orders are excluded even if an API happens to return them in this list.
+  """
+  if expiry_minutes <= 0:
+    return []
+  ref = float(now if now is not None else time.time())
+
+  def _true(value: Any) -> bool:
+    return value is True or str(value or "").strip().lower() in {"1", "true", "yes"}
+
+  expired: list[dict] = []
+  for order in pending_orders or []:
+    if not isinstance(order, dict):
+      continue
+    if not str(order.get("clientOid") or "").startswith("traide-entry-"):
+      continue
+    if _true(order.get("reduceOnly")) or _true(order.get("closeOrder")):
+      continue
+    raw_ts = order.get("createdAt") or order.get("orderTime") or order.get("created_at")
+    try:
+      created = float(raw_ts)
+    except (TypeError, ValueError):
+      continue
+    if created > 1e15:  # nanoseconds
+      created /= 1e9
+    elif created > 1e12:  # milliseconds
+      created /= 1e3
+    if ref - created >= expiry_minutes * 60:
+      expired.append(order)
+  return expired
+
+
 def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
   raw_coins = _load_active_coins(cfg, memory)
   coins, tickers = _fetch_tickers(cfg, kucoin, raw_coins, memory)
@@ -324,6 +360,7 @@ async def trading_loop() -> None:
   consecutive_no_trade_runs = 0  # runs where the agent placed no order (drives forced research)
   force_research = False         # when True, next agent run must hand off to Research first
   last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
+  last_agent_run_ts = 0.0        # cost/churn throttle; protection still runs on every poll
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
   # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
@@ -359,6 +396,31 @@ async def trading_loop() -> None:
       await asyncio.sleep(cfg.trading.poll_interval_sec)
       continue
 
+    # GTC entry orders do not expire just because the tool response contains an expiresAt note.
+    # Enforce the configured TTL on bot-tagged orders before the agent sees the book, preventing a
+    # stale thesis from filling hours later.  Manual and protective orders are never touched.
+    if kucoin_futures and snapshot.futures_pending_orders:
+      expired_orders = _expired_bot_entry_orders(
+        snapshot.futures_pending_orders,
+        cfg.trading.entry_limit_expiry_minutes,
+      )
+      cancelled_ids: set[str] = set()
+      for order in expired_orders:
+        oid = str(order.get("id") or order.get("orderId") or "")
+        if not oid:
+          continue
+        try:
+          kucoin_futures.cancel_order(oid, symbol=order.get("symbol"))
+          cancelled_ids.add(oid)
+          logger.info("Expired stale futures entry %s (%s) after %.0fmin", oid, order.get("symbol"), cfg.trading.entry_limit_expiry_minutes)
+        except Exception as exc:
+          logger.warning("Unable to expire stale futures entry %s: %s", oid, exc)
+      if cancelled_ids:
+        snapshot.futures_pending_orders = [
+          o for o in snapshot.futures_pending_orders
+          if str(o.get("id") or o.get("orderId") or "") not in cancelled_ids
+        ]
+
     spot_usdt = 0.0
     for acct in snapshot.spot_accounts:
       if acct.currency == "USDT":
@@ -390,8 +452,8 @@ async def trading_loop() -> None:
 
     total_usdt = spot_usdt + futures_usdt + financial_usdt
 
-    # Track daily drawdown per venue for informational context passed to the agent.
-    # No kill switch — the agent decides how to adapt when drawdown is high.
+    # Track daily drawdown per venue; the circuit-breaker section below converts the total scope
+    # into a hard close-only restriction when its configured limit is breached.
     limits_total = memory.update_limits(total_usdt, scope="total")
     limits_spot = memory.update_limits(spot_usdt, scope="spot")
     limits_futures = memory.update_limits(futures_usdt, scope="futures")
@@ -436,7 +498,7 @@ async def trading_loop() -> None:
     except Exception as exc:
       logger.warning("Profit-lock run failed: %s", exc)
 
-    should_run = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
+    run_candidate = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
 
     recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=30)
     new_events_count = len(recent_fills["spot_fills"]) + len(recent_fills["futures_fills"]) + len(recent_fills["closed_positions"])
@@ -499,6 +561,7 @@ async def trading_loop() -> None:
       last_loss_ts = None
       with memory._lock:
         decs = memory._read().get("decisions", [])
+      decs = memory._authoritative_realized_rows(decs)
       for d in sorted(decs, key=lambda x: x.get("ts", 0), reverse=True):
         pnl = d.get("pnl")
         if pnl is not None:
@@ -521,8 +584,24 @@ async def trading_loop() -> None:
       logger.warning("CIRCUIT BREAKER: %s", snapshot.restriction_reason)
       notifier.send(f"<b>CIRCUIT BREAKER ACTIVE</b>\n{snapshot.restriction_reason}\nAgent restricted to close-only mode.")
 
+    # The model is the most expensive and least deterministic part of the loop.  Code-driven
+    # protection still evaluates every poll; discretionary analysis is throttled by book state.
+    # A fill/close event is actionable and uses the active cadence even if the book is now flat.
+    book_active = bool(snapshot.futures_positions or snapshot.futures_pending_orders or snapshot.spot_pending_orders)
+    cooldown_sec = (
+      cfg.trading.active_agent_cooldown_sec
+      if book_active or new_events_count
+      else cfg.trading.flat_agent_cooldown_sec
+    )
+    run_candidate = run_candidate or bool(new_events_count)
+    cooldown_elapsed = time.time() - last_agent_run_ts
+    should_run = run_candidate and (last_agent_run_ts <= 0 or cooldown_elapsed >= max(0.0, cooldown_sec))
+    if run_candidate and not should_run and idle_polls % max(1, cfg.trading.max_idle_polls) == 0:
+      logger.info("Agent run throttled for another %dsec (book_active=%s)", int(cooldown_sec - cooldown_elapsed), book_active)
+
     if should_run:
       idle_polls = 0
+      last_agent_run_ts = time.time()
       logger.info("Running agent. Triggers: %s", triggers or ["idle_threshold"])
       try:
         result = await asyncio.to_thread(

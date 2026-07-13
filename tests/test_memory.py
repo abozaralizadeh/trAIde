@@ -212,6 +212,35 @@ def test_performance_summary_with_decisions(store):
     assert summary["futures"]["totalTrades"] == 0
 
 
+def test_hold_close_only_is_not_miscounted_as_realized(store):
+    store.record_trade("XRP-USDT", "sell", 25.0, paper=False, price=1.0, size=25, venue="futures")
+    store.log_decision("XRP-USDT", "hold-close-only", 0.99, "circuit breaker hold", pnl=0.0)
+    store.log_decision("XRP-USDT", "futures_buy_triggered", 0.0, "real close", pnl=-0.25)
+    summary = store.performance_summary()
+    assert summary["closedWithPnl"] == 1
+    assert summary["losses"] == 1
+
+
+def test_close_metadata_survives_restart_for_no_chase(tmp_path):
+    path = str(tmp_path / "memory.json")
+    mem = MemoryStore(path, retention_days=7)
+    mem.log_decision("ETH-USDT", "futures_sell_triggered", 0.0, "tp", pnl=1.0,
+                     exit_price=2500.0, close_type="CLOSE_LONG")
+    fresh = MemoryStore(path, retention_days=7)
+    close = fresh.realized_closes()[0]
+    assert close["exitPrice"] == 2500.0
+    assert close["closeType"] == "CLOSE_LONG"
+
+
+def test_exchange_close_supersedes_recent_local_pnl_estimate(store):
+    store.record_trade("ZEC-USDT", "buy", 50.0, paper=False, price=500, size=0.1, venue="futures")
+    store.log_decision("ZEC-USDT", "futures_sell", 0.9, "estimated close", pnl=0.56)
+    store.log_decision("ZEC-USDT", "futures_sell_triggered", 0.0, "exchange cumulative close", pnl=1.44)
+    summary = store.performance_summary()
+    assert summary["closedWithPnl"] == 1
+    assert summary["totalRealizedPnl"] == 1.44
+
+
 def test_record_trade_venue_futures(store):
     entry = store.record_trade("BTC-USDT", "buy", 500.0, paper=False, price=100000.0, size=0.005, venue="futures")
     assert entry["venue"] == "futures"

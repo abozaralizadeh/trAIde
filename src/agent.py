@@ -386,6 +386,7 @@ def _screen_contracts(
   sort_by: str = "momentum",
   side: str = "both",
   top_n: int = 15,
+  max_abs_change_pct: float | None = None,
 ) -> Dict[str, Any]:
   """Rank the full active-perp universe into a shortlist of tradable opportunities. Pure/testable.
 
@@ -416,10 +417,16 @@ def _screen_contracts(
       if min_age_days > 0 and age_days < min_age_days:
         continue
     chg = _to_float(c.get("priceChgPct"))
+    chg_pct = chg * 100 if chg is not None else None
+    # Extreme 24h movers are usually already extended and frequently fail the downstream ATR gate.
+    # Excluding them here stops the research loop from repeatedly selecting an untradeable top mover
+    # (LAB monopolised dozens of July 13 cycles this way) and rotates to the next liquid candidate.
+    if max_abs_change_pct and chg_pct is not None and abs(chg_pct) > max_abs_change_pct:
+      continue
     qualified.append({
       "symbol": _normalize_symbol(sym),
       "futuresSymbol": sym,
-      "chgPct24h": round(chg * 100, 2) if chg is not None else None,
+      "chgPct24h": round(chg_pct, 2) if chg_pct is not None else None,
       "turnover24hUsd": round(turnover),
       "funding": _to_float(c.get("fundingFeeRate")),
       "markPrice": _to_float(c.get("markPrice")) or _to_float(c.get("lastTradePrice")),
@@ -682,7 +689,10 @@ def run_trading_agent(
   unique_span_id = gen_span_id()
 
   allowed_symbols = set(snapshot.tickers.keys())
-  memory = MemoryStore(cfg.memory_file)
+  # Use the configured learning horizon here too.  The per-run store previously defaulted to seven
+  # days and pruned outcomes that the main loop intended to retain for longer, making adaptive edge
+  # controls forget losses simply because the agent ran.
+  memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   permanent_notes = memory.get_permanent_notes()
   temporary_notes = memory.consume_temporary_notes()
   current_prices = {sym: float(t.price) for sym, t in snapshot.tickers.items()}
@@ -1068,12 +1078,10 @@ def run_trading_agent(
     "They are reasons to adjust size, tighten stops, or choose a different entry point.\n"
     "- The ONLY valid reasons to decline: strong opposing trend on 1h, clearly negative breaking news, "
     "or RSI extreme (>80 or <20) directly against your intended direction.\n"
-    "- If you find yourself writing 'wait for pullback' or 'no edge' — STOP. Check the other venue, check other coins, "
-    "check futures. Find a trade.\n"
-    "- A small profitable trade is infinitely better than no trade. Use smaller size when uncertain, but trade.\n"
+    "- If a setup has no demonstrated edge after fees, stand aside. Never manufacture a trade to satisfy activity.\n"
     "- You are FULLY AUTONOMOUS. NEVER write 'If you want...', 'Would you like...', or 'Do you want...'. "
     "Just execute. No one is reading your output interactively.\n"
-    "- DIVERSIFY: analyze multiple coins every run. If one coin is blocked or has no edge, move to the next. "
+    "- DIVERSIFY: if the primary coin is blocked or has no edge, move to the next screened candidate. "
     "Do NOT spend the entire run on a single symbol.\n"
     "- EXCEPTION (no-setup tape): when the majors (BTC/ETH) are gated in BOTH directions — daily blocks one side, "
     "intraday blocks the other — and no liquid, established coin offers a clean setup, then STANDING ASIDE IS THE "
@@ -1082,8 +1090,8 @@ def run_trading_agent(
     "Forcing a low-quality trade in a no-setup tape is worse than declining.\n\n"
 
     "## STEP 1 — Account audit (always first):\n"
-    "- Call fetch_account_state to confirm live balances across spot, funding, financial, and futures.\n"
-    "- Call list_spot_stop_orders + list_futures_positions + list_futures_stop_orders to audit open positions and their protection.\n"
+    "- The input already contains a fresh account snapshot, balances, positions, stops, and pending orders. Use it first; "
+    "call account/list tools only if a write changed state or the snapshot is ambiguous.\n"
     "- For any open position missing a TP or SL: use set_spot_position_protection or set_futures_position_protection "
     "to add the bracket BEFORE looking for new trades.\n"
     "- Cancel stale stop orders (stop exists but no position) via cancel_spot_stop_order.\n"
@@ -1191,7 +1199,7 @@ def run_trading_agent(
     "**When summary.squeeze_breakout is set (structured breakout signal):**\n"
     "- summary.squeeze_breakout = 'long' or 'short' fires only on the FRESH transition out of a 1h squeeze "
     "(BBW expanding ≥25% off the floor, ADX>20, price beyond BB band, RSI confirming).\n"
-    "- This is a high-EV setup (backtested PF ~1.59 on ETH D1). Take it at FULL size (1.0×, not range-trade size).\n"
+    "- Treat this as higher quality only after volume confirmation; request normal size and let code-enforced risk/volatility limits size it.\n"
     "- REQUIRED CONFIRMATION: volume on the breakout candle ≥ 1.5× the 20-candle average. "
     "If volume is weak, decline_trade — false breakouts ('head fakes') are common.\n"
     "- TP: rely on plan_spot_position's volatility-scaled rr (or set futures TP at 2-3× stop_distance in high vol). "
@@ -1272,7 +1280,7 @@ def run_trading_agent(
     "  Note: plan_spot_position now returns a volatility-scaled `rr` — the effective RR widens up to 2× the "
     "base when daily ATR >= 4% (cap at daily ATR 10%). This lets winners run further in volatile coins to "
     "compensate for the smaller position size enforced by the ATR soft-gate.\n"
-    f"- For futures: size so margin required is 20–40% of available futures USDT (up to maxPositionUsd={snapshot.max_position_usd}).\n"
+    f"- For futures: propose no more than maxPositionUsd={snapshot.max_position_usd}; code shrinks contracts so stop-defined loss stays within the per-trade and portfolio risk budgets.\n"
     "- Keep at least 10% USDT reserve across all venues combined.\n\n"
 
     "**TP/SL rules (mandatory on every new entry):**\n"
@@ -1305,12 +1313,12 @@ def run_trading_agent(
     "- Keep at least 10% of total USDT untouched as reserve.\n"
     f"- Minimum {cfg.trading.min_trade_interval_minutes:.0f} minutes between trades on the same symbol (enforced by system).\n\n"
 
-    "## Drawdown context (informational only — never a reason to stop trading):\n"
+    "## Drawdown and circuit-breaker context:\n"
     "- drawdownPct is based on USDT cash, not total portfolio value. If you hold coins in spot, the USDT cash "
     "may be low while total value is fine. Do NOT treat low spot USDT drawdown as a reason to stop trading.\n"
     "- Use the TOTAL drawdownPct (not per-venue) for sizing decisions.\n"
-    "- drawdownPct 5–15%: slightly reduce size, prefer higher-conviction setups.\n"
-    "- drawdownPct >15%: use smaller size but KEEP TRADING — the goal is to recover, not sit idle.\n\n"
+    "- When the input says tradingRestricted, the hard circuit breaker has fired: manage/close only and do not retry entries.\n"
+    "- Below that limit, prefer smaller, higher-conviction setups as drawdown rises; never increase risk to recover losses.\n\n"
 
     "## Performance awareness:\n"
     "- Check the performanceSummary field in your input: it shows your recent win rate, avg win/loss, total PnL.\n"
@@ -1325,12 +1333,12 @@ def run_trading_agent(
     "- Use this data to adapt — don't repeat losing patterns.\n\n"
 
     "## MANDATORY — Diversification and opportunity discovery:\n"
-    "- You MUST analyze at least 2 different coins every run. Do NOT fixate on a single coin.\n"
+    "- Analyze the best screened candidate first; rotate immediately if it is rejected. Research handoffs handle broad scans.\n"
     "- If a coin is rejected (daily gate, cooldown, trade cap, low confidence), IMMEDIATELY move to the next coin. "
     "Do NOT keep retrying the same symbol.\n"
     "- NEVER output 'If you want, I can scout...' or 'Would you like me to...' — just DO it. You are autonomous.\n"
     "- The coin list is a starting point, not a boundary. Better opportunities may exist outside it.\n"
-    "- Use web_search, fetch_kucoin_news, and fetch_coindesk_news every run to scan for market-moving events: new listings, breakouts, "
+    "- Use web/news search during Research Agent handoffs or when a specific event could change the setup; do not repeat unchanged news calls every run. Look for "
     "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"
     "- If you spot a coin with a stronger setup than anything in your current list, hand off to Research Agent "
     "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it.\n"
