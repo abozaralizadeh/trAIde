@@ -3808,7 +3808,23 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       conf = float(confidence)
     except (TypeError, ValueError):
       return {"error": "Invalid confidence"}
-    entry = memory.log_decision(_normalize_symbol(symbol), action, conf, reason, pnl=pnl, paper=paper)
+    normalized = _normalize_symbol(symbol)
+    lifecycle: Dict[str, Any] = {}
+    if pnl is not None and memory._is_realized_close(action):
+      position = next(
+        (p for p in snapshot.futures_positions if _normalize_symbol(p.get("symbol") or "") == normalized),
+        None,
+      )
+      if position:
+        qty = _to_float(position.get("currentQty")) or 0.0
+        lifecycle = {
+          "position_id": position.get("id") or position.get("positionId"),
+          "position_open_time": position.get("openTime") or position.get("openingTimestamp"),
+          "position_side": "long" if qty > 0 else "short" if qty < 0 else None,
+        }
+    entry = memory.log_decision(
+      normalized, action, conf, reason, pnl=pnl, paper=paper, **lifecycle,
+    )
     return {"decision": entry}
 
 

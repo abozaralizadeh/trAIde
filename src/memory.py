@@ -139,6 +139,10 @@ class MemoryStore:
             # sanitizing on startup silently disabled both protections after every process restart.
             "exitPrice": d.get("exitPrice"),
             "closeType": d.get("closeType"),
+            "positionId": d.get("positionId"),
+            "positionOpenTime": d.get("positionOpenTime"),
+            "positionSide": d.get("positionSide"),
+            "positionLifecycleVersion": d.get("positionLifecycleVersion"),
           }
           for d in data.get("decisions", [])
           if isinstance(d, dict) and d.get("symbol") and d.get("ts") is not None
@@ -493,6 +497,9 @@ class MemoryStore:
     trough_pnl: Optional[float] = None,
     exit_price: Optional[float] = None,
     close_type: Optional[str] = None,
+    position_id: Optional[str] = None,
+    position_open_time: Optional[int | float | str] = None,
+    position_side: Optional[str] = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -527,6 +534,19 @@ class MemoryStore:
           pass
       if close_type:
         entry["closeType"] = str(close_type)
+      if position_id not in (None, ""):
+        entry["positionId"] = str(position_id)
+      if position_open_time not in (None, ""):
+        try:
+          entry["positionOpenTime"] = int(float(position_open_time))
+        except (TypeError, ValueError):
+          pass
+      if position_side and str(position_side).lower() in {"long", "short"}:
+        entry["positionSide"] = str(position_side).lower()
+      if any(value not in (None, "") for value in (position_id, position_open_time, position_side)):
+        # Marks rows written by lifecycle-aware code. If an exchange omits the identifiers, fail
+        # safe by keeping both PnL rows instead of falling back to an unsafe symbol/time merge.
+        entry["positionLifecycleVersion"] = 1
       data.setdefault("decisions", [])
       data["decisions"].append(entry)
       self._write(data)
@@ -690,7 +710,7 @@ class MemoryStore:
 
   @staticmethod
   def _dedupe_realized(closes: list[Dict[str, Any]], window_sec: int = 1800) -> list[Dict[str, Any]]:
-    """Drop re-recorded duplicates of the same close (same symbol/closeType/pnl within a window).
+    """Drop re-recorded duplicates, preferring lifecycle identity when it is available.
 
     The main loop's seen-ID set used to live only in process memory, so a restart within the
     30-min fill lookback re-recorded the same close (observed: ETH -0.5007 at 13:48 and again
@@ -701,11 +721,21 @@ class MemoryStore:
     last_seen: Dict[tuple, int] = {}
     for c in sorted(closes, key=lambda d: d.get("ts") or 0):
       pnl = c.get("pnl")
-      try:
-        key = (c.get("symbol"), c.get("closeType") or "", round(float(pnl), 6))
-      except (TypeError, ValueError):
+      position_id = str(c.get("positionId") or "").strip()
+      position_open_time = MemoryStore._position_open_time_ms(c)
+      if position_id:
+        key = (c.get("symbol"), "position-id", position_id)
+      elif position_open_time is not None:
+        key = (c.get("symbol"), "position-open", position_open_time)
+      elif c.get("positionLifecycleVersion"):
         kept.append(c)
         continue
+      else:
+        try:
+          key = (c.get("symbol"), "legacy", c.get("closeType") or "", round(float(pnl), 6))
+        except (TypeError, ValueError):
+          kept.append(c)
+          continue
       ts = int(c.get("ts") or 0)
       prev = last_seen.get(key)
       if prev is not None and 0 <= ts - prev <= window_sec:
@@ -713,6 +743,71 @@ class MemoryStore:
       last_seen[key] = ts
       kept.append(c)
     return kept
+
+  @staticmethod
+  def _position_open_time_ms(row: Dict[str, Any]) -> Optional[int]:
+    value = row.get("positionOpenTime")
+    if value in (None, ""):
+      return None
+    try:
+      timestamp = int(float(value))
+    except (TypeError, ValueError):
+      return None
+    return timestamp if timestamp > 1_000_000_000_000 else timestamp * 1000
+
+  @staticmethod
+  def _position_side(row: Dict[str, Any]) -> Optional[str]:
+    explicit = str(row.get("positionSide") or "").lower()
+    if explicit in {"long", "short"}:
+      return explicit
+    close_type = str(row.get("closeType") or "").upper()
+    if "LONG" in close_type:
+      return "long"
+    if "SHORT" in close_type:
+      return "short"
+    action = str(row.get("action") or "").lower()
+    if action.startswith("futures_sell"):
+      return "long"
+    if action.startswith("futures_buy"):
+      return "short"
+    return None
+
+  @staticmethod
+  def _same_position_lifecycle(
+    local: Dict[str, Any],
+    authoritative: Dict[str, Any],
+    *,
+    window_sec: int,
+  ) -> bool:
+    """Match closes from one position without merging a rapid same-symbol re-entry.
+
+    Current records use position ID/open time. Only legacy local rows lacking both identifiers
+    use a shorter direction-aware time match so historical restart duplicates remain healed.
+    """
+    local_id = str(local.get("positionId") or "").strip()
+    auth_id = str(authoritative.get("positionId") or "").strip()
+    local_open = MemoryStore._position_open_time_ms(local)
+    auth_open = MemoryStore._position_open_time_ms(authoritative)
+
+    comparable = False
+    if local_id and auth_id:
+      comparable = True
+      if local_id == auth_id:
+        return True
+    if local_open is not None and auth_open is not None:
+      comparable = True
+      if abs(local_open - auth_open) <= 1000:
+        return True
+    if comparable or local_id or local_open is not None or local.get("positionLifecycleVersion"):
+      return False
+
+    local_side = MemoryStore._position_side(local)
+    auth_side = MemoryStore._position_side(authoritative)
+    if not local_side or local_side != auth_side:
+      return False
+    delta = int(authoritative.get("ts") or 0) - int(local.get("ts") or 0)
+    legacy_window_sec = min(max(0, int(window_sec)), 600)
+    return 0 <= delta <= legacy_window_sec
 
   def realized_closes(self, limit: int = 100, symbol: str | None = None) -> list[Dict[str, Any]]:
     """Recent realized closes (pnl-bearing 'triggered' decisions), deduped, oldest→newest.
@@ -838,8 +933,8 @@ class MemoryStore:
 
     A market close is logged immediately with an estimated PnL.  KuCoin then reports the closed
     position with authoritative cumulative PnL (including earlier partial reductions).  Counting
-    both overstated the ZEC lifecycle by +0.5606 USDT.  When an exchange-triggered close for the
-    same symbol arrives shortly after a local futures close/reduction, keep only the exchange row.
+    both overstated the ZEC lifecycle by +0.5606 USDT. Position identity/open time now determines
+    whether a local close belongs to the exchange result, avoiding collisions after rapid re-entry.
     """
     rows = [
       d for d in decisions
@@ -857,6 +952,7 @@ class MemoryStore:
         if any(
           later.get("symbol") == row.get("symbol")
           and 0 <= int(later.get("ts") or 0) - ts <= window_sec
+          and MemoryStore._same_position_lifecycle(row, later, window_sec=window_sec)
           for later in triggered
         ):
           continue

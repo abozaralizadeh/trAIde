@@ -1,4 +1,33 @@
-from src.main import _agent_made_a_move, _expired_bot_entry_orders
+import pytest
+
+from src.main import _adaptive_agent_cooldown, _agent_made_a_move, _expired_bot_entry_orders
+
+
+class TestAdaptiveAgentCooldown:
+  def _cooldown(self, moves=None, *, active=False, events=0):
+    return _adaptive_agent_cooldown(
+      flat_cooldown_sec=3600,
+      active_cooldown_sec=300,
+      book_active=active,
+      new_events_count=events,
+      trigger_move_pcts=moves or [],
+      price_trigger_pct=0.5,
+    )
+
+  def test_quiet_flat_market_keeps_hourly_ceiling(self):
+    assert self._cooldown() == 3600
+
+  def test_trigger_magnitude_shortens_flat_cadence(self):
+    assert self._cooldown([0.5]) == pytest.approx(1800)
+    assert self._cooldown([1.0]) == pytest.approx(720)
+    assert self._cooldown([1.5]) == pytest.approx(360)
+
+  def test_breadth_and_large_moves_converge_on_active_floor(self):
+    assert self._cooldown([1.5, 1.5]) == 300
+
+  def test_active_book_or_new_event_uses_active_cadence(self):
+    assert self._cooldown(active=True) == 300
+    assert self._cooldown(events=1) == 300
 
 
 class TestAgentMadeAMove:

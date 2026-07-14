@@ -23,6 +23,35 @@ from .utils import normalize_symbol
 logger = logging.getLogger(__name__)
 
 
+def _adaptive_agent_cooldown(
+  *,
+  flat_cooldown_sec: float,
+  active_cooldown_sec: float,
+  book_active: bool,
+  new_events_count: int,
+  trigger_move_pcts: list[float],
+  price_trigger_pct: float,
+) -> float:
+  """Return a model-call cooldown that falls continuously as a flat-market move gets urgent.
+
+  The configured flat value remains the quiet-market/cost ceiling and the active value remains
+  the floor.  A move exactly at the trigger halves the quiet cooldown; larger moves and breadth
+  (several symbols moving together) accelerate it further without another setting to tune.
+  """
+  flat = max(0.0, float(flat_cooldown_sec))
+  active = max(0.0, min(flat, float(active_cooldown_sec)))
+  if book_active or new_events_count:
+    return active
+  threshold = float(price_trigger_pct)
+  moves = [abs(float(move)) for move in trigger_move_pcts if float(move) > 0]
+  if threshold <= 0 or not moves or flat <= 0:
+    return flat
+  # At 1x threshold: flat/2; at 2x: flat/5; at 3x: flat/10. Multiple triggered
+  # symbols add breadth to the urgency score, so a market-wide move is reviewed sooner.
+  urgency_sq = (max(moves) / threshold) ** 2 * len(moves)
+  return max(active, min(flat, flat / (1.0 + urgency_sq)))
+
+
 def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
   if not cfg.trading.flexible_coins_enabled:
     return cfg.trading.coins
@@ -361,6 +390,7 @@ async def trading_loop() -> None:
   force_research = False         # when True, next agent run must hand off to Research first
   last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
   last_agent_run_ts = 0.0        # cost/churn throttle; protection still runs on every poll
+  pending_trigger_moves: Dict[str, float] = {}  # strongest move per symbol, retained until reviewed
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
   # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
@@ -477,6 +507,7 @@ async def trading_loop() -> None:
         change_pct = abs(price - prev) / prev * 100
         if change_pct >= cfg.trading.price_change_trigger_pct:
           triggers.append(f"price_move:{symbol}:{change_pct:.2f}%")
+          pending_trigger_moves[symbol] = max(change_pct, pending_trigger_moves.get(symbol, 0.0))
       last_prices[symbol] = price
 
     # Snapshot peak/trough BEFORE the update prunes just-closed positions — otherwise a position's
@@ -498,7 +529,9 @@ async def trading_loop() -> None:
     except Exception as exc:
       logger.warning("Profit-lock run failed: %s", exc)
 
-    run_candidate = bool(triggers) or idle_polls >= cfg.trading.max_idle_polls
+    # Retain throttled moves until the model actually reviews them. Without this queue, a trigger
+    # followed by a quiet poll vanished and the adaptive shorter cooldown never got another chance.
+    run_candidate = bool(triggers or pending_trigger_moves) or idle_polls >= cfg.trading.max_idle_polls
 
     recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=30)
     new_events_count = len(recent_fills["spot_fills"]) + len(recent_fills["futures_fills"]) + len(recent_fills["closed_positions"])
@@ -516,6 +549,11 @@ async def trading_loop() -> None:
         roe = float(cp.get("roe") or 0)
         close_type = cp.get("type") or "unknown"
         side = "sell" if "LONG" in close_type.upper() else "buy"
+        position_side = (
+          "long" if "LONG" in close_type.upper()
+          else "short" if "SHORT" in close_type.upper()
+          else None
+        )
         # Capture the exit price so the no-chase guard knows where we sold/covered.
         exit_price = None
         for _k in ("closePrice", "avgExitPrice", "settleClosePrice", "markPrice", "lastPrice"):
@@ -540,6 +578,9 @@ async def trading_loop() -> None:
           paper=False,
           exit_price=exit_price,
           close_type=close_type,
+          position_id=cp.get("id"),
+          position_open_time=cp.get("openTime") or cp.get("openingTimestamp"),
+          position_side=position_side,
           peak_pnl=_ext.get("peakPnl"),
           trough_pnl=_ext.get("troughPnl"),
         )
@@ -588,10 +629,13 @@ async def trading_loop() -> None:
     # protection still evaluates every poll; discretionary analysis is throttled by book state.
     # A fill/close event is actionable and uses the active cadence even if the book is now flat.
     book_active = bool(snapshot.futures_positions or snapshot.futures_pending_orders or snapshot.spot_pending_orders)
-    cooldown_sec = (
-      cfg.trading.active_agent_cooldown_sec
-      if book_active or new_events_count
-      else cfg.trading.flat_agent_cooldown_sec
+    cooldown_sec = _adaptive_agent_cooldown(
+      flat_cooldown_sec=cfg.trading.flat_agent_cooldown_sec,
+      active_cooldown_sec=cfg.trading.active_agent_cooldown_sec,
+      book_active=book_active,
+      new_events_count=new_events_count,
+      trigger_move_pcts=list(pending_trigger_moves.values()),
+      price_trigger_pct=cfg.trading.price_change_trigger_pct,
     )
     run_candidate = run_candidate or bool(new_events_count)
     cooldown_elapsed = time.time() - last_agent_run_ts
@@ -602,7 +646,12 @@ async def trading_loop() -> None:
     if should_run:
       idle_polls = 0
       last_agent_run_ts = time.time()
-      logger.info("Running agent. Triggers: %s", triggers or ["idle_threshold"])
+      agent_triggers = triggers or [
+        f"pending_price_move:{symbol}:{move:.2f}%"
+        for symbol, move in sorted(pending_trigger_moves.items())
+      ] or ["idle_threshold"]
+      pending_trigger_moves.clear()
+      logger.info("Running agent. Triggers: %s", agent_triggers)
       try:
         result = await asyncio.to_thread(
           run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client,
@@ -612,7 +661,7 @@ async def trading_loop() -> None:
         logger.info("--- Agent Decision Narrative ---\n%s", result["narrative"])
         if result.get("decisions"):
           logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
-        notifier.notify_agent_run(triggers or ["idle_threshold"], result)
+        notifier.notify_agent_run(agent_triggers, result)
 
         # Stuck-state detection: when the agent makes no move for several consecutive runs,
         # force a Research Agent handoff next run to refresh the coin universe. Forcing resets
@@ -645,7 +694,7 @@ async def trading_loop() -> None:
         notifier.notify_error(str(exc), context="Agent run")
     else:
       idle_polls += 1
-      logger.info("No triggers. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)
+      logger.info("Agent idle/throttled. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)
 
     # Publish a sanitized public-safe snapshot for the read-only spectator dashboard.
     # Self-throttled and never raises, so it is safe to call every poll. Open positions are

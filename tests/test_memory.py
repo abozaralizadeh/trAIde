@@ -232,6 +232,21 @@ def test_close_metadata_survives_restart_for_no_chase(tmp_path):
     assert close["closeType"] == "CLOSE_LONG"
 
 
+def test_position_lifecycle_metadata_survives_restart(tmp_path):
+    path = str(tmp_path / "memory.json")
+    mem = MemoryStore(path, retention_days=7)
+    mem.log_decision(
+      "ETH-USDT", "futures_sell_triggered", 0.0, "tp", pnl=1.0,
+      position_id="position-123", position_open_time=1_700_000_000_000,
+      position_side="long",
+    )
+    row = MemoryStore(path, retention_days=7).realized_closes()[0]
+    assert row["positionId"] == "position-123"
+    assert row["positionOpenTime"] == 1_700_000_000_000
+    assert row["positionSide"] == "long"
+    assert row["positionLifecycleVersion"] == 1
+
+
 def test_exchange_close_supersedes_recent_local_pnl_estimate(store):
     store.record_trade("ZEC-USDT", "buy", 50.0, paper=False, price=500, size=0.1, venue="futures")
     store.log_decision("ZEC-USDT", "futures_sell", 0.9, "estimated close", pnl=0.56)
@@ -239,6 +254,51 @@ def test_exchange_close_supersedes_recent_local_pnl_estimate(store):
     summary = store.performance_summary()
     assert summary["closedWithPnl"] == 1
     assert summary["totalRealizedPnl"] == 1.44
+
+
+def test_exchange_close_supersedes_only_the_same_position_lifecycle():
+    decisions = [
+      {"symbol": "ZEC-USDT", "action": "futures_sell", "pnl": 0.56, "ts": 100,
+       "positionId": "old-position", "positionOpenTime": 1_700_000_000_000, "positionSide": "long"},
+      {"symbol": "ZEC-USDT", "action": "futures_sell_triggered", "pnl": 1.44, "ts": 120,
+       "positionId": "old-position", "positionOpenTime": 1_700_000_000_000, "positionSide": "long"},
+    ]
+    rows = MemoryStore._authoritative_realized_rows(decisions)
+    assert [(row["action"], row["pnl"]) for row in rows] == [("futures_sell_triggered", 1.44)]
+
+
+def test_new_same_symbol_lifecycle_is_not_dropped_inside_close_window():
+    decisions = [
+      {"symbol": "ZEC-USDT", "action": "futures_sell", "pnl": 0.56, "ts": 100,
+       "positionId": "old-position", "positionOpenTime": 1_700_000_000_000, "positionSide": "long"},
+      {"symbol": "ZEC-USDT", "action": "futures_sell_triggered", "pnl": 0.75, "ts": 500,
+       "positionId": "new-position", "positionOpenTime": 1_700_001_000_000, "positionSide": "long"},
+    ]
+    rows = MemoryStore._authoritative_realized_rows(decisions)
+    assert [(row["action"], row["pnl"]) for row in rows] == [
+      ("futures_sell", 0.56),
+      ("futures_sell_triggered", 0.75),
+    ]
+
+
+def test_new_lifecycle_row_without_exchange_ids_fails_safe():
+    decisions = [
+      {"symbol": "ZEC-USDT", "action": "futures_sell", "pnl": 0.56, "ts": 100,
+       "positionSide": "long", "positionLifecycleVersion": 1},
+      {"symbol": "ZEC-USDT", "action": "futures_sell_triggered", "pnl": 0.75, "ts": 120,
+       "positionId": "new-position", "positionSide": "long", "positionLifecycleVersion": 1},
+    ]
+    assert MemoryStore._authoritative_realized_rows(decisions) == decisions
+
+
+def test_two_equal_pnl_closes_with_distinct_position_ids_are_both_kept():
+    closes = [
+      {"symbol": "ETH-USDT", "action": "futures_sell_triggered", "closeType": "CLOSE_LONG",
+       "pnl": 1.0, "ts": 100, "positionId": "position-a"},
+      {"symbol": "ETH-USDT", "action": "futures_sell_triggered", "closeType": "CLOSE_LONG",
+       "pnl": 1.0, "ts": 200, "positionId": "position-b"},
+    ]
+    assert MemoryStore._dedupe_realized(closes) == closes
 
 
 def test_record_trade_venue_futures(store):

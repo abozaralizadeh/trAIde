@@ -71,7 +71,7 @@ flowchart TB
 
 ### Runtime: the poll loop
 
-Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and considers agent invocation when a trigger fires or the idle threshold is reached. Model calls are additionally throttled by book state (`FLAT_AGENT_COOLDOWN_SEC` / `ACTIVE_AGENT_COOLDOWN_SEC`); code-driven protection is never throttled.
+Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and considers agent invocation when a trigger fires or the idle threshold is reached. Model calls are additionally throttled by book state (`FLAT_AGENT_COOLDOWN_SEC` / `ACTIVE_AGENT_COOLDOWN_SEC`). While flat, price-move magnitude and market breadth automatically shorten the quiet cooldown toward the active cadence; code-driven protection is never throttled.
 
 ```mermaid
 sequenceDiagram
@@ -279,7 +279,7 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 |----------|---------|-------------|
 | `PAPER_TRADING` | `true` | Simulate orders without real execution |
 | `MAX_POSITION_USD` | `500` | Maximum spend per trade |
-| `RISK_PER_TRADE_PCT` | `0.02` | Risk per trade as fraction of equity (2%). Best-practice survival rule is 1–2%; high-frequency bots lean to the low end |
+| `RISK_PER_TRADE_PCT` | `0.01` | Maximum stop-defined risk per trade as a fraction of equity (1%); fees, slippage, and gaps can make realized loss higher |
 | `MIN_CONFIDENCE` | `0.65` | Minimum confidence score (0-1) to place a trade |
 | `MAX_LEVERAGE` | `3` | Maximum futures leverage (1-125) |
 | `MAX_TRADES_PER_SYMBOL_PER_DAY` | `6` | Daily trade cap per symbol (curbs fee churn and loss streaks) |
@@ -411,7 +411,7 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `POLL_INTERVAL_SEC` | `60` | Seconds between polling cycles |
 | `PRICE_CHANGE_TRIGGER_PCT` | `0.5` | Price move % that triggers an agent run |
 | `MAX_IDLE_POLLS` | `10` | Force agent run after N idle polls |
-| `FLAT_AGENT_COOLDOWN_SEC` | `3600` | Minimum interval between model runs while flat; poll-loop protection still runs continuously |
+| `FLAT_AGENT_COOLDOWN_SEC` | `3600` | Quiet-market maximum interval while flat; triggered move magnitude/breadth automatically reduce it toward the active cadence |
 | `ACTIVE_AGENT_COOLDOWN_SEC` | `300` | Minimum interval between model runs with an open/pending book or a recent event |
 | `AGENT_MAX_TURNS` | `30` | Max tool-call turns per agent run |
 
