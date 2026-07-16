@@ -12,9 +12,11 @@ Import note: this module imports a few low-level helpers from ``agent`` and ``ag
 
 from __future__ import annotations
 
+import contextlib
 import math
 import time
 import uuid
+from decimal import Decimal, ROUND_HALF_UP
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
@@ -35,15 +37,18 @@ from .regime import (
   allow_reversal_long,
   allow_reversal_short,
   allow_trend_aligned_short,
+  add_on_guard_reason,
   block_alt_long_in_btc_downtrend,
   bracket_risk_scale,
   concentration_scale,
   conviction_size_factor,
   effective_min_confidence,
   is_relative_strength_alt_long,
+  oi_price_signal,
   regime_size_factor,
   resolve_gate_deadlock,
   reward_risk_ratio,
+  risk_capped_contracts,
 )
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
@@ -57,6 +62,19 @@ from .agent import (
   _to_futures_symbol,
   _truncate_to_increment,
 )
+
+
+def normalize_futures_side(side: str) -> str | None:
+  value = str(side or "").strip().lower()
+  return {"buy": "buy", "long": "buy", "sell": "sell", "short": "sell"}.get(value)
+
+
+def round_price_to_tick(value: float, tick_size: float) -> float:
+  tick = Decimal(str(tick_size))
+  if tick <= 0:
+    return float(value)
+  steps = (Decimal(str(value)) / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+  return float(steps * tick)
 
 
 def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
@@ -80,6 +98,20 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   _spot_position_info = ctx._spot_position_info
   _spot_position_size = ctx._spot_position_size
   _stop_distance_ok = ctx._stop_distance_ok
+  safety_state = getattr(ctx, "safety_state", None)
+  entry_token = getattr(ctx, "entry_token", None)
+
+  def _authority_error() -> str | None:
+    if safety_state is None:
+      return None
+    state = safety_state.check(
+      entry_token,
+      max_age_sec=max(180.0, float(cfg.trading.poll_interval_sec) * 3.0),
+    )
+    return None if state.get("allowed") else str(state.get("reason") or "Order authority unavailable")
+
+  def _exchange_write_lock():
+    return safety_state.order_lock if safety_state is not None else contextlib.nullcontext()
 
   # Mutable per-agent-run view of regular futures orders.  The snapshot is otherwise frozen for
   # the whole LLM run, which previously let repeated tool calls place many identical GTC entries
@@ -106,6 +138,173 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   def _gate_for(symbol: str) -> Dict[str, Any]:
     return _daily_gate_state.get(symbol, {})
+
+  def _normalize_futures_side(side: str) -> str | None:
+    return normalize_futures_side(side)
+
+  def _entry_context_error(symbol: str, confidence: float | None) -> str | None:
+    authority_error = _authority_error()
+    if authority_error:
+      return authority_error
+    with memory._lock:
+      current_limits = (memory._read().get("limits") or {}).get("total", {})
+    if float(current_limits.get("drawdownPct") or 0.0) >= cfg.circuit_breaker.max_daily_drawdown_pct:
+      return "Live daily-drawdown circuit breaker is active"
+    if memory.consecutive_losses() >= cfg.circuit_breaker.max_consecutive_losses:
+      closes = memory.realized_closes(limit=1)
+      last_close_ts = int(closes[-1].get("ts") or 0) if closes else 0
+      if last_close_ts and time.time() - last_close_ts < cfg.circuit_breaker.cooldown_minutes * 60:
+        return "Live consecutive-loss circuit breaker cooldown is active"
+    if confidence is None:
+      return "Entry confidence is required"
+    gate = _gate_for(symbol)
+    if not gate:
+      return "Fresh analyze_market_context result is required before entry"
+    analyzed_at = float(gate.get("analyzed_at") or 0.0)
+    if analyzed_at <= 0 or time.time() - analyzed_at > 900:
+      return "Market analysis is stale (>15 minutes); refresh analyze_market_context before entry"
+    if not gate.get("data_quality_ok", False):
+      return "Required daily/intraday market data is incomplete or invalid"
+    return None
+
+  def _refresh_live_futures_truth() -> Dict[str, Any]:
+    """Refresh complete exchange truth used for entry sizing and return a comparable fingerprint."""
+    if not kucoin_futures:
+      return {"error": "Futures client unavailable"}
+    failures: list[str] = []
+    overview: Dict[str, Any] = {}
+    positions: list = []
+    stops: list = []
+    pending: list = []
+    try:
+      overview = kucoin_futures.get_account_overview() or {}
+    except Exception as exc:
+      failures.append(f"overview: {exc}")
+    try:
+      positions = kucoin_futures.list_positions() or []
+    except Exception as exc:
+      failures.append(f"positions: {exc}")
+    try:
+      stops = kucoin_futures.list_stop_orders(status="active") or []
+    except Exception as exc:
+      failures.append(f"stops: {exc}")
+    try:
+      pending = kucoin_futures.list_orders(status="active") or []
+    except Exception as exc:
+      failures.append(f"pending orders: {exc}")
+    if failures:
+      return {"error": "Incomplete live entry snapshot (" + "; ".join(failures) + ")"}
+
+    old_futures_equity = _to_float((snapshot.futures_account or {}).get("accountEquity"))
+    if old_futures_equity <= 0:
+      old_futures_equity = _to_float((snapshot.futures_account or {}).get("marginBalance"))
+    new_futures_equity = _to_float(overview.get("accountEquity"))
+    if new_futures_equity <= 0:
+      new_futures_equity = _to_float(overview.get("marginBalance"))
+    if new_futures_equity <= 0:
+      return {"error": "Live futures equity is unavailable or non-positive"}
+    adjusted_total = max(0.0, float(snapshot.total_usdt) - max(0.0, old_futures_equity) + new_futures_equity)
+    if snapshot.total_usdt > 0:
+      snapshot.total_usdt = min(float(snapshot.total_usdt), adjusted_total)
+    else:
+      snapshot.total_usdt = adjusted_total
+    snapshot.futures_account = overview
+    snapshot.futures_positions = positions
+    snapshot.futures_stop_orders = stops
+    snapshot.futures_pending_orders = pending
+    _runtime_futures_pending.clear()
+    for order in pending:
+      if not isinstance(order, dict):
+        continue
+      oid = str(order.get("id") or order.get("orderId") or order.get("clientOid") or "")
+      if oid:
+        _runtime_futures_pending[oid] = dict(order)
+
+    def _rows_fingerprint(rows: list, keys: tuple[str, ...]) -> tuple:
+      normalized = []
+      for row in rows:
+        if isinstance(row, dict):
+          normalized.append(tuple(str(row.get(key) or "") for key in keys))
+      return tuple(sorted(normalized))
+
+    return {
+      "overview": overview,
+      "positions": positions,
+      "stops": stops,
+      "pending": pending,
+      "futuresEquity": new_futures_equity,
+      "fingerprint": (
+        _rows_fingerprint(positions, ("symbol", "currentQty", "avgEntryPrice", "openingTimestamp")),
+        _rows_fingerprint(stops, ("id", "symbol", "side", "stop", "stopPrice", "reduceOnly", "closeOrder")),
+        _rows_fingerprint(pending, ("id", "symbol", "side", "price", "size", "reduceOnly")),
+      ),
+    }
+
+  def _round_price_to_tick(value: float, tick_size: float) -> float:
+    return round_price_to_tick(value, tick_size)
+
+  def _live_entry_price(symbol: str) -> float | None:
+    try:
+      price = float(kucoin.get_ticker(symbol).price)
+      return price if price > 0 else None
+    except Exception as exc:
+      logger.warning("Live ticker refresh failed for %s entry: %s", symbol, exc)
+      return None
+
+  def _add_on_state(
+    futures_symbol: str,
+    side: str,
+    proposed_stop: float,
+    multiplier: float,
+    live_price: float,
+  ) -> Dict[str, Any]:
+    """Return existing lifecycle risk/exposure or a hard rejection for unsafe pyramiding."""
+    try:
+      position = kucoin_futures.get_position(futures_symbol)
+    except Exception as exc:
+      return {"error": f"Unable to verify live position before entry: {exc}"}
+    if not isinstance(position, dict):
+      return {"error": "Unable to verify live position before entry"}
+    qty = _to_float(position.get("currentQty")) or 0.0
+    if not qty:
+      return {"existingRiskUsd": 0.0, "existingNotionalUsd": 0.0, "position": None}
+    avg_entry = _to_float(position.get("avgEntryPrice")) or 0.0
+    try:
+      active_stops = kucoin_futures.list_stop_orders(status="active", symbol=futures_symbol) or []
+    except Exception as exc:
+      return {"error": f"Unable to verify live stop before add-on: {exc}"}
+    loss_dir = "down" if qty > 0 else "up"
+    exit_side = "sell" if qty > 0 else "buy"
+    stop_prices = []
+    for order in active_stops:
+      if str(order.get("stop") or "").lower() != loss_dir:
+        continue
+      if str(order.get("side") or "").lower() != exit_side:
+        continue
+      if not (_order_flag(order.get("reduceOnly")) or _order_flag(order.get("closeOrder"))):
+        continue
+      price = _to_float(order.get("stopPrice"))
+      if price and price > 0:
+        stop_prices.append(price)
+    protective_stop = (max(stop_prices) if qty > 0 else min(stop_prices)) if stop_prices else None
+    fee_buffer = float(cfg.profit_protection.breakeven_fee_pct or 0.0)
+    guard_reason = add_on_guard_reason(
+      current_qty=qty,
+      new_side=side,
+      avg_entry=avg_entry,
+      protective_stop=protective_stop,
+      proposed_stop=proposed_stop,
+      fee_buffer_fraction=fee_buffer,
+    )
+    if guard_reason:
+      return {"error": guard_reason}
+    risk_distance = max(0.0, avg_entry - proposed_stop) if qty > 0 else max(0.0, proposed_stop - avg_entry)
+    return {
+      "existingRiskUsd": abs(qty) * multiplier * risk_distance,
+      "existingNotionalUsd": abs(qty) * multiplier * live_price,
+      "position": position,
+      "protectiveStop": protective_stop,
+    }
 
   def _relative_strength_exception(symbol: str, side: str, confidence) -> bool:
     gate = _gate_for(symbol)
@@ -148,16 +347,66 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     cap = float(cfg.trading.max_24h_volatility_pct or 0.0)
     return move if cap > 0 and abs(move) > cap else None
 
-  def _risk_capped_contracts(contracts: int, lot: int, multiplier: float, entry: float, stop_loss: float) -> int:
-    """Final post-rounding risk cap; returns 0 when even one lot exceeds the budget."""
+  def _quarantine_symbol(symbol: str, reason: str) -> None:
+    """Remove a persistently unsafe candidate from the next run's active universe."""
+    if _authority_error():
+      logger.warning("AUTO-QUARANTINE skipped for %s because this run no longer has mutation authority", symbol)
+      return
+    futures_symbol = _to_futures_symbol(symbol)
+    has_live_exposure = any(
+      str(position.get("symbol") or "") == futures_symbol
+      and abs(_to_float(position.get("currentQty"))) > 0
+      for position in (snapshot.futures_positions or [])
+      if isinstance(position, dict)
+    ) or any(
+      str(order.get("symbol") or "") == futures_symbol
+      for order in (snapshot.futures_pending_orders or [])
+      if isinstance(order, dict)
+    )
+    if has_live_exposure:
+      logger.warning("AUTO-QUARANTINE deferred for %s until its live position/orders are flat — %s", symbol, reason)
+      return
     try:
-      risk_per_contract = float(multiplier) * abs(float(entry) - float(stop_loss))
-      budget = float(snapshot.total_usdt) * float(cfg.trading.risk_per_trade_pct)
-    except (TypeError, ValueError):
+      memory.remove_coin(
+        symbol,
+        reason=f"Automatic risk quarantine: {reason}",
+        exit_plan="No new entries. Reconsider only after fresh analysis shows normal, valid volatility data.",
+      )
+      logger.warning("AUTO-QUARANTINE: removed %s from active universe — %s", symbol, reason)
+    except Exception as exc:
+      logger.warning("Unable to quarantine %s: %s", symbol, exc)
+
+  def _risk_capped_contracts(
+    contracts: int,
+    lot: int,
+    multiplier: float,
+    entry: float,
+    stop_loss: float,
+    existing_risk_usd: float = 0.0,
+  ) -> int:
+    """Final post-rounding risk cap; returns 0 when even one lot exceeds the budget."""
+    return risk_capped_contracts(
+      contracts, lot, multiplier, entry, stop_loss,
+      snapshot.total_usdt, cfg.trading.risk_per_trade_pct,
+      existing_risk_usd=existing_risk_usd,
+    )
+
+  def _concentration_capped_contracts(
+    contracts: int,
+    lot: int,
+    multiplier: float,
+    price: float,
+    existing_notional_usd: float,
+  ) -> int:
+    cap_fraction = float(cfg.trading.max_position_equity_pct or 0.0)
+    equity = float(snapshot.total_usdt or 0.0)
+    if cap_fraction <= 0 or equity <= 0:
       return contracts
-    if risk_per_contract <= 0 or budget <= 0:
-      return contracts
-    max_contracts = int(math.floor((budget / risk_per_contract) / lot) * lot)
+    remaining = max(0.0, equity * cap_fraction - max(0.0, float(existing_notional_usd)))
+    per_contract = float(multiplier) * float(price)
+    if per_contract <= 0:
+      return 0
+    max_contracts = int(math.floor((remaining / per_contract) / lot) * lot)
     return min(contracts, max_contracts)
 
   def _existing_futures_risk_usd() -> float:
@@ -191,7 +440,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if multiplier <= 0:
         total += per_trade_budget
         continue
-      total += abs(qty) * multiplier * abs(entry - stop_price)
+      risk_distance = max(0.0, entry - stop_price) if qty > 0 else max(0.0, stop_price - entry)
+      total += abs(qty) * multiplier * risk_distance
     # A resting entry can fill before the next poll.  Its bracket is not consistently returned by
     # KuCoin's active-order list, so reserve one configured risk unit rather than pretending it is 0.
     total += sum(
@@ -229,10 +479,23 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     target_rr: float | None = None,
     auto_protect: bool = True,
   ) -> Dict[str, Any]:
-    """Place a spot market order on Kucoin using quote funds in USDT. Enforces stop/TP for buys to avoid ultra-tight churn."""
+    """Close a spot position with a market sell. New spot market buys are disabled."""
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
+    side_lower = str(side or "").lower()
+    if side_lower not in {"buy", "sell"}:
+      return {"error": "Invalid side", "allowed": ["buy", "sell"]}
+    side = side_lower
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
+    if side_lower == "buy":
+      return {
+        "rejected": True,
+        "reason": "New spot entries are disabled because KuCoin cannot atomically attach both exits to a resting spot entry",
+        "hint": "Use a bracketed futures limit setup or stand aside; market chasing and temporarily naked spot entries are not allowed.",
+      }
 
     # Circuit breaker: block new entries when trading is restricted
     if (side or "").lower() == "buy" and snapshot.trading_restricted:
@@ -712,7 +975,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         pass
 
     try:
-      res = kucoin.place_order(order_req).__dict__
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin.place_order(order_req).__dict__
       record = memory.record_trade(symbol, side, funds_val, paper=False, price=price, size=size_est)
       res["tradeRecord"] = record
       if side == "sell" and expected_pnl is not None:
@@ -788,12 +1055,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     take_profit_price: float | None = None,
     risk_pct: float | None = None,
   ) -> Dict[str, Any]:
-    """Place a spot limit entry order at a technically derived target price.
+    """Place a spot limit sell/close order at a technically derived target price.
     Use for new entries where you want to wait for price to reach a key level
     (EMA, Bollinger Band, swing high/low, VWAP) rather than entering at the
-    current market price. Rejects if entry_price is too close to current price
-    — use place_market_order instead when price is already at the target level.
-    Bracket TP/SL are placed on the NEXT run after the limit fills."""
+    current market price. New spot buys are disabled because their protection cannot be attached
+    atomically on this exchange path."""
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
@@ -805,6 +1071,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"error": "entry_price must be positive"}
 
     side_lower = (side or "").lower()
+    if side_lower not in {"buy", "sell"}:
+      return {"error": "Invalid side", "allowed": ["buy", "sell"]}
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
+    if side_lower == "buy":
+      return {
+        "rejected": True,
+        "reason": "New spot limit entries are disabled until atomic entry protection is available",
+        "hint": "Use a futures limit with exchange-attached TP/SL or stand aside.",
+      }
 
     if side_lower == "buy" and snapshot.trading_restricted:
       return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only sell/close operations are allowed during circuit breaker activation."}
@@ -898,7 +1175,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {
         "rejected": True,
         "reason": f"entry_price {entry_price_val} is within {deviation*100:.3f}% of current price {current_price:.4f} (minimum deviation: {cfg.trading.min_entry_deviation_pct*100:.2f}%)",
-        "hint": "Price is already at your target — use place_market_order to enter immediately, or pick a further entry_price to genuinely wait for a better level.",
+        "hint": "Do not switch to a market entry; wait for a valid limit level or decline the setup.",
         "currentPrice": current_price,
         "entryPrice": entry_price_val,
       }
@@ -952,7 +1229,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       }
 
     try:
-      res = kucoin.place_order(order_req).__dict__
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin.place_order(order_req).__dict__
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(symbol, f"spot_{side_lower}_limit", float(confidence), rationale or "live limit entry", paper=False)
       res["pendingLimitEntry"] = True
@@ -978,6 +1259,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     client_oid: str | None = None,
   ) -> Dict[str, Any]:
     """Place a spot stop order (stop-loss or take-profit). stop_price_type: TP(trigger when price rises) or MP(falls)."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
@@ -1015,7 +1299,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if snapshot.paper_trading:
       return {"paper": True, "orderRequest": order_req.__dict__}
     try:
-      res = kucoin.place_stop_order(order_req).__dict__
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin.place_stop_order(order_req).__dict__
       res["orderRequest"] = order_req.__dict__
       return res
     except Exception as exc:
@@ -1049,10 +1337,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def cancel_spot_stop_order(order_id: str | None = None, client_oid: str | None = None) -> Dict[str, Any]:
     """Cancel a spot stop order by orderId or clientOid."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if snapshot.paper_trading:
       return {"paper": True, "cancelled": {"orderId": order_id, "clientOid": client_oid}}
     try:
-      res = kucoin.cancel_stop_order(order_id=order_id, client_oid=client_oid)
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin.cancel_stop_order(order_id=order_id, client_oid=client_oid)
       return {"cancelled": res, "orderId": order_id, "clientOid": client_oid}
     except Exception as exc:
       return {"error": str(exc), "orderId": order_id, "clientOid": client_oid}
@@ -1060,10 +1355,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def cancel_spot_limit_order(order_id: str) -> Dict[str, Any]:
     """Cancel a pending spot limit order (non-stop) by orderId."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if snapshot.paper_trading:
       return {"paper": True, "cancelled": {"orderId": order_id}}
     try:
-      res = kucoin.cancel_order(order_id)
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin.cancel_order(order_id)
       return {"cancelled": res, "orderId": order_id}
     except Exception as exc:
       return {"error": str(exc), "orderId": order_id}
@@ -1085,6 +1387,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     cancel_existing: bool = True,
   ) -> Dict[str, Any]:
     """Add or replace TP/SL for an existing open spot position using sell stop orders."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
@@ -1106,33 +1411,28 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     cancelled: list[Dict[str, Any]] = []
     cancel_errors: list[Dict[str, Any]] = []
-    active_orders: list[Dict[str, Any]] = []
-    if cancel_existing:
-      try:
-        active_orders = kucoin.list_stop_orders(status="active", symbol=symbol) or []
-      except Exception as exc:
-        cancel_errors.append({"stage": "list", "error": str(exc)})
-      for order in active_orders:
-        if not isinstance(order, dict):
-          continue
-        order_side = str(order.get("side") or "").lower()
-        if order_side and order_side != "sell":
-          continue
-        order_symbol = _normalize_symbol(str(order.get("symbol") or symbol))
-        if order_symbol and order_symbol != symbol:
-          continue
-        order_id = str(order.get("id") or order.get("orderId") or "").strip()
-        client_oid = str(order.get("clientOid") or "").strip() or None
-        if not order_id and not client_oid:
-          continue
-        if snapshot.paper_trading:
-          cancelled.append({"paper": True, "orderId": order_id or None, "clientOid": client_oid, "symbol": symbol})
-          continue
-        try:
-          res = kucoin.cancel_stop_order(order_id=order_id or None, client_oid=client_oid)
-          cancelled.append({"orderId": order_id or None, "clientOid": client_oid, "response": res})
-        except Exception as exc:
-          cancel_errors.append({"orderId": order_id or None, "clientOid": client_oid, "error": str(exc)})
+    try:
+      active_orders: list[Dict[str, Any]] = kucoin.list_stop_orders(status="active", symbol=symbol) or []
+    except Exception as exc:
+      return {"error": f"Unable to verify existing spot protection: {exc}", "symbol": symbol}
+    stop_adjustment = None
+    existing_loss_prices = [
+      _to_float(order.get("stopPrice"))
+      for order in active_orders
+      if isinstance(order, dict)
+      and str(order.get("side") or "").lower() == "sell"
+      and str(order.get("stopPriceType") or "").upper() == "MP"
+      and _to_float(order.get("stopPrice")) > 0
+    ]
+    if sl_val and existing_loss_prices:
+      strongest = max(existing_loss_prices)
+      if sl_val < strongest:
+        stop_adjustment = {
+          "requested": sl_val,
+          "keptAtLeast": strongest,
+          "reason": "spot stop protection is monotonic",
+        }
+        sl_val = strongest
 
     bracket: Dict[str, Any] = {}
     if sl_val:
@@ -1189,12 +1489,54 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           limit_price=tp_val,
         )
 
+    def _spot_placement_ok(result: Any) -> bool:
+      if not isinstance(result, dict) or result.get("error") or result.get("rejected"):
+        return False
+      if result.get("staged"):
+        tranches = result.get("tranches") or []
+        return bool(tranches) and all(_spot_placement_ok(item.get("result")) for item in tranches)
+      return bool(result.get("paper") or result.get("orderId") or result.get("clientOid"))
+
+    replace_types: set[str] = set()
+    if sl_val and _spot_placement_ok(bracket.get("stopLoss")):
+      replace_types.add("MP")
+    if tp_val and _spot_placement_ok(bracket.get("takeProfit")):
+      replace_types.add("TP")
+    if cancel_existing:
+      for order in active_orders:
+        if not isinstance(order, dict) or str(order.get("side") or "").lower() != "sell":
+          continue
+        order_symbol = _normalize_symbol(str(order.get("symbol") or symbol))
+        if order_symbol and order_symbol != symbol:
+          continue
+        order_type = str(order.get("stopPriceType") or "").upper()
+        if order_type not in replace_types:
+          continue
+        order_id = str(order.get("id") or order.get("orderId") or "").strip()
+        client_oid = str(order.get("clientOid") or "").strip() or None
+        if not order_id and not client_oid:
+          continue
+        if snapshot.paper_trading:
+          cancelled.append({"paper": True, "orderId": order_id or None, "clientOid": client_oid, "symbol": symbol})
+          continue
+        try:
+          with _exchange_write_lock():
+            authority_error = _authority_error()
+            if authority_error:
+              cancel_errors.append({"orderId": order_id or None, "error": authority_error})
+              continue
+            res = kucoin.cancel_stop_order(order_id=order_id or None, client_oid=client_oid)
+          cancelled.append({"orderId": order_id or None, "clientOid": client_oid, "response": res})
+        except Exception as exc:
+          cancel_errors.append({"orderId": order_id or None, "clientOid": client_oid, "error": str(exc)})
+
     return {
       "symbol": symbol,
       "positionSize": position_size,
       "cancelledOrders": cancelled,
       "cancelErrors": cancel_errors,
       "bracket": bracket,
+      "stopAdjustment": stop_adjustment,
     }
 
 
@@ -1202,6 +1544,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def decline_trade(reason: str, confidence: float) -> Dict[str, Any]:
     """Decline trading due to low confidence or risk."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     memory.log_decision("ALL", "decline", confidence, reason, paper=True)
     return {"skipped": True, "reason": reason, "confidence": confidence}
 
@@ -1276,6 +1621,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         interval_order.append(extra)
 
     snapshots: list[Dict[str, Any]] = []
+    analysis_errors: Dict[str, str] = {}
     end_at = int(time.time())
     futures_granularity = {"1min": 1, "5min": 5, "15min": 15, "1hour": 60, "4hour": 240, "1day": 1440}
     context_futures_symbol = _to_futures_symbol(symbol) if cfg.kucoin_futures.enabled and kucoin_futures else None
@@ -1320,6 +1666,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
       if not candles:
         if iv in ("4hour", "1day"):
+          analysis_errors[iv] = "no candles returned"
           continue
         return {"error": "No candles returned", "interval": iv}
       try:
@@ -1330,6 +1677,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         snapshots.append(snapshot)
       except Exception as exc:
         if iv in ("4hour", "1day"):
+          analysis_errors[iv] = str(exc)
           continue
         return {"error": str(exc), "interval": iv}
 
@@ -1344,6 +1692,25 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         daily_atr_pct = atr_pct
       elif iv == "15min" and atr_pct is not None:
         intraday_atr_pct = atr_pct
+    required_intervals = {"15min", "1hour", "1day"}
+    present_intervals = {str(snap.get("interval")) for snap in snapshots}
+    data_quality_ok = (
+      required_intervals.issubset(present_intervals)
+      and daily_atr_pct is not None
+      and intraday_atr_pct is not None
+      and math.isfinite(float(daily_atr_pct))
+      and math.isfinite(float(intraday_atr_pct))
+      and float(daily_atr_pct) > 0
+      and float(intraday_atr_pct) > 0
+    )
+    atr_hard_limit = float(cfg.trading.max_atr_pct_for_entry) * 1.5
+    if daily_atr_pct is not None and float(daily_atr_pct) > atr_hard_limit:
+      data_quality_ok = False
+      analysis_errors["volatility"] = (
+        f"daily ATR {float(daily_atr_pct):.2f}% exceeds {atr_hard_limit:.2f}% hard limit; "
+        "possible price-scale discontinuity or untradeable volatility"
+      )
+      _quarantine_symbol(symbol, analysis_errors["volatility"])
     _daily_gate_state[symbol] = {
       "daily_bias": summary.get("daily_bias", "neutral"),
       "daily_bias_raw": summary.get("daily_bias_raw", summary.get("daily_bias", "neutral")),
@@ -1358,8 +1725,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "intraday_bias_1h": summary.get("intraday_bias_1h", "neutral"),
       "intraday_bias_4h": summary.get("intraday_bias_4h", "neutral"),
       "strength": summary.get("strength", "weak"),
+      "market_regime": summary.get("market_regime", "unknown"),
+      "analyzed_at": time.time(),
+      "data_quality_ok": data_quality_ok,
+      "analysis_errors": analysis_errors,
     }
-    result: Dict[str, Any] = {"symbol": symbol, "snapshots": snapshots, "summary": summary}
+    result: Dict[str, Any] = {
+      "symbol": symbol,
+      "snapshots": snapshots,
+      "summary": summary,
+      "dataQuality": {"ok": data_quality_ok, "errors": analysis_errors},
+    }
 
     if cfg.kucoin_futures.enabled and kucoin_futures:
       fsym = _to_futures_symbol(symbol)
@@ -1398,7 +1774,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         except Exception:
           pass
 
-        # OI-Price divergence signal
+        # OI-price divergence must compare timestamped OI observations. The old implementation
+        # called OI "up" whenever 24h volume was positive, fabricating continuation confirmation.
         price_dir = None
         for snap in snapshots:
           if snap.get("interval") in ("4hour", "1hour"):
@@ -1407,28 +1784,25 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             if ema_f is not None and ema_s is not None:
               price_dir = "up" if ema_f > ema_s else "down"
               break
-        if price_dir and current_oi is not None:
+        if current_oi is not None:
           try:
             oi_val = float(current_oi)
-            vol_24h = float(futures_data.get("volumeOf24h") or 0)
-            oi_trend = "up" if vol_24h > 0 else "neutral"
-            if oi_trend != "neutral":
-              if price_dir == "up" and oi_trend == "up":
-                futures_data["oiPriceSignal"] = "strong_trend"
-                futures_data["oiPriceHint"] = "Rising price + rising OI = strong trend continuation. Stay in or add to position."
-              elif price_dir == "up" and oi_trend != "up":
-                futures_data["oiPriceSignal"] = "short_covering"
-                futures_data["oiPriceHint"] = "Rising price + flat/falling OI = short covering rally. Exit longs cautiously, don't add."
-              elif price_dir == "down" and oi_trend == "up":
-                futures_data["oiPriceSignal"] = "aggressive_shorts"
-                futures_data["oiPriceHint"] = (
-                  "Falling price + rising OI = aggressive short BUILDING. Trend likely continues lower. "
-                  "Do NOT enter contrarian longs hoping for a squeeze unless price reclaims a clear structural level "
-                  "(prior swing high or daily EMA cross). Stay short, exit longs, or stand aside."
-                )
-              else:
-                futures_data["oiPriceSignal"] = "long_capitulation"
-                futures_data["oiPriceHint"] = "Falling price + flat/falling OI = long capitulation. Potential reversal zone for contrarian long."
+            observed_price = _to_float(futures_data.get("markPrice"))
+            if observed_price <= 0 and symbol in snapshot.tickers:
+              observed_price = _to_float(snapshot.tickers[symbol].price)
+            observation = memory.observe_open_interest(
+              symbol, oi_val, price=observed_price if observed_price > 0 else None,
+            )
+            oi_trend = observation.get("trend")
+            observed_price_trend = observation.get("priceTrend")
+            signal, hint = oi_price_signal(observed_price_trend, oi_trend)
+            futures_data["oiTrend"] = oi_trend or "unknown"
+            futures_data["oiChangePct"] = observation.get("changePct")
+            futures_data["oiPriceTrend"] = observed_price_trend or "unknown"
+            futures_data["oiObservedPriceChangePct"] = observation.get("priceChangePct")
+            futures_data["oiObservationAgeSec"] = observation.get("ageSec")
+            futures_data["oiPriceSignal"] = signal
+            futures_data["oiPriceHint"] = hint
           except (TypeError, ValueError):
             pass
 
@@ -1591,8 +1965,30 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if not spot_symbol:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
 
-    is_entry = not reduce_only
+    normalized_side = _normalize_futures_side(side)
+    if normalized_side is None:
+      return {"error": "Invalid futures side", "allowed": ["buy", "sell", "long", "short"]}
+    side = normalized_side
+
     _pre_futures_symbol = _to_futures_symbol(spot_symbol)
+    _pre_existing = next(
+      (p for p in (snapshot.futures_positions or []) if p.get("symbol") == _pre_futures_symbol),
+      None,
+    )
+    _pre_qty = _to_float((_pre_existing or {}).get("currentQty")) or 0.0
+    if (_pre_qty > 0 and side == "sell") or (_pre_qty < 0 and side == "buy"):
+      reduce_only = True
+    reduce_only = bool(reduce_only)
+    is_entry = not reduce_only
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
+    if is_entry:
+      return {
+        "rejected": True,
+        "reason": "Futures market entries are disabled; new exposure must use an atomic bracketed limit order",
+        "hint": "Wait for a non-marketable pullback/rally limit with TP and SL attached. Market orders are close/emergency-only.",
+      }
     if is_entry and _pre_futures_symbol:
       existing_pending = _pending_entry_for(_pre_futures_symbol)
       if existing_pending:
@@ -1608,6 +2004,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "reason": "Futures entries require both take-profit and stop-loss prices",
         "hint": "Define the complete bracket up front so risk and reward can be measured before exposure is opened.",
       }
+    if is_entry:
+      context_error = _entry_context_error(spot_symbol, confidence)
+      if context_error:
+        return {"rejected": True, "reason": context_error, "hint": "Analyze this symbol immediately before submitting an entry."}
     # Circuit breaker: block new entries when trading is restricted
     if is_entry and snapshot.trading_restricted:
       return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
@@ -1744,6 +2144,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
         if daily_atr_pct > hard_limit:
           logger.warning("VOLATILITY BLOCK: %s rejected — ATR=%.2f%% exceeds hard limit %.2f%%", spot_symbol, daily_atr_pct, hard_limit)
+          _quarantine_symbol(spot_symbol, f"daily ATR {daily_atr_pct:.2f}% exceeds {hard_limit:.2f}% hard limit")
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
         _atr_scale_fm = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: futures %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fm * 100)
@@ -1806,24 +2207,16 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"error": "Invalid notional or leverage"}
     if notional_input <= 0 or lev_requested <= 0:
       return {"error": "Invalid notional or leverage"}
-    # Concentration cap: shrink a single position's notional to <= max_position_equity_pct of total
-    # equity regardless of leverage — bounds blast radius (RE-USDT was ~74% of equity in one name).
-    if is_entry:
-      _conc_scale = concentration_scale(notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct)
-      if _conc_scale < 1.0:
-        logger.info("CONCENTRATION CAP: futures %s notional %.2f → %.2f (<= %.0f%% of equity %.2f)",
-                    spot_symbol, notional_input, notional_input * _conc_scale, cfg.trading.max_position_equity_pct * 100, snapshot.total_usdt)
-        notional_input *= _conc_scale
     rationale_norm = (rationale or "").lower() if rationale else ""
     trades_today = memory.trades_today(spot_symbol)
-    if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
+    if is_entry and trades_today >= cfg.trading.max_trades_per_symbol_per_day:
       return {
         "rejected": True,
         "reason": "Daily trade cap reached",
         "tradesToday": trades_today,
         "limit": cfg.trading.max_trades_per_symbol_per_day,
       }
-    if cfg.trading.sentiment_filter_enabled:
+    if is_entry and cfg.trading.sentiment_filter_enabled:
       latest_sent = memory.latest_sentiment(symbol)
       day_key = int(time.time() // 86400)
       if not latest_sent or latest_sent.get("day") != day_key:
@@ -1854,9 +2247,51 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           logger.warning("NEW-LISTING BLOCK: %s rejected — contract age %.1fd < %.1fd minimum", futures_symbol, _age_days, cfg.trading.min_futures_listing_age_days)
           return {"rejected": True, "reason": f"New-listing guard: {futures_symbol} is {_age_days:.1f}d old (< {cfg.trading.min_futures_listing_age_days:.0f}d minimum)", "hint": "Freshly-listed perps are thin and ultra-volatile (this is how RE-USDT blew up). Wait for a real price history, or trade an established contract."}
 
-    price = float(snapshot.tickers[spot_symbol].price)
-    if price <= 0:
-      return {"error": "Invalid or missing price"}
+    multiplier = _to_float(contract.get("multiplier"))
+    if multiplier <= 0:
+      return {"error": "Invalid contract multiplier", "contract": contract}
+    live_close_position = None
+    if reduce_only:
+      try:
+        live_close_position = kucoin_futures.get_position(futures_symbol)
+      except Exception as exc:
+        return {"rejected": True, "reason": f"Unable to verify live position before close: {exc}"}
+      live_qty = _to_float((live_close_position or {}).get("currentQty")) or 0.0
+      correct_exit_side = (live_qty > 0 and side == "sell") or (live_qty < 0 and side == "buy")
+      if not live_qty or not correct_exit_side:
+        return {"rejected": True, "reason": "No live position exists in the direction this reduce-only order would close"}
+    if is_entry:
+      price = _live_entry_price(spot_symbol)
+    else:
+      price = _to_float((live_close_position or {}).get("markPrice"))
+      if price <= 0:
+        try:
+          price = _to_float((kucoin_futures.get_mark_price(futures_symbol) or {}).get("value"))
+        except Exception:
+          price = 0.0
+      if price <= 0 and spot_symbol in snapshot.tickers:
+        price = _to_float(snapshot.tickers[spot_symbol].price)
+    if price is None or price <= 0:
+      return {"error": "Invalid or missing live price"}
+    existing_risk_usd = 0.0
+    existing_notional_usd = 0.0
+    if is_entry:
+      proposed_stop = _to_float(stop_loss_price) or _to_float(stop_price)
+      add_on = _add_on_state(futures_symbol, side, proposed_stop, multiplier, price)
+      if add_on.get("error"):
+        return {"rejected": True, "reason": add_on["error"]}
+      existing_risk_usd = float(add_on.get("existingRiskUsd") or 0.0)
+      existing_notional_usd = float(add_on.get("existingNotionalUsd") or 0.0)
+      _conc_scale = concentration_scale(
+        notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct,
+        existing_notional_usd=existing_notional_usd,
+      )
+      if _conc_scale < 1.0:
+        logger.info("PROJECTED CONCENTRATION CAP: futures %s new notional %.2f → %.2f (existing %.2f)",
+                    spot_symbol, notional_input, notional_input * _conc_scale, existing_notional_usd)
+        notional_input *= _conc_scale
+      if notional_input <= 0:
+        return {"rejected": True, "reason": "Projected same-symbol concentration cap leaves no room for another entry"}
 
     # Risk is defined by the bracket, not notional or leverage.  Shrink any model-requested size
     # whose stop loss would exceed the configured fraction of account equity.
@@ -1865,22 +2300,19 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       entry=price,
       stop_loss=_risk_stop_fm,
       notional_usd=notional_input,
-      equity_usd=snapshot.total_usdt,
+      equity_usd=max(0.0, snapshot.total_usdt - existing_risk_usd / max(cfg.trading.risk_per_trade_pct, 1e-9)),
       risk_fraction=cfg.trading.risk_per_trade_pct,
-    )
+    ) if is_entry else 1.0
     if _risk_scale_fm < 1.0:
       logger.info("RISK-BUDGET CAP: futures %s notional %.2f → %.2f (risk <= %.2f%% equity)",
                   spot_symbol, notional_input, notional_input * _risk_scale_fm, cfg.trading.risk_per_trade_pct * 100)
       notional_input *= _risk_scale_fm
 
-    multiplier = _to_float(contract.get("multiplier"))
     lot_size = int(contract.get("lotSize") or 1)
     max_order_qty = contract.get("maxOrderQty")
     contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
     fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
     slippage_rate = cfg.trading.estimated_slippage_pct
-    if multiplier <= 0:
-      return {"error": "Invalid contract multiplier", "contract": contract}
     leverage_caps = [
       c for c in (
         snapshot.max_leverage,
@@ -1898,7 +2330,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.info("Entry leverage capped: requested %.1fx → applied %.1fx (max_entry_leverage=%.1f)", lev_requested, lev, cfg.trading.max_entry_leverage)
 
     try:
-      base_size = (float(size_override) * _risk_scale_fm) if size_override is not None else notional_input / price
+      safe_size = notional_input / price
+      base_size = min(float(size_override), safe_size) if size_override is not None else safe_size
     except (TypeError, ValueError):
       return {"error": "Invalid size_override"}
     if base_size <= 0:
@@ -1908,7 +2341,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     closing_pnl = None
     closing_roi = None
     is_closing_trade = False
-    existing_pos = next((p for p in snapshot.futures_positions if p.get("symbol") == futures_symbol), None)
+    existing_pos = live_close_position or next((p for p in snapshot.futures_positions if p.get("symbol") == futures_symbol), None)
     if existing_pos:
       try:
         pos_qty = float(existing_pos.get("currentQty") or 0)
@@ -1965,7 +2398,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             min_roi = cfg.trading.min_profit_roi_pct
             
             # For closing trades: allow any non-negative PnL. Only block actual losses without explicit keyword.
-            if net_pnl < 0 and not allow_loss_keyword:
+            if net_pnl < 0 and not reduce_only and not allow_loss_keyword:
                return {
                 "rejected": True,
                 "reason": f"Closing at a loss (expected PnL ${net_pnl:.4f}); include 'stop loss' or 'cut loss' in rationale to allow",
@@ -1987,7 +2420,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     lot = max(1, lot_size)
     contracts = int(math.ceil(contracts_raw / lot) * lot)
     if is_entry:
-      contracts = _risk_capped_contracts(contracts, lot, multiplier, price, _risk_stop_fm)
+      contracts = _risk_capped_contracts(
+        contracts, lot, multiplier, price, _risk_stop_fm, existing_risk_usd=existing_risk_usd,
+      )
       if contracts < lot:
         return {
           "rejected": True,
@@ -2002,6 +2437,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "maxPortfolioHeatPct": cfg.circuit_breaker.max_portfolio_heat_pct,
           "currentRiskUsd": _existing_futures_risk_usd(),
         }
+      contracts = _concentration_capped_contracts(
+        contracts, lot, multiplier, price, existing_notional_usd,
+      )
+      if contracts < lot:
+        return {"rejected": True, "reason": "Contract minimum exceeds remaining same-symbol concentration budget"}
+    else:
+      live_contracts = abs(int(_to_float((live_close_position or {}).get("currentQty")) or 0.0))
+      max_close_contracts = int(math.floor(live_contracts / lot) * lot)
+      contracts = min(contracts, max_close_contracts)
+      if contracts < lot:
+        return {"rejected": True, "reason": "No reducible live contracts remain"}
     actual_notional = contracts * multiplier * price
     min_notional = lot * multiplier * price
     if actual_notional < min_notional:
@@ -2014,7 +2460,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if max_order_qty and isinstance(max_order_qty, (int, float)) and contracts > max_order_qty:
       return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty, "contracts": contracts}
     notional = actual_notional
-    if notional > snapshot.max_position_usd * max_leverage_cap:
+    if is_entry and notional > snapshot.max_position_usd * max_leverage_cap:
       return {
         "rejected": True,
         "reason": "Exceeds max notional cap",
@@ -2099,14 +2545,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "tp": tp_val,
         "feeRate": fee_rate,
         "slippageRate": slippage_rate,
-        "hint": f"Widen TP farther from entry (min {min_edge_pct*100:.2f}% away), increase notional, or increase leverage to amplify the edge.",
+        "hint": f"Rebuild TP/SL from valid structural levels that clear {min_edge_pct*100:.2f}% after costs, or skip the setup. Never increase risk merely to pass this gate.",
       }
 
     protection_stop_val = sl_val or trigger_stop_val
     protection_tp_val = tp_val
     protection_price_type = (stop_price_type or "MP").upper() if (stop_price_type or "").upper() in {"TP", "MP", "IP"} else "MP"
     # Ensure required margin is funded; auto-transfer from spot if futures are empty.
-    spot_accounts = kucoin.get_accounts()
+    spot_accounts = [] if reduce_only else kucoin.get_accounts()
     spot_balance_map: Dict[str, float] = {}
     for bal in spot_accounts:
       spot_balance_map[bal.currency] = spot_balance_map.get(bal.currency, 0.0) + float(bal.available or 0)
@@ -2133,8 +2579,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         logger.warning("Futures overview unavailable: %s", exc)
 
     margin_needed = 0.0 if reduce_only else notional / lev
-    fee_allowance = notional * (fee_rate + slippage_rate)
-    buffer = max(1.0, margin_needed * 0.01)
+    fee_allowance = 0.0 if reduce_only else notional * (fee_rate + slippage_rate)
+    buffer = 0.0 if reduce_only else max(1.0, margin_needed * 0.01)
     required_futures_balance = margin_needed + fee_allowance + buffer
 
     transfer_used: dict[str, Any] | None = None
@@ -2199,7 +2645,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "available": futures_available,
         "spotAvailable": spot_usdt_available,
         "transferAttempt": transfer_used,
-        "hint": f"Need {shortfall:.2f} more USDT in futures. Try: transfer_funds('spot_to_futures', amount={min(shortfall, spot_usdt_available):.2f}), or sell a spot position to free capital, or reduce notional/increase leverage.",
+        "hint": f"Need {shortfall:.2f} more USDT in futures. Reduce requested notional or skip; do not increase leverage merely to pass a margin check.",
       }
 
     def _build_order(mode: str | None) -> KucoinFuturesOrderRequest:
@@ -2296,13 +2742,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     attempts: list[Dict[str, Any]] = []
     order_req = _build_order(margin_mode)
+    if not reduce_only:
+      try:
+        kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"))
+      except Exception as exc:
+        logger.warning("set_margin_mode failed (continuing): %s", exc)
+      _apply_cross_leverage(futures_symbol, lev, margin_mode)
     try:
-      kucoin_futures.set_margin_mode(futures_symbol, (margin_mode or "cross"))
-    except Exception as exc:
-      logger.warning("set_margin_mode failed (continuing): %s", exc)
-    _apply_cross_leverage(futures_symbol, lev, margin_mode)
-    try:
-      res = kucoin_futures.place_order(order_req).__dict__
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin_futures.place_order(order_req).__dict__
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
@@ -2337,6 +2788,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     except Exception as exc:
       attempts.append({"marginMode": margin_mode, "error": str(exc)})
 
+    if reduce_only:
+      return {
+        "error": f"Reduce-only futures close failed: {attempts[-1]['error']}",
+        "futuresSymbol": futures_symbol,
+        "attempts": attempts,
+      }
+
     # If we reach here, try the opposite mode as a fallback.
     opposite_mode = "isolated" if margin_mode == "cross" else "cross"
     order_req = _build_order(opposite_mode)
@@ -2346,7 +2804,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.warning("set_margin_mode fallback failed (continuing): %s", exc)
     _apply_cross_leverage(futures_symbol, lev, opposite_mode, context="fallback")
     try:
-      res = kucoin_futures.place_order(order_req).__dict__
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin_futures.place_order(order_req).__dict__
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
@@ -2406,8 +2868,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     """Place a futures limit entry order at a technically derived target price.
     Use for new entries where you want to wait for price to reach a key level
     (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
-    Rejects if entry_price is too close to current price — use place_futures_market_order
-    for closes or when price is already at the target level.
+    Rejects if entry_price is too close to current price; wait for a genuine limit level instead
+    of chasing. Futures market orders are reserved for closes and emergencies.
     ALWAYS pass take_profit_price AND stop_loss_price: they are attached to the order and arm
     automatically the instant it fills (KuCoin st-orders), so the position is never left unprotected
     in the gap before your next run. Decide the best entry, TP and SL together, up front."""
@@ -2416,6 +2878,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       spot_symbol = _repair_allowed_symbol(symbol)
     if not spot_symbol:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols), "requested": symbol}
+    side_lower = _normalize_futures_side(side)
+    if side_lower is None:
+      return {"error": "Invalid futures side", "allowed": ["buy", "sell", "long", "short"]}
     _pre_futures_symbol_fl = _to_futures_symbol(spot_symbol)
     if _pre_futures_symbol_fl:
       existing_pending = _pending_entry_for(_pre_futures_symbol_fl)
@@ -2432,6 +2897,19 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "reason": "Futures limit entries require both take-profit and stop-loss prices",
         "hint": "Define the atomic bracket before placing the entry so risk is bounded from the instant it fills.",
       }
+    try:
+      take_profit_price = float(take_profit_price)
+      stop_loss_price = float(stop_loss_price)
+    except (TypeError, ValueError):
+      return {"rejected": True, "reason": "Take-profit and stop-loss must be valid positive prices"}
+    if take_profit_price <= 0 or stop_loss_price <= 0:
+      return {"rejected": True, "reason": "Take-profit and stop-loss must be positive"}
+    if not cfg.trading.atomic_bracket_enabled and not snapshot.paper_trading:
+      return {
+        "rejected": True,
+        "reason": "Live futures entries require ATOMIC_BRACKET_ENABLED=true",
+        "hint": "The bot will not submit an entry that can fill without exchange-attached TP and SL.",
+      }
 
     try:
       entry_price_val = float(entry_price)
@@ -2440,8 +2918,38 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if entry_price_val <= 0:
       return {"error": "entry_price must be positive"}
 
-    side_lower = (side or "").lower()
     lev_requested = max(1.0, float(leverage or 1.0))
+
+    context_error = _entry_context_error(spot_symbol, confidence)
+    if context_error:
+      return {"rejected": True, "reason": context_error, "hint": "Analyze this symbol immediately before submitting an entry."}
+    live_entry_book = _refresh_live_futures_truth()
+    if live_entry_book.get("error"):
+      return {"rejected": True, "reason": live_entry_book["error"]}
+    initial_entry_fingerprint = live_entry_book.get("fingerprint")
+    initial_entry_equity = float(live_entry_book.get("futuresEquity") or 0.0)
+    if _pre_futures_symbol_fl:
+      existing_pending = _pending_entry_for(_pre_futures_symbol_fl)
+      if existing_pending:
+        return {
+          "rejected": True,
+          "reason": f"Live pending entry already exists for {spot_symbol}",
+          "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
+        }
+
+    if cfg.profit_protection.no_chase_enabled:
+      win = memory.recent_win_close(spot_symbol, cfg.profit_protection.post_win_cooldown_minutes)
+      if win and win.get("exitPrice") and should_block_chase(
+        close_type=win.get("closeType") or "",
+        exit_price=float(win["exitPrice"]),
+        new_side=side_lower,
+        new_price=entry_price_val,
+        buffer_pct=cfg.profit_protection.no_chase_buffer_pct,
+      ):
+        return {
+          "rejected": True,
+          "reason": f"No-chase: proposed {side_lower} entry {entry_price_val:.8g} is worse than recent profitable exit {float(win['exitPrice']):.8g}",
+        }
 
     if snapshot.trading_restricted:
       return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
@@ -2552,6 +3060,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if daily_atr_pct is not None and daily_atr_pct > cfg.trading.max_atr_pct_for_entry:
         hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
         if daily_atr_pct > hard_limit:
+          _quarantine_symbol(spot_symbol, f"daily ATR {daily_atr_pct:.2f}% exceeds {hard_limit:.2f}% hard limit")
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
         _atr_scale_fl = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
         logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fl * 100)
@@ -2608,19 +3117,30 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           logger.warning("NEW-LISTING BLOCK: %s rejected — contract age %.1fd < %.1fd minimum", futures_symbol, _age_days, cfg.trading.min_futures_listing_age_days)
           return {"rejected": True, "reason": f"New-listing guard: {futures_symbol} is {_age_days:.1f}d old (< {cfg.trading.min_futures_listing_age_days:.0f}d minimum)", "hint": "Freshly-listed perps are thin and ultra-volatile (this is how RE-USDT blew up). Wait for a real price history, or trade an established contract."}
 
-    try:
-      current_price = float(snapshot.tickers[spot_symbol].price)
-    except Exception:
-      return {"error": "Unable to fetch current price for deviation check"}
-    if current_price <= 0:
-      return {"error": "Invalid current price"}
+    current_price = _live_entry_price(spot_symbol)
+    if current_price is None:
+      return {"error": "Unable to fetch current live price for deviation check"}
+
+    tick_size = _to_float(contract.get("tickSize")) or 0.0
+    if tick_size > 0:
+      entry_price_val = _round_price_to_tick(entry_price_val, tick_size)
+      take_profit_price = _round_price_to_tick(float(take_profit_price), tick_size)
+      stop_loss_price = _round_price_to_tick(float(stop_loss_price), tick_size)
+
+    wrong_side = (side_lower == "buy" and entry_price_val >= current_price) or (side_lower == "sell" and entry_price_val <= current_price)
+    if wrong_side:
+      return {
+        "rejected": True,
+        "reason": f"Marketable/wrong-side limit: {side_lower} at {entry_price_val:.8g} versus live {current_price:.8g}",
+        "hint": "A pullback buy must rest below live price; a rally short must rest above it.",
+      }
 
     deviation = abs(entry_price_val - current_price) / current_price
     if deviation < cfg.trading.min_entry_deviation_pct:
       return {
         "rejected": True,
         "reason": f"entry_price {entry_price_val} is within {deviation*100:.3f}% of current price {current_price:.4f} (minimum deviation: {cfg.trading.min_entry_deviation_pct*100:.2f}%)",
-        "hint": "Price is already at your target — use place_futures_market_order to enter immediately, or pick a further entry_price to genuinely wait for a better level.",
+        "hint": "Do not chase with a market entry; wait for a valid pullback/rally limit or decline the setup.",
         "currentPrice": current_price,
         "entryPrice": entry_price_val,
       }
@@ -2633,6 +3153,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     slippage_rate = cfg.trading.estimated_slippage_pct
     if multiplier <= 0:
       return {"error": "Invalid contract multiplier", "contract": contract}
+
+    add_on = _add_on_state(futures_symbol, side_lower, float(stop_loss_price), multiplier, current_price)
+    if add_on.get("error"):
+      return {"rejected": True, "reason": add_on["error"]}
+    existing_risk_usd = float(add_on.get("existingRiskUsd") or 0.0)
+    existing_notional_usd = float(add_on.get("existingNotionalUsd") or 0.0)
 
     leverage_caps = [c for c in (snapshot.max_leverage, cfg.trading.max_leverage, contract_max_leverage) if c and c > 0]
     if cfg.trading.max_entry_leverage > 0:
@@ -2654,13 +3180,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
                   spot_symbol, notional_input, notional_input * _risk_scale_fl, cfg.trading.risk_per_trade_pct * 100)
       notional_input *= _risk_scale_fl
     # Concentration cap: shrink notional to <= max_position_equity_pct of total equity (blast-radius guard).
-    _conc_scale = concentration_scale(notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct)
+    _conc_scale = concentration_scale(
+      notional_input, snapshot.total_usdt, cfg.trading.max_position_equity_pct,
+      existing_notional_usd=existing_notional_usd,
+    )
     if _conc_scale < 1.0:
-      logger.info("CONCENTRATION CAP: futures limit %s notional %.2f → %.2f (<= %.0f%% of equity %.2f)",
-                  spot_symbol, notional_input, notional_input * _conc_scale, cfg.trading.max_position_equity_pct * 100, snapshot.total_usdt)
+      logger.info("PROJECTED CONCENTRATION CAP: futures limit %s new notional %.2f → %.2f (existing %.2f)",
+                  spot_symbol, notional_input, notional_input * _conc_scale, existing_notional_usd)
       notional_input *= _conc_scale
     try:
-      base_size = (float(size_override) * _risk_scale_fl) if size_override is not None else notional_input / entry_price_val
+      safe_size = notional_input / entry_price_val
+      base_size = min(float(size_override), safe_size) if size_override is not None else safe_size
     except (TypeError, ValueError):
       return {"error": "Invalid size_override"}
     if base_size <= 0:
@@ -2669,7 +3199,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
     contracts = int(math.ceil(contracts_raw / lot) * lot)
-    contracts = _risk_capped_contracts(contracts, lot, multiplier, entry_price_val, float(stop_loss_price))
+    contracts = _risk_capped_contracts(
+      contracts, lot, multiplier, entry_price_val, float(stop_loss_price),
+      existing_risk_usd=existing_risk_usd,
+    )
     if contracts < lot:
       return {
         "rejected": True,
@@ -2684,6 +3217,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "maxPortfolioHeatPct": cfg.circuit_breaker.max_portfolio_heat_pct,
         "currentRiskUsd": _existing_futures_risk_usd(),
       }
+    contracts = _concentration_capped_contracts(
+      contracts, lot, multiplier, entry_price_val, existing_notional_usd,
+    )
+    if contracts < lot:
+      return {"rejected": True, "reason": "Contract minimum exceeds remaining same-symbol concentration budget"}
     actual_notional = contracts * multiplier * entry_price_val
     min_notional = lot * multiplier * entry_price_val
     if actual_notional < min_notional:
@@ -2705,6 +3243,27 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         logger.warning("RR BLOCK: futures limit %s %s rejected — reward:risk %.2f < %.2f", side_lower, spot_symbol, _rr_fl, _req_rr_fl)
         return {"rejected": True, "reason": f"Reward:risk {_rr_fl:.2f} below minimum {_req_rr_fl:.2f}", "rr": _rr_fl, "minRr": _req_rr_fl, "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {_req_rr_fl:.1f}x the stop distance (floor rises while recent trades are net-losing). Skip setups that can't clear it."}
 
+    base_units = contracts * multiplier
+    gross_reward = (
+      (float(take_profit_price) - entry_price_val) * base_units
+      if side_lower == "buy"
+      else (entry_price_val - float(take_profit_price)) * base_units
+    )
+    round_trip_friction = (entry_price_val + float(take_profit_price)) * base_units * (fee_rate + slippage_rate)
+    expected_net_profit = gross_reward - round_trip_friction
+    expected_roi = expected_net_profit / actual_notional if actual_notional > 0 else None
+    if (
+      expected_net_profit < cfg.trading.min_net_profit_usd
+      and (expected_roi is None or expected_roi < cfg.trading.min_profit_roi_pct)
+    ):
+      return {
+        "rejected": True,
+        "reason": "Limit-entry target does not clear the fee/slippage-aware profit floor",
+        "expectedNetProfit": expected_net_profit,
+        "expectedRoi": expected_roi,
+        "roundTripFriction": round_trip_friction,
+      }
+
     expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
     pending_protection = {"takeProfitPrice": take_profit_price, "stopLossPrice": stop_loss_price}
     # Attach TP/SL to the entry itself (KuCoin st-orders) when both are supplied, so a limit fill that
@@ -2722,17 +3281,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     )
 
     def _submit(oq: KucoinFuturesOrderRequest) -> Dict[str, Any]:
-      """Place the entry with an atomic TP/SL bracket when possible; fall back to a plain order
-      (poll-loop safety net then protects it) so a bracket-endpoint hiccup never blocks the trade."""
-      if _use_bracket:
-        try:
-          r = kucoin_futures.place_bracket_order(oq, take_profit_price, stop_loss_price, stop_price_type="MP").__dict__
-          r["bracketAttached"] = True
-          return r
-        except Exception as bexc:
-          logger.warning("Atomic bracket (st-orders) failed for %s — placing plain limit; safety net will protect on fill: %s", futures_symbol, bexc)
-      r = kucoin_futures.place_order(oq).__dict__
-      r["bracketAttached"] = False
+      """Place only an exchange-atomic entry bracket; never fall back to naked exposure."""
+      if not _use_bracket:
+        raise RuntimeError("Atomic TP/SL bracket is unavailable")
+      r = kucoin_futures.place_bracket_order(
+        oq, take_profit_price, stop_loss_price, stop_price_type="MP",
+      ).__dict__
+      r["bracketAttached"] = True
       return r
 
     def _build_limit_order(mode: str | None) -> KucoinFuturesOrderRequest:
@@ -2762,7 +3317,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
         "size": contracts, "reduceOnly": False,
       }
-      record = memory.record_trade(spot_symbol, side, actual_notional, paper=True, price=entry_price_val, size=contracts * multiplier, venue="futures")
+      record = memory.record_trade(
+        spot_symbol, side_lower, actual_notional, paper=True, price=entry_price_val,
+        size=contracts * multiplier, venue="futures", filled=False, track_position=False,
+        client_oid=order_req.clientOid,
+      )
       decision = None
       if confidence is not None:
         decision = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "paper futures limit entry", paper=True)
@@ -2800,61 +3359,79 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     order_req = _build_limit_order(margin_mode)
     try:
-      kucoin_futures.set_margin_mode(futures_symbol, margin_mode)
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        final_entry_book = _refresh_live_futures_truth()
+        if final_entry_book.get("error"):
+          return {"rejected": True, "reason": final_entry_book["error"]}
+        if final_entry_book.get("fingerprint") != initial_entry_fingerprint:
+          return {
+            "rejected": True,
+            "reason": "Account positions, protection, pending orders, or equity changed while this entry was being prepared",
+            "hint": "Refresh analysis and size from the latest complete snapshot before retrying.",
+          }
+        final_equity = float(final_entry_book.get("futuresEquity") or 0.0)
+        if initial_entry_equity > 0 and final_equity < initial_entry_equity * 0.995:
+          return {
+            "rejected": True,
+            "reason": "Live futures equity fell materially while this entry was being prepared",
+            "hint": "Recompute the lifecycle risk budget from the latest account equity.",
+          }
+        try:
+          kucoin_futures.set_margin_mode(futures_symbol, margin_mode)
+        except Exception as exc:
+          logger.warning("set_margin_mode failed (continuing): %s", exc)
+        _apply_cross_leverage(futures_symbol, lev, margin_mode)
+        res = _submit(order_req)
     except Exception as exc:
-      logger.warning("set_margin_mode failed (continuing): %s", exc)
-    _apply_cross_leverage(futures_symbol, lev, margin_mode)
-    try:
-      res = _submit(order_req)
-      _runtime_oid = str(res.get("orderId") or res.get("clientOid") or order_req.clientOid)
-      _runtime_futures_pending[_runtime_oid] = {
-        "orderId": res.get("orderId"), "clientOid": res.get("clientOid") or order_req.clientOid,
+      _runtime_futures_pending[order_req.clientOid] = {
+        "clientOid": order_req.clientOid,
         "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
-        "size": contracts, "reduceOnly": False,
+        "size": contracts, "reduceOnly": False, "acknowledgementUncertain": True,
       }
+      return {
+        "uncertain": True,
+        "pendingLimitEntry": True,
+        "reason": f"Atomic bracket acknowledgement was ambiguous: {exc}",
+        "futuresSymbol": futures_symbol,
+        "orderRequest": order_req.__dict__,
+        "hint": "Do NOT retry in this run. Check live pending orders/position on the next poll; no plain fallback was attempted.",
+      }
+
+    # Exchange acknowledgement is authoritative. Register the pending order before optional local
+    # logging so a disk/memory failure can never make the model retry an already-live entry.
+    _runtime_oid = str(res.get("orderId") or res.get("clientOid") or order_req.clientOid)
+    _runtime_futures_pending[_runtime_oid] = {
+      "orderId": res.get("orderId"), "clientOid": res.get("clientOid") or order_req.clientOid,
+      "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
+      "size": contracts, "reduceOnly": False,
+    }
+    try:
+      res["tradeRecord"] = memory.record_trade(
+        spot_symbol, side_lower, actual_notional, paper=False,
+        price=entry_price_val, size=contracts * multiplier, venue="futures", filled=False,
+        track_position=False, order_id=res.get("orderId"),
+        client_oid=res.get("clientOid") or order_req.clientOid,
+      )
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
-      res["pendingLimitEntry"] = True
-      res["entryPrice"] = entry_price_val
-      res["currentPrice"] = current_price
-      res["deviationPct"] = round(deviation * 100, 3)
-      res["contracts"] = contracts
-      res["futuresSymbol"] = futures_symbol
-      res["appliedLeverage"] = lev
-      res["leverageClampedFrom"] = lev_requested if leverage_clamped else None
-      res["expiresAt"] = expiry_ts
-      res["pendingProtection"] = pending_protection
-      res["note"] = note
-      return res
     except Exception as exc:
-      # Fallback: try opposite margin mode
-      opposite_mode = "isolated" if margin_mode == "cross" else "cross"
-      order_req = _build_limit_order(opposite_mode)
-      try:
-        kucoin_futures.set_margin_mode(futures_symbol, opposite_mode)
-        _apply_cross_leverage(futures_symbol, lev, opposite_mode, context="fallback")
-        res = _submit(order_req)
-        _runtime_oid = str(res.get("orderId") or res.get("clientOid") or order_req.clientOid)
-        _runtime_futures_pending[_runtime_oid] = {
-          "orderId": res.get("orderId"), "clientOid": res.get("clientOid") or order_req.clientOid,
-          "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
-          "size": contracts, "reduceOnly": False,
-        }
-        if confidence is not None:
-          res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
-        res["pendingLimitEntry"] = True
-        res["entryPrice"] = entry_price_val
-        res["currentPrice"] = current_price
-        res["deviationPct"] = round(deviation * 100, 3)
-        res["contracts"] = contracts
-        res["futuresSymbol"] = futures_symbol
-        res["appliedLeverage"] = lev
-        res["expiresAt"] = expiry_ts
-        res["pendingProtection"] = pending_protection
-        res["note"] = note
-        return res
-      except Exception as exc2:
-        return {"error": f"Futures limit order failed: {exc2}", "firstAttemptError": str(exc), "futuresSymbol": futures_symbol}
+      logger.error("Live futures entry %s was placed but local memory logging failed: %s", _runtime_oid, exc)
+      res["memoryError"] = str(exc)
+    res["pendingLimitEntry"] = True
+    res["entryPrice"] = entry_price_val
+    res["currentPrice"] = current_price
+    res["deviationPct"] = round(deviation * 100, 3)
+    res["contracts"] = contracts
+    res["futuresSymbol"] = futures_symbol
+    res["appliedLeverage"] = lev
+    res["leverageClampedFrom"] = lev_requested if leverage_clamped else None
+    res["expiresAt"] = expiry_ts
+    res["pendingProtection"] = pending_protection
+    res["note"] = note
+    return res
 
   async def _place_futures_stop_order_impl(
     symbol: str,
@@ -2873,6 +3450,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     client_oid: str | None = None,
   ) -> Dict[str, Any]:
     """Place a futures stop/TP/SL order (works for reduce-only hedges)."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     requested_symbol = symbol
     symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not symbol:
@@ -2920,11 +3500,6 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       margin_mode = _futures_margin_mode
 
     margin_mode_norm = margin_mode.upper() if margin_mode else None
-    try:
-      kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS")
-    except Exception as exc:
-      logger.warning("set_margin_mode failed for stop order (continuing): %s", exc)
-    _apply_cross_leverage(futures_symbol, lev, margin_mode, context="stop order")
     order_req = KucoinFuturesOrderRequest(
       symbol=futures_symbol,
       side="buy" if side == "buy" else "sell",
@@ -2946,7 +3521,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if snapshot.paper_trading:
       return {"paper": True, "orderRequest": order_req.__dict__}
     try:
-      res = kucoin_futures.place_order(order_req).__dict__
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        if not reduce_only and not close_order:
+          try:
+            kucoin_futures.set_margin_mode(futures_symbol, margin_mode_norm or "CROSS")
+          except Exception as exc:
+            logger.warning("set_margin_mode failed for stop order (continuing): %s", exc)
+          _apply_cross_leverage(futures_symbol, lev, margin_mode, context="stop order")
+        res = kucoin_futures.place_order(order_req).__dict__
       res["orderRequest"] = order_req.__dict__
       return res
     except Exception as exc:
@@ -2990,13 +3575,20 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def cancel_futures_order(order_id: str, symbol: str | None = None) -> Dict[str, Any]:
     """Cancel a futures order (stop or regular) by orderId."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if snapshot.paper_trading:
       _runtime_futures_pending.pop(str(order_id), None)
       return {"paper": True, "cancelled": {"orderId": order_id, "symbol": symbol}}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"error": "Futures disabled in config"}
     try:
-      res = kucoin_futures.cancel_order(order_id, symbol=symbol)
+      with _exchange_write_lock():
+        authority_error = _authority_error()
+        if authority_error:
+          return {"rejected": True, "reason": authority_error}
+        res = kucoin_futures.cancel_order(order_id, symbol=symbol)
       _runtime_futures_pending.pop(str(order_id), None)
       # Some snapshots key an order by clientOid while cancellation uses exchange orderId.
       for _key, _order in list(_runtime_futures_pending.items()):
@@ -3310,6 +3902,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     cancel_existing: bool = True,
   ) -> Dict[str, Any]:
     """Add or replace TP/SL for an existing open futures position using reduce-only close orders."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     requested_symbol = symbol
     symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not symbol:
@@ -3363,29 +3958,49 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     cancelled: list[Dict[str, Any]] = []
     cancel_errors: list[Dict[str, Any]] = []
-    if cancel_existing:
-      try:
-        active_orders = kucoin_futures.list_stop_orders(status="active", symbol=futures_symbol) or []
-      except Exception as exc:
-        active_orders = []
-        cancel_errors.append({"stage": "list", "error": str(exc)})
-      for order in active_orders:
-        if not isinstance(order, dict):
-          continue
-        order_side = str(order.get("side") or "").lower()
-        if order_side and order_side != exit_side:
-          continue
-        order_id = str(order.get("id") or order.get("orderId") or "").strip()
-        if not order_id:
-          continue
-        if snapshot.paper_trading:
-          cancelled.append({"paper": True, "orderId": order_id, "symbol": futures_symbol})
-          continue
-        try:
-          res = kucoin_futures.cancel_order(order_id, symbol=futures_symbol)
-          cancelled.append({"orderId": order_id, "response": res})
-        except Exception as exc:
-          cancel_errors.append({"orderId": order_id, "error": str(exc)})
+    try:
+      active_orders = kucoin_futures.list_stop_orders(status="active", symbol=futures_symbol) or []
+    except Exception as exc:
+      # Replacement without knowing the live stop set is unsafe: we could loosen protection or
+      # cancel the wrong lifecycle. Existing exchange protection remains untouched.
+      return {"error": f"Unable to verify existing protection: {exc}", "futuresSymbol": futures_symbol}
+
+    tick_size = _to_float(contract.get("tickSize")) if contract else None
+    if tick_size and tick_size > 0:
+      if sl_val:
+        sl_val = _round_price_to_tick(sl_val, tick_size)
+      if tp_val:
+        tp_val = _round_price_to_tick(tp_val, tick_size)
+
+    mark_price = _to_float(position.get("markPrice")) or _live_entry_price(symbol) or 0.0
+    if tp_val and mark_price > 0:
+      invalid_tp_side = tp_val <= mark_price if current_qty > 0 else tp_val >= mark_price
+      if invalid_tp_side:
+        return {
+          "error": "Take profit is on the wrong side of the live mark price",
+          "takeProfit": tp_val,
+          "markPrice": mark_price,
+        }
+    stop_adjustment = None
+    existing_loss_prices = [
+      _to_float(order.get("stopPrice"))
+      for order in active_orders
+      if isinstance(order, dict)
+      and str(order.get("side") or "").lower() == exit_side
+      and (_order_flag(order.get("reduceOnly")) or _order_flag(order.get("closeOrder")))
+      and str(order.get("stop") or "").lower() == sl_stop
+      and _to_float(order.get("stopPrice"))
+    ]
+    if sl_val and existing_loss_prices:
+      strongest = max(existing_loss_prices) if current_qty > 0 else min(existing_loss_prices)
+      loosens = sl_val < strongest if current_qty > 0 else sl_val > strongest
+      if loosens:
+        stop_adjustment = {"requested": sl_val, "keptAtLeast": strongest, "reason": "stop protection is monotonic"}
+        sl_val = strongest
+    if sl_val and mark_price > 0:
+      invalid_side = sl_val >= mark_price if current_qty > 0 else sl_val <= mark_price
+      if invalid_side:
+        return {"error": "Stop loss is already beyond the live mark price", "stopLoss": sl_val, "markPrice": mark_price}
 
     bracket: Dict[str, Any] = {}
     if sl_val:
@@ -3402,13 +4017,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         order_type="market",
         client_oid=f"{futures_symbol.lower()}-sl-{uuid.uuid4().hex[:12]}",
       )
+      if bracket["stopLoss"].get("error"):
+        return {
+          "error": "Replacement stop placement failed; existing protection was preserved",
+          "replacement": bracket["stopLoss"],
+          "stopAdjustment": stop_adjustment,
+          "cancelledOrders": [],
+        }
     if tp_val:
       if cfg.trading.partial_tp_enabled and base_size > 0:
         contract_spec = _get_contract_spec(futures_symbol) or {}
         lot_size = int(contract_spec.get("lotSize") or 1)
-        cur_price = float(snapshot.tickers.get(symbol, next(iter(snapshot.tickers.values()))).price) if snapshot.tickers else 0.0
+        cur_price = mark_price
         tp_distance = abs(tp_val - cur_price) if cur_price > 0 else 0
         tp1_price = cur_price + tp_distance * 0.6 * (1 if current_qty > 0 else -1) if tp_distance > 0 else tp_val
+        if tick_size and tick_size > 0:
+          tp1_price = _round_price_to_tick(tp1_price, tick_size)
         tp2_price = tp_val
         raw_contracts = abs(current_qty)
         size_t1 = int(raw_contracts * 0.6 / lot_size) * lot_size
@@ -3456,6 +4080,45 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           client_oid=f"{futures_symbol.lower()}-tp-{uuid.uuid4().hex[:12]}",
         )
 
+    def _placement_ok(result: Any) -> bool:
+      if not isinstance(result, dict) or result.get("error"):
+        return False
+      if result.get("staged"):
+        tranches = result.get("tranches") or []
+        return bool(tranches) and all(_placement_ok(item.get("result")) for item in tranches)
+      return bool(result.get("paper") or result.get("orderId") or result.get("clientOid"))
+
+    replace_dirs: set[str] = set()
+    if sl_val and _placement_ok(bracket.get("stopLoss")):
+      replace_dirs.add(sl_stop)
+    if tp_val and _placement_ok(bracket.get("takeProfit")):
+      replace_dirs.add(tp_stop)
+    if cancel_existing:
+      for order in active_orders:
+        if not isinstance(order, dict) or str(order.get("stop") or "").lower() not in replace_dirs:
+          continue
+        order_side = str(order.get("side") or "").lower()
+        if order_side != exit_side:
+          continue
+        if not (_order_flag(order.get("reduceOnly")) or _order_flag(order.get("closeOrder"))):
+          continue
+        order_id = str(order.get("id") or order.get("orderId") or "").strip()
+        if not order_id:
+          continue
+        if snapshot.paper_trading:
+          cancelled.append({"paper": True, "orderId": order_id, "symbol": futures_symbol})
+          continue
+        try:
+          with _exchange_write_lock():
+            authority_error = _authority_error()
+            if authority_error:
+              cancel_errors.append({"orderId": order_id, "error": authority_error})
+              continue
+            res = kucoin_futures.cancel_order(order_id, symbol=futures_symbol)
+          cancelled.append({"orderId": order_id, "response": res})
+        except Exception as exc:
+          cancel_errors.append({"orderId": order_id, "error": str(exc)})
+
     return {
       "symbol": symbol,
       "futuresSymbol": futures_symbol,
@@ -3466,6 +4129,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "cancelledOrders": cancelled,
       "cancelErrors": cancel_errors,
       "bracket": bracket,
+      "stopAdjustment": stop_adjustment,
       "position": position,
     }
 
@@ -3478,6 +4142,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     amount: float = 0.0,
   ) -> Dict[str, Any]:
     """Transfer funds between spot (trade), futures (contract), and financial (earn/pool)."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     dir_norm = (direction or "").lower()
     allowed_dirs = {
       "spot_to_futures",
@@ -3689,6 +4356,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def refresh_fee_rates() -> Dict[str, Any]:
     """Fetch latest fee rates (spot base fee). Futures fee not provided by API; keep previous/default."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     try:
       base_fee = kucoin.get_base_fee()
       spot_taker = float(base_fee.get("takerFeeRate") or 0.001)
@@ -3708,6 +4378,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def save_trade_plan(title: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Persist a trading plan (title, summary, actions) for recall."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     return memory.save_plan(title=title, summary=summary, actions=actions, author="Trading Agent")
 
   @function_tool
@@ -3725,6 +4398,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def clear_plans() -> Dict[str, Any]:
     """Clear all stored plans and triggers."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     return memory.clear_plans()
 
   @function_tool
@@ -3736,6 +4412,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     stop_price: float | None = None,
   ) -> Dict[str, Any]:
     """Store an auto-buy/sell trigger idea (persists to disk for follow-up by future runs)."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     symbol = _normalize_symbol(symbol)
     if symbol not in allowed_symbols:
       return {"error": "Unsupported symbol", "allowed": sorted(allowed_symbols)}
@@ -3759,7 +4438,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   @function_tool
   async def add_coin(symbol: str, reason: str) -> Dict[str, Any]:
-    """Add a coin to the active universe (requires reason). The symbol is validated against KuCoin first."""
+    """Add a risk-eligible coin after fresh context, liquidity, maturity, and volatility checks."""
     if not symbol:
       return {"error": "symbol required"}
     norm = _normalize_symbol(symbol)
@@ -3767,22 +4446,83 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       kucoin.get_ticker(norm)
     except Exception:
       return {"error": f"Symbol {norm} not found on KuCoin. Verify the symbol exists before adding."}
+    context_error = _entry_context_error(norm, confidence=1.0)
+    if context_error:
+      return {"rejected": True, "reason": f"Cannot add {norm}: {context_error}"}
+    gate = _gate_for(norm)
+    daily_atr = _to_float(gate.get("daily_atr_pct"))
+    atr_hard = float(cfg.trading.max_atr_pct_for_entry) * 1.5
+    if daily_atr is None or daily_atr > atr_hard:
+      return {"rejected": True, "reason": f"Cannot add {norm}: daily ATR is invalid or above {atr_hard:.1f}%"}
+    extreme_move = _extreme_24h_move(norm)
+    if extreme_move is not None:
+      return {"rejected": True, "reason": f"Cannot add {norm}: 24h move {extreme_move:+.2f}% exceeds safety cap"}
+    fsym = _to_futures_symbol(norm)
+    contract = _get_contract_spec(fsym) if fsym else None
+    if not contract:
+      return {"rejected": True, "reason": f"Cannot add {norm}: active futures contract unavailable"}
+    turnover = _to_float(contract.get("turnoverOf24h")) or 0.0
+    if turnover < cfg.trading.screener_min_turnover_usd_24h:
+      return {"rejected": True, "reason": f"Cannot add {norm}: 24h turnover {turnover:.0f} below liquidity floor"}
+    first_open = _to_float(contract.get("firstOpenDate")) or 0.0
+    first_open_sec = first_open / 1000.0 if first_open > 1e12 else first_open
+    if first_open_sec and (time.time() - first_open_sec) / 86400.0 < cfg.trading.min_futures_listing_age_days:
+      return {"rejected": True, "reason": f"Cannot add {norm}: futures contract is too new"}
     entry = memory.add_coin(norm, reason)
     return {"added": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
   async def remove_coin(symbol: str, reason: str, exit_plan: str) -> Dict[str, Any]:
     """Remove a coin from the active universe with an exit plan noted."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if not symbol:
       return {"error": "symbol required"}
     if not exit_plan:
       return {"error": "exit_plan required to remove coin"}
-    entry = memory.remove_coin(_normalize_symbol(symbol), reason, exit_plan)
+    norm = _normalize_symbol(symbol)
+    futures_symbol = _to_futures_symbol(norm)
+    live_position = any(
+      str(position.get("symbol") or "") == futures_symbol
+      and abs(_to_float(position.get("currentQty"))) > 0
+      for position in (snapshot.futures_positions or [])
+      if isinstance(position, dict)
+    )
+    pending_order = any(
+      str(order.get("symbol") or "") == futures_symbol
+      for order in (snapshot.futures_pending_orders or [])
+      if isinstance(order, dict)
+    )
+    if kucoin_futures and futures_symbol:
+      try:
+        current_position = kucoin_futures.get_position(futures_symbol) or {}
+        live_position = live_position or abs(_to_float(current_position.get("currentQty"))) > 0
+        live_orders = kucoin_futures.list_orders(status="active") or []
+        pending_order = pending_order or any(
+          str(order.get("symbol") or "") == futures_symbol
+          for order in live_orders if isinstance(order, dict)
+        )
+      except Exception as exc:
+        return {
+          "rejected": True,
+          "reason": f"Cannot verify {norm} is flat before removal: {exc}",
+        }
+    if live_position or pending_order or _spot_position_size(norm) > 0:
+      return {
+        "rejected": True,
+        "reason": f"Cannot remove {norm} while a live position or pending order still requires management",
+        "exitPlan": exit_plan,
+      }
+    entry = memory.remove_coin(norm, reason, exit_plan)
     return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
   async def log_sentiment(symbol: str, score: float, rationale: str, source: str = "") -> Dict[str, Any]:
     """Store a sentiment score (0-1) with rationale and source for gating trades."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     try:
       score_val = float(score)
     except (TypeError, ValueError):
@@ -3802,6 +4542,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     paper: bool = False,
   ) -> Dict[str, Any]:
     """Record decision/confidence for calibration."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if not symbol:
       return {"error": "symbol required"}
     try:
@@ -3894,6 +4637,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def log_research(topic: str, summary: str, actions: List[str]) -> Dict[str, Any]:
     """Record a research note/strategy idea (persists in memory)."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if not topic or not summary:
       return {"error": "topic and summary required"}
     return memory.save_plan(title=f"Research: {topic}", summary=summary, actions=actions, author="Research Agent")
@@ -3901,6 +4647,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def add_source(name: str, url: str, reason: str) -> Dict[str, Any]:
     """Add a data/research source to memory."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if not name or not url:
       return {"error": "name and url required"}
     entry = memory.save_plan(title=f"Source: {name}", summary=url, actions=[reason or ""], author="Research Agent")
@@ -3909,6 +4658,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   @function_tool
   async def remove_source(name: str, reason: str) -> Dict[str, Any]:
     """Mark a data/research source as removed."""
+    authority_error = _authority_error()
+    if authority_error:
+      return {"rejected": True, "reason": authority_error}
     if not name or not reason:
       return {"error": "name and reason required"}
     entry = memory.save_plan(title=f"Removed Source: {name}", summary=reason, actions=[], author="Research Agent")

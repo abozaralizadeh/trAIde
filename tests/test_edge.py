@@ -97,7 +97,7 @@ def test_symbol_rr_raised_only_for_the_losing_symbol():
               + [_close("ETH-USDT", 0.1, 100 + i) for i in range(2)]   # net still negative
               + [_close("ADA-USDT", 0.2, 200 + i) for i in range(2)])
     stats = edge_stats(closes, 30)
-    assert symbol_adaptive_rr("ETH-USDT", stats, 1.5, _cfg()) == 2.0   # net-negative symbol → raised
+    assert symbol_adaptive_rr("ETH-USDT", stats, 1.5, _cfg(), now=202) == 2.0  # net-negative symbol → raised
     assert symbol_adaptive_rr("ADA-USDT", stats, 1.5, _cfg()) == 1.5   # winning symbol → base
     assert symbol_adaptive_rr("XRP-USDT", stats, 1.5, _cfg()) == 1.5   # no history → base
 
@@ -106,6 +106,20 @@ def test_symbol_rr_needs_min_trades():
     # A single bad close shouldn't raise the floor on noise (symbol_rr_min_trades=2).
     stats = edge_stats([_close("ADA-USDT", -0.5, 1)], 30)
     assert symbol_adaptive_rr("ADA-USDT", stats, 1.5, _cfg()) == 1.5
+
+
+def test_symbol_rr_decays_when_that_symbols_outcomes_are_stale():
+    base_ts = 1_000_000
+    closes = [
+        _close("ETH-USDT", -0.5, base_ts),
+        _close("ETH-USDT", -0.5, base_ts + 1),
+        # A fresh close on another symbol must not make ETH's own losses fresh.
+        _close("ADA-USDT", 0.5, base_ts + 30 * 3600),
+    ]
+    stats = edge_stats(closes, 30)
+    assert stats["per_symbol"]["ETH-USDT"]["last_close_ts"] == base_ts + 1
+    assert symbol_adaptive_rr("ETH-USDT", stats, 1.5, _cfg(), now=base_ts + 3600) == 2.0
+    assert symbol_adaptive_rr("ETH-USDT", stats, 1.5, _cfg(), now=base_ts + 30 * 3600) == 1.5
 
 
 def test_symbol_rr_disabled_or_base_zero():
@@ -198,6 +212,22 @@ def test_realized_closes_keeps_distinct_pnls(tmp_path):
     assert len(mem.realized_closes()) == 2
 
 
+def test_realized_closes_includes_explicit_close_without_exchange_duplicate(tmp_path):
+    mem = MemoryStore(str(tmp_path / "mem.json"), retention_days=7)
+    mem.log_decision("XRP-USDT", "futures_close", 0.8, "manual risk close", pnl=-0.01)
+    assert [row["action"] for row in mem.realized_closes()] == ["futures_close"]
+
+
+def test_hold_pnl_rows_do_not_evict_real_close_outcomes(tmp_path):
+    mem = MemoryStore(str(tmp_path / "mem.json"), retention_days=7)
+    mem.log_decision("ETH-USDT", "futures_sell_triggered", 0.0, "close", pnl=1.0)
+    for i in range(240):
+        mem.log_decision("ETH-USDT", "hold", 0.7, f"snapshot {i}", pnl=-0.1)
+    actions = [row["action"] for row in mem._read()["decisions"]]
+    assert "futures_sell_triggered" in actions
+    assert actions.count("hold") <= 51
+
+
 def test_seen_close_ids_persist(tmp_path):
     path = str(tmp_path / "mem.json")
     mem = MemoryStore(path, retention_days=7)
@@ -207,3 +237,22 @@ def test_seen_close_ids_persist(tmp_path):
     # a fresh instance (= restart) still sees them
     mem2 = MemoryStore(path, retention_days=7)
     assert set(mem2.get_seen_close_ids()) == {"pos-123", "pos-456"}
+
+
+def test_seen_fill_ids_persist(tmp_path):
+    path = str(tmp_path / "mem.json")
+    mem = MemoryStore(path, retention_days=7)
+    mem.record_seen_fill_id("fill-123")
+    mem.record_seen_fill_id("fill-123")
+    assert MemoryStore(path, retention_days=7).get_seen_fill_ids() == ["fill-123"]
+
+
+def test_open_interest_trend_uses_aged_observation(tmp_path):
+    mem = MemoryStore(str(tmp_path / "mem.json"), retention_days=7)
+    assert mem.observe_open_interest("ETH-USDT", 1000, price=100, now=1000)["trend"] is None
+    assert mem.observe_open_interest("ETH-USDT", 1100, price=101, now=1100)["trend"] is None
+    observed = mem.observe_open_interest("ETH-USDT", 1100, price=102, now=1300)
+    assert observed["trend"] == "up"
+    assert observed["changePct"] == 10.0
+    assert observed["priceTrend"] == "up"
+    assert observed["priceChangePct"] == 2.0

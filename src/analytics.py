@@ -65,10 +65,15 @@ def compute_indicators(df: pd.DataFrame, settings: IndicatorSettings | None = No
   loss = (-delta).clip(lower=0)
   avg_gain = gain.ewm(alpha=1 / settings.rsi_length, adjust=False).mean()
   avg_loss = loss.ewm(alpha=1 / settings.rsi_length, adjust=False).mean()
-  # Avoid silent downcasting warning by using mask instead of replace -> ffill.
-  avg_loss = avg_loss.mask(avg_loss == 0).ffill()
   rs = avg_gain / avg_loss
-  out["rsi"] = 100 - (100 / (1 + rs))
+  rsi = 100 - (100 / (1 + rs))
+  no_gain = avg_gain.eq(0)
+  no_loss = avg_loss.eq(0)
+  # Define the zero-denominator cases explicitly: uninterrupted gains/losses sit at
+  # the corresponding extreme, while an unchanged market has neutral momentum.
+  rsi = rsi.mask(avg_gain.gt(0) & no_loss, 100.0)
+  rsi = rsi.mask(no_gain & avg_loss.gt(0), 0.0)
+  out["rsi"] = rsi.mask(no_gain & no_loss, 50.0)
 
   # ATR
   out["true_range"] = _compute_true_range(out)

@@ -555,7 +555,10 @@ async def _run_agent_with_tracing(
     tr = provider.create_trace(run_name, trace_id=unique_trace_id)
     tr.start(mark_as_current=True)
     try:
-      return await Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns)
+      return await asyncio.wait_for(
+        Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns),
+        timeout=20 * 60,
+      )
     finally:
       try:
         tr.finish(reset_current=True)
@@ -658,6 +661,8 @@ def run_trading_agent(
   langsmith_client: Any | None = None,
   recent_fills: Dict[str, Any] | None = None,
   force_research: bool = False,
+  safety_state: Any | None = None,
+  entry_token: str | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   if openai_client is None:
@@ -689,6 +694,14 @@ def run_trading_agent(
   unique_span_id = gen_span_id()
 
   allowed_symbols = set(snapshot.tickers.keys())
+  # A symbol removed from the research universe must remain manageable until every live futures
+  # position and pending order is flat/cancelled. Otherwise the next run cannot close or protect it.
+  for row in (snapshot.futures_positions or []) + (snapshot.futures_pending_orders or []):
+    if not isinstance(row, dict):
+      continue
+    live_symbol = _normalize_symbol(str(row.get("symbol") or ""))
+    if live_symbol:
+      allowed_symbols.add(live_symbol)
   # Use the configured learning horizon here too.  The per-run store previously defaulted to seven
   # days and pruned outcomes that the main loop intended to retain for longer, making adaptive edge
   # controls forget losses simply because the agent ran.
@@ -1019,6 +1032,8 @@ def run_trading_agent(
     _spot_position_info=_spot_position_info,
     _spot_position_size=_spot_position_size,
     _stop_distance_ok=_stop_distance_ok,
+    safety_state=safety_state,
+    entry_token=entry_token,
   ))
   place_market_order = _tools.place_market_order
   place_limit_order = _tools.place_limit_order
@@ -1072,13 +1087,12 @@ def run_trading_agent(
     "You are a quantitative intraday crypto trader. Your mission is to grow the account by finding and executing profitable trades "
     "with proper risk management (TP + SL on every position).\n\n"
 
-    "## CRITICAL — You must trade, not spectate:\n"
-    "- Your DEFAULT is to place a trade every run. Declining is a failure unless conditions are clearly dangerous.\n"
-    "- 'Price is near resistance', 'extended', 'stretched', 'no strong catalyst' — these are NOT reasons to decline. "
-    "They are reasons to adjust size, tighten stops, or choose a different entry point.\n"
-    "- The ONLY valid reasons to decline: strong opposing trend on 1h, clearly negative breaking news, "
-    "or RSI extreme (>80 or <20) directly against your intended direction.\n"
-    "- If a setup has no demonstrated edge after fees, stand aside. Never manufacture a trade to satisfy activity.\n"
+    "## CRITICAL — Trade only when there is real edge:\n"
+    "- Your default is to screen efficiently and place a trade only when fresh, complete data shows a liquid setup "
+    "with positive expected value after fees that clears every code-enforced risk and edge gate.\n"
+    "- Declining is correct when no setup naturally offers a structure-based invalidation and reachable target at the "
+    "required reward:risk, or when data-quality, cooldown, volatility, concentration, or circuit-breaker gates block it.\n"
+    "- Never manufacture confidence, loosen protection, increase risk, or force a fill merely to create activity.\n"
     "- You are FULLY AUTONOMOUS. NEVER write 'If you want...', 'Would you like...', or 'Do you want...'. "
     "Just execute. No one is reading your output interactively.\n"
     "- DIVERSIFY: if the primary coin is blocked or has no edge, move to the next screened candidate. "
@@ -1095,8 +1109,9 @@ def run_trading_agent(
     "- For any open position missing a TP or SL: use set_spot_position_protection or set_futures_position_protection "
     "to add the bracket BEFORE looking for new trades.\n"
     "- Cancel stale stop orders (stop exists but no position) via cancel_spot_stop_order.\n"
-    "- Check the 'staleStops' field: if any stop order has its price far above/below market "
-    "(e.g., stop-loss above current price), cancel it and replace with a proper stop based on current support/ATR.\n"
+    "- Check the 'staleStops' field. Cancel an orphaned stop only when no position exists. For an open position, use "
+    "set_spot_position_protection or set_futures_position_protection to place and confirm valid replacement protection; "
+    "never cancel the only loss-side stop first. If replacement fails, retain the existing protection and report it.\n"
     "- Check 'pendingLimitOrders' in your input for any limit entries still waiting to fill:\n"
     "  * If a pending order's symbol now appears in open positions (it filled): immediately place bracket TP/SL via "
     "set_spot_position_protection or set_futures_position_protection.\n"
@@ -1107,18 +1122,25 @@ def run_trading_agent(
     "## STEP 1b — Review protection on existing positions:\n"
     "- Check the 'positions' field in your input — it lists every coin you hold in spot with netSize, avgEntry, "
     "unrealizedPnl, and currentPrice.\n"
-    "- Exits are handled automatically by TP/SL stop orders — do NOT manually sell. Instead, ensure every position "
-    "has proper protection and adjust levels when conditions change.\n"
+    "- Prefer exchange TP/SL orders for exits. Use a reduce-only market close only for an emergency, hard risk limit, "
+    "or clear thesis invalidation — never as a new entry.\n"
     "- If a position has no TP or SL: set them immediately via set_spot_position_protection or set_futures_position_protection.\n"
-    "- If momentum is shifting (RSI divergence, EMA cross against, trend weakening): tighten the SL or lower the TP to lock in gains.\n"
-    "- If momentum is strengthening in your favor: consider trailing the SL up or raising the TP.\n"
+    "- Protection is monotonic after entry: a replacement SL may preserve or improve protection but must never widen "
+    "the existing loss. Place and confirm the new stop before retiring the old one.\n"
+    "- Existing exposure is not grandfathered past thesis failure: if fresh 15m AND 1h biases both oppose the position, "
+    "treat that as a confirmed intraday reversal even when 4h/1D still lag. Reassess for a reduce-only close or a "
+    "structurally tighter stop; never keep or add merely because the daily trend still agrees.\n"
+    "- Revise an SL or TP only to a defensible structural level; do not mechanically squeeze a bracket to make a metric pass.\n"
+    "- The code-driven protection loop runs every poll and may move a stop to breakeven or close a position at the "
+    "hard unrealized-loss equity cap. Never re-open or weaken protection to override that safety action.\n"
     "- For positions with unknown avgEntry: estimate a reasonable SL based on current support/ATR and set protection.\n\n"
 
     "## STEP 1c — Portfolio health review (unlisted/unknown-entry holdings):\n"
     "- Check 'unlistedHoldings' in your input: these are coins you hold but that were NOT in your active coin list, "
     "often bought externally. They have unknown entry prices.\n"
     "- For EACH unlisted holding:\n"
-    "  1. Research the coin: call web_search for recent news, project health, and fundamentals.\n"
+    "  1. Review recent Research Agent notes and current KuCoin/CoinDesk news for project health and fundamentals; "
+    "hand off to the Research Agent if broad-web verification is genuinely needed.\n"
     "  2. Call analyze_market_context (15min + 1hour) to assess current trend and momentum (also fetches 4H + 1D automatically).\n"
     "  3. Decide: HOLD (if fundamentals are strong and trend is recovering) or CLOSE (if project is declining, "
     "no catalyst, or capital is better deployed elsewhere).\n"
@@ -1137,7 +1159,9 @@ def run_trading_agent(
     "- Call get_recent_fills or get_closed_positions for more detail if needed.\n\n"
 
     "## STEP 2 — Research (required before every entry decision):\n"
-    "- Call analyze_market_context for each coin — it fetches 15m + 1h + 4h + 1D timeframes automatically.\n"
+    "- Call analyze_market_context for each coin — it fetches 15m + 1h + 4h + 1D timeframes automatically. "
+    "An entry requires dataQuality.ok=true and analysis no more than 15 minutes old; if either condition fails, refresh "
+    "once and otherwise stand aside.\n"
     "  The 4H timeframe has the highest intraday weight (40%). The 1D acts as a HARD REGIME GATE:\n"
     "  - Counter-daily trades are BLOCKED at the code level. If daily_bias='bearish', buy/long orders are rejected. "
     "If daily_bias='bullish', sell/short orders are rejected. This is NOT optional.\n"
@@ -1155,19 +1179,25 @@ def run_trading_agent(
     "  - For mean-reversion: enter near VAL (longs) or VAH (shorts), target POC.\n"
     "  - For trend-following: use POC as pullback entry level; target VAH (bullish) or VAL (bearish).\n"
     "- Call fetch_recent_candles if you need raw price detail to set precise TP/SL levels.\n"
-    "- Call web_search for news, sentiment, and catalysts. Call fetch_kucoin_news for exchange-specific events. Call fetch_coindesk_news for broader crypto market news and macro context.\n"
+    "- Broad-web discovery belongs to the Research Agent during flat-book research handoffs, where findings are cached "
+    "with log_research. On ordinary trading runs, use recent research plus fetch_kucoin_news/fetch_coindesk_news only "
+    "when a catalyst is material to the thesis; do not repeat the same news search on every poll.\n"
     "- Use fetch_orderbook when you need microstructure (depth, imbalance) to time entry or set tight stops.\n"
     "- Assign a sentiment score 0–1 from news. If sentiment_filter_enabled and score < sentiment_min_score, skip buys.\n\n"
+    "- News evidence must name the same asset/project and include a traceable source. Uncited, stale, or unrelated "
+    "articles are neutral and must never be repurposed as a symbol-specific catalyst.\n\n"
 
     "## STEP 2b — Futures-specific research (when considering futures trades):\n"
     "- analyze_market_context now returns pre-computed futures signals. Read them carefully:\n"
-    "  - **oiPriceSignal**: 'strong_trend' (stay in), 'short_covering' (exit longs), "
-    "'aggressive_shorts' (stay/enter short), 'long_capitulation' (contrarian long opportunity).\n"
+    "  - **oiPriceSignal** compares two timestamped, real open-interest samples: price+OI up='strong_trend', "
+    "price up/OI down='short_covering', price down/OI up='aggressive_shorts', and price+OI down='long_capitulation'. "
+    "It is 'neutral' until enough observations exist or changes are meaningful. Never infer OI direction from volume "
+    "or from the absolute OI level.\n"
     "  - **fundingDivergence**: 'hidden_strength' (bullish despite negative funding), "
     "'hidden_weakness' (bearish despite positive funding), 'aligned', 'neutral'.\n"
-    "- Use these signals to confirm or veto your trade direction. Do NOT ignore them.\n"
-    "- A 'short_covering' signal with bullish indicators = weak rally, avoid new longs.\n"
-    "- A 'long_capitulation' signal with oversold RSI = high-probability reversal setup.\n"
+    "- Treat OI/funding as secondary confirmation, never as a standalone entry, exit, or add-on instruction. "
+    "Short covering can weaken a rally thesis and long capitulation can flag exhaustion, but both still require "
+    "price structure, multi-timeframe confirmation, liquidity, and acceptable net reward:risk.\n"
     "- Call fetch_funding_rate for detailed rate history, fetch_open_interest for OI levels.\n"
     "- Call fetch_futures_mark_price to check basis. Large basis = mean reversion risk.\n"
     "- Call fetch_contract_details to check multiplier, maxLeverage, tick size, and fees before sizing.\n\n"
@@ -1187,13 +1217,15 @@ def run_trading_agent(
     "- SIZE: 50-70% of normal position size. Range trades are higher frequency, lower conviction.\n"
     "- CRITICAL: If the entry would yield less than 0.3% profit after fees (2x round-trip), skip it. "
     "The range must be wide enough to profit from.\n"
-    "- You CAN have alternating long/short positions on the same coin as it oscillates within the range.\n"
+    "- Alternating long/short range trades must be sequential: fully close the current lifecycle with reduce_only before "
+    "opening the opposite direction. Never implicitly reverse or stack conflicting same-symbol exposure.\n"
     "- Use reduce_only=True to take profit on a portion when price reaches the midline.\n\n"
 
     "**When market_regime is 'squeeze':**\n"
     "- A Bollinger Band squeeze means volatility is compressed and a big move is coming.\n"
     "- Do NOT enter new range trades during a squeeze — the breakout will stop you out.\n"
-    "- Tighten stops on existing positions. Reduce size on any new entries.\n"
+    "- On existing positions, ratchet a stop only when current structure supports the new level; never mechanically "
+    "squeeze it into market noise. Reduce size on any new entries.\n"
     "- When the squeeze resolves (BBW expands AND ADX rises above 25), enter in the breakout direction.\n\n"
 
     "**When summary.squeeze_breakout is set (structured breakout signal):**\n"
@@ -1202,7 +1234,8 @@ def run_trading_agent(
     "- Treat this as higher quality only after volume confirmation; request normal size and let code-enforced risk/volatility limits size it.\n"
     "- REQUIRED CONFIRMATION: volume on the breakout candle ≥ 1.5× the 20-candle average. "
     "If volume is weak, decline_trade — false breakouts ('head fakes') are common.\n"
-    "- TP: rely on plan_spot_position's volatility-scaled rr (or set futures TP at 2-3× stop_distance in high vol). "
+    "- TP: use the nearest credible futures structural target that clears requiredRrBySymbol; a runner may extend "
+    "toward 2-3× stop distance only when structure and volume support it. "
     "Squeezes resolve in extended moves; don't cap the target at the minimum reward:risk — let it run to 2-3×.\n"
     "- The anti-FOMO daily-exhaustion block still wins: if 1D is exhausted in the same direction, the entry is rejected "
     "(squeezes near tops are statistically more likely to be head fakes).\n\n"
@@ -1210,11 +1243,12 @@ def run_trading_agent(
     "**When market_regime is 'trending':**\n"
     "- Use your standard trend-following strategy (STEP 3 below). The regime confirms your edge.\n"
     "- Do NOT mean-revert against a confirmed trend. Do NOT short rallies or buy dips against the trend.\n"
-    "- A trending regime with ADX > 35 is a STRONG signal — use full size and wider TP targets.\n\n"
+    "- A trending regime with ADX > 35 strengthens the thesis, but request normal risk size and let the code's "
+    "live equity, volatility, concentration, and rolling-edge controls determine final size.\n\n"
 
     "**Regime transitions (breakout/breakdown):**\n"
-    "- If the commentary says 'ADX rising' during a range, a breakout is forming. "
-    "Tighten range trade stops and prepare to flip to trend-following.\n"
+    "- If the commentary says 'ADX rising' during a range, a breakout is forming. Review range-trade protection and "
+    "ratchet it only to a valid structural level; prepare to flip only after the existing lifecycle is closed.\n"
     "- If the commentary says 'ADX weakening' during a trend, the trend is exhausting. "
     "Take profit on trend trades and prepare for range conditions.\n"
     "- Close range trades when ADX crosses 25. Close trend trades when ADX drops below 18.\n\n"
@@ -1224,7 +1258,8 @@ def run_trading_agent(
     "Use the research to decide direction and build a complete trade plan (entry, stop, TP) BEFORE placing the order.\n\n"
 
     "**Entry tool selection (MANDATORY for all new positions):**\n"
-    "- Use place_limit_order (spot) or place_futures_limit_order (futures) for ALL new entries.\n"
+    "- New exposure is FUTURES-ONLY and must use place_futures_limit_order with an exchange-atomic TP/SL bracket. "
+    "Spot order tools are management/close-only because the spot entry path cannot attach both exits atomically.\n"
     "- Reserve place_market_order / place_futures_market_order ONLY for closing positions or emergency exits.\n"
     "- Why: market orders execute at current price regardless of chart structure. Limit orders let price "
     "come TO you at a better level — avoiding the worst timing failures (shorting into a dump, buying into a pump).\n"
@@ -1251,12 +1286,14 @@ def run_trading_agent(
     "- **Volume check**: the target level is stronger when it coincides with a prior high-volume node (POC or VAH/VAL from volume profile).\n"
     "- **Rejection confirmation**: for shorts, prefer entry at resistance only when you also see bearish RSI divergence or RSI > 65. "
     "For longs, prefer pullback entries when RSI < 40 or bullish divergence is present.\n"
-    "- If current price is ALREADY at the optimal level (within ~0.2%), the limit tool will reject — use place_market_order instead.\n"
+    "- If current price is already at or through the optimal level, do not chase with a market order; wait for a "
+    "valid pullback limit or decline the setup. Market tools remain close/emergency-only.\n"
     "- NEVER set entry_price at or worse than the current price for a new entry "
     "(do NOT short at current price when price just dumped — wait for the bounce to resistance).\n\n"
 
     "**Entry signal — trade when the 1h trend_bias is clear (bullish or bearish):**\n"
-    "- Strong setup (trade full size): 1h AND 15m both agree on direction, RSI 40–65, MACD confirms, catalyst from news.\n"
+    "- Strong setup (request normal risk size): 1h AND 15m both agree on direction, RSI 40–65, MACD confirms; "
+    "a catalyst is supporting evidence when one exists, not a reason to force a news lookup or a trade.\n"
     "- Normal setup (trade reduced size, 50–70% of normal): 1h is clear, 15m mixed, OR 1h mixed but strong news catalyst.\n"
     + (
     "- Range setup (when market_regime='ranging'): Use mean-reversion entries per STEP 2c above. "
@@ -1268,35 +1305,34 @@ def run_trading_agent(
     "or clearly negative news.\n\n"
     ) +
 
-    "**Venue preference:**\n"
-    "- Your input includes availableUsdt with spot, futures, and total balances. Read ALL of them before choosing a venue.\n"
-    "- Pick the venue where you have the capital to act. If one venue is underfunded, use the other.\n"
-    "- Futures with leverage lets you trade with a smaller USDT balance than spot requires — factor this in.\n"
-    "- Use transfer_funds to move capital between venues when needed.\n"
-    "- A rejected spot order is not a reason to give up — reconsider via futures or a smaller size.\n\n"
+    "**Venue policy:**\n"
+    "- Use futures for new exposure; use spot tools only to protect or close an existing spot holding.\n"
+    "- Read all balances, but never transfer funds or increase leverage merely to force an otherwise unaffordable setup. "
+    "If the safe futures size cannot clear exchange minimums and profit-after-cost gates, skip it.\n\n"
 
     "**Sizing:**\n"
-    "- Call plan_spot_position to compute ATR-based stop distance, size, and TP for spot trades.\n"
-    "  Note: plan_spot_position now returns a volatility-scaled `rr` — the effective RR widens up to 2× the "
-    "base when daily ATR >= 4% (cap at daily ATR 10%). This lets winners run further in volatile coins to "
-    "compensate for the smaller position size enforced by the ATR soft-gate.\n"
-    f"- For futures: propose no more than maxPositionUsd={snapshot.max_position_usd}; code shrinks contracts so stop-defined loss stays within the per-trade and portfolio risk budgets.\n"
+    "- Do not plan new spot positions. For existing spot holdings, protection/close decisions must use live balance and structural levels.\n"
+    f"- For futures: propose no more than maxPositionUsd={snapshot.max_position_usd}; code caps projected same-symbol "
+    "notional (existing plus new legs) and stop-defined loss across the entire position lifecycle using the remaining "
+    "equity-risk and concentration budgets. The safe code-sized amount can be much smaller than the requested amount.\n"
+    "- ADD-ONS/PYRAMIDING: add only in the existing position's direction, only after the exchange confirms its stop "
+    "at or beyond breakeven, and never loosen that stop. All legs share one lifecycle risk and concentration budget; "
+    "never average down or repeatedly add to a losing position. If those conditions are not verified, do not add.\n"
     "- Keep at least 10% USDT reserve across all venues combined.\n\n"
 
     "**TP/SL rules (mandatory on every new entry):**\n"
     "- Stop-loss: ATR-based (1.5–2.5x ATR from entry) OR 1.0–2.0% if ATR is unavailable. Place the SL where "
     "your thesis is invalidated, then control dollar risk with SIZE — NOT by widening the stop past the target.\n"
-    f"- Take-profit: the TP distance MUST be at least {cfg.trading.min_futures_rr:.1f}x the SL distance "
-    f"(reward:risk >= {cfg.trading.min_futures_rr:.1f}). The system HARD-REJECTS futures entries below this "
-    "(losses were running ~4x the wins because stops sat wider than targets). Aim for 2.0+ when momentum is strong. "
-    "If a setup can't offer that much room to the target before the invalidation level, SKIP it — do not shrink the TP to force a fill.\n"
+    f"- Take-profit: {cfg.trading.min_futures_rr:.1f}R is only the base floor. Read edgeReport.requiredRrBySymbol; "
+    "the code HARD-REJECTS a futures entry below that symbol's current adaptive floor. The nearest realistic structural "
+    "target and true invalidation must naturally clear it. If they do not, SKIP — never distort either level to force a fill.\n"
     "- For FUTURES limit entries: ALWAYS pass BOTH take_profit_price and stop_loss_price in the SAME "
     "place_futures_limit_order call. They are attached to the order (KuCoin bracket) and arm the instant "
     "it fills — so decide entry + TP + SL together, up front. Do NOT defer protection to a later run; a "
     "fill between runs would otherwise sit unprotected. (Spot limit entries still bracket on the next run.)\n"
     + (
-    f"- FOR RANGE TRADES: TP toward the BB midline (mean), SL beyond the BB band. Still respect the "
-    f"reward:risk >= {cfg.trading.min_futures_rr:.1f} floor — if the mean-reversion target is too close to justify the stop, "
+    f"- FOR RANGE TRADES: TP toward the BB midline (mean), SL beyond the BB band. Still respect the adaptive "
+    f"requiredRrBySymbol floor (never below base {cfg.trading.min_futures_rr:.1f}R) — if the mean-reversion target is too close to justify the stop, "
     "skip the trade. Never set a range trade TP beyond the opposite BB band.\n\n"
     if cfg.trading.range_trading_enabled else "\n") +
 
@@ -1306,7 +1342,8 @@ def run_trading_agent(
     "- Log sentiment via log_sentiment.\n\n"
 
     "## Capital and risk limits:\n"
-    f"- Do NOT exceed maxPositionUsd={snapshot.max_position_usd} USDT per trade.\n"
+    f"- Do NOT request more than maxPositionUsd={snapshot.max_position_usd} USDT for a new order. This is only a ceiling, "
+    "not permission: projected same-symbol exposure and whole-lifecycle stop risk can impose a lower limit.\n"
     f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades for that symbol.\n"
     f"- Futures entry leverage is HARD CAPPED at {cfg.trading.max_entry_leverage}x by the system. Do NOT request higher leverage to meet profit thresholds — if a trade doesn't work at {cfg.trading.max_entry_leverage}x, skip it.\n"
     f"- Only place a trade if your confidence >= {snapshot.min_confidence}.\n"
@@ -1322,12 +1359,14 @@ def run_trading_agent(
 
     "## Performance awareness:\n"
     "- Check the performanceSummary field in your input: it shows your recent win rate, avg win/loss, total PnL.\n"
-    "- If win rate is below 40%: prioritize higher-conviction setups and tighter stops.\n"
-    "- If avg loss exceeds avg win by 2x+: your stops may be too wide — tighten them.\n"
+    "- If win rate is below 40%: raise selectivity and request less size. Never move a structurally valid stop inside "
+    "the invalidation level merely to improve summary statistics.\n"
+    "- If avg loss exceeds avg win by 2x+: inspect entry quality, add-ons, and any stop widening; keep the invalidation "
+    "structural and control the dollar loss with smaller size.\n"
     "- If total realized PnL is negative: focus on smaller positions until you find a winning pattern.\n"
     "- **Missed profit analysis**: performanceSummary includes missedProfitCount/totalMissedProfit — these show trades "
-    "where the position was in profit (peakPnl > 0) but you closed at a lower PnL. High missed profit means "
-    "you're being too greedy with TP targets; lower them or take partial profits earlier.\n"
+    "where the position was in profit (peakPnl > 0) but you closed at a lower PnL. Treat a high value as a prompt to "
+    "review staged TP, breakeven, and trailing behavior — never lower TP below required RR or squeeze the SL into noise.\n"
     "- **Position extremes**: each open position shows peakPnl (best it reached) and troughPnl (worst it reached). "
     "If peakPnl was positive but current unrealizedPnl is negative, you missed an exit opportunity.\n"
     "- Use this data to adapt — don't repeat losing patterns.\n\n"
@@ -1341,22 +1380,26 @@ def run_trading_agent(
     "- Use web/news search during Research Agent handoffs or when a specific event could change the setup; do not repeat unchanged news calls every run. Look for "
     "macro catalysts, sector rotations, unusual volume, or trending narratives.\n"
     "- If you spot a coin with a stronger setup than anything in your current list, hand off to Research Agent "
-    "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it.\n"
-    "- Hand off to Research Agent after completing your trades for the current coins — use idle time to scout.\n"
+    "to validate it (liquidity, fundamentals, catalyst), then add it via add_coin and trade it only if all entry gates clear.\n"
+    "- Hand off to Research Agent only when force_research is active, cached research is stale, the qualified universe "
+    "is exhausted, or a specific catalyst genuinely needs broad-web validation. Do not hand off merely because the current work is complete.\n"
     "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) and act on findings.\n"
     "- Remove coins that have gone stale (no volatility, no catalyst, no edge) to keep the list focused. "
     "Use remove_coin with a documented reason.\n\n"
 
-    "## CRITICAL — Handle rejections, don't give up:\n"
-    "A rejected tool call is NOT a reason to stop. It's feedback — read the 'reason' and 'hint' fields and fix the issue:\n"
-    "- **TP/SL too tight**: widen your TP/SL targets using the suggested minimum values in the hint, then retry.\n"
-    "- **Insufficient balance (spot)**: use transfer_funds to move USDT from futures/financial to spot, "
-    "or sell an underperforming spot position to free capital, or switch to futures with leverage.\n"
+    "## CRITICAL — Handle rejections without brute-forcing them:\n"
+    "Read the reason and reassess once. A risk, data-quality, cooldown, concentration, or edge rejection means rotate "
+    "to another qualified symbol or stand aside — never mutate parameters repeatedly until an order passes.\n"
+    "- **TP/SL or RR rejection**: rebuild the complete plan from the true invalidation and nearest reachable structural "
+    "target. Do not nudge one bracket leg merely to clear the gate; skip if the natural plan still fails.\n"
+    "- **Insufficient balance**: reduce requested futures notional within the same risk plan or skip. Never transfer funds or raise leverage just to make a rejected setup fit.\n"
     "- **Insufficient margin (futures)**: use transfer_funds('spot_to_futures') or sell a spot position first, "
     "or reduce notional. Do NOT increase leverage to compensate.\n"
-    "- **Size too small / below minimum**: increase position size or skip this particular coin for one with better sizing.\n"
+    "- **Size too small / below minimum**: skip this coin if the safely code-sized order is below the exchange minimum. "
+    "Never increase lifecycle risk just to reach a lot-size threshold.\n"
     "- **Daily trade cap**: move to another symbol.\n"
-    "- **Profit too low**: widen TP or increase size. Do NOT increase leverage beyond the entry cap.\n"
+    "- **Profit too low**: improve the resting entry or use a realistic structural target; otherwise skip. Never increase "
+    "size, leverage, or risk solely to pass a minimum-profit check.\n"
     "- **Daily gate rejection**: the 1D trend opposes your trade direction. Do NOT retry the same direction — trade WITH the daily trend or move to another symbol.\n"
     "- **Trade interval cooldown**: you traded this symbol too recently. Move to another symbol or wait.\n\n"
     "**Multi-step execution is expected.** If you want to open a futures trade but funds are in spot:\n"
@@ -1403,8 +1446,9 @@ def run_trading_agent(
       "universe is not producing actionable setups. BEFORE analyzing or declining anything else this run, "
       "you MUST hand off to the Research Agent and instruct it to OVERHAUL the coin list: remove stale, "
       "illiquid, or no-catalyst symbols and add fresh, liquid, high-opportunity coins with real catalysts. "
-      "After the Research Agent hands control back to you, re-audit the refreshed universe and find a trade. "
-      "Do NOT simply decline again — a stale coin list is the problem, so fix it via research first.\n\n"
+      "After the Research Agent hands control back to you, re-audit the refreshed universe and trade only if a candidate "
+      "clears every entry and risk gate. If none qualifies, log that result and stand aside; research is mandatory here, "
+      "but a trade is not.\n\n"
       + instructions
     )
 
@@ -1433,6 +1477,8 @@ def run_trading_agent(
       "- Mission: Find high-confidence setups beyond the current universe, plus catalysts the main agent may have missed.\n"
       "- Sources to prioritize when using web_search: CoinDesk/The Block/Cointelegraph for news; exchange blogs (Binance/Coinbase/OKX/Bybit) for listings/delistings/rule changes; X/Twitter lists (founders, analysts, journalists) for real-time signals; macro outlets (Bloomberg/Reuters/FT) when relevant; on-chain sentiment/flows when available.\n"
       "- Tasks: gather news, sentiment, liquidity, catalysts, and narrative strength; highlight listings/delistings, hacks, regulatory moves, funding rounds, and smart-money activity.\n"
+      "- CITATION DISCIPLINE: record the actual source URL and verify it concerns the same asset. Treat uncited, stale, "
+      "or cross-asset articles as neutral; never use generic BTC news as evidence for an unrelated altcoin.\n"
       "- Output: concise recommendations with evidence (why this beats current options), liquidity check, and confidence. Prefer liquid, tradable pairs; avoid illiquid/obscure tokens.\n"
       "- When idle, discover high-quality sources; add via add_source(name, url, reason) and remove low-value ones via remove_source(name, reason).\n\n"
       "## COIN-LIST CURATION (your core job — act, don't just suggest):\n"
@@ -1441,8 +1487,9 @@ def run_trading_agent(
       "only opportunity — even in a bad tape, some liquid coin is trending. Scan 'momentum' and, in a bearish "
       "BTC daily, 'losers'/'short'; then deep-validate the top few with analyze_market_context + fetch_orderbook.\n"
       "- Do NOT stay anchored to BTC/ETH/SOL out of habit. If the scan surfaces a more liquid, cleaner setup "
-      "(strong trend, catalyst, good structure) that clears the bars, ADD it and let the Trading Agent trade it.\n"
-      "- You OWN the active coin list. Call list_coins to see it, then RESHAPE it so the Trading Agent always has tradable opportunities:\n"
+      "(strong trend, catalyst, good structure) that clears the bars, ADD it for the Trading Agent to evaluate.\n"
+      "- You OWN the active coin list. Call list_coins to see it, then keep only the best qualified opportunities; a "
+      "narrow or unchanged list is correct when nothing new clears the quality bars:\n"
       "  - add_coin(symbol, reason) for LIQUID, ESTABLISHED pairs with a real catalyst or strong technical setup. Verify liquidity with analyze_market_context/fetch_orderbook before adding.\n"
       "  - remove_coin(symbol, reason, exit_plan) for stale symbols: no volatility, no catalyst, repeated losses, or chronically blocked by the daily/regime gates.\n"
       "- HARD QUALITY BARS for any coin you add (they mirror code-level gates — adding a coin that violates them just wastes the Trading Agent's run):\n"
@@ -1454,13 +1501,15 @@ def run_trading_agent(
       "- You must still NEVER place orders or set TP/SL — that is the Trading Agent's job. You only curate the list and log research.\n\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
       "- **Strategy review**: Use latest_items('decisions') to review recent trades. Look for patterns:\n"
-      "  - Trades with high peakPnl but low/negative final pnl = greedy TP targets (suggest tighter TPs).\n"
-      "  - Trades with deep troughPnl = poor entries or wide stops (suggest better entry timing).\n"
+      "  - Trades with high peakPnl but low/negative final pnl = review staged TP, breakeven, and trailing behavior; "
+      "do not prescribe a mechanically tighter bracket.\n"
+      "  - Trades with deep troughPnl = review entry quality, add-ons, and risk sizing; do not blindly tighten a structural stop.\n"
       "  - Repeated losses on the same coin = bad coin choice (remove it via remove_coin).\n"
       "  - Log strategy improvement suggestions via log_research so the Trading Agent can adapt.\n\n"
       "## MANDATORY FINAL STEP — always hand back:\n"
       "- You MUST finish EVERY turn by handing control back to the Trading Agent. Never end your turn without handing off.\n"
-      "- Before handing off, log a research note (log_research) summarizing what you found and exactly which coins you added/removed, and remind the Trading Agent to read it via latest_plan/latest_items and to trade the refreshed universe.\n"
+      "- Before handing off, log a research note (log_research) summarizing what you found and exactly which coins you "
+      "added/removed, and remind the Trading Agent to read it via latest_plan/latest_items and evaluate the refreshed universe.\n"
     ),
     tools=[
       WebSearchTool(search_context_size="high"),
@@ -1493,7 +1542,6 @@ def run_trading_agent(
     name="Trading Agent",
     instructions=instructions,
     tools=[
-      WebSearchTool(search_context_size="high"),
       fetch_recent_candles,
       fetch_orderbook,
       analyze_market_context,
@@ -1510,7 +1558,6 @@ def run_trading_agent(
       cancel_spot_stop_order,
       cancel_spot_limit_order,
       list_spot_stop_orders,
-      place_futures_stop_order,
       set_futures_position_protection,
       cancel_futures_order,
       list_futures_stop_orders,
@@ -1584,11 +1631,10 @@ def run_trading_agent(
         "The RR floor and bench are SYMBOL-SPECIFIC — a symbol you keep losing on (negative net in perSymbol) "
         "must clear a higher bar and gets rested longer, while fresh names default to baseRr. So DIVERSIFY: "
         "rotate off losing/benched symbols toward the liquid movers scan_futures_market surfaces. "
-        "REALITY CHECK: realizedRewardRisk is what your closed trades ACTUALLY achieved (avg win / avg loss). "
-        "If it is far below baseRr (e.g. 0.3 vs 1.5), your TPs are set too far to reach in this tape while "
-        "stops run full — set the TAKE-PROFIT at the NEAREST realistic structural target (VWAP, POC, prior "
-        "swing, band mid) that price can actually hit, and TIGHTEN the stop to the true invalidation so the "
-        "RR floor still passes at a REACHABLE scale. A smaller target that fills beats a bigger one that never does."
+        "REALITY CHECK: realizedRewardRisk is what your closed trades ACTUALLY achieved (avg win / avg loss), but "
+        "a gap from planned RR is diagnostic rather than an instruction to compress every bracket. Select entries where "
+        "the nearest reachable structural target (VWAP, POC, prior swing, band mid) and the true invalidation naturally "
+        "clear requiredRrBySymbol. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor."
       ),
     }
   except Exception as _edge_exc:
@@ -1703,10 +1749,18 @@ def run_trading_agent(
   handoff_events: List[Dict[str, str]] = artifacts["handoffs"]
   research_activity: List[str] = artifacts["research"]
   agents_used: set[str] = artifacts["agents_used"]
+  run_still_authorized = True
+  if safety_state is not None:
+    run_still_authorized = bool(
+      safety_state.check(
+        entry_token,
+        max_age_sec=max(180.0, float(cfg.trading.poll_interval_sec) * 3.0),
+      ).get("allowed")
+    )
 
   # Record handoffs in memory so they surface in the dashboard decision feed (marked as
   # handoff_* actions). pnl stays None so they never count toward win/loss stats.
-  for h in handoff_events:
+  for h in handoff_events if run_still_authorized else []:
     direction = "research" if h.get("to") == "Research Agent" else "trading"
     try:
       memory.log_decision(

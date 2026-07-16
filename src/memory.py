@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -25,14 +26,20 @@ MAX_CLOSED_TRADES = 200  # closed-trade outcomes (pnl != None) — kept separate
 MAX_FEES = 3
 MAX_TEMPORARY_NOTES = 20
 MAX_PERMANENT_NOTES = 10
+MAX_PENDING_AGENT_EVENTS = 200
 
 
 class MemoryStore:
   """Lightweight JSON-backed store for agent plans/notes."""
 
+  _path_locks_guard = threading.Lock()
+  _path_locks: Dict[str, threading.Lock] = {}
+
   def __init__(self, path: str, retention_days: int = 7) -> None:
     self.path = Path(path)
-    self._lock = threading.Lock()
+    lock_key = str(self.path.expanduser().resolve())
+    with self._path_locks_guard:
+      self._lock = self._path_locks.setdefault(lock_key, threading.Lock())
     self.retention_days = retention_days
     self._cache: Dict[str, Any] | None = None
     self._cache_mtime: float | None = None
@@ -40,7 +47,7 @@ class MemoryStore:
     self._read()
 
   def _read(self) -> Dict[str, Any]:
-    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}}
+    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}, "seen_close_ids": [], "seen_fill_ids": [], "open_interest_observations": {}, "pending_agent_events": []}
     if self._cache is not None:
       try:
         disk_mtime = self.path.stat().st_mtime
@@ -67,6 +74,10 @@ class MemoryStore:
         data.setdefault("supervisor_notes_temporary", [])
         data.setdefault("supervisor_notes_permanent", [])
         data.setdefault("position_extremes", {})
+        data.setdefault("seen_close_ids", [])
+        data.setdefault("seen_fill_ids", [])
+        data.setdefault("open_interest_observations", {})
+        data.setdefault("pending_agent_events", [])
         # prune invalid entries while keeping timestamp
         data["plans"] = [
           p
@@ -105,11 +116,28 @@ class MemoryStore:
             "size": t.get("size"),
             "paper": t.get("paper", False),
             "venue": t.get("venue", "spot"),
+            "filled": t.get("filled", True),
+            "trackPosition": t.get("trackPosition", True),
+            "orderId": t.get("orderId"),
+            "clientOid": t.get("clientOid"),
             "ts": t.get("ts") or int(time.time()),
             "day": t.get("day"),
           }
           for t in data.get("trades", [])
           if isinstance(t, dict) and t.get("symbol") and t.get("ts")
+        ]
+        data["pending_agent_events"] = [
+          {
+            "id": str(event.get("id") or ""),
+            "kind": str(event.get("kind") or ""),
+            "payload": event.get("payload"),
+            "ts": int(event.get("ts") or time.time()),
+          }
+          for event in data.get("pending_agent_events", [])
+          if isinstance(event, dict)
+          and event.get("id")
+          and event.get("kind") in {"spot_fills", "futures_fills", "closed_positions"}
+          and isinstance(event.get("payload"), dict)
         ]
         data["sentiments"] = [
           {
@@ -176,8 +204,9 @@ class MemoryStore:
           except OSError:
             self._cache_mtime = None
         return data
+      return _empty
     except Exception:
-      return {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": []}
+      return _empty
 
   def _prune(self, data: Dict[str, Any]) -> Dict[str, Any]:
     """Drop entries older than retention_days."""
@@ -199,6 +228,10 @@ class MemoryStore:
     data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
     data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
     data["supervisor_notes_temporary"] = [n for n in data.get("supervisor_notes_temporary", []) if (n.get("ts") or now) >= cutoff]
+    data["pending_agent_events"] = [
+      event for event in data.get("pending_agent_events", [])
+      if isinstance(event, dict) and (event.get("ts") or now) >= cutoff
+    ][-MAX_PENDING_AGENT_EVENTS:]
     # Permanent notes are exempt from the retention-days cutoff by design — they persist
     # until manually deleted. Only the count cap (MAX_PERMANENT_NOTES) applies below.
     data.setdefault("supervisor_notes_permanent", [])
@@ -218,13 +251,17 @@ class MemoryStore:
     _cap_list("coins", MAX_COINS)
     _cap_list("trades", MAX_TRADES)
     _cap_list("sentiments", MAX_SENTIMENTS)
-    # Two-tier cap: trade outcomes (pnl != None) get a larger cap so losses are never
-    # evicted by high-volume entry/decline decisions (pnl=None).
+    # Two-tier cap: only actual close actions get the larger outcome bucket. The model often logs
+    # unrealized PnL on hold/decline rows; treating those as closes crowded real outcomes out of
+    # memory and made diagnostics misleading.
     def _is_handoff(d: Dict[str, Any]) -> bool:
       return str(d.get("action") or "").startswith("handoff")
 
-    pnl_decisions = [d for d in (data.get("decisions") or []) if d.get("pnl") is not None]
-    null_all = [d for d in (data.get("decisions") or []) if d.get("pnl") is None]
+    pnl_decisions = [
+      d for d in (data.get("decisions") or [])
+      if d.get("pnl") is not None and self._is_realized_close(str(d.get("action") or ""))
+    ]
+    null_all = [d for d in (data.get("decisions") or []) if d not in pnl_decisions]
     # Handoff markers get their own bucket so the high-volume decline/hold snapshots (capped at
     # MAX_DECISIONS) can't evict them — the dashboard surfaces handoffs from the recent feed.
     handoff_decisions = [d for d in null_all if _is_handoff(d)]
@@ -252,8 +289,15 @@ class MemoryStore:
     return data
 
   def _write(self, data: Dict[str, Any]) -> None:
+    payload = json.dumps(data, indent=2)
+    temp_path = self.path.with_name(self.path.name + ".tmp")
+    self.path.parent.mkdir(parents=True, exist_ok=True)
+    with temp_path.open("w", encoding="utf-8") as handle:
+      handle.write(payload)
+      handle.flush()
+      os.fsync(handle.fileno())
+    os.replace(temp_path, self.path)
     self._cache = copy.deepcopy(data)
-    self.path.write_text(json.dumps(data, indent=2))
     try:
       self._cache_mtime = self.path.stat().st_mtime
     except OSError:
@@ -320,16 +364,9 @@ class MemoryStore:
 
   def clear_plans(self) -> Dict[str, Any]:
     with self._lock:
-      existing = self._read()
-      data = {
-        "plans": [],
-        "triggers": [],
-        "coins": existing.get("coins", []),
-        "trades": existing.get("trades", []),
-        "limits": existing.get("limits", {}),
-        "sentiments": existing.get("sentiments", []),
-        "decisions": existing.get("decisions", []),
-      }
+      data = self._read()
+      data["plans"] = []
+      data["triggers"] = []
       self._write(self._prune(data))
       return self._prune(data)
 
@@ -439,6 +476,10 @@ class MemoryStore:
     price: float | None = None,
     size: float | None = None,
     venue: str = "spot",
+    filled: bool = True,
+    track_position: bool = True,
+    order_id: str | None = None,
+    client_oid: str | None = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -452,6 +493,10 @@ class MemoryStore:
         "size": size,
         "paper": paper,
         "venue": venue,
+        "filled": bool(filled),
+        "trackPosition": bool(track_position),
+        "orderId": str(order_id) if order_id not in (None, "") else None,
+        "clientOid": str(client_oid) if client_oid not in (None, "") else None,
         "ts": now,
         "day": day_key,
       }
@@ -608,6 +653,8 @@ class MemoryStore:
       return cost / qty if qty else 0.0
 
     for t in trades:
+      if t.get("filled") is False or t.get("trackPosition") is False:
+        continue
       sym = t.get("symbol")
       side = (t.get("side") or "").lower()
       try:
@@ -684,8 +731,14 @@ class MemoryStore:
           continue
         active_symbols.add(sym)
         ext = extremes.get(sym)
-        if ext is None:
-          extremes[sym] = {"peakPnl": upnl, "troughPnl": upnl, "peakTs": now, "troughTs": now, "openTs": now}
+        lifecycle_key = f"{pos.get('positionOpenTime') or ''}:{pos.get('positionSide') or ('long' if net > 0 else 'short')}"
+        if ext is None or ext.get("lifecycleKey") != lifecycle_key:
+          extremes[sym] = {
+            "peakPnl": upnl, "troughPnl": upnl, "peakTs": now, "troughTs": now,
+            "openTs": now, "lifecycleKey": lifecycle_key,
+            "positionOpenTime": pos.get("positionOpenTime"),
+            "positionSide": pos.get("positionSide") or ("long" if net > 0 else "short"),
+          }
         else:
           if upnl > (ext.get("peakPnl") or float("-inf")):
             ext["peakPnl"] = upnl
@@ -810,7 +863,7 @@ class MemoryStore:
     return 0 <= delta <= legacy_window_sec
 
   def realized_closes(self, limit: int = 100, symbol: str | None = None) -> list[Dict[str, Any]]:
-    """Recent realized closes (pnl-bearing 'triggered' decisions), deduped, oldest→newest.
+    """Recent realized closes, exchange-triggered or explicit, deduped oldest→newest.
 
     The strict realized set (exchange-confirmed TP/SL closes) the adaptive edge controller
     computes its rolling stats from — hold/manage snapshots are excluded.
@@ -821,11 +874,11 @@ class MemoryStore:
     rows = [
       d for d in (data.get("decisions") or [])
       if isinstance(d, dict)
-      and "triggered" in str(d.get("action") or "").lower()
+      and self._is_realized_close(str(d.get("action") or ""))
       and d.get("pnl") is not None
       and (sym is None or d.get("symbol") == sym)
     ]
-    rows = self._dedupe_realized(rows)
+    rows = self._authoritative_realized_rows(rows)
     return rows[-max(1, int(limit)):]
 
   def get_seen_close_ids(self) -> list[str]:
@@ -846,6 +899,141 @@ class MemoryStore:
         ids.append(cid)
         data["seen_close_ids"] = ids[-cap:]
         self._write(data)
+
+  def get_seen_fill_ids(self) -> list[str]:
+    """Exchange fill IDs already delivered to the agent (persists across polls/restarts)."""
+    with self._lock:
+      data = self._read()
+    return [str(x) for x in (data.get("seen_fill_ids") or [])]
+
+  def mark_order_filled(self, order_id: Any = None, client_oid: Any = None) -> bool:
+    """Promote a submitted-order record to executed without using it for position reconstruction."""
+    refs = {
+      str(value) for value in (order_id, client_oid)
+      if value not in (None, "")
+    }
+    if not refs:
+      return False
+    with self._lock:
+      data = self._prune(self._read())
+      trades = data.get("trades", []) or []
+      for trade in reversed(trades):
+        trade_refs = {
+          str(value) for value in (trade.get("orderId"), trade.get("clientOid"))
+          if value not in (None, "")
+        }
+        if refs & trade_refs:
+          if trade.get("filled") is not True:
+            trade["filled"] = True
+            self._write(data)
+          return True
+    return False
+
+  def record_seen_fill_id(self, fill_id: str, cap: int = 1000) -> None:
+    fid = str(fill_id or "").strip()
+    if not fid:
+      return
+    with self._lock:
+      data = self._read()
+      ids = [str(x) for x in (data.get("seen_fill_ids") or [])]
+      if fid not in ids:
+        ids.append(fid)
+        data["seen_fill_ids"] = ids[-cap:]
+        self._write(data)
+
+  def queue_agent_event(self, kind: str, event_id: str, payload: Dict[str, Any]) -> bool:
+    """Persist a fill/close until a successful model run acknowledges that exact event."""
+    if kind not in {"spot_fills", "futures_fills", "closed_positions"}:
+      return False
+    eid = str(event_id or "").strip()
+    if not eid or not isinstance(payload, dict):
+      return False
+    with self._lock:
+      data = self._prune(self._read())
+      pending = data.setdefault("pending_agent_events", [])
+      if any(str(event.get("id") or "") == eid for event in pending if isinstance(event, dict)):
+        return False
+      pending.append({"id": eid, "kind": kind, "payload": copy.deepcopy(payload), "ts": int(time.time())})
+      data["pending_agent_events"] = pending[-MAX_PENDING_AGENT_EVENTS:]
+      self._write(data)
+      return True
+
+  def get_pending_agent_events(self) -> list[Dict[str, Any]]:
+    with self._lock:
+      data = self._prune(self._read())
+      return copy.deepcopy(data.get("pending_agent_events", []) or [])
+
+  def acknowledge_agent_events(self, event_ids: list[str]) -> list[Dict[str, Any]]:
+    ids = {str(event_id) for event_id in event_ids if str(event_id or "").strip()}
+    if not ids:
+      return []
+    with self._lock:
+      data = self._prune(self._read())
+      pending = data.get("pending_agent_events", []) or []
+      acknowledged = [event for event in pending if str(event.get("id") or "") in ids]
+      data["pending_agent_events"] = [
+        event for event in pending if str(event.get("id") or "") not in ids
+      ]
+      self._write(data)
+      return copy.deepcopy(acknowledged)
+
+  def observe_open_interest(
+    self,
+    symbol: str,
+    value: float,
+    *,
+    price: Optional[float] = None,
+    now: Optional[int] = None,
+    min_age_sec: int = 300,
+    change_threshold: float = 0.005,
+    price_change_threshold: float = 0.001,
+  ) -> Dict[str, Any]:
+    """Compare timestamp-aligned OI and price observations; never infer either from volume."""
+    ts = int(now if now is not None else time.time())
+    sym = _normalize_symbol(symbol)
+    current = float(value)
+    current_price = float(price) if price is not None else None
+    if current_price is not None and current_price <= 0:
+      current_price = None
+    if current <= 0:
+      return {"trend": None, "changePct": None, "priceTrend": None, "priceChangePct": None, "ageSec": None}
+    with self._lock:
+      data = self._read()
+      observations = data.setdefault("open_interest_observations", {})
+      previous = observations.get(sym) if isinstance(observations, dict) else None
+      if not isinstance(previous, dict) or not previous.get("value") or not previous.get("ts"):
+        observations[sym] = {"value": current, "price": current_price, "ts": ts}
+        data["open_interest_observations"] = observations
+        self._write(data)
+        return {"trend": None, "changePct": None, "priceTrend": None, "priceChangePct": None, "ageSec": None}
+
+      prior = float(previous["value"])
+      age = max(0, ts - int(previous["ts"]))
+      change = (current - prior) / prior if prior > 0 else 0.0
+      trend = None
+      prior_price = float(previous.get("price")) if previous.get("price") not in (None, "") else None
+      price_change = (
+        (current_price - prior_price) / prior_price
+        if current_price is not None and prior_price is not None and prior_price > 0
+        else None
+      )
+      price_trend = None
+      if age >= max(1, int(min_age_sec)):
+        threshold = max(0.0, float(change_threshold))
+        trend = "up" if change >= threshold else "down" if change <= -threshold else "flat"
+        if price_change is not None:
+          price_threshold = max(0.0, float(price_change_threshold))
+          price_trend = "up" if price_change >= price_threshold else "down" if price_change <= -price_threshold else "flat"
+        observations[sym] = {"value": current, "price": current_price, "ts": ts}
+        data["open_interest_observations"] = observations
+        self._write(data)
+      return {
+        "trend": trend,
+        "changePct": change * 100.0,
+        "priceTrend": price_trend,
+        "priceChangePct": price_change * 100.0 if price_change is not None else None,
+        "ageSec": age,
+      }
 
   @staticmethod
   def _is_realized_close(action: str) -> bool:
@@ -963,23 +1151,31 @@ class MemoryStore:
     """Compute win/loss stats from recorded decisions, split by venue and paper/live."""
     with self._lock:
       data = self._prune(self._read())
-      trades = data.get("trades", [])
+      all_trade_records = data.get("trades", [])
       decisions = data.get("decisions", [])
+    trades = [trade for trade in all_trade_records if trade.get("filled") is not False]
+    submissions = [trade for trade in all_trade_records if trade.get("filled") is False]
 
     if not trades:
-      return {"totalTrades": 0, "message": "No trade history yet."}
+      return {
+        "totalTrades": 0,
+        "orderSubmissions": len(submissions),
+        "message": "No executed trade history yet.",
+      }
 
     overall = self._pnl_stats(decisions)
     overall["totalTrades"] = len(trades)
+    overall["orderSubmissions"] = len(submissions)
 
     spot_decisions = [d for d in decisions if (d.get("action") or "").startswith("spot_")]
     futures_decisions = [d for d in decisions if (d.get("action") or "").startswith("futures_")]
     spot_trades = [t for t in trades if t.get("venue", "spot") == "spot"]
     futures_trades = [t for t in trades if t.get("venue", "spot") == "futures"]
 
-    def _venue_block(venue_decisions: list, venue_trades: list) -> Dict[str, Any]:
+    def _venue_block(venue_decisions: list, venue_trades: list, venue_submissions: list) -> Dict[str, Any]:
       block = self._pnl_stats(venue_decisions)
       block["totalTrades"] = len(venue_trades)
+      block["orderSubmissions"] = len(venue_submissions)
       live_d = [d for d in venue_decisions if not d.get("paper", False)]
       paper_d = [d for d in venue_decisions if d.get("paper", False)]
       live_t = [t for t in venue_trades if not t.get("paper", False)]
@@ -992,8 +1188,10 @@ class MemoryStore:
       block["paper"] = paper_stats
       return block
 
-    overall["spot"] = _venue_block(spot_decisions, spot_trades)
-    overall["futures"] = _venue_block(futures_decisions, futures_trades)
+    spot_submissions = [t for t in submissions if t.get("venue", "spot") == "spot"]
+    futures_submissions = [t for t in submissions if t.get("venue", "spot") == "futures"]
+    overall["spot"] = _venue_block(spot_decisions, spot_trades, spot_submissions)
+    overall["futures"] = _venue_block(futures_decisions, futures_trades, futures_submissions)
     return overall
 
   def reset_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:

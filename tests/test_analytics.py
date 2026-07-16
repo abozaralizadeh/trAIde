@@ -44,6 +44,26 @@ def test_rsi_in_range():
     assert (rsi_values <= 100).all()
 
 
+@pytest.mark.parametrize(
+    ("closes", "expected"),
+    [
+        ([float(i) for i in range(1, 31)], 100.0),
+        ([float(i) for i in range(30, 0, -1)], 0.0),
+        ([100.0] * 30, 50.0),
+    ],
+)
+def test_rsi_handles_monotonic_and_flat_prices(closes, expected):
+    df = pd.DataFrame({
+        "close": closes,
+        "high": [price + 1.0 for price in closes],
+        "low": [price - 1.0 for price in closes],
+        "volume": [1.0] * len(closes),
+    })
+    rsi = compute_indicators(df)["rsi"].iloc[1:]
+    assert rsi.notna().all()
+    assert rsi.tolist() == pytest.approx([expected] * len(rsi))
+
+
 def test_summarize_interval_keys():
     df = candles_to_dataframe(_make_candles(60))
     result = summarize_interval(df, "15min")

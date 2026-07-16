@@ -19,6 +19,8 @@ do with the results.
 
 from __future__ import annotations
 
+import math
+
 from .config import RegimeConfig
 
 
@@ -259,8 +261,13 @@ def reward_risk_ratio(side: str, entry, take_profit, stop_loss):
   return reward / risk
 
 
-def concentration_scale(notional_usd: float, total_equity_usd: float, max_pct: float) -> float:
-  """Scale factor (<=1.0) that shrinks a position's notional to at most `max_pct` of equity.
+def concentration_scale(
+  notional_usd: float,
+  total_equity_usd: float,
+  max_pct: float,
+  existing_notional_usd: float = 0.0,
+) -> float:
+  """Shrink an order so projected same-symbol notional stays within the equity cap.
 
   Returns 1.0 when the cap is disabled (max_pct<=0), equity is unknown (<=0), or the position is
   already within the cap. Caps the per-position blast radius regardless of leverage.
@@ -269,14 +276,86 @@ def concentration_scale(notional_usd: float, total_equity_usd: float, max_pct: f
     notional = float(notional_usd)
     equity = float(total_equity_usd)
     pct = float(max_pct)
+    existing = max(0.0, float(existing_notional_usd))
   except (TypeError, ValueError):
     return 1.0
   if pct <= 0 or equity <= 0 or notional <= 0:
     return 1.0
   cap = pct * equity
-  if notional <= cap:
+  remaining = max(0.0, cap - existing)
+  if notional <= remaining:
     return 1.0
-  return max(0.0, cap / notional)
+  return max(0.0, remaining / notional)
+
+
+def risk_capped_contracts(
+  requested_contracts: int,
+  lot_size: int,
+  multiplier: float,
+  entry_price: float,
+  stop_price: float,
+  equity_usd: float,
+  risk_fraction: float,
+  existing_risk_usd: float = 0.0,
+) -> int:
+  """Cap a new leg by the remaining risk budget for the whole position lifecycle."""
+  try:
+    requested = int(requested_contracts)
+    lot = max(1, int(lot_size))
+    risk_per_contract = float(multiplier) * abs(float(entry_price) - float(stop_price))
+    remaining = max(0.0, float(equity_usd) * float(risk_fraction) - float(existing_risk_usd))
+  except (TypeError, ValueError):
+    return int(requested_contracts)
+  if requested <= 0 or risk_per_contract <= 0:
+    return requested
+  maximum = int(math.floor((remaining / risk_per_contract) / lot) * lot)
+  return min(requested, maximum)
+
+
+def add_on_guard_reason(
+  *,
+  current_qty: float,
+  new_side: str,
+  avg_entry: float,
+  protective_stop: float | None,
+  proposed_stop: float,
+  fee_buffer_fraction: float = 0.0,
+) -> str | None:
+  """Reject pyramiding that reverses, re-risks, or loosens an existing lifecycle."""
+  qty = float(current_qty)
+  side = str(new_side or "").lower()
+  same_direction = (qty > 0 and side == "buy") or (qty < 0 and side == "sell")
+  if not same_direction:
+    return "Opposite-side entry would implicitly reverse an open position; close it explicitly with reduce_only first"
+  if protective_stop is None:
+    return "Add-on blocked until the existing position has a verified breakeven-or-better stop"
+  entry = float(avg_entry)
+  stop = float(protective_stop)
+  proposed = float(proposed_stop)
+  fee = max(0.0, float(fee_buffer_fraction))
+  breakeven = entry * (1 + fee) if qty > 0 else entry * (1 - fee)
+  locked = stop >= breakeven if qty > 0 else stop <= breakeven
+  if not locked:
+    return "Add-on blocked until existing lifecycle risk is locked at breakeven"
+  loosens = proposed < stop if qty > 0 else proposed > stop
+  if loosens:
+    return "Add-on stop would loosen existing protection"
+  return None
+
+
+def oi_price_signal(price_direction: str | None, oi_trend: str | None) -> tuple[str, str]:
+  """Classify price/OI quadrants only when a real, timestamped OI trend exists."""
+  price = str(price_direction or "").lower()
+  oi = str(oi_trend or "").lower()
+  if price not in {"up", "down"} or oi not in {"up", "down"}:
+    return "neutral", "Open-interest change is unavailable or flat; do not use OI as confirmation."
+  if price == "up" and oi == "up":
+    return "strong_trend", "Rising price + rising OI supports trend continuation."
+  if price == "up" and oi == "down":
+    return "short_covering", "Rising price + falling OI suggests short covering; do not treat it as fresh long conviction."
+  if price == "down" and oi == "up":
+    return "aggressive_shorts", "Falling price + rising OI indicates new short positioning and bearish continuation risk."
+  return "long_capitulation", "Falling price + falling OI indicates long liquidation/capitulation and possible exhaustion."
 
 
 def allow_reversal_long(

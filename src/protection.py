@@ -26,6 +26,7 @@ import logging
 import math
 import time
 import uuid
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
 from .config import ProfitProtectionConfig
@@ -45,6 +46,29 @@ def _to_float(value: Any) -> Optional[float]:
     return float(value)
   except (TypeError, ValueError):
     return None
+
+
+def should_close_for_unrealized_loss(
+  *,
+  unrealized_pnl: Any,
+  equity: Any,
+  max_loss_equity_fraction: Any,
+) -> bool:
+  """Return whether an open position has breached its hard equity-loss budget.
+
+  Invalid/missing inputs and a non-positive fraction disable the guard. The comparison is
+  deliberately strict: a loss exactly equal to the budget has not yet *exceeded* it.
+  """
+  pnl = _to_float(unrealized_pnl)
+  account_equity = _to_float(equity)
+  fraction = _to_float(max_loss_equity_fraction)
+  if pnl is None or account_equity is None or fraction is None:
+    return False
+  if not all(math.isfinite(value) for value in (pnl, account_equity, fraction)):
+    return False
+  if pnl >= 0 or account_equity <= 0 or fraction <= 0:
+    return False
+  return -pnl > account_equity * fraction
 
 
 def decide_protection(
@@ -185,6 +209,7 @@ class ProtectionManager:
     notifier: Any = None,
     emergency_sl_pct: float = 0.0,
     min_rr: float = 1.5,
+    max_loss_equity_fraction: float = 0.0,
   ) -> None:
     self.cfg = cfg
     self.kucoin_futures = kucoin_futures
@@ -195,10 +220,15 @@ class ProtectionManager:
     # refines the bracket later; this just guarantees no position is ever left naked.
     self.emergency_sl_pct = float(emergency_sl_pct or 0.0)
     self.min_rr = float(min_rr or 1.5)
+    # Independent last-resort loss cap. 0 disables it; callers can wire the account's normal
+    # per-trade equity budget here so a missing/gapped stop cannot produce an unbounded loss.
+    self.max_loss_equity_fraction = max(0.0, _to_float(max_loss_equity_fraction) or 0.0)
     self._peak_fe: Dict[str, float] = {}      # futures symbol -> peak favourable excursion (px)
     self._peak_side: Dict[str, bool] = {}     # futures symbol -> side_long (to reset on flip)
+    self._position_lifecycle: Dict[str, tuple[Any, ...]] = {}
     self._tick_cache: Dict[str, float] = {}   # futures symbol -> tick size
     self._naked_since: Dict[str, float] = {}  # futures symbol -> ts first seen open with no stop
+    self._emergency_placed_legs: Dict[str, set[str]] = {}
     self._emergency_grace_sec: float = 90.0   # let an atomic/attached bracket appear before we add one
     self._open_since: Dict[str, float] = {}   # futures symbol -> ts first seen open (for early-cut age)
 
@@ -208,13 +238,15 @@ class ProtectionManager:
     """Evaluate and (unless dry-run) apply protective actions. Returns actions taken."""
     actions: List[Dict[str, Any]] = []
     try:
-      if not self.cfg.enabled:
+      profit_guards_enabled = bool(self.cfg.enabled)
+      if not profit_guards_enabled and self.max_loss_equity_fraction <= 0:
         return actions
       if not self.kucoin_futures or not getattr(snapshot, "futures_enabled", False):
         return actions
 
       positions = list(getattr(snapshot, "futures_positions", []) or [])
       stops = list(getattr(snapshot, "futures_stop_orders", []) or [])
+      equity = self._snapshot_equity(snapshot)
       open_symbols: set[str] = set()
 
       for pos in positions:
@@ -224,20 +256,52 @@ class ProtectionManager:
         if abs(qty) <= 0:
           continue
         fsym = str(pos.get("symbol") or "").strip()
-        avg_entry = _to_float(pos.get("avgEntryPrice")) or 0.0
-        mark = _to_float(pos.get("markPrice")) or 0.0
-        if not fsym or avg_entry <= 0 or mark <= 0:
+        if not fsym:
           continue
         open_symbols.add(fsym)
         side_long = qty > 0
-        opened_min_ago = (time.time() - self._open_since.setdefault(fsym, time.time())) / 60.0
 
-        # Reset peak/age tracking if the position flipped direction since we last saw it.
-        if self._peak_side.get(fsym) != side_long:
+        unrealized_pnl = pos.get("unrealisedPnl")
+        if unrealized_pnl is None:
+          unrealized_pnl = pos.get("unrealizedPnl")
+        if should_close_for_unrealized_loss(
+          unrealized_pnl=unrealized_pnl,
+          equity=equity,
+          max_loss_equity_fraction=self.max_loss_equity_fraction,
+        ):
+          pnl = _to_float(unrealized_pnl) or 0.0
+          budget = equity * self.max_loss_equity_fraction
+          decision = {
+            "action": "close",
+            "reason": (
+              f"hard unrealized-loss cap — loss {abs(pnl):.4f} exceeded "
+              f"{self.max_loss_equity_fraction:.2%} equity budget {budget:.4f}"
+            ),
+          }
+          result = self._apply(fsym, pos, side_long, stops, decision)
+          if result:
+            actions.append(result)
+          continue
+
+        # A configured hard cap remains active independently, but the ratchet, give-back, early-cut,
+        # and emergency-bracket rules retain their existing master switch.
+        if not profit_guards_enabled:
+          continue
+
+        avg_entry = _to_float(pos.get("avgEntryPrice")) or 0.0
+        mark = _to_float(pos.get("markPrice")) or 0.0
+        if avg_entry <= 0 or mark <= 0:
+          continue
+        lifecycle = self._position_signature(pos, side_long, qty, avg_entry)
+        # A same-side close/reopen, add-on, or partial reduction is a new excursion baseline. Keeping
+        # the prior peak against a changed average entry can immediately produce a false give-back.
+        if self._position_lifecycle.get(fsym) != lifecycle:
+          self._position_lifecycle[fsym] = lifecycle
           self._peak_side[fsym] = side_long
           self._peak_fe.pop(fsym, None)
+          self._emergency_placed_legs.pop(fsym, None)
           self._open_since[fsym] = time.time()
-          opened_min_ago = 0.0
+        opened_min_ago = (time.time() - self._open_since.setdefault(fsym, time.time())) / 60.0
 
         fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)
         peak_fe = max(self._peak_fe.get(fsym, fe_now), fe_now)
@@ -252,13 +316,30 @@ class ProtectionManager:
         if sl_price is None and self.emergency_sl_pct > 0:
           first = self._naked_since.setdefault(fsym, time.time())
           if (time.time() - first) >= self._emergency_grace_sec:
-            res = self._ensure_emergency_bracket(fsym, pos, side_long, avg_entry)
-            self._naked_since.pop(fsym, None)
+            already_placed = set(self._emergency_placed_legs.get(fsym, set()))
+            tp_dir = "up" if side_long else "down"
+            if self._has_protective_exit_stop(fsym, side_long, stops, tp_dir):
+              already_placed.add("takeProfit")
+            res = self._ensure_emergency_bracket(
+              fsym, pos, side_long, avg_entry, skip_legs=already_placed,
+            )
             if res:
               actions.append(res)
-            continue  # protected this poll; the agent refines the bracket on its next run
+              for key, leg in (res.get("legs") or {}).items():
+                # Remember a confirmed TP only to avoid stacking another one while retrying a
+                # failed SL. A stop must be visible in the next live snapshot; never trust this
+                # local cache as proof that critical loss protection is still active.
+                if key == "takeProfit" and isinstance(leg, dict) and leg.get("placed"):
+                  self._emergency_placed_legs.setdefault(fsym, set()).add(key)
+              stop_leg = (res.get("legs") or {}).get("stopLoss") or {}
+              # A failed SL must retry on the next poll without another grace period. TP-only
+              # success is useful but does not make the position protected.
+              if res.get("dryRun") or stop_leg.get("placed"):
+                self._naked_since.pop(fsym, None)
+            continue  # emergency placement attempt handled this poll
         else:
           self._naked_since.pop(fsym, None)
+          self._emergency_placed_legs.pop(fsym, None)
 
         decision = decide_protection(
           side_long=side_long,
@@ -282,17 +363,85 @@ class ProtectionManager:
         if sym not in open_symbols:
           self._peak_fe.pop(sym, None)
           self._peak_side.pop(sym, None)
+          self._position_lifecycle.pop(sym, None)
       for sym in list(self._naked_since.keys()):
         if sym not in open_symbols:
           self._naked_since.pop(sym, None)
       for sym in list(self._open_since.keys()):
         if sym not in open_symbols:
           self._open_since.pop(sym, None)
+      for sym in list(self._emergency_placed_legs.keys()):
+        if sym not in open_symbols:
+          self._emergency_placed_legs.pop(sym, None)
     except Exception as exc:  # never break the poll loop
       logger.warning("ProtectionManager.run failed (continuing): %s", exc)
     return actions
 
   # -- internals ----------------------------------------------------------------
+
+  def _snapshot_equity(self, snapshot: Any) -> float:
+    """Best available positive account-equity figure for the hard loss cap."""
+    total = _to_float(getattr(snapshot, "total_usdt", None))
+    if total is not None and math.isfinite(total) and total > 0:
+      return total
+    account = getattr(snapshot, "futures_account", None)
+    if isinstance(account, dict):
+      for key in ("accountEquity", "marginBalance", "availableBalance"):
+        value = _to_float(account.get(key))
+        if value is not None and math.isfinite(value) and value > 0:
+          return value
+    return 0.0
+
+  @staticmethod
+  def _position_signature(
+    pos: Dict[str, Any], side_long: bool, qty: float, avg_entry: float,
+  ) -> tuple[Any, ...]:
+    """Stable identity for excursion/age state, including same-side lifecycle changes."""
+    opened = None
+    for key in ("openingTimestamp", "openingTime", "openTime", "createdAt"):
+      value = pos.get(key)
+      if value not in (None, ""):
+        try:
+          opened = int(float(value))
+        except (TypeError, ValueError):
+          opened = str(value)
+        break
+    return (opened, bool(side_long), float(qty), float(avg_entry))
+
+  @staticmethod
+  def _order_flag(value: Any) -> bool:
+    return value is True or str(value or "").strip().lower() in {"1", "true", "yes"}
+
+  def _is_protective_exit_stop(
+    self,
+    order: Dict[str, Any],
+    fsym: str,
+    side_long: bool,
+    stop_direction: str,
+  ) -> bool:
+    """Only trust conditional orders that can actually reduce/close this position."""
+    if not isinstance(order, dict):
+      return False
+    if str(order.get("symbol") or "").strip() != fsym:
+      return False
+    if str(order.get("stop") or "").strip().lower() != stop_direction:
+      return False
+    expected_side = "sell" if side_long else "buy"
+    if str(order.get("side") or "").strip().lower() != expected_side:
+      return False
+    return self._order_flag(order.get("reduceOnly")) or self._order_flag(order.get("closeOrder"))
+
+  def _has_protective_exit_stop(
+    self,
+    fsym: str,
+    side_long: bool,
+    stops: List[Dict[str, Any]],
+    stop_direction: str,
+  ) -> bool:
+    return any(
+      self._is_protective_exit_stop(order, fsym, side_long, stop_direction)
+      for order in stops
+    )
 
   def _current_stop_price(self, fsym: str, side_long: bool, stops: List[Dict[str, Any]]) -> Optional[float]:
     """Find the protective stop-loss price for a position from active stop orders.
@@ -304,11 +453,7 @@ class ProtectionManager:
     loss_dir = "down" if side_long else "up"
     candidates: List[float] = []
     for o in stops:
-      if not isinstance(o, dict):
-        continue
-      if str(o.get("symbol") or "").strip() != fsym:
-        continue
-      if str(o.get("stop") or "").lower() != loss_dir:
+      if not self._is_protective_exit_stop(o, fsym, side_long, loss_dir):
         continue
       sp = _to_float(o.get("stopPrice"))
       if sp and sp > 0:
@@ -352,7 +497,15 @@ class ProtectionManager:
       record["error"] = str(exc)
     return record
 
-  def _ensure_emergency_bracket(self, fsym: str, pos: Dict[str, Any], side_long: bool, avg_entry: float) -> Optional[Dict[str, Any]]:
+  def _ensure_emergency_bracket(
+    self,
+    fsym: str,
+    pos: Dict[str, Any],
+    side_long: bool,
+    avg_entry: float,
+    *,
+    skip_legs: Optional[set[str]] = None,
+  ) -> Optional[Dict[str, Any]]:
     """Attach a baseline SL (+TP at min_rr) to a position that has no protective stop.
 
     A last-resort net, not the agent's considered bracket: it caps risk at ``emergency_sl_pct`` from
@@ -377,8 +530,17 @@ class ProtectionManager:
     exit_side = "sell" if side_long else "buy"
     loss_dir = "down" if side_long else "up"
     tp_dir = "up" if side_long else "down"
-    try:
-      for label, sdir, sp in (("SL", loss_dir, sl_r), ("TP", tp_dir, tp_r)):
+    leg_results: Dict[str, Dict[str, Any]] = {}
+    errors: Dict[str, str] = {}
+    skip_legs = set(skip_legs or set())
+    for key, label, sdir, sp in (
+      ("stopLoss", "SL", loss_dir, sl_r),
+      ("takeProfit", "TP", tp_dir, tp_r),
+    ):
+      if key in skip_legs:
+        leg_results[key] = {"placed": True, "existing": True}
+        continue
+      try:
         req = KucoinFuturesOrderRequest(
           symbol=fsym, side=exit_side, type="market",
           leverage=common["leverage"], size=common["size"],
@@ -387,14 +549,48 @@ class ProtectionManager:
           reduceOnly=True, closeOrder=True, marginMode=common["marginMode"],
           autoDeposit=False if common["marginMode"] == "ISOLATED" else None,
         )
-        self.kucoin_futures.place_order(req)
+        resp = self.kucoin_futures.place_order(req)
+        order_id = self._confirmed_order_id(resp)
+        if not order_id:
+          raise RuntimeError(f"{label} placement was not confirmed (missing orderId)")
+        leg_results[key] = {"placed": True, "orderId": order_id}
+      except Exception as exc:
+        errors[key] = str(exc)
+        leg_results[key] = {"placed": False, "error": str(exc)}
+
+    record["legs"] = leg_results
+    placed = [key for key, result in leg_results.items() if result.get("placed")]
+    if not errors:
       logger.warning("PROFIT-LOCK attached EMERGENCY bracket on %s (no stop existed) — SL %s / TP %s", spot_symbol, sl_r, tp_r)
       self._notify(f"\U0001f6e1 <b>Profit-lock</b>\n{spot_symbol}: emergency bracket attached (was unprotected)\nSL {sl_r} · TP {tp_r}")
       record["result"] = "placed"
-    except Exception as exc:
-      logger.warning("Emergency bracket failed for %s: %s", spot_symbol, exc)
-      record["error"] = str(exc)
+    else:
+      record["errors"] = errors
+      record["error"] = "; ".join(f"{key}: {error}" for key, error in errors.items())
+      if placed:
+        record["result"] = "partial"
+        logger.warning(
+          "Emergency bracket PARTIAL for %s — placed %s; failed %s",
+          spot_symbol, ", ".join(placed), record["error"],
+        )
+        self._notify(
+          f"\u26a0\ufe0f <b>Profit-lock</b>\n{spot_symbol}: emergency bracket only partially attached\n"
+          f"Placed: {', '.join(placed)} · Failed: {record['error']}"
+        )
+      else:
+        record["result"] = "failed"
+        logger.warning("Emergency bracket failed for %s — %s", spot_symbol, record["error"])
+        self._notify(f"\u26a0\ufe0f <b>Profit-lock</b>\n{spot_symbol}: emergency bracket failed\n{record['error']}")
     return record
+
+  @staticmethod
+  def _confirmed_order_id(response: Any) -> str:
+    """Extract the exchange acknowledgement used before retiring old protection."""
+    if isinstance(response, dict):
+      value = response.get("orderId")
+    else:
+      value = getattr(response, "orderId", None)
+    return str(value or "").strip()
 
   def _order_common(self, pos: Dict[str, Any]) -> Dict[str, Any]:
     """Leverage / margin-mode fields shared by the protective orders."""
@@ -414,24 +610,9 @@ class ProtectionManager:
     stops: List[Dict[str, Any]],
     be_price: float,
   ) -> Dict[str, Any]:
-    # 1) cancel the existing loss-side stop(s) so we don't stack protection.
+    # Place and confirm the replacement first. A duplicate protective stop is safer than even a
+    # brief naked window, and an unconfirmed placement must leave every old stop untouched.
     loss_dir = "down" if side_long else "up"
-    cancelled: List[str] = []
-    for o in stops:
-      if not isinstance(o, dict) or str(o.get("symbol") or "").strip() != fsym:
-        continue
-      if str(o.get("stop") or "").lower() != loss_dir:
-        continue
-      oid = str(o.get("id") or o.get("orderId") or "").strip()
-      if not oid:
-        continue
-      try:
-        self.kucoin_futures.cancel_order(oid, symbol=fsym)
-        cancelled.append(oid)
-      except Exception as exc:
-        logger.warning("PROFIT-LOCK could not cancel stop %s on %s: %s", oid, fsym, exc)
-
-    # 2) place a fresh reduce-only close stop at breakeven.
     common = self._order_common(pos)
     exit_side = "sell" if side_long else "buy"
     be_rounded = self._round_to_tick(fsym, be_price)
@@ -451,7 +632,33 @@ class ProtectionManager:
       autoDeposit=False if common["marginMode"] == "ISOLATED" else None,
     )
     resp = self.kucoin_futures.place_order(req)
-    return {"cancelled": cancelled, "newStop": be_rounded, "orderId": getattr(resp, "orderId", None)}
+    new_order_id = self._confirmed_order_id(resp)
+    if not new_order_id:
+      raise RuntimeError("breakeven stop placement was not confirmed (missing orderId); old stop retained")
+
+    cancelled: List[str] = []
+    cancel_errors: List[Dict[str, str]] = []
+    for o in stops:
+      if not self._is_protective_exit_stop(o, fsym, side_long, loss_dir):
+        continue
+      oid = str(o.get("id") or o.get("orderId") or "").strip()
+      if not oid:
+        continue
+      try:
+        self.kucoin_futures.cancel_order(oid, symbol=fsym)
+        cancelled.append(oid)
+      except Exception as exc:
+        logger.warning("PROFIT-LOCK could not cancel stop %s on %s: %s", oid, fsym, exc)
+        cancel_errors.append({"orderId": oid, "error": str(exc)})
+
+    result: Dict[str, Any] = {
+      "cancelled": cancelled,
+      "newStop": be_rounded,
+      "orderId": new_order_id,
+    }
+    if cancel_errors:
+      result["cancelErrors"] = cancel_errors
+    return result
 
   def _close_position(self, fsym: str, pos: Dict[str, Any], side_long: bool) -> Dict[str, Any]:
     common = self._order_common(pos)
@@ -483,10 +690,17 @@ class ProtectionManager:
       self._tick_cache[fsym] = tick
     if not tick or tick <= 0:
       return price
-    # round to the nearest tick, then normalise float noise to the tick's precision
-    steps = math.floor(price / tick + 0.5)
-    decimals = max(0, -int(math.floor(math.log10(tick)))) if tick < 1 else 0
-    return round(steps * tick, decimals)
+    # Decimal arithmetic supports arbitrary increments such as 0.25 and 0.0025. Inferring decimal
+    # places from log10(tick) corrupts those ticks (for example, 100.25 became 100.2).
+    try:
+      tick_decimal = Decimal(str(tick))
+      price_decimal = Decimal(str(price))
+      if not tick_decimal.is_finite() or not price_decimal.is_finite() or tick_decimal <= 0:
+        return price
+      steps = (price_decimal / tick_decimal).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+      return float(steps * tick_decimal)
+    except (InvalidOperation, ValueError):
+      return price
 
   def _notify(self, message: str) -> None:
     if not self.notifier:

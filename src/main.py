@@ -1,26 +1,69 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import signal
 import sys
 import threading
 import time
 from logging.handlers import RotatingFileHandler
-from typing import Dict
+from typing import Any, Callable, Dict
 
 from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
 from .agent import TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client
 from .config import load_config
 from .dashboard_publisher import DashboardPublisher
-from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount
+from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
 from .memory import MemoryStore
 from .protection import ProtectionManager
+from .safety import TradingSafetyState
 from .telegram import TelegramNotifier
 from .utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
+
+_AGENT_RUN_TIMEOUT_SEC = 20 * 60
+_AGENT_SHUTDOWN_GRACE_SEC = 30
+
+
+class IncompleteFuturesSnapshot(RuntimeError):
+  def __init__(self, failures: list[str], overview: dict | None, positions: list, stops: list) -> None:
+    super().__init__("Incomplete futures snapshot (" + "; ".join(failures) + ")")
+    self.failures = failures
+    self.overview = overview
+    self.positions = positions
+    self.stops = stops
+
+
+async def _run_in_daemon_thread(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+  """Await blocking work in a daemon thread so a timed-out model cannot hold process shutdown."""
+  loop = asyncio.get_running_loop()
+  future = loop.create_future()
+
+  def _worker() -> None:
+    try:
+      outcome = (True, fn(*args, **kwargs))
+    except BaseException as exc:  # propagate model/tool failures back to the loop
+      outcome = (False, exc)
+
+    def _settle() -> None:
+      if future.done():
+        return
+      if outcome[0]:
+        future.set_result(outcome[1])
+      else:
+        future.set_exception(outcome[1])
+
+    try:
+      loop.call_soon_threadsafe(_settle)
+    except RuntimeError:
+      pass  # event loop already closed; daemon worker has no remaining authority
+
+  threading.Thread(target=_worker, daemon=True, name="trAIde-agent").start()
+  return await future
 
 
 def _adaptive_agent_cooldown(
@@ -71,7 +114,13 @@ _TICKER_FAIL_COUNTS: dict[str, int] = {}
 _TICKER_FAIL_THRESHOLD = 3  # consecutive failures before removal
 
 
-def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemoryStore) -> tuple[list[str], dict]:
+def _fetch_tickers(
+  cfg,
+  kucoin: KucoinClient,
+  coins: list[str],
+  memory: MemoryStore,
+  preserve_symbols: set[str] | None = None,
+) -> tuple[list[str], dict]:
   """Normalize symbols, fetch tickers with retry. Only remove after repeated consecutive failures."""
   normalized: list[str] = []
   seen: set[str] = set()
@@ -92,7 +141,11 @@ def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemorySt
       _TICKER_FAIL_COUNTS[symbol] = _TICKER_FAIL_COUNTS.get(symbol, 0) + 1
       fail_count = _TICKER_FAIL_COUNTS[symbol]
       logger.warning("Ticker fetch failed for %s (%d/%d): %s", symbol, fail_count, _TICKER_FAIL_THRESHOLD, exc)
-      if cfg.trading.flexible_coins_enabled and fail_count >= _TICKER_FAIL_THRESHOLD:
+      if (
+        cfg.trading.flexible_coins_enabled
+        and fail_count >= _TICKER_FAIL_THRESHOLD
+        and symbol not in (preserve_symbols or set())
+      ):
         try:
           removal = memory.remove_coin(
             symbol,
@@ -104,7 +157,7 @@ def _fetch_tickers(cfg, kucoin: KucoinClient, coins: list[str], memory: MemorySt
         except Exception as remove_exc:
           logger.warning("Failed to remove unavailable symbol %s: %s", symbol, remove_exc)
 
-  if not tickers:
+  if not tickers and not (preserve_symbols or set()):
     raise RuntimeError(f"No tickers available; failed symbols: {missing}")
 
   return list(tickers.keys()), tickers
@@ -153,21 +206,67 @@ def _fetch_futures(cfg, kucoin_futures: KucoinFuturesClient | None) -> tuple[dic
   """Fetch futures account overview, positions, and stop orders. Returns (overview, positions, stops)."""
   if not (cfg.kucoin_futures.enabled and kucoin_futures):
     return None, [], []
+  failures: list[str] = []
+  overview = None
+  positions: list = []
+  stops: list = []
   try:
     overview = kucoin_futures.get_account_overview()
-    stops = kucoin_futures.list_stop_orders(status="active") or []
-    positions = kucoin_futures.list_positions() or []
-    return overview, positions, stops
   except Exception as exc:
-    logger.warning("Unable to fetch futures account overview: %s", exc)
-    return None, [], []
+    failures.append(f"overview: {exc}")
+  try:
+    positions = kucoin_futures.list_positions() or []
+  except Exception as exc:
+    failures.append(f"positions: {exc}")
+  try:
+    stops = kucoin_futures.list_stop_orders(status="active") or []
+  except Exception as exc:
+    failures.append(f"stops: {exc}")
+  if failures:
+    # Never turn a partial API failure into an apparently flat/unprotected book. The outer loop
+    # retries the entire snapshot and blocks all entries until exchange truth is complete again.
+    raise IncompleteFuturesSnapshot(failures, overview, positions, stops)
+  return overview, positions, stops
+
+
+def _fill_event_id(entry: dict, venue: str) -> str:
+  """Stable fill identity for poll/restart deduplication, including partial fills."""
+  for key in ("tradeId", "id", "fillId"):
+    value = entry.get(key)
+    if value not in (None, ""):
+      return f"{venue}:{value}"
+  parts = [
+    entry.get("orderId"), entry.get("createdAt") or entry.get("tradeCreatedAt"),
+    entry.get("symbol"), entry.get("side"), entry.get("price"),
+    entry.get("size") or entry.get("filledSize"),
+  ]
+  if not any(value not in (None, "") for value in parts):
+    digest = hashlib.sha256(json.dumps(entry, sort_keys=True, default=str).encode()).hexdigest()[:24]
+    return f"{venue}:payload:{digest}"
+  return f"{venue}:" + ":".join(str(value or "") for value in parts)
+
+
+def _close_event_id(entry: dict) -> str:
+  """Stable close identity; fallback includes lifecycle fields instead of open time alone."""
+  value = entry.get("id") or entry.get("positionId")
+  if value not in (None, ""):
+    return str(value)
+  parts = [
+    entry.get("symbol"), entry.get("type") or entry.get("side"),
+    entry.get("openTime") or entry.get("openingTimestamp"),
+    entry.get("closeTime") or entry.get("updatedAt"),
+  ]
+  if not any(value not in (None, "") for value in parts):
+    digest = hashlib.sha256(json.dumps(entry, sort_keys=True, default=str).encode()).hexdigest()[:24]
+    return f"close:payload:{digest}"
+  return "close:" + ":".join(str(value or "") for value in parts)
 
 
 def _fetch_recent_fills(kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, lookback_minutes: int = 10) -> Dict:
   """Fetch fills and closed positions from the last N minutes (using KuCoin server time to avoid clock drift)."""
   now_ms = kucoin._timestamp_ms()
   cutoff_ms = now_ms - lookback_minutes * 60 * 1000
-  result: Dict[str, Any] = {"spot_fills": [], "futures_fills": [], "closed_positions": []}
+  result: Dict[str, Any] = {"spot_fills": [], "futures_fills": [], "closed_positions": [], "_errors": []}
 
   def _after_cutoff(entry: dict, *ts_keys: str) -> bool:
     for k in ts_keys:
@@ -178,24 +277,73 @@ def _fetch_recent_fills(kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
           return True
     return False
 
+  def _paged(fetch: Callable[..., list], *, page_size: int, ts_keys: tuple[str, ...], label: str) -> list:
+    rows_in_window: list = []
+    seen_payloads: set[str] = set()
+    previous_page_signature = ""
+    max_pages = 20
+    for page in range(1, max_pages + 1):
+      rows = fetch(page=page, page_size=page_size) or []
+      signature = hashlib.sha256(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
+      if page > 1 and signature == previous_page_signature:
+        break  # defensive: endpoint ignored page and repeated page 1
+      previous_page_signature = signature
+      for row in rows:
+        if not isinstance(row, dict) or not _after_cutoff(row, *ts_keys):
+          continue
+        payload_id = hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()
+        if payload_id not in seen_payloads:
+          seen_payloads.add(payload_id)
+          rows_in_window.append(row)
+      if len(rows) < page_size:
+        break
+      timestamps = []
+      for row in rows:
+        if not isinstance(row, dict):
+          continue
+        for key in ts_keys:
+          value = row.get(key)
+          if value is None:
+            continue
+          try:
+            ts = int(value)
+            timestamps.append(ts if ts > 1e12 else ts * 1000)
+          except (TypeError, ValueError):
+            pass
+          break
+      if timestamps and min(timestamps) < cutoff_ms:
+        break
+    else:
+      result["_errors"].append(f"{label}: pagination exceeded {max_pages} pages")
+    return rows_in_window
+
   try:
-    spot_fills = kucoin.get_fills(page_size=50) or []
-    result["spot_fills"] = [f for f in spot_fills if _after_cutoff(f, "createdAt", "tradeCreatedAt")]
+    result["spot_fills"] = _paged(
+      kucoin.get_fills, page_size=50,
+      ts_keys=("createdAt", "tradeCreatedAt"), label="spot fills",
+    )
   except Exception as exc:
     logger.warning("Unable to fetch spot fills: %s", exc)
+    result["_errors"].append(f"spot fills: {exc}")
 
   if kucoin_futures:
     try:
-      futures_fills = kucoin_futures.get_fills(page_size=50) or []
-      result["futures_fills"] = [f for f in futures_fills if _after_cutoff(f, "createdAt", "tradeCreatedAt")]
+      result["futures_fills"] = _paged(
+        kucoin_futures.get_fills, page_size=50,
+        ts_keys=("createdAt", "tradeCreatedAt"), label="futures fills",
+      )
     except Exception as exc:
       logger.warning("Unable to fetch futures fills: %s", exc)
+      result["_errors"].append(f"futures fills: {exc}")
 
     try:
-      closed = kucoin_futures.get_position_history(page_size=20) or []
-      result["closed_positions"] = [p for p in closed if _after_cutoff(p, "closeTime", "updatedAt")]
+      result["closed_positions"] = _paged(
+        kucoin_futures.get_position_history, page_size=50,
+        ts_keys=("closeTime", "updatedAt"), label="closed positions",
+      )
     except Exception as exc:
       logger.warning("Unable to fetch closed positions: %s", exc)
+      result["_errors"].append(f"closed positions: {exc}")
 
   return result
 
@@ -243,7 +391,12 @@ def _live_extremes_map(snapshot) -> Dict[str, dict]:
       upnl = float(upnl) if upnl is not None else None
     except (TypeError, ValueError):
       upnl = None
-    out[sym] = {"netSize": qty, "unrealizedPnl": upnl}
+    out[sym] = {
+      "netSize": qty,
+      "unrealizedPnl": upnl,
+      "positionOpenTime": p.get("openingTimestamp") or p.get("openTime"),
+      "positionSide": "long" if qty > 0 else "short",
+    }
   return out
 
 
@@ -302,15 +455,50 @@ def _expired_bot_entry_orders(pending_orders: list[dict], expiry_minutes: float,
 
 def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClient | None, memory: MemoryStore) -> TradingSnapshot:
   raw_coins = _load_active_coins(cfg, memory)
-  coins, tickers = _fetch_tickers(cfg, kucoin, raw_coins, memory)
+  futures_overview, futures_positions, futures_stops = _fetch_futures(cfg, kucoin_futures)
+  live_futures_symbols: set[str] = set()
+  for position in futures_positions:
+    if not isinstance(position, dict):
+      continue
+    try:
+      qty = float(position.get("currentQty") or 0)
+    except (TypeError, ValueError):
+      continue
+    symbol = normalize_symbol(position.get("symbol") or "")
+    if qty and symbol:
+      live_futures_symbols.add(symbol)
+  coins, tickers = _fetch_tickers(
+    cfg, kucoin, raw_coins, memory,
+    preserve_symbols=live_futures_symbols,
+  )
+  for symbol in sorted(live_futures_symbols):
+    if symbol in tickers:
+      continue
+    try:
+      tickers[symbol] = kucoin.get_ticker(symbol)
+      coins.append(symbol)
+    except Exception as exc:
+      live_position = next(
+        (position for position in futures_positions if normalize_symbol(position.get("symbol") or "") == symbol),
+        {},
+      )
+      mark = float(live_position.get("markPrice") or 0) if isinstance(live_position, dict) else 0.0
+      if mark > 0:
+        mark_str = str(mark)
+        tickers[symbol] = KucoinTicker(
+          sequence="", bestAsk=mark_str, size="0", price=mark_str,
+          bestBidSize="0", bestBid=mark_str, bestAskSize="0", time=kucoin._timestamp_ms(),
+        )
+        coins.append(symbol)
+        logger.warning("Using futures mark for manageable live symbol %s because spot ticker failed: %s", symbol, exc)
+      else:
+        logger.warning("Live futures symbol %s has no spot ticker; management remains enabled: %s", symbol, exc)
   spot_accounts, financial_accounts, all_accounts = _fetch_balances(kucoin)
 
   # Discover spot holdings not in the active coin list (e.g., externally bought coins).
   extra_coins, extra_tickers = _discover_unlisted_holdings(kucoin, spot_accounts, tickers)
   coins.extend(extra_coins)
   tickers.update(extra_tickers)
-
-  futures_overview, futures_positions, futures_stops = _fetch_futures(cfg, kucoin_futures)
 
   spot_stops: list[dict] = []
   try:
@@ -375,8 +563,13 @@ def build_snapshot(cfg, kucoin: KucoinClient, kucoin_futures: KucoinFuturesClien
   )
 
 
-async def trading_loop() -> None:
+async def trading_loop(
+  stop_event: asyncio.Event | None = None,
+  safety: TradingSafetyState | None = None,
+) -> None:
   cfg = load_config()
+  stop_event = stop_event or asyncio.Event()
+  safety = safety or TradingSafetyState()
   setup_tracing(cfg)
   ls_client = setup_lstracing(cfg)
   azure_client = _build_openai_client(cfg)
@@ -391,10 +584,25 @@ async def trading_loop() -> None:
   last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
   last_agent_run_ts = 0.0        # cost/churn throttle; protection still runs on every poll
   pending_trigger_moves: Dict[str, float] = {}  # strongest move per symbol, retained until reviewed
+  pending_agent_triggers: set[str] = set()
+  agent_task: asyncio.Task | None = None
+  agent_task_triggers: list[str] = []
+  agent_task_forced_research = False
+  agent_task_token: str | None = None
+  agent_task_event_ids: list[str] = []
+  agent_task_started_ts = 0.0
+  agent_task_timed_out = False
+  agent_task_trigger_moves: Dict[str, float] = {}
+  agent_task_discrete_triggers: set[str] = set()
+  last_complete_fill_poll_ts = 0.0
   memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
   # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
   logged_closed_position_ids: set[str] = set(memory.get_seen_close_ids())
+  logged_fill_ids: set[str] = set(memory.get_seen_fill_ids())
+  for pending_event in memory.get_pending_agent_events():
+    if pending_event.get("kind") in {"spot_fills", "futures_fills"}:
+      logged_fill_ids.add(str(pending_event.get("id") or ""))
   notifier = TelegramNotifier(cfg)
   notifier.notify_startup(cfg)
   dashboard = DashboardPublisher(cfg)
@@ -407,6 +615,7 @@ async def trading_loop() -> None:
   protection = ProtectionManager(
     cfg.profit_protection, kucoin_futures, notifier=notifier,
     emergency_sl_pct=cfg.trading.emergency_sl_pct, min_rr=cfg.trading.min_futures_rr,
+    max_loss_equity_fraction=cfg.trading.risk_per_trade_pct,
   )
   if cfg.profit_protection.enabled:
     logger.info(
@@ -417,14 +626,39 @@ async def trading_loop() -> None:
     )
 
   logger.info("Starting trading loop...")
-  while True:
+  while not stop_event.is_set():
     try:
       snapshot = build_snapshot(cfg, kucoin, kucoin_futures, memory)
     except Exception as exc:
+      safety.invalidate(f"Snapshot incomplete: {exc}", revoke_active=True)
       logger.error("Snapshot failed, retrying after delay: %s", exc)
       notifier.notify_error(str(exc), context="Snapshot build")
-      await asyncio.sleep(cfg.trading.poll_interval_sec)
+      # If positions and stops were both fetched, keep the deterministic safety loop alive even
+      # though entries stay disabled because some other part of exchange truth is incomplete.
+      if isinstance(exc, IncompleteFuturesSnapshot) and kucoin_futures:
+        failed_names = {failure.split(":", 1)[0] for failure in exc.failures}
+        if "positions" not in failed_names and "stops" not in failed_names:
+          try:
+            degraded = type("DegradedSnapshot", (), {
+              "futures_enabled": True,
+              "futures_positions": exc.positions,
+              "futures_stop_orders": exc.stops,
+              "futures_account": exc.overview or {},
+              "total_usdt": 0.0,
+            })()
+            with safety.order_lock:
+              actions = protection.run(degraded)
+            if actions:
+              logger.warning("Protection actions taken from degraded snapshot: %s", actions)
+          except Exception as protection_exc:
+            logger.warning("Degraded protection failed: %s", protection_exc)
+      try:
+        await asyncio.wait_for(stop_event.wait(), timeout=cfg.trading.poll_interval_sec)
+      except asyncio.TimeoutError:
+        pass
       continue
+    if stop_event.is_set():
+      break
 
     # GTC entry orders do not expire just because the tool response contains an expiresAt note.
     # Enforce the configured TTL on bot-tagged orders before the agent sees the book, preventing a
@@ -440,7 +674,8 @@ async def trading_loop() -> None:
         if not oid:
           continue
         try:
-          kucoin_futures.cancel_order(oid, symbol=order.get("symbol"))
+          with safety.order_lock:
+            kucoin_futures.cancel_order(oid, symbol=order.get("symbol"))
           cancelled_ids.add(oid)
           logger.info("Expired stale futures entry %s (%s) after %.0fmin", oid, order.get("symbol"), cfg.trading.entry_limit_expiry_minutes)
         except Exception as exc:
@@ -481,6 +716,7 @@ async def trading_loop() -> None:
           continue
 
     total_usdt = spot_usdt + futures_usdt + financial_usdt
+    safety.refresh(total_usdt)
 
     # Track daily drawdown per venue; the circuit-breaker section below converts the total scope
     # into a hard close-only restriction when its configured limit is breached.
@@ -497,12 +733,96 @@ async def trading_loop() -> None:
       logger.info("Daily drawdown: total=%.2f%% spot=%.2f%% futures=%.2f%%",
                   snapshot.drawdown_pct, snapshot.drawdown_pct_spot, snapshot.drawdown_pct_futures)
 
+    if (
+      agent_task is not None
+      and not agent_task.done()
+      and not agent_task_timed_out
+      and agent_task_started_ts > 0
+      and time.time() - agent_task_started_ts >= _AGENT_RUN_TIMEOUT_SEC
+    ):
+      agent_task_timed_out = True
+      safety.revoke_run(agent_task_token, "Background agent exceeded its 20-minute authority window")
+      logger.error("Background agent exceeded %dsec; all later exchange writes from that run are disabled.", _AGENT_RUN_TIMEOUT_SEC)
+      notifier.notify_error("Model run exceeded 20 minutes; entry/order authority revoked.", context="Agent timeout")
+      # Cancelling the asyncio wrapper cannot stop a thread stuck in blocking SDK code. Detach it
+      # after revoking its unique token so it cannot touch the exchange, retain its inbox events,
+      # and allow a fresh single-flight run after the normal active cooldown.
+      agent_task.cancel()
+      for symbol, move in agent_task_trigger_moves.items():
+        pending_trigger_moves[symbol] = max(move, pending_trigger_moves.get(symbol, 0.0))
+      pending_agent_triggers.update(agent_task_discrete_triggers)
+      last_agent_run_ts = time.time()
+      agent_task = None
+      agent_task_triggers = []
+      agent_task_forced_research = False
+      agent_task_token = None
+      agent_task_event_ids = []
+      agent_task_started_ts = 0.0
+      agent_task_timed_out = False
+      agent_task_trigger_moves = {}
+      agent_task_discrete_triggers = set()
+
+    # Harvest a completed single-flight model run without ever pausing the snapshot/protection loop.
+    if agent_task is not None and agent_task.done():
+      last_agent_run_ts = time.time()  # enforce cadence from completion, not from a long run's start
+      try:
+        result = agent_task.result()
+        logger.info("--- Agent Decision Narrative ---\n%s", result.get("narrative", ""))
+        if result.get("decisions"):
+          logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
+        notifier.notify_agent_run(agent_task_triggers or ["background_run"], result)
+
+        acknowledged = memory.acknowledge_agent_events(agent_task_event_ids)
+        for event in acknowledged:
+          if event.get("kind") in {"spot_fills", "futures_fills"}:
+            memory.record_seen_fill_id(str(event.get("id") or ""))
+
+        threshold = cfg.trading.research_handoff_after_no_trade_runs
+        research_cooldown_sec = cfg.trading.research_handoff_cooldown_min * 60
+        if agent_task_forced_research:
+          consecutive_no_trade_runs = 0
+          force_research = False
+          last_forced_research_ts = time.time()
+        elif _agent_made_a_move(result):
+          consecutive_no_trade_runs = 0
+        else:
+          consecutive_no_trade_runs += 1
+        current_book_active = bool(
+          snapshot.futures_positions or snapshot.futures_pending_orders or snapshot.spot_pending_orders
+        )
+        # Whole-market research is deliberately flat-only. Running it while capital is exposed
+        # caused 10–25 minute protection blind spots and encouraged unrelated add-ons.
+        if threshold > 0 and consecutive_no_trade_runs >= threshold and not current_book_active:
+          elapsed = time.time() - last_forced_research_ts
+          if elapsed >= research_cooldown_sec:
+            force_research = True
+            logger.info("No trade for %d flat-book runs — forcing Research Agent handoff next run.", consecutive_no_trade_runs)
+      except Exception as exc:
+        logger.error("Agent run failed: %s", exc)
+        notifier.notify_error(str(exc), context="Agent run")
+        for symbol, move in agent_task_trigger_moves.items():
+          pending_trigger_moves[symbol] = max(move, pending_trigger_moves.get(symbol, 0.0))
+        pending_agent_triggers.update(agent_task_discrete_triggers)
+      finally:
+        safety.finish_run(agent_task_token)
+        agent_task = None
+        agent_task_triggers = []
+        agent_task_forced_research = False
+        agent_task_token = None
+        agent_task_event_ids = []
+        agent_task_started_ts = 0.0
+        agent_task_timed_out = False
+        agent_task_trigger_moves = {}
+        agent_task_discrete_triggers = set()
+
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
       price = float(ticker.price)
       prev = last_prices.get(symbol)
       if prev is None:
-        triggers.append(f"initial:{symbol}")
+        initial_trigger = f"initial:{symbol}"
+        triggers.append(initial_trigger)
+        pending_agent_triggers.add(initial_trigger)
       else:
         change_pct = abs(price - prev) / prev * 100
         if change_pct >= cfg.trading.price_change_trigger_pct:
@@ -523,7 +843,8 @@ async def trading_loop() -> None:
     # Code-driven profit protection: ratchet stops to breakeven and cap give-back on
     # live futures positions every poll, independent of whether the agent runs. Never raises.
     try:
-      protection_actions = protection.run(snapshot)
+      with safety.order_lock:
+        protection_actions = protection.run(snapshot)
       if protection_actions:
         logger.info("Profit-lock actions taken: %s", protection_actions)
     except Exception as exc:
@@ -531,16 +852,62 @@ async def trading_loop() -> None:
 
     # Retain throttled moves until the model actually reviews them. Without this queue, a trigger
     # followed by a quiet poll vanished and the adaptive shorter cooldown never got another chance.
-    run_candidate = bool(triggers or pending_trigger_moves) or idle_polls >= cfg.trading.max_idle_polls
+    run_candidate = bool(triggers or pending_trigger_moves or pending_agent_triggers) or idle_polls >= cfg.trading.max_idle_polls
 
-    recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=30)
+    fill_lookback_minutes = 1440 if last_complete_fill_poll_ts <= 0 else max(
+      30,
+      min(1440, int((time.time() - last_complete_fill_poll_ts) / 60) + 5),
+    )
+    recent_fills = _fetch_recent_fills(kucoin, kucoin_futures, lookback_minutes=fill_lookback_minutes)
+    fill_poll_errors = recent_fills.pop("_errors", [])
+    critical_fill_errors = [
+      error for error in fill_poll_errors
+      if kucoin_futures is None or not str(error).startswith("spot fills:")
+    ]
+    if critical_fill_errors:
+      safety.invalidate("Fill/close history incomplete: " + "; ".join(critical_fill_errors), revoke_active=True)
+      logger.error("Entry/order authority disabled because futures event history is incomplete: %s", critical_fill_errors)
+    if not fill_poll_errors:
+      last_complete_fill_poll_ts = time.time()
+    new_spot_fills = []
+    for fill in recent_fills["spot_fills"]:
+      fill_id = _fill_event_id(fill, "spot")
+      if fill_id in logged_fill_ids:
+        continue
+      logged_fill_ids.add(fill_id)
+      memory.mark_order_filled(fill.get("orderId"), fill.get("clientOid"))
+      if memory.queue_agent_event("spot_fills", fill_id, fill):
+        new_spot_fills.append(fill)
+    new_futures_fills = []
+    for fill in recent_fills["futures_fills"]:
+      fill_id = _fill_event_id(fill, "futures")
+      if fill_id in logged_fill_ids:
+        continue
+      logged_fill_ids.add(fill_id)
+      memory.mark_order_filled(fill.get("orderId"), fill.get("clientOid"))
+      if memory.queue_agent_event("futures_fills", fill_id, fill):
+        new_futures_fills.append(fill)
+    new_closed_positions = []
+    for cp in recent_fills["closed_positions"]:
+      close_id = _close_event_id(cp)
+      legacy_id = str(cp.get("openTime") or "")
+      if close_id in logged_closed_position_ids or (legacy_id and legacy_id in logged_closed_position_ids):
+        continue
+      memory.queue_agent_event("closed_positions", f"closed:{close_id}", cp)
+      new_closed_positions.append(cp)
+    recent_fills = {
+      "spot_fills": new_spot_fills,
+      "futures_fills": new_futures_fills,
+      "closed_positions": new_closed_positions,
+    }
     new_events_count = len(recent_fills["spot_fills"]) + len(recent_fills["futures_fills"]) + len(recent_fills["closed_positions"])
+    pending_events_count = len(memory.get_pending_agent_events())
     if new_events_count:
       logger.info("Detected %d new fill/close events (spot=%d, futures=%d, closed=%d)",
                    new_events_count, len(recent_fills["spot_fills"]), len(recent_fills["futures_fills"]), len(recent_fills["closed_positions"]))
 
     for cp in recent_fills["closed_positions"]:
-      cp_id = str(cp.get("id") or cp.get("openTime") or "")
+      cp_id = _close_event_id(cp)
       if not cp_id or cp_id in logged_closed_position_ids:
         continue
       try:
@@ -569,6 +936,23 @@ async def trading_loop() -> None:
         # MFE/MAE from the pre-reset extremes: how far the trade ran in profit (peak) and underwater
         # (trough) before closing — the data that tells us if TPs are set within realistic reach.
         _ext = pre_close_extremes.get(sym, {}) if isinstance(pre_close_extremes, dict) else {}
+        cp_open_time = cp.get("openTime") or cp.get("openingTimestamp")
+        if _ext.get("positionOpenTime") not in (None, "") and cp_open_time not in (None, ""):
+          try:
+            ext_open = int(float(_ext["positionOpenTime"]))
+            close_open = int(float(cp_open_time))
+            ext_open = ext_open if ext_open > 1_000_000_000_000 else ext_open * 1000
+            close_open = close_open if close_open > 1_000_000_000_000 else close_open * 1000
+            if abs(ext_open - close_open) > 1000:
+              _ext = {}
+          except (TypeError, ValueError):
+            _ext = {}
+        peak_pnl = _ext.get("peakPnl")
+        trough_pnl = _ext.get("troughPnl")
+        # Include the fee/funding-adjusted terminal result so every close lies inside its recorded
+        # lifecycle range; sampled unrealized extrema alone missed terminal slippage and fees.
+        peak_pnl = pnl if peak_pnl is None else max(float(peak_pnl), pnl)
+        trough_pnl = pnl if trough_pnl is None else min(float(trough_pnl), pnl)
         memory.log_decision(
           sym,
           f"futures_{side}_triggered",
@@ -581,8 +965,8 @@ async def trading_loop() -> None:
           position_id=cp.get("id"),
           position_open_time=cp.get("openTime") or cp.get("openingTimestamp"),
           position_side=position_side,
-          peak_pnl=_ext.get("peakPnl"),
-          trough_pnl=_ext.get("troughPnl"),
+          peak_pnl=peak_pnl,
+          trough_pnl=trough_pnl,
         )
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)
@@ -633,75 +1017,92 @@ async def trading_loop() -> None:
       flat_cooldown_sec=cfg.trading.flat_agent_cooldown_sec,
       active_cooldown_sec=cfg.trading.active_agent_cooldown_sec,
       book_active=book_active,
-      new_events_count=new_events_count,
+      new_events_count=pending_events_count + len(pending_agent_triggers),
       trigger_move_pcts=list(pending_trigger_moves.values()),
       price_trigger_pct=cfg.trading.price_change_trigger_pct,
     )
-    run_candidate = run_candidate or bool(new_events_count)
+    run_candidate = run_candidate or bool(pending_events_count)
     cooldown_elapsed = time.time() - last_agent_run_ts
-    should_run = run_candidate and (last_agent_run_ts <= 0 or cooldown_elapsed >= max(0.0, cooldown_sec))
-    if run_candidate and not should_run and idle_polls % max(1, cfg.trading.max_idle_polls) == 0:
+    should_run = (
+      agent_task is None
+      and run_candidate
+      and (last_agent_run_ts <= 0 or cooldown_elapsed >= max(0.0, cooldown_sec))
+    )
+    if agent_task is None and run_candidate and not should_run and idle_polls % max(1, cfg.trading.max_idle_polls) == 0:
       logger.info("Agent run throttled for another %dsec (book_active=%s)", int(cooldown_sec - cooldown_elapsed), book_active)
 
-    if should_run:
+    if should_run and not stop_event.is_set():
+      run_token = safety.authorize_run()
+      if not run_token:
+        logger.warning("Agent run skipped because live entry/order authority is unavailable.")
+        idle_polls += 1
+        try:
+          await asyncio.wait_for(stop_event.wait(), timeout=cfg.trading.poll_interval_sec)
+        except asyncio.TimeoutError:
+          pass
+        continue
       idle_polls = 0
       last_agent_run_ts = time.time()
-      agent_triggers = triggers or [
+      agent_triggers = list(pending_agent_triggers)
+      agent_triggers.extend(trigger for trigger in triggers if trigger not in agent_triggers)
+      agent_triggers.extend(
         f"pending_price_move:{symbol}:{move:.2f}%"
         for symbol, move in sorted(pending_trigger_moves.items())
-      ] or ["idle_threshold"]
+        if not any(trigger.startswith(f"price_move:{symbol}:") for trigger in agent_triggers)
+      )
+      if not agent_triggers:
+        agent_triggers = ["idle_threshold"]
+      agent_task_trigger_moves = dict(pending_trigger_moves)
+      agent_task_discrete_triggers = set(pending_agent_triggers)
       pending_trigger_moves.clear()
-      logger.info("Running agent. Triggers: %s", agent_triggers)
-      try:
-        result = await asyncio.to_thread(
-          run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client,
-          recent_fills=recent_fills if new_events_count else None,
-          force_research=force_research,
-        )
-        logger.info("--- Agent Decision Narrative ---\n%s", result["narrative"])
-        if result.get("decisions"):
-          logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
-        notifier.notify_agent_run(agent_triggers, result)
-
-        # Stuck-state detection: when the agent makes no move for several consecutive runs,
-        # force a Research Agent handoff next run to refresh the coin universe. Forcing resets
-        # the counter so research is re-triggered only after another `threshold` quiet runs
-        # (rate-limits the costly web research instead of firing every poll).
-        threshold = cfg.trading.research_handoff_after_no_trade_runs
-        cooldown_sec = cfg.trading.research_handoff_cooldown_min * 60
-        if force_research:
-          consecutive_no_trade_runs = 0
-          force_research = False
-          last_forced_research_ts = time.time()
-        elif _agent_made_a_move(result):
-          consecutive_no_trade_runs = 0
-        else:
-          consecutive_no_trade_runs += 1
-        # Force a research handoff once the no-trade streak crosses the threshold, but not more
-        # often than the cooldown — forced research runs an expensive high-context web sweep, and
-        # in a genuine no-setup tape hammering it every few minutes just burns tokens.
-        if threshold > 0 and consecutive_no_trade_runs >= threshold:
-          elapsed = time.time() - last_forced_research_ts
-          if elapsed >= cooldown_sec:
-            force_research = True
-            logger.info("No trade for %d consecutive runs — forcing Research Agent handoff next run.", consecutive_no_trade_runs)
-          else:
-            logger.info("Stuck %d runs but research cooldown active (%dmin left) — not forcing yet.",
-                        consecutive_no_trade_runs, int((cooldown_sec - elapsed) / 60))
-      except Exception as exc:
-        # Keep the loop alive across restarts and transient errors.
-        logger.error("Agent run failed: %s", exc)
-        notifier.notify_error(str(exc), context="Agent run")
+      pending_agent_triggers.clear()
+      pending_batch = memory.get_pending_agent_events()
+      events_for_agent: Dict[str, list] = {}
+      for event in pending_batch:
+        kind = str(event.get("kind") or "")
+        if kind:
+          events_for_agent.setdefault(kind, []).append(event.get("payload"))
+      force_research_for_run = bool(force_research and not book_active)
+      agent_task_triggers = agent_triggers
+      agent_task_forced_research = force_research_for_run
+      agent_task_token = run_token
+      agent_task_event_ids = [str(event.get("id") or "") for event in pending_batch]
+      agent_task_started_ts = time.time()
+      agent_task_timed_out = False
+      logger.info("Starting background agent. Triggers: %s", agent_triggers)
+      agent_task = asyncio.create_task(_run_in_daemon_thread(
+        run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client,
+        recent_fills=events_for_agent or None,
+        force_research=force_research_for_run,
+        safety_state=safety,
+        entry_token=run_token,
+      ))
     else:
       idle_polls += 1
-      logger.info("Agent idle/throttled. Idle polls: %d/%d", idle_polls, cfg.trading.max_idle_polls)
+      logger.info(
+        "Agent %s. Idle polls: %d/%d",
+        "running in background" if agent_task is not None else "idle/throttled",
+        idle_polls,
+        cfg.trading.max_idle_polls,
+      )
 
     # Publish a sanitized public-safe snapshot for the read-only spectator dashboard.
     # Self-throttled and never raises, so it is safe to call every poll. Open positions are
     # read from `snapshot` (live exchange truth), not MemoryStore (which lingers after TP/SL).
     dashboard.publish(memory, snapshot, last_prices, cfg)
 
-    await asyncio.sleep(cfg.trading.poll_interval_sec)
+    try:
+      await asyncio.wait_for(stop_event.wait(), timeout=cfg.trading.poll_interval_sec)
+    except asyncio.TimeoutError:
+      pass
+
+  safety.begin_shutdown()
+  if agent_task is not None and not agent_task.done():
+    safety.revoke_run(agent_task_token, "Process is shutting down")
+    try:
+      await asyncio.wait_for(asyncio.shield(agent_task), timeout=_AGENT_SHUTDOWN_GRACE_SEC)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+      agent_task.cancel()
 
 
 def main() -> None:
@@ -728,15 +1129,22 @@ def main() -> None:
 
   loop = asyncio.new_event_loop()
   asyncio.set_event_loop(loop)
-  loop.add_signal_handler(signal.SIGTERM, loop.stop)
+  stop_event = asyncio.Event()
+  safety = TradingSafetyState()
+  def _request_shutdown() -> None:
+    safety.begin_shutdown()
+    stop_event.set()
+  loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+  loop.add_signal_handler(signal.SIGINT, _request_shutdown)
   try:
-    loop.run_until_complete(trading_loop())
+    loop.run_until_complete(trading_loop(stop_event=stop_event, safety=safety))
   except KeyboardInterrupt:
     logger.info("Shutting down...")
   except Exception as exc:
     logger.error("Fatal error: %s", exc)
     sys.exit(1)
   finally:
+    safety.begin_shutdown()
     loop.close()
 
 

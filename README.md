@@ -63,15 +63,15 @@ flowchart TB
     sandbox --> spectators
 ```
 
-**Trading Agent** -- Places orders, manages positions, sets TP/SL, runs multi-timeframe analysis, enforces risk rules. Has 46 tools covering order execution, market analysis, position planning, account management, memory, and coin universe management.
+**Trading Agent** -- Places bracketed futures limits, manages positions, sets TP/SL, runs multi-timeframe analysis, and explains code-enforced risk decisions. New spot exposure and market entries are disabled; spot tools remain for existing-position protection and closes.
 
-**Research Agent** -- Runs concurrently while the Trading Agent executes. Searches CoinDesk, The Block, Cointelegraph, exchange blogs, X/Twitter, and macro news. Analyzes strategy patterns (missed profits, repeated losses). Logs findings to memory for the Trading Agent to consume.
+**Research Agent** -- Runs as an explicit, flat-book handoff when research is stale or repeated no-trade runs justify a wider market scan. It owns broad web discovery and logs reusable findings; ordinary position-management runs do not repeat expensive web searches.
 
 **Supervisor Agent** -- Interactive Telegram bot with read access to the entire system. Can query positions, balances, performance, logs, source code, and config. Can inject temporary (one-shot, highest priority) or permanent notes into the Trading Agent's system prompt to influence its behavior.
 
 ### Runtime: the poll loop
 
-Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and considers agent invocation when a trigger fires or the idle threshold is reached. Model calls are additionally throttled by book state (`FLAT_AGENT_COOLDOWN_SEC` / `ACTIVE_AGENT_COOLDOWN_SEC`). While flat, price-move magnitude and market breadth automatically shorten the quiet cooldown toward the active cadence; code-driven protection is never throttled.
+Every `POLL_INTERVAL_SEC` the loop rebuilds a full account snapshot, runs profit protection, checks circuit breakers, and considers agent invocation when a trigger fires or the idle threshold is reached. The model runs in a single background worker, so slow inference never pauses polling or deterministic protection. Model calls are additionally throttled by book state (`FLAT_AGENT_COOLDOWN_SEC` / `ACTIVE_AGENT_COOLDOWN_SEC`). While flat, price-move magnitude and market breadth automatically shorten the quiet cooldown toward the active cadence.
 
 ```mermaid
 sequenceDiagram
@@ -91,7 +91,7 @@ sequenceDiagram
         L->>M: record triggered TP/SL closes (with exit price)
         L->>L: check circuit breakers (drawdown, losses, heat)
         alt triggers fired OR idle threshold reached
-            L->>A: run agents
+            L-->>A: start one background agent run
             A->>K: place / cancel / bracket orders
             A->>M: log decisions, trades, research notes
         else otherwise
@@ -196,7 +196,7 @@ flowchart LR
 - **No-chase after a win**: Blocks re-entering the *same direction* at a *worse* price than a recent winning exit (within `POST_WIN_COOLDOWN_MINUTES`). Stops the "take profit, then immediately re-buy the top" pattern; a genuine pullback (better price than the exit) is still allowed.
 - **Regime throttle**: In a hostile regime (bearish or RSI-exhausted daily) the confidence bar is raised (`REGIME_CAUTION_MIN_CONFIDENCE`) and position size shrunk (`REGIME_CAUTION_SIZE_FACTOR`), so the bot trades less and more selectively instead of churning low-conviction bounce-scalps in a downtrend.
 - **Conviction-scaled sizing**: Position size scales with how far the entry's confidence clears the (regime-adjusted) floor — a trade that barely clears it gets `CONVICTION_MIN_SIZE_FACTOR` of full size, ramping linearly to full size at `CONVICTION_FULL_CONFIDENCE`. Targets the failure mode where the agent takes a *full-size* position on a setup it itself reads as "mixed / low-conviction" (the pattern behind the SOL drawdown); only ever shrinks, never enlarges, and is floored by the 30% volatility floor.
-- **Concentration cap**: Shrinks any single position's notional to ≤ `MAX_POSITION_EQUITY_PCT` of total equity, regardless of leverage — bounds the per-name blast radius (the RE-USDT blowup was one name at ~74% of the account). Applied after every other size scaler, just before the order is placed.
+- **Lifecycle risk + concentration caps**: Every add-on shares the original position's stop-defined risk and projected same-symbol exposure budgets. Caps are reapplied after contract-lot rounding; an exchange minimum that exceeds either budget is rejected. Add-ons require a live fee-adjusted breakeven stop and may never loosen it or average down.
 - **Correlation gate + relative-strength exception**: Blocks ordinary non-major alt longs while BTC's daily regime is bearish. A rotating leader may pass only when its 1D/4H/1H/15M trends are all bullish, strength is high, and confidence clears `RELATIVE_STRENGTH_MIN_CONFIDENCE`; it is then reduced by `RELATIVE_STRENGTH_SIZE_FACTOR`. No symbol is hardcoded.
 - **New-listing guard**: Blocks futures entries on contracts younger than `MIN_FUTURES_LISTING_AGE_DAYS` (via the contract's first-open date). Freshly-listed perps are thin and ultra-volatile — RE-USDT had a ~100% intraday range on day one.
 - **Minimum reward:risk (futures)**: Rejects any futures entry whose take-profit distance is less than `MIN_FUTURES_RR` × the stop-loss distance (checked when both are supplied at entry). Previously the R:R floor existed only on the spot path, so futures brackets were being set with stops *wider* than targets — the direct cause of losses running ~4× the wins at a high win rate. Dollar risk is meant to be controlled by position size, not by widening the stop past the target.
@@ -209,11 +209,13 @@ flowchart LR
 - **Anti-FOMO stacking**: Refuses adds to an existing position — even a profitable one — when the daily is exhausted in the same direction. Stops doubling down at the top/bottom.
 - **Volatility soft-gate**: Above `MAX_ATR_PCT_FOR_ENTRY`, position size is scaled down quadratically (`(threshold/ATR)²`, floor 30%). Above 1.5× the threshold, the entry is hard-blocked.
 - **Squeeze-breakout signal**: Structured `squeeze_breakout` field (`long` / `short` / `None`) surfaced in `analyze_market_context`. Fires only on the fresh transition out of a 1h Bollinger squeeze (BBW expanding ≥25% off the floor, ADX>20, price beyond BB band, RSI confirming). Takes the asymmetric upside after coiled-volatility periods; volume ≥1.5× 20-candle average is required confirmation. Anti-FOMO block still wins if daily is exhausted in the same direction.
-- **Volatility-scaled take-profit**: `plan_spot_position` widens the effective RR up to 2× the base when daily ATR ≥ 4% (capped at daily ATR 10%). Lets winners run further in volatile coins to recover the EV that the ATR soft-gate trims off entry size. Pairs naturally with staged take-profit (TP1 books guaranteed profit, runner rides the wider TP2).
 - **1h alignment requirement**: Blocks new entries and add-ons when the 1h bias opposes the proposed side, regardless of what the daily trend says. The 1h timeframe captures the multi-hour trajectory — when daily EMAs are still bullish but 1h is bearish, the daily uptrend is in correction (not a healthy pullback) and buying bounces gets stopped out repeatedly. Catches the failure mode where 15m briefly turns bullish on a dead-cat bounce while the actual correction is still in progress.
 - **Deadlock break**: The daily gate (blocks the counter-trend direction) and the 1h-alignment gate (blocks the daily-aligned direction during a counter-bounce) can together strand the bot flat in both directions in a clean trend. With `DEADLOCK_BREAK_ENABLED`, the *daily-aligned* entry (short in a bearish daily, long in a bullish daily) is allowed past the 1h gate **only when the counter-bounce is stalling** — 15m no longer confirms it — and confidence clears `DEADLOCK_MIN_CONFIDENCE`. Takes the trend-continuation trade instead of standing aside, without knife-catching a live bounce. Disjoint from trend-aligned shorts (which covers the *exhausted*-daily case).
 - **Timeframe-conflict gate**: Secondary check on top of 1h alignment — blocks new entries when `analyze_market_context` reports `timeframe_conflict=True` AND the 15m bias opposes the proposed direction. Catches lower-TF disagreement that slips past 1h alignment (e.g., 15m bearish while 1h is neutral). Position management (manage/hold/protect) is unaffected by both gates.
-- **Atomic entry bracket** (`ATOMIC_BRACKET_ENABLED`): futures limit entries attach TP/SL to the order itself via KuCoin's st-orders endpoint, so the bracket arms the instant the order fills — even if that's minutes later, between agent runs. Previously the bracket was placed on the *next* agent run, leaving a filled position unprotected in the gap (positions were repeatedly found "missing protection"). The agent now decides entry + TP + SL together, up front. Falls back to a plain order (then the safety net below) if the bracket endpoint errors.
+- **Atomic entry bracket** (`ATOMIC_BRACKET_ENABLED`): futures limit entries attach TP/SL via KuCoin's st-orders endpoint, so protection arms with the fill. If the atomic endpoint fails, the entry fails closed; there is no plain/unprotected-order fallback.
+- **Live entry lease** (`src/safety.py`): every background run receives revocable order authority. Incomplete account/fill truth, a 20-minute run timeout, or shutdown revokes it. Immediately before an entry, equity, positions, stops, and pending orders are fetched again under a serialized exchange-write lock; any structural change forces re-analysis.
+- **Hard unrealized-loss cap**: the polling protection loop closes a futures lifecycle when its unrealized loss exceeds `RISK_PER_TRADE_PCT` of current equity. This is a last-resort guard; gaps, fees, and slippage can still make realized loss larger.
+- **Real OI sampling**: OI/price quadrants use timestamped exchange open-interest observations with minimum age/change thresholds. The signal stays neutral without a valid baseline; 24h volume is never substituted for OI direction.
 - **Unprotected-position safety net** (`EMERGENCY_SL_PCT`, in `src/protection.py`): every poll, any open futures position found with no protective stop (after a short grace so an attached bracket can appear) gets an emergency SL at `EMERGENCY_SL_PCT` from entry + a TP at `MIN_FUTURES_RR`× that — within ~1 poll, not the next agent run. It's a floor, not the agent's considered bracket; the agent refines it next run. Guarantees no position is ever left naked.
 - **Realized-vs-intended R:R reality check**: each close records its MFE/MAE (peak/trough PnL), and the agent's `edgeReport` surfaces `realizedRewardRisk` (avg win ÷ avg loss actually achieved). When it's far below the intended floor, the agent is told the take-profits are set too far to reach and to pull them to the nearest realistic structural target with a tighter stop — so the RR floor passes at a *reachable* scale rather than aiming at targets that never fill.
 - **Early invalidation cut** (`EARLY_CUT_*`, in `src/protection.py`): the recorded MFE/MAE shows a clean split — winning trades stay green from entry (near-zero adverse excursion) while losers go against immediately. So a position that (after `EARLY_CUT_GRACE_MIN`) has **never** gone meaningfully green *and* has run `EARLY_CUT_MAE_FRAC` of the way to its stop is closed early rather than riding to the full SL. Because winners work fast, this rarely touches one; it surgically shrinks the loss on trades that "never worked" — attacking the avg-loss > avg-win asymmetry. Disjoint from the give-back/breakeven guards (which only act once a trade has gone green).
@@ -223,15 +225,16 @@ flowchart LR
 - **Fee-aware profit targets**: Minimum net profit and ROI thresholds after accounting for fees and slippage
 
 ### Order Execution
-- **Spot + Futures**: Full support for both KuCoin spot and futures markets
-- **Target-price limit entries**: `place_limit_order` / `place_futures_limit_order` place orders at a technically derived price level (EMA, Bollinger Band, swing high/low, VWAP, Fibonacci) and wait for price to come to the order — preventing the worst-case timing of shorting into dumps or buying into pumps. Market orders are reserved for closes and emergency exits.
+- **Futures-only new exposure**: New positions use non-marketable `place_futures_limit_order` requests with atomic TP/SL. Spot and futures market orders are close/emergency-only; existing spot holdings can still be protected or closed.
+- **Target-price limit entries**: Futures entries wait at a technically derived level (EMA, Bollinger Band, swing high/low, VWAP, Fibonacci), preventing shorting into a dump or buying into a pump.
 - **Pending order safety**: Every run includes pending orders; code permits only one futures entry per symbol per run/book, tags bot-created GTC entries, and automatically cancels tagged entries older than `ENTRY_LIMIT_EXPIRY_MINUTES`. Manual and protective orders are never auto-cancelled.
-- **Limit order fee saving**: Separate `PREFER_LIMIT_ORDERS` mode places spot buys at best ask instead of market to save on taker fees
+- **Fee-aware entry gate**: Atomic limit entries must clear configured net-profit/ROI floors after estimated fees and slippage.
 - **Leverage control**: Configurable max leverage (up to 125x) with automatic margin mode management
 - **Fund transfers**: Move USDT between spot, futures, and financial/Earn accounts
 
 ### Memory & Learning
 - **Trade memory**: Records all trades, decisions, plans, sentiments, triggers, and fee snapshots
+- **Persistent event inbox**: Fill and close payloads survive restarts and model failures. They are acknowledged only after a successful agent run, eliminating repeated poll-triggered runs without silently dropping unprocessed events.
 - **Two-tier decision retention**: realized closed-trade outcomes (those with a PnL) are kept far longer (cap 200) than routine entry/decline decisions (cap 50), so win/loss history — and the exit prices the no-chase guard relies on — is never crowded out by no-trade decisions
 - **Performance tracking**: Win rate, PnL, trade counts split by venue (spot/futures) and mode (paper/live)
 - **Position extremes**: Tracks peak and trough unrealized PnL during position lifetime for post-trade analysis
@@ -297,7 +300,7 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 | `PARTIAL_TP_ENABLED` | `true` | Split take-profit into staged tranches (60%/40%) |
 | `KELLY_SIZING_ENABLED` | `true` | Use Kelly criterion for adaptive position sizing |
 | `KELLY_MIN_TRADES` | `30` | Minimum trade history before Kelly sizing activates |
-| `PREFER_LIMIT_ORDERS` | `true` | Place spot buys at best ask instead of market for fee savings |
+| `PREFER_LIMIT_ORDERS` | `true` | Legacy spot-entry preference; new spot exposure is currently disabled |
 | `LIMIT_ORDER_TIMEOUT_SEC` | `20` | Timeout before falling back to market order (fee-saving path) |
 | `ENTRY_LIMIT_EXPIRY_MINUTES` | `30` | Cancel unfilled target-price entry limit orders after this many minutes |
 | `MIN_ENTRY_DEVIATION_PCT` | `0.002` | Minimum distance (0.2%) from current price to use a target-price limit order |
@@ -310,7 +313,7 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `CB_MAX_DAILY_DRAWDOWN_PCT` | `5.0` | Restrict trading when daily drawdown exceeds this % (daily loss limit ≈ 2–3× per-trade risk) |
+| `CB_MAX_DAILY_DRAWDOWN_PCT` | `3.0` | Restrict new exposure at a 3R daily drawdown with the default 1% lifecycle risk |
 | `CB_MAX_CONSECUTIVE_LOSSES` | `3` | Restrict trading after N consecutive losses |
 | `CB_MAX_PORTFOLIO_HEAT_PCT` | `6.0` | Maximum total capital at risk % across open positions (the "6% rule") |
 | `CB_COOLDOWN_MINUTES` | `120` | Cooldown duration after consecutive loss trigger |
@@ -413,7 +416,7 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `MAX_IDLE_POLLS` | `10` | Force agent run after N idle polls |
 | `FLAT_AGENT_COOLDOWN_SEC` | `3600` | Quiet-market maximum interval while flat; triggered move magnitude/breadth automatically reduce it toward the active cadence |
 | `ACTIVE_AGENT_COOLDOWN_SEC` | `300` | Minimum interval between model runs with an open/pending book or a recent event |
-| `AGENT_MAX_TURNS` | `30` | Max tool-call turns per agent run |
+| `AGENT_MAX_TURNS` | `20` | Max tool-call turns per run; a separate 20-minute wall-clock timeout revokes order authority |
 
 ### KuCoin
 
@@ -568,7 +571,7 @@ Each polling cycle (`POLL_INTERVAL_SEC` seconds):
 5. **Profit protection** -- Ratchets stops to breakeven and caps give-back on live futures positions (code-driven, independent of the agent)
 6. **Event tracking** -- Logs triggered futures TP/SL closes as decisions (with exit price, for the no-chase guard)
 7. **Circuit breakers** -- Checks drawdown and consecutive losses against thresholds
-8. **Agent run** -- If triggers exist or idle threshold reached, runs Trading + Research agents concurrently
+8. **Agent run** -- If triggers exist or idle threshold reached, starts one non-blocking Trading Agent run; broad Research is an explicit flat-book handoff
 9. **Wait** -- Sleeps until next cycle
 
 Trigger types: `initial:SYMBOL` (first snapshot), `price_move:SYMBOL:X.XX%` (price change), `idle_threshold` (forced run after max idle polls).
@@ -587,6 +590,7 @@ src/
   main.py              Main trading loop, snapshot building, circuit breakers, trigger detection
   memory.py            Agent memory store (trades, decisions, plans, Kelly, cooldowns)
   protection.py        Code-driven profit guards: breakeven ratchet, give-back cap, no-chase (runs every poll)
+  safety.py            Revocable background-run authority and serialized exchange-write lock
   supervisor.py        Supervisor agent tools (read logs, memory, config, write notes)
   telegram.py          Telegram notification sender (async, background thread)
   telegram_bot.py      Telegram long-polling bot for Supervisor Agent
@@ -666,3 +670,10 @@ sudo bash setup_service.sh
 ```
 
 Environment overrides: `SERVICE_NAME`, `SERVICE_USER`, `SERVICE_GROUP`, `WORKDIR`, `VENV_PATH`, `BIND_ADDR`.
+
+
+___
+
+# Disclaimer
+
+This software is for educational purposes only. USE THE SOFTWARE AT YOUR OWN RISK. THE AUTHORS AND ALL AFFILIATES ASSUME NO RESPONSIBILITY FOR YOUR TRADING RESULTS. Do not risk money that you are afraid to lose. There might be bugs in the code - this software DOES NOT come with ANY warranty.

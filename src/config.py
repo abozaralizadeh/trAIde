@@ -327,7 +327,7 @@ def load_config() -> AppConfig:
       active_agent_cooldown_sec=float(os.getenv("ACTIVE_AGENT_COOLDOWN_SEC", "300")),
     ),
     circuit_breaker=CircuitBreakerConfig(
-      max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "5.0")),
+      max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "3.0")),
       max_consecutive_losses=int(os.getenv("CB_MAX_CONSECUTIVE_LOSSES", "3")),
       max_portfolio_heat_pct=float(os.getenv("CB_MAX_PORTFOLIO_HEAT_PCT", "6.0")),
       cooldown_minutes=float(os.getenv("CB_COOLDOWN_MINUTES", "120")),
@@ -422,7 +422,7 @@ def load_config() -> AppConfig:
     openai_trace_api_key=os.getenv("OPENAI_TRACE_API_KEY"),
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
     retention_days=int(os.getenv("RETENTION_DAYS", "90")),
-    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "30")),
+    agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "20")),
   )
 
   validate_config(config)

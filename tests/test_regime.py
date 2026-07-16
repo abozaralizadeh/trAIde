@@ -10,13 +10,16 @@ from src.regime import (
     allow_reversal_long,
     allow_reversal_short,
     allow_trend_aligned_short,
+    add_on_guard_reason,
     block_alt_long_in_btc_downtrend,
     bracket_risk_scale,
     concentration_scale,
     conviction_size_factor,
     is_relative_strength_alt_long,
+    oi_price_signal,
     resolve_gate_deadlock,
     reward_risk_ratio,
+    risk_capped_contracts,
 )
 from src.memory import MemoryStore
 
@@ -32,6 +35,15 @@ def _cfg(**overrides) -> RegimeConfig:
     )
     base.update(overrides)
     return RegimeConfig(**base)
+
+
+def test_oi_price_signal_all_real_quadrants_and_unknown():
+    assert oi_price_signal("up", "up")[0] == "strong_trend"
+    assert oi_price_signal("up", "down")[0] == "short_covering"
+    assert oi_price_signal("down", "up")[0] == "aggressive_shorts"
+    assert oi_price_signal("down", "down")[0] == "long_capitulation"
+    assert oi_price_signal("up", "flat")[0] == "neutral"
+    assert oi_price_signal("down", None)[0] == "neutral"
 
 
 # ── Reversal long: catch a confirmed turn against a lagging bearish daily ─────────
@@ -155,6 +167,36 @@ def test_concentration_scale_shrinks_oversized_position():
 
 def test_concentration_scale_noop_within_cap():
     assert concentration_scale(20.0, 70.0, 0.5) == 1.0
+
+
+def test_concentration_scale_uses_projected_existing_symbol_exposure():
+    assert concentration_scale(20.0, 100.0, 0.5, existing_notional_usd=40.0) == 0.5
+    assert concentration_scale(20.0, 100.0, 0.5, existing_notional_usd=50.0) == 0.0
+
+
+def test_risk_contract_cap_uses_remaining_lifecycle_budget():
+    # $1 budget, each contract risks $0.10. Existing leg already consumes $0.60 -> only 4 remain.
+    assert risk_capped_contracts(20, 1, 0.01, 100, 90, 100, 0.01, existing_risk_usd=0.60) == 4
+    assert risk_capped_contracts(20, 1, 0.01, 100, 90, 100, 0.01, existing_risk_usd=1.0) == 0
+
+
+def test_add_on_requires_locked_risk_and_monotonic_stop():
+    assert "breakeven" in add_on_guard_reason(
+        current_qty=10, new_side="buy", avg_entry=100, protective_stop=99,
+        proposed_stop=99, fee_buffer_fraction=0,
+    )
+    assert "loosen" in add_on_guard_reason(
+        current_qty=10, new_side="buy", avg_entry=100, protective_stop=101,
+        proposed_stop=100.5, fee_buffer_fraction=0,
+    )
+    assert add_on_guard_reason(
+        current_qty=10, new_side="buy", avg_entry=100, protective_stop=101,
+        proposed_stop=101, fee_buffer_fraction=0,
+    ) is None
+    assert "Opposite" in add_on_guard_reason(
+        current_qty=10, new_side="sell", avg_entry=100, protective_stop=101,
+        proposed_stop=101, fee_buffer_fraction=0,
+    )
 
 
 def test_concentration_scale_disabled_or_unknown_equity():
@@ -449,7 +491,12 @@ def test_live_extremes_map_from_snapshot():
     ])
     out = _live_extremes_map(snap)
     assert set(out.keys()) == {"ETH-USDT", "BTC-USDT"}
-    assert out["ETH-USDT"] == {"netSize": 5.0, "unrealizedPnl": 3.2}
+    assert out["ETH-USDT"] == {
+        "netSize": 5.0,
+        "unrealizedPnl": 3.2,
+        "positionOpenTime": None,
+        "positionSide": "long",
+    }
     assert out["BTC-USDT"]["netSize"] == -2.0
 
 

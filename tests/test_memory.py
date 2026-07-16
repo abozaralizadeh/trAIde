@@ -140,6 +140,11 @@ def test_cross_instance_notes_survive_update_limits(tmp_path):
     assert "reduce position sizes" in notes[0]["content"]
 
 
+def test_same_path_instances_share_process_lock(tmp_path):
+    path = str(tmp_path / "memory.json")
+    assert MemoryStore(path)._lock is MemoryStore(path)._lock
+
+
 def test_cross_instance_permanent_notes_survive(tmp_path):
     """Permanent notes written by supervisor must survive main loop writes."""
     path = str(tmp_path / "memory.json")
@@ -389,6 +394,18 @@ def test_update_position_extremes_tracks_peak_and_trough(store):
     assert ext["troughPnl"] == pytest.approx(-2.0)  # trough unchanged
 
 
+def test_position_extremes_reset_when_exchange_lifecycle_changes(store):
+    store.update_position_extremes({
+      "ETH-USDT": {"netSize": 1, "unrealizedPnl": 5.0, "positionOpenTime": 1000, "positionSide": "long"},
+    })
+    store.update_position_extremes({
+      "ETH-USDT": {"netSize": 1, "unrealizedPnl": -1.0, "positionOpenTime": 2000, "positionSide": "long"},
+    })
+    ext = store.get_position_extremes("ETH-USDT")
+    assert ext["peakPnl"] == -1.0 and ext["troughPnl"] == -1.0
+    assert ext["positionOpenTime"] == 2000
+
+
 def test_extremes_cleared_when_position_closes(store):
     store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
     pos = store.positions(prices={"BTC-USDT": 51000.0})
@@ -441,3 +458,31 @@ def test_performance_summary_no_missed_profit_when_peak_equals_pnl(store):
     store.log_decision("BTC-USDT", "spot_sell", 0.8, "perfect exit", pnl=2.0, peak_pnl=2.0, trough_pnl=-0.1)
     summary = store.performance_summary()
     assert "missedProfitCount" not in summary
+
+
+def test_agent_event_inbox_persists_until_acknowledged(tmp_path):
+    path = str(tmp_path / "memory.json")
+    first = MemoryStore(path, retention_days=7)
+    assert first.queue_agent_event("futures_fills", "futures:fill-1", {"id": "fill-1"}) is True
+    assert first.queue_agent_event("futures_fills", "futures:fill-1", {"id": "fill-1"}) is False
+
+    restarted = MemoryStore(path, retention_days=7)
+    assert [event["id"] for event in restarted.get_pending_agent_events()] == ["futures:fill-1"]
+    assert len(restarted.acknowledge_agent_events(["futures:fill-1"])) == 1
+    assert restarted.get_pending_agent_events() == []
+
+
+def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
+    mem = MemoryStore(str(tmp_path / "memory.json"), retention_days=7)
+    mem.record_trade(
+        "ETH-USDT", "buy", 20.0, price=2000.0, size=0.01,
+        venue="futures", filled=False, track_position=False, order_id="order-1",
+    )
+    assert mem.trades_today("ETH-USDT") == 1
+    assert mem.positions(venue="futures") == {}
+    summary = mem.performance_summary()
+    assert summary["totalTrades"] == 0
+    assert summary["orderSubmissions"] == 1
+    assert mem.mark_order_filled("order-1") is True
+    assert mem.performance_summary()["totalTrades"] == 1
+    assert mem.positions(venue="futures") == {}

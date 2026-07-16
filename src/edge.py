@@ -60,9 +60,10 @@ def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
   per_symbol: Dict[str, Dict[str, Any]] = {}
   for c in window:
     sym = str(c.get("symbol") or "?")
-    row = per_symbol.setdefault(sym, {"n": 0, "net": 0.0, "losses": 0})
+    row = per_symbol.setdefault(sym, {"n": 0, "net": 0.0, "losses": 0, "last_close_ts": 0})
     row["n"] += 1
     row["net"] = round(row["net"] + float(c["pnl"]), 6)
+    row["last_close_ts"] = int(c.get("ts") or 0)
     if float(c["pnl"]) < 0:
       row["losses"] += 1
 
@@ -116,7 +117,13 @@ def adaptive_min_rr(stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig, now:
   return min(base_rr + cfg.rr_step, max(cfg.rr_cap, base_rr))
 
 
-def symbol_adaptive_rr(symbol: str, stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig) -> float:
+def symbol_adaptive_rr(
+  symbol: str,
+  stats: Dict[str, Any],
+  base_rr: float,
+  cfg: EdgeConfig,
+  now: float | None = None,
+) -> float:
   """Reward:risk floor for ONE symbol, raised only while THAT symbol is net-losing.
 
   The old global floor punished every symbol for one symbol's losses — with ETH bleeding, even a
@@ -132,6 +139,11 @@ def symbol_adaptive_rr(symbol: str, stats: Dict[str, Any], base_rr: float, cfg: 
   if not row or int(row.get("n") or 0) < cfg.symbol_rr_min_trades:
     return base_rr
   if float(row.get("net") or 0.0) < 0:
+    last_ts = int(row.get("last_close_ts") or 0)
+    if cfg.rr_stale_hours > 0 and last_ts > 0:
+      ref = now if now is not None else time.time()
+      if (ref - last_ts) > cfg.rr_stale_hours * 3600:
+        return base_rr
     return min(base_rr + cfg.rr_step, max(cfg.rr_cap, base_rr))
   return base_rr
 
