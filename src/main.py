@@ -27,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 _AGENT_RUN_TIMEOUT_SEC = 20 * 60
 _AGENT_SHUTDOWN_GRACE_SEC = 30
+_PRICE_NOISE_MULTIPLIER = 4.0
+_PRICE_TRIGGER_MAX_MULTIPLIER = 4.0
+_PRICE_NOISE_ALPHA = 0.20
+_PRICE_NOISE_MIN_SAMPLES = 3
 
 
 class IncompleteFuturesSnapshot(RuntimeError):
@@ -93,6 +97,56 @@ def _adaptive_agent_cooldown(
   # symbols add breadth to the urgency score, so a market-wide move is reviewed sooner.
   urgency_sq = (max(moves) / threshold) ** 2 * len(moves)
   return max(active, min(flat, flat / (1.0 + urgency_sq)))
+
+
+def _adaptive_price_trigger_threshold(
+  base_trigger_pct: float,
+  noise_ewma_pct: float,
+  samples: int,
+) -> float:
+  """Raise the model trigger above a symbol's ordinary poll-to-poll noise.
+
+  The configured threshold is always the floor. After a few observations, routine volatility
+  must be exceeded by roughly four times its EWMA, capped at four times the configured floor so
+  a genuinely structural move can never be suppressed indefinitely.
+  """
+  base = max(0.0, float(base_trigger_pct))
+  if base <= 0 or int(samples) < _PRICE_NOISE_MIN_SAMPLES:
+    return base
+  noise_threshold = max(0.0, float(noise_ewma_pct)) * _PRICE_NOISE_MULTIPLIER
+  return min(base * _PRICE_TRIGGER_MAX_MULTIPLIER, max(base, noise_threshold))
+
+
+def _next_price_noise_ewma(
+  previous_ewma_pct: float,
+  observed_move_pct: float,
+  base_trigger_pct: float,
+  samples: int,
+) -> float:
+  """Update robust price noise without letting one shock disable later model reviews."""
+  base = max(0.0, float(base_trigger_pct))
+  ceiling = base * _PRICE_TRIGGER_MAX_MULTIPLIER if base > 0 else abs(float(observed_move_pct))
+  observed = min(abs(float(observed_move_pct)), ceiling)
+  if int(samples) <= 0:
+    return observed
+  previous = max(0.0, float(previous_ewma_pct))
+  return (1.0 - _PRICE_NOISE_ALPHA) * previous + _PRICE_NOISE_ALPHA * observed
+
+
+def _rebase_reviewed_price_triggers(
+  pending_moves: Dict[str, float],
+  pending_discrete_triggers: set[str],
+  reviewed_symbols: set[str],
+) -> None:
+  """Discard trigger evidence measured against the pre-run anchor for reviewed symbols."""
+  for symbol in reviewed_symbols:
+    pending_moves.pop(symbol, None)
+  stale_initials = {
+    trigger
+    for trigger in pending_discrete_triggers
+    if trigger.startswith("initial:") and trigger.split(":", 1)[1] in reviewed_symbols
+  }
+  pending_discrete_triggers.difference_update(stale_initials)
 
 
 def _load_active_coins(cfg, memory: MemoryStore) -> list[str]:
@@ -577,12 +631,32 @@ async def trading_loop(
   set_default_openai_client(azure_client, use_for_tracing=False)
   kucoin = KucoinClient(cfg)
   kucoin_futures = KucoinFuturesClient(cfg) if cfg.kucoin_futures.enabled else None
-  last_prices: Dict[str, float] = {}
+  memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
+  scheduler_state = memory.get_agent_scheduler()
+  now_ts = time.time()
+  try:
+    last_agent_run_ts = min(now_ts, max(0.0, float(scheduler_state.get("lastRunTs") or 0.0)))
+  except (TypeError, ValueError):
+    last_agent_run_ts = 0.0
+  reviewed_prices: Dict[str, float] = dict(scheduler_state.get("reviewedPrices") or {})
+  price_observations: Dict[str, Dict[str, Any]] = dict(scheduler_state.get("priceObservations") or {})
+  last_prices: Dict[str, float] = {
+    symbol: float(observation["lastPrice"])
+    for symbol, observation in price_observations.items()
+    if isinstance(observation, dict) and float(observation.get("lastPrice") or 0) > 0
+  }
+
+  def _persist_agent_scheduler() -> None:
+    memory.save_agent_scheduler({
+      "lastRunTs": last_agent_run_ts,
+      "reviewedPrices": reviewed_prices,
+      "priceObservations": price_observations,
+    })
+
   idle_polls = 0
   consecutive_no_trade_runs = 0  # runs where the agent placed no order (drives forced research)
   force_research = False         # when True, next agent run must hand off to Research first
   last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
-  last_agent_run_ts = 0.0        # cost/churn throttle; protection still runs on every poll
   pending_trigger_moves: Dict[str, float] = {}  # strongest move per symbol, retained until reviewed
   pending_agent_triggers: set[str] = set()
   agent_task: asyncio.Task | None = None
@@ -594,8 +668,8 @@ async def trading_loop(
   agent_task_timed_out = False
   agent_task_trigger_moves: Dict[str, float] = {}
   agent_task_discrete_triggers: set[str] = set()
+  agent_task_prices: Dict[str, float] = {}
   last_complete_fill_poll_ts = 0.0
-  memory = MemoryStore(cfg.memory_file, retention_days=cfg.retention_days)
   # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
   # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
   logged_closed_position_ids: set[str] = set(memory.get_seen_close_ids())
@@ -752,6 +826,7 @@ async def trading_loop(
         pending_trigger_moves[symbol] = max(move, pending_trigger_moves.get(symbol, 0.0))
       pending_agent_triggers.update(agent_task_discrete_triggers)
       last_agent_run_ts = time.time()
+      _persist_agent_scheduler()
       agent_task = None
       agent_task_triggers = []
       agent_task_forced_research = False
@@ -761,12 +836,25 @@ async def trading_loop(
       agent_task_timed_out = False
       agent_task_trigger_moves = {}
       agent_task_discrete_triggers = set()
+      agent_task_prices = {}
 
     # Harvest a completed single-flight model run without ever pausing the snapshot/protection loop.
     if agent_task is not None and agent_task.done():
       last_agent_run_ts = time.time()  # enforce cadence from completion, not from a long run's start
+      _persist_agent_scheduler()
       try:
         result = agent_task.result()
+        # Anchor future triggers to the exact snapshot the successful run reviewed. A move during
+        # the model call remains visible and can therefore schedule a genuinely new follow-up.
+        reviewed_prices.update(agent_task_prices)
+        # Polls during the run measured displacement from the previous anchor. Recalculate against
+        # this run's snapshot below instead of carrying that stale magnitude into another call.
+        _rebase_reviewed_price_triggers(
+          pending_trigger_moves,
+          pending_agent_triggers,
+          set(agent_task_prices),
+        )
+        _persist_agent_scheduler()
         logger.info("--- Agent Decision Narrative ---\n%s", result.get("narrative", ""))
         if result.get("decisions"):
           logger.info("--- Decisions ---\n%s", "\n".join(f"- {d}" for d in result["decisions"]))
@@ -814,21 +902,53 @@ async def trading_loop(
         agent_task_timed_out = False
         agent_task_trigger_moves = {}
         agent_task_discrete_triggers = set()
+        agent_task_prices = {}
 
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
       price = float(ticker.price)
       prev = last_prices.get(symbol)
-      if prev is None:
+      observation = price_observations.get(symbol) or {}
+      noise_ewma = float(observation.get("noiseEwmaPct") or 0.0)
+      samples = int(observation.get("samples") or 0)
+      reviewed_price = reviewed_prices.get(symbol)
+      if reviewed_price is None:
         initial_trigger = f"initial:{symbol}"
         triggers.append(initial_trigger)
         pending_agent_triggers.add(initial_trigger)
-      else:
-        change_pct = abs(price - prev) / prev * 100
-        if change_pct >= cfg.trading.price_change_trigger_pct:
-          triggers.append(f"price_move:{symbol}:{change_pct:.2f}%")
-          pending_trigger_moves[symbol] = max(change_pct, pending_trigger_moves.get(symbol, 0.0))
+      elif reviewed_price > 0:
+        # Compare with the last successful model-reviewed state, not the immediately preceding
+        # poll. The old per-poll comparison repeatedly called the model on ordinary oscillation.
+        state_move_pct = abs(price - reviewed_price) / reviewed_price * 100
+        adaptive_threshold = _adaptive_price_trigger_threshold(
+          cfg.trading.price_change_trigger_pct,
+          noise_ewma,
+          samples,
+        )
+        if state_move_pct >= adaptive_threshold:
+          triggers.append(f"price_move:{symbol}:{state_move_pct:.2f}%")
+          pending_trigger_moves[symbol] = max(
+            state_move_pct,
+            pending_trigger_moves.get(symbol, 0.0),
+          )
+
+      if prev is not None and prev > 0:
+        poll_move_pct = abs(price - prev) / prev * 100
+        noise_ewma = _next_price_noise_ewma(
+          noise_ewma,
+          poll_move_pct,
+          cfg.trading.price_change_trigger_pct,
+          samples,
+        )
+        samples = min(samples + 1, 1_000_000)
+      price_observations[symbol] = {
+        "lastPrice": price,
+        "noiseEwmaPct": noise_ewma,
+        "samples": samples,
+        "updated": int(time.time()),
+      }
       last_prices[symbol] = price
+    _persist_agent_scheduler()
 
     # Snapshot peak/trough BEFORE the update prunes just-closed positions — otherwise a position's
     # MFE/MAE is reset before we record its close, and every close lands with peak/trough = None
@@ -1028,7 +1148,7 @@ async def trading_loop(
       flat_cooldown_sec=cfg.trading.flat_agent_cooldown_sec,
       active_cooldown_sec=cfg.trading.active_agent_cooldown_sec,
       book_active=book_active,
-      new_events_count=pending_events_count + len(pending_agent_triggers),
+      new_events_count=pending_events_count,
       trigger_move_pcts=list(pending_trigger_moves.values()),
       price_trigger_pct=cfg.trading.price_change_trigger_pct,
     )
@@ -1054,6 +1174,7 @@ async def trading_loop(
         continue
       idle_polls = 0
       last_agent_run_ts = time.time()
+      _persist_agent_scheduler()
       agent_triggers = list(pending_agent_triggers)
       agent_triggers.extend(trigger for trigger in triggers if trigger not in agent_triggers)
       agent_triggers.extend(
@@ -1065,6 +1186,10 @@ async def trading_loop(
         agent_triggers = ["idle_threshold"]
       agent_task_trigger_moves = dict(pending_trigger_moves)
       agent_task_discrete_triggers = set(pending_agent_triggers)
+      agent_task_prices = {
+        symbol: float(ticker.price)
+        for symbol, ticker in snapshot.tickers.items()
+      }
       pending_trigger_moves.clear()
       pending_agent_triggers.clear()
       pending_batch = memory.get_pending_agent_events()

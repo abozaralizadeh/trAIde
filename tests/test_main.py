@@ -4,12 +4,15 @@ from types import SimpleNamespace
 
 from src.main import (
   _adaptive_agent_cooldown,
+  _adaptive_price_trigger_threshold,
   _agent_made_a_move,
   _close_event_id,
   _expired_bot_entry_orders,
   _fetch_futures,
   _fetch_recent_fills,
   _fill_event_id,
+  _next_price_noise_ewma,
+  _rebase_reviewed_price_triggers,
 )
 
 
@@ -38,6 +41,30 @@ class TestAdaptiveAgentCooldown:
   def test_active_book_or_new_event_uses_active_cadence(self):
     assert self._cooldown(active=True) == 300
     assert self._cooldown(events=1) == 300
+
+
+class TestAdaptivePriceTrigger:
+  def test_configured_threshold_is_floor_during_warmup_and_quiet_tape(self):
+    assert _adaptive_price_trigger_threshold(0.5, 0.8, 2) == 0.5
+    assert _adaptive_price_trigger_threshold(0.5, 0.05, 20) == 0.5
+
+  def test_observed_noise_raises_threshold_but_is_bounded(self):
+    assert _adaptive_price_trigger_threshold(0.5, 0.3, 20) == pytest.approx(1.2)
+    assert _adaptive_price_trigger_threshold(0.5, 5.0, 20) == 2.0
+
+  def test_noise_ewma_decays_and_single_shock_is_winsorized(self):
+    seeded = _next_price_noise_ewma(0.0, 0.5, 0.5, 0)
+    assert seeded == pytest.approx(0.5)
+    assert _next_price_noise_ewma(seeded, 0.0, 0.5, 1) == pytest.approx(0.4)
+    # A 20% print cannot lift the learned one-poll noise by the full outlier amount.
+    assert _next_price_noise_ewma(0.5, 20.0, 0.5, 10) == pytest.approx(0.8)
+
+  def test_successful_review_rebases_only_symbols_in_its_snapshot(self):
+    moves = {"BTC-USDT": 2.0, "NEW-USDT": 1.5}
+    discrete = {"initial:BTC-USDT", "initial:NEW-USDT", "supervisor_note"}
+    _rebase_reviewed_price_triggers(moves, discrete, {"BTC-USDT"})
+    assert moves == {"NEW-USDT": 1.5}
+    assert discrete == {"initial:NEW-USDT", "supervisor_note"}
 
 
 def test_fill_event_id_prefers_trade_id_and_separates_venues():

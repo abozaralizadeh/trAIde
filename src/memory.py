@@ -27,6 +27,67 @@ MAX_FEES = 3
 MAX_TEMPORARY_NOTES = 20
 MAX_PERMANENT_NOTES = 10
 MAX_PENDING_AGENT_EVENTS = 200
+MAX_AGENT_SCHEDULER_SYMBOLS = 100
+
+
+def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
+  """Normalize the small restart-safe state used to throttle discretionary model calls."""
+  raw = value if isinstance(value, dict) else {}
+
+  try:
+    last_run_ts = max(0.0, float(raw.get("lastRunTs") or 0.0))
+  except (TypeError, ValueError):
+    last_run_ts = 0.0
+
+  reviewed_prices: Dict[str, float] = {}
+  for symbol, price in (raw.get("reviewedPrices") or {}).items() if isinstance(raw.get("reviewedPrices"), dict) else []:
+    try:
+      normalized = _normalize_symbol(str(symbol))
+      numeric = float(price)
+    except (TypeError, ValueError):
+      continue
+    if normalized and numeric > 0:
+      reviewed_prices[normalized] = numeric
+
+  observations: Dict[str, Dict[str, Any]] = {}
+  raw_observations = raw.get("priceObservations") or {}
+  if isinstance(raw_observations, dict):
+    for symbol, observation in raw_observations.items():
+      if not isinstance(observation, dict):
+        continue
+      try:
+        normalized = _normalize_symbol(str(symbol))
+        last_price = float(observation.get("lastPrice") or 0.0)
+        noise = max(0.0, float(observation.get("noiseEwmaPct") or 0.0))
+        samples = max(0, int(observation.get("samples") or 0))
+        updated = max(0, int(observation.get("updated") or 0))
+      except (TypeError, ValueError):
+        continue
+      if normalized and last_price > 0:
+        observations[normalized] = {
+          "lastPrice": last_price,
+          "noiseEwmaPct": noise,
+          "samples": samples,
+          "updated": updated,
+        }
+
+  # Keep the newest bounded set if research rotated through many temporary candidates.
+  observations = dict(
+    sorted(observations.items(), key=lambda item: item[1].get("updated", 0))[-MAX_AGENT_SCHEDULER_SYMBOLS:]
+  )
+  if len(reviewed_prices) > MAX_AGENT_SCHEDULER_SYMBOLS:
+    reviewed_prices = {
+      symbol: price
+      for symbol, price in reviewed_prices.items()
+      if symbol in observations
+    }
+    reviewed_prices = dict(list(reviewed_prices.items())[-MAX_AGENT_SCHEDULER_SYMBOLS:])
+
+  return {
+    "lastRunTs": last_run_ts,
+    "reviewedPrices": reviewed_prices,
+    "priceObservations": observations,
+  }
 
 
 class MemoryStore:
@@ -47,7 +108,7 @@ class MemoryStore:
     self._read()
 
   def _read(self) -> Dict[str, Any]:
-    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}, "seen_close_ids": [], "seen_fill_ids": [], "open_interest_observations": {}, "pending_agent_events": []}
+    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}, "seen_close_ids": [], "seen_fill_ids": [], "open_interest_observations": {}, "pending_agent_events": [], "agent_scheduler": _sanitize_agent_scheduler({})}
     if self._cache is not None:
       try:
         disk_mtime = self.path.stat().st_mtime
@@ -78,6 +139,7 @@ class MemoryStore:
         data.setdefault("seen_fill_ids", [])
         data.setdefault("open_interest_observations", {})
         data.setdefault("pending_agent_events", [])
+        data["agent_scheduler"] = _sanitize_agent_scheduler(data.get("agent_scheduler"))
         # prune invalid entries while keeping timestamp
         data["plans"] = [
           p
@@ -982,6 +1044,22 @@ class MemoryStore:
       ]
       self._write(data)
       return copy.deepcopy(acknowledged)
+
+  def get_agent_scheduler(self) -> Dict[str, Any]:
+    """Return persisted model-cadence and adaptive price-noise state."""
+    with self._lock:
+      data = self._prune(self._read())
+      return copy.deepcopy(_sanitize_agent_scheduler(data.get("agent_scheduler")))
+
+  def save_agent_scheduler(self, state: Dict[str, Any]) -> Dict[str, Any]:
+    """Atomically persist scheduler state without exposing arbitrary memory keys."""
+    normalized = _sanitize_agent_scheduler(state)
+    with self._lock:
+      data = self._prune(self._read())
+      if data.get("agent_scheduler") != normalized:
+        data["agent_scheduler"] = normalized
+        self._write(data)
+      return copy.deepcopy(normalized)
 
   def observe_open_interest(
     self,

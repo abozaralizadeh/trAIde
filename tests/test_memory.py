@@ -472,6 +472,36 @@ def test_agent_event_inbox_persists_until_acknowledged(tmp_path):
     assert restarted.get_pending_agent_events() == []
 
 
+def test_agent_scheduler_persists_restart_cadence_and_price_noise(tmp_path):
+    path = str(tmp_path / "memory.json")
+    first = MemoryStore(path, retention_days=7)
+    first.save_agent_scheduler({
+        "lastRunTs": 1234.5,
+        "reviewedPrices": {"btcusdt": 50_000, "bad": -1},
+        "priceObservations": {
+            "btcusdt": {
+                "lastPrice": 50_100,
+                "noiseEwmaPct": 0.2,
+                "samples": 12,
+                "updated": 1234,
+            },
+            "invalid": {"lastPrice": 0},
+        },
+    })
+
+    restarted = MemoryStore(path, retention_days=7)
+    state = restarted.get_agent_scheduler()
+    assert state["lastRunTs"] == pytest.approx(1234.5)
+    assert state["reviewedPrices"] == {"BTC-USDT": 50_000.0}
+    assert state["priceObservations"]["BTC-USDT"] == {
+        "lastPrice": 50_100.0,
+        "noiseEwmaPct": 0.2,
+        "samples": 12,
+        "updated": 1234,
+    }
+    assert "INVALID" not in state["priceObservations"]
+
+
 def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
     mem = MemoryStore(str(tmp_path / "memory.json"), retention_days=7)
     mem.record_trade(
