@@ -933,6 +933,16 @@ async def trading_loop(
               continue
         if exit_price is None:
           exit_price = last_prices.get(sym)  # fallback: latest poll price ≈ exit
+        # Entry price for the closed-position chart's open marker (public-safe price, no size).
+        entry_price = None
+        for _k in ("avgEntryPrice", "openPrice", "entryPrice", "avgEntry"):
+          _v = cp.get(_k)
+          if _v not in (None, "", 0, "0"):
+            try:
+              entry_price = float(_v)
+              break
+            except (TypeError, ValueError):
+              continue
         # MFE/MAE from the pre-reset extremes: how far the trade ran in profit (peak) and underwater
         # (trough) before closing — the data that tells us if TPs are set within realistic reach.
         _ext = pre_close_extremes.get(sym, {}) if isinstance(pre_close_extremes, dict) else {}
@@ -967,6 +977,7 @@ async def trading_loop(
           position_side=position_side,
           peak_pnl=peak_pnl,
           trough_pnl=trough_pnl,
+          entry_price=entry_price,
         )
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)

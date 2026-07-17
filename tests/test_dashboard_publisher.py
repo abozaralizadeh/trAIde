@@ -71,3 +71,43 @@ class TestSanitizeCoins:
     pub = _publisher()
     out = pub._sanitize_coins([{"status": "active"}, "nope", {"symbol": "XRP-USDT", "status": "active"}])
     assert [c["symbol"] for c in out] == ["XRP-USDT"]
+
+
+class TestTriggerFreshness:
+  def test_stale_triggers_dropped_recent_kept(self):
+    import time as _t
+    from src.dashboard_publisher import _TRIGGER_FRESHNESS_SEC
+    pub = _publisher()
+    now = _t.time()
+    out = pub._sanitize_triggers([
+      {"symbol": "SOL-USDT", "direction": "buy", "ts": now - _TRIGGER_FRESHNESS_SEC - 3600},  # stale
+      {"symbol": "ETH-USDT", "direction": "sell", "ts": now - 600},                            # fresh
+      {"symbol": "NOPE-USDT", "direction": "buy"},                                             # no ts
+    ])
+    syms = {t["symbol"] for t in out}
+    assert syms == {"ETH-USDT"}
+
+
+class TestClosedLifecycles:
+  def test_lifecycle_fields_and_order(self):
+    pub = _publisher()
+    rows = pub._closed_position_lifecycles(_FakeMem([
+      {"action": "futures_buy_triggered", "symbol": "ZEC-USDT", "pnl": -3.7, "ts": 1_784_003_600,
+       "closeType": "CLOSE_LONG", "positionOpenTime": 1_784_000_000_000, "exitPrice": 560.0,
+       "entryPrice": 590.0, "reason": "TP/SL triggered (CLOSE_LONG, ROE -5.56%)"},
+      {"action": "futures_sell_triggered", "symbol": "XRP-USDT", "pnl": 0.3, "ts": 1_784_010_000,
+       "closeType": "CLOSE_SHORT", "exitPrice": 1.05, "reason": "TP/SL triggered (CLOSE_SHORT, ROE 2.0%)"},
+      {"action": "hold_short", "symbol": "ETH-USDT", "pnl": -0.1, "ts": 1_784_011_000},  # not a realized close
+    ]), limit=3)
+    assert [r["symbol"] for r in rows] == ["XRP-USDT", "ZEC-USDT"]  # newest first, hold excluded
+    zec = rows[1]
+    assert zec["side"] == "long" and zec["win"] is False and zec["roePct"] == -5.56
+    assert zec["openTs"] == 1_784_000_000 and zec["closeTs"] == 1_784_003_600  # ms normalized to seconds
+    assert zec["entryPrice"] == 590.0 and zec["exitPrice"] == 560.0
+
+
+class _FakeMem:
+  def __init__(self, decisions):
+    self._decisions = decisions
+  def latest_items(self, kind, limit=5):
+    return {"items": list(self._decisions)}

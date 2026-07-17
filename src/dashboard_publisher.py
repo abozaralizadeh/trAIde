@@ -29,6 +29,13 @@ from .memory import MemoryStore
 
 logger = logging.getLogger(__name__)
 
+# A trigger the agent hasn't refreshed within this window is stale intent, not something it's still
+# "watching" — dropping it keeps the dashboard's Watching panel from fixating on an old level (a
+# single Jul-10 SOL trigger kept showing for a week once retention was extended to 90 days).
+_TRIGGER_FRESHNESS_SEC = 12 * 3600
+# How many most-recent closed positions to publish with full open→close lifecycle detail.
+_CLOSED_DETAIL_LIMIT = 3
+
 try:
   from azure.data.tables import TableServiceClient, UpdateMode
   from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -76,6 +83,16 @@ def _f(value: Any) -> Optional[float]:
 def _round(value: Any, ndigits: int = 6) -> Optional[float]:
   v = _f(value)
   return round(v, ndigits) if v is not None else None
+
+
+def _normalize_ts_sec(value: Any) -> Optional[int]:
+  """Coerce an epoch that may be in seconds, ms, or ns to whole seconds. None if unparseable."""
+  v = _f(value)
+  if v is None or v <= 0:
+    return None
+  while v > 1e12:  # ms (1e12) or ns (1e18) -> seconds
+    v /= 1000.0
+  return int(v)
 
 
 def _month_key(day: int) -> str:
@@ -200,6 +217,7 @@ class DashboardPublisher:
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
+      "closedPositions": self._closed_position_lifecycles(memory),
       "coins": self._sanitize_coins(coins),
       "feed": [self._sanitize_decision(d) for d in decisions],
       "trades": [self._sanitize_decision(d) for d in closed],
@@ -458,6 +476,7 @@ class DashboardPublisher:
     ]
 
   def _sanitize_triggers(self, triggers: Any) -> List[Dict[str, Any]]:
+    now = time.time()
     return [
       {
         "symbol": t.get("symbol"),
@@ -468,6 +487,9 @@ class DashboardPublisher:
         "ts": t.get("ts"),
       }
       for t in (triggers or []) if isinstance(t, dict)
+      # Only surface triggers the agent set/refreshed recently — an old level it moved on from is
+      # not something it is still watching.
+      and t.get("ts") and (now - float(t.get("ts") or 0)) <= _TRIGGER_FRESHNESS_SEC
     ]
 
   def _sanitize_coins(self, coins: Any) -> List[Dict[str, Any]]:
@@ -516,6 +538,39 @@ class DashboardPublisher:
       if d.get("pnl") is not None and MemoryStore._is_realized_close(d.get("action") or "")
     ]
     return closed[:limit]
+
+  def _closed_position_lifecycles(self, memory: MemoryStore, limit: int = _CLOSED_DETAIL_LIMIT) -> List[Dict[str, Any]]:
+    """The most recent closed positions with open→close timing + entry/exit prices (public-safe).
+
+    Lets the dashboard chart each finished trade against candles and mark where it opened, where it
+    closed, and — visible from the candles between those points — whether a better exit was missed.
+    Prices are already disclosed by the live position charts; no size/balance/identity is exposed.
+    """
+    items = memory.latest_items("decisions", limit=80).get("items", [])
+    rows: List[Dict[str, Any]] = []
+    for d in items:
+      if d.get("pnl") is None or not MemoryStore._is_realized_close(d.get("action") or ""):
+        continue
+      close_ts = d.get("ts")
+      if not close_ts:
+        continue
+      open_ts = _normalize_ts_sec(d.get("positionOpenTime"))
+      close_type = str(d.get("closeType") or "")
+      side = "long" if "LONG" in close_type.upper() else ("short" if "SHORT" in close_type.upper() else (d.get("positionSide") or ""))
+      m = re.search(r"ROE\s*(-?\d+(?:\.\d+)?)\s*%", d.get("reason") or "")
+      rows.append({
+        "symbol": d.get("symbol"),
+        "side": side,
+        "openTs": open_ts,
+        "closeTs": int(close_ts),
+        "entryPrice": _round(d.get("entryPrice")),
+        "exitPrice": _round(d.get("exitPrice")),
+        "win": bool(_f(d.get("pnl")) and _f(d.get("pnl")) > 0),
+        "roePct": round(float(m.group(1)), 4) if m else None,
+        "closeType": close_type or None,
+      })
+    rows.sort(key=lambda r: r["closeTs"], reverse=True)
+    return rows[:limit]
 
   def _prev_day_close(self, today: int) -> float:
     """The indexClose of the most recent finalized day before `today` (durable, from Azure)."""

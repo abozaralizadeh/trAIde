@@ -545,6 +545,7 @@ class MemoryStore:
     position_id: Optional[str] = None,
     position_open_time: Optional[int | float | str] = None,
     position_side: Optional[str] = None,
+    entry_price: Optional[float] = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -575,6 +576,11 @@ class MemoryStore:
       if exit_price is not None:
         try:
           entry["exitPrice"] = float(exit_price)
+        except (TypeError, ValueError):
+          pass
+      if entry_price is not None:
+        try:
+          entry["entryPrice"] = float(entry_price)
         except (TypeError, ValueError):
           pass
       if close_type:
