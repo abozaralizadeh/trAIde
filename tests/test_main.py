@@ -49,15 +49,19 @@ class TestAdaptivePriceTrigger:
     assert _adaptive_price_trigger_threshold(0.5, 0.05, 20) == 0.5
 
   def test_observed_noise_raises_threshold_but_is_bounded(self):
-    assert _adaptive_price_trigger_threshold(0.5, 0.3, 20) == pytest.approx(1.2)
-    assert _adaptive_price_trigger_threshold(0.5, 5.0, 20) == 2.0
+    # Default ceiling is 2× the base trigger (safety-biased): 0.3×4=1.2 is clamped to 0.5×2=1.0.
+    assert _adaptive_price_trigger_threshold(0.5, 0.3, 20) == pytest.approx(1.0)
+    assert _adaptive_price_trigger_threshold(0.5, 5.0, 20) == 1.0
+    # A wider ceiling can be opted into for more token savings.
+    assert _adaptive_price_trigger_threshold(0.5, 0.3, 20, max_multiplier=4.0) == pytest.approx(1.2)
+    assert _adaptive_price_trigger_threshold(0.5, 5.0, 20, max_multiplier=4.0) == 2.0
 
   def test_noise_ewma_decays_and_single_shock_is_winsorized(self):
     seeded = _next_price_noise_ewma(0.0, 0.5, 0.5, 0)
     assert seeded == pytest.approx(0.5)
     assert _next_price_noise_ewma(seeded, 0.0, 0.5, 1) == pytest.approx(0.4)
-    # A 20% print cannot lift the learned one-poll noise by the full outlier amount.
-    assert _next_price_noise_ewma(0.5, 20.0, 0.5, 10) == pytest.approx(0.8)
+    # A 20% print is winsorized to the ceiling (base × 2) before it can lift learned noise.
+    assert _next_price_noise_ewma(0.5, 20.0, 0.5, 10) == pytest.approx(0.6)
 
   def test_successful_review_rebases_only_symbols_in_its_snapshot(self):
     moves = {"BTC-USDT": 2.0, "NEW-USDT": 1.5}

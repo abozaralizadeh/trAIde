@@ -90,8 +90,17 @@ class TradingConfig:
                                               # position (fraction of entry) until the agent sets a real one (0=off)
   # Model invocation budget: protection remains code-driven every poll, while expensive discretionary
   # analysis runs less often when flat and more often when capital is exposed.
-  flat_agent_cooldown_sec: float = 3600.0
+  # When FLAT and quiet, this is how often the model wakes to HUNT — run the screener, do research,
+  # and open new positions (all model-only tools). 600 = ~every 10 min (the pre-throttle cadence);
+  # the adaptive triggers still suppress redundant runs on watchlist noise between those beats.
+  flat_agent_cooldown_sec: float = 600.0
   active_agent_cooldown_sec: float = 300.0
+  # Adaptive price-trigger tuning (the model-call gate). A symbol's per-poll noise EWMA × the noise
+  # multiplier sets its trigger threshold, capped at price_change_trigger_pct × the ceiling multiplier.
+  # The ceiling bounds worst-case blindness: at 2.0 (default) any move >= 2× the base trigger always
+  # gets a fresh model look, even in the noisiest symbol — biased toward safety over token savings.
+  price_noise_multiplier: float = 4.0
+  price_trigger_max_multiplier: float = 2.0
 
 
 @dataclass
@@ -323,8 +332,10 @@ def load_config() -> AppConfig:
       screener_min_turnover_usd_24h=float(os.getenv("SCREENER_MIN_TURNOVER_USD_24H", "5000000")),
       atomic_bracket_enabled=_as_bool(os.getenv("ATOMIC_BRACKET_ENABLED"), True),
       emergency_sl_pct=float(os.getenv("EMERGENCY_SL_PCT", "0.02")),
-      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "3600")),
+      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "600")),
       active_agent_cooldown_sec=float(os.getenv("ACTIVE_AGENT_COOLDOWN_SEC", "300")),
+      price_noise_multiplier=float(os.getenv("PRICE_NOISE_MULTIPLIER", "4.0")),
+      price_trigger_max_multiplier=float(os.getenv("PRICE_TRIGGER_MAX_MULTIPLIER", "2.0")),
     ),
     circuit_breaker=CircuitBreakerConfig(
       max_daily_drawdown_pct=float(os.getenv("CB_MAX_DAILY_DRAWDOWN_PCT", "3.0")),
@@ -469,6 +480,10 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"RISK_PER_TRADE_PCT={cfg.trading.risk_per_trade_pct} (must be >0 and <=1.0)")
   if cfg.trading.flat_agent_cooldown_sec < 0 or cfg.trading.active_agent_cooldown_sec < 0:
     invalid.append("FLAT_AGENT_COOLDOWN_SEC and ACTIVE_AGENT_COOLDOWN_SEC must be >=0")
+  if cfg.trading.price_noise_multiplier < 0:
+    invalid.append(f"PRICE_NOISE_MULTIPLIER={cfg.trading.price_noise_multiplier} (must be >=0)")
+  if cfg.trading.price_trigger_max_multiplier < 1.0:
+    invalid.append(f"PRICE_TRIGGER_MAX_MULTIPLIER={cfg.trading.price_trigger_max_multiplier} (must be >=1.0 so the ceiling never drops below the base trigger)")
   if not (0.0 <= cfg.regime.relative_strength_min_confidence <= 1.0):
     invalid.append(f"RELATIVE_STRENGTH_MIN_CONFIDENCE={cfg.regime.relative_strength_min_confidence} (must be 0.0–1.0)")
   if not (0.0 < cfg.regime.relative_strength_size_factor <= 1.0):

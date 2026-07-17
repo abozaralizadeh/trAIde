@@ -566,7 +566,7 @@ Each polling cycle (`POLL_INTERVAL_SEC` seconds):
 
 1. **Snapshot** -- Fetches tickers, spot/futures/financial balances, open positions, stop orders, pending limit orders, recent fills, closed positions, and fee rates from KuCoin
 2. **Reconciliation** -- Sums USDT across all accounts, tracks daily drawdown per venue
-3. **Price detection** -- Compares prices with the last successful model-reviewed state. Each symbol learns an EWMA of ordinary poll noise and raises its trigger adaptively (bounded at 4x the configured floor), preventing oscillation from repeatedly calling the model
+3. **Price detection** -- Compares prices with the last successful model-reviewed state. Each symbol learns an EWMA of ordinary poll noise and raises its trigger adaptively, bounded at `PRICE_TRIGGER_MAX_MULTIPLIER`× the configured floor (default 2× — safety-biased, so any move ≥ 2× the base trigger always earns a fresh model look even in the noisiest symbol; raise it to save more tokens), preventing oscillation from repeatedly calling the model
 4. **Position extremes** -- Updates peak/trough unrealized PnL for open positions
 5. **Profit protection** -- Ratchets stops to breakeven and caps give-back on live futures positions (code-driven, independent of the agent)
 6. **Event tracking** -- Logs triggered futures TP/SL closes as decisions (with exit price, for the no-chase guard)

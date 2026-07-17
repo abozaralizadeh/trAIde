@@ -28,7 +28,10 @@ logger = logging.getLogger(__name__)
 _AGENT_RUN_TIMEOUT_SEC = 20 * 60
 _AGENT_SHUTDOWN_GRACE_SEC = 30
 _PRICE_NOISE_MULTIPLIER = 4.0
-_PRICE_TRIGGER_MAX_MULTIPLIER = 4.0
+# Ceiling on the adaptive trigger, as a multiple of the base trigger. 2.0 keeps worst-case blindness
+# bounded (any move >= 2× the base trigger always earns a fresh model look) — biased toward safety;
+# raise via PRICE_TRIGGER_MAX_MULTIPLIER to save more tokens. Overridable per call from config.
+_PRICE_TRIGGER_MAX_MULTIPLIER = 2.0
 _PRICE_NOISE_ALPHA = 0.20
 _PRICE_NOISE_MIN_SAMPLES = 3
 
@@ -103,18 +106,22 @@ def _adaptive_price_trigger_threshold(
   base_trigger_pct: float,
   noise_ewma_pct: float,
   samples: int,
+  *,
+  noise_multiplier: float = _PRICE_NOISE_MULTIPLIER,
+  max_multiplier: float = _PRICE_TRIGGER_MAX_MULTIPLIER,
 ) -> float:
   """Raise the model trigger above a symbol's ordinary poll-to-poll noise.
 
-  The configured threshold is always the floor. After a few observations, routine volatility
-  must be exceeded by roughly four times its EWMA, capped at four times the configured floor so
-  a genuinely structural move can never be suppressed indefinitely.
+  The configured threshold is always the floor. After a few observations, routine volatility must be
+  exceeded by ``noise_multiplier`` times its EWMA, capped at ``max_multiplier`` times the configured
+  floor so a genuinely structural move can never be suppressed indefinitely (the cap bounds
+  worst-case blindness; the default keeps it tight for safety).
   """
   base = max(0.0, float(base_trigger_pct))
   if base <= 0 or int(samples) < _PRICE_NOISE_MIN_SAMPLES:
     return base
-  noise_threshold = max(0.0, float(noise_ewma_pct)) * _PRICE_NOISE_MULTIPLIER
-  return min(base * _PRICE_TRIGGER_MAX_MULTIPLIER, max(base, noise_threshold))
+  noise_threshold = max(0.0, float(noise_ewma_pct)) * float(noise_multiplier)
+  return min(base * max(1.0, float(max_multiplier)), max(base, noise_threshold))
 
 
 def _next_price_noise_ewma(
@@ -122,10 +129,12 @@ def _next_price_noise_ewma(
   observed_move_pct: float,
   base_trigger_pct: float,
   samples: int,
+  *,
+  max_multiplier: float = _PRICE_TRIGGER_MAX_MULTIPLIER,
 ) -> float:
   """Update robust price noise without letting one shock disable later model reviews."""
   base = max(0.0, float(base_trigger_pct))
-  ceiling = base * _PRICE_TRIGGER_MAX_MULTIPLIER if base > 0 else abs(float(observed_move_pct))
+  ceiling = base * max(1.0, float(max_multiplier)) if base > 0 else abs(float(observed_move_pct))
   observed = min(abs(float(observed_move_pct)), ceiling)
   if int(samples) <= 0:
     return observed
@@ -924,6 +933,8 @@ async def trading_loop(
           cfg.trading.price_change_trigger_pct,
           noise_ewma,
           samples,
+          noise_multiplier=cfg.trading.price_noise_multiplier,
+          max_multiplier=cfg.trading.price_trigger_max_multiplier,
         )
         if state_move_pct >= adaptive_threshold:
           triggers.append(f"price_move:{symbol}:{state_move_pct:.2f}%")
@@ -939,6 +950,7 @@ async def trading_loop(
           poll_move_pct,
           cfg.trading.price_change_trigger_pct,
           samples,
+          max_multiplier=cfg.trading.price_trigger_max_multiplier,
         )
         samples = min(samples + 1, 1_000_000)
       price_observations[symbol] = {
