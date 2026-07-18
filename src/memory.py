@@ -1295,7 +1295,7 @@ class MemoryStore:
     def _limit_execution_stats(records: list[Dict[str, Any]]) -> Dict[str, Any]:
       limit_records = [
         trade for trade in records
-        if trade.get("orderId") not in (None, "") or trade.get("clientOid") not in (None, "")
+        if str(trade.get("clientOid") or "").startswith("traide-entry-")
       ]
       filled_limits = [trade for trade in limit_records if trade.get("filled") is True]
       return {

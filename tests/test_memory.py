@@ -531,6 +531,7 @@ def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
     mem.record_trade(
         "ETH-USDT", "buy", 20.0, price=2000.0, size=0.01,
         venue="futures", filled=False, track_position=False, order_id="order-1",
+        client_oid="traide-entry-limit-1",
     )
     assert mem.trades_today("ETH-USDT") == 1
     assert mem.positions(venue="futures") == {}
@@ -546,3 +547,27 @@ def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
     assert filled_summary["limitOrdersFilled"] == 1
     assert filled_summary["limitFillRate"] == 1.0
     assert mem.positions(venue="futures") == {}
+
+
+def test_market_reduce_only_close_does_not_affect_limit_fill_stats(tmp_path):
+    mem = MemoryStore(str(tmp_path / "memory.json"), retention_days=7)
+    mem.record_trade(
+        "ETH-USDT", "buy", 20.0, price=2000.0, size=0.01,
+        venue="futures", filled=False, track_position=False,
+        order_id="limit-order-1", client_oid="traide-entry-limit-1",
+    )
+    before = mem.performance_summary()
+    assert before["limitOrdersSubmitted"] == 1
+    assert before["limitOrdersFilled"] == 0
+    assert before["limitFillRate"] == 0.0
+
+    # Market/reduce-only closes receive exchange order IDs, but never the traide-entry tag.
+    mem.record_trade(
+        "ETH-USDT", "sell", 20.0, price=1990.0, size=0.01,
+        venue="futures", filled=True, track_position=False,
+        order_id="market-close-1", client_oid="ethusdtm-close-deadbeef",
+    )
+    after = mem.performance_summary()
+    assert after["limitOrdersSubmitted"] == before["limitOrdersSubmitted"]
+    assert after["limitOrdersFilled"] == before["limitOrdersFilled"]
+    assert after["limitFillRate"] == before["limitFillRate"]

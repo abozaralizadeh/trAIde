@@ -118,3 +118,9 @@ def test_invalid_max_position_usd():
     cfg = _make_valid_config(max_position_usd=0.0)
     with pytest.raises(ValueError, match="MAX_POSITION_USD"):
         validate_config(cfg)
+
+
+def test_invalid_flat_backoff_max_multiplier():
+    cfg = _make_valid_config(flat_backoff_max_multiplier=0.99)
+    with pytest.raises(ValueError, match="FLAT_BACKOFF_MAX_MULTIPLIER"):
+        validate_config(cfg)

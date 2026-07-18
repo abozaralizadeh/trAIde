@@ -43,15 +43,17 @@ class TestAdaptiveAgentCooldown:
     assert self._cooldown(active=True) == 300
     assert self._cooldown(events=1) == 300
 
-  def test_repeated_unproductive_runs_back_off_to_derived_hourly_ceiling(self):
-    assert _productivity_adjusted_flat_cooldown(600, 300, 0) == 600
-    assert _productivity_adjusted_flat_cooldown(600, 300, 1) == 1200
-    assert _productivity_adjusted_flat_cooldown(600, 300, 2) == 2400
-    assert _productivity_adjusted_flat_cooldown(600, 300, 3) == 3600
-    assert _productivity_adjusted_flat_cooldown(600, 300, 20) == 3600
+  def test_flat_backoff_is_disabled_by_default(self):
+    assert _productivity_adjusted_flat_cooldown(600, 0) == 600
+    assert _productivity_adjusted_flat_cooldown(600, 1) == 600
+    assert _productivity_adjusted_flat_cooldown(600, 100) == 600
 
-  def test_existing_long_flat_cadence_is_never_shortened(self):
-    assert _productivity_adjusted_flat_cooldown(3600, 300, 10) == 3600
+  def test_opt_in_flat_backoff_uses_power_of_two_up_to_configured_cap(self):
+    assert _productivity_adjusted_flat_cooldown(600, 0, 4.0) == 600
+    assert _productivity_adjusted_flat_cooldown(600, 1, 4.0) == 1200
+    assert _productivity_adjusted_flat_cooldown(600, 2, 4.0) == 2400
+    assert _productivity_adjusted_flat_cooldown(600, 20, 4.0) == 2400
+    assert _productivity_adjusted_flat_cooldown(600, 3, 1.5) == 900
 
 
 class TestAdaptivePriceTrigger:

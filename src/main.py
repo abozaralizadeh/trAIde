@@ -104,19 +104,17 @@ def _adaptive_agent_cooldown(
 
 def _productivity_adjusted_flat_cooldown(
   flat_cooldown_sec: float,
-  active_cooldown_sec: float,
   unproductive_runs: int,
+  max_multiplier: float = 1.0,
 ) -> float:
-  """Back off repeated no-action deliberation while retaining a bounded discovery cadence."""
+  """Optionally back off no-action deliberation; disabled when max_multiplier is 1."""
   base = max(0.0, float(flat_cooldown_sec))
   if base <= 0:
     return 0.0
-  # Derive the ceiling from the active cadence instead of adding another tuning knob. With the
-  # defaults this grows 10m -> 20m -> 40m -> 60m after repeated declines, then automatically
-  # contracts when a fill/position proves that the model is finding executable opportunities.
-  ceiling = max(base, max(0.0, float(active_cooldown_sec)) * 12.0)
-  exponent = min(3, max(0, int(unproductive_runs)))
-  return min(ceiling, base * (2 ** exponent))
+  cap = max(1.0, float(max_multiplier))
+  exponent = max(0, int(unproductive_runs))
+  multiplier = min(cap, 2.0 ** exponent)
+  return base * multiplier
 
 
 def _adaptive_price_trigger_threshold(
@@ -1188,8 +1186,8 @@ async def trading_loop(
     open_book = capital_exposed or pending_orders_active
     effective_flat_cooldown = _productivity_adjusted_flat_cooldown(
       cfg.trading.flat_agent_cooldown_sec,
-      cfg.trading.active_agent_cooldown_sec,
       unproductive_runs,
+      cfg.trading.flat_backoff_max_multiplier,
     )
     cooldown_sec = _adaptive_agent_cooldown(
       flat_cooldown_sec=effective_flat_cooldown,

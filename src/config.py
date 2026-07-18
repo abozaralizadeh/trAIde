@@ -91,10 +91,11 @@ class TradingConfig:
   # Model invocation budget: protection remains code-driven every poll, while expensive discretionary
   # analysis runs less often when flat and more often when capital is exposed.
   # When FLAT and quiet, this is the initial model HUNT cadence. Repeated no-action runs back it off
-  # automatically toward an hour; fills and executable activity contract it again. Pending atomic
-  # brackets are managed by deterministic expiry and do not count as exposed capital.
+  # only when flat_backoff_max_multiplier is explicitly >1. Pending atomic brackets are managed by
+  # deterministic expiry and do not count as exposed capital.
   flat_agent_cooldown_sec: float = 600.0
   active_agent_cooldown_sec: float = 300.0
+  flat_backoff_max_multiplier: float = 1.0  # 1 disables no-action backoff; >1 opts into it
   # Adaptive price-trigger tuning (the model-call gate). A symbol's per-poll noise EWMA × the noise
   # multiplier sets its trigger threshold, capped at price_change_trigger_pct × the ceiling multiplier.
   # The ceiling bounds worst-case blindness: at 2.0 (default) any move >= 2× the base trigger always
@@ -334,6 +335,7 @@ def load_config() -> AppConfig:
       emergency_sl_pct=float(os.getenv("EMERGENCY_SL_PCT", "0.02")),
       flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "600")),
       active_agent_cooldown_sec=float(os.getenv("ACTIVE_AGENT_COOLDOWN_SEC", "300")),
+      flat_backoff_max_multiplier=float(os.getenv("FLAT_BACKOFF_MAX_MULTIPLIER", "1.0")),
       price_noise_multiplier=float(os.getenv("PRICE_NOISE_MULTIPLIER", "4.0")),
       price_trigger_max_multiplier=float(os.getenv("PRICE_TRIGGER_MAX_MULTIPLIER", "2.0")),
     ),
@@ -480,6 +482,10 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"RISK_PER_TRADE_PCT={cfg.trading.risk_per_trade_pct} (must be >0 and <=1.0)")
   if cfg.trading.flat_agent_cooldown_sec < 0 or cfg.trading.active_agent_cooldown_sec < 0:
     invalid.append("FLAT_AGENT_COOLDOWN_SEC and ACTIVE_AGENT_COOLDOWN_SEC must be >=0")
+  if not (cfg.trading.flat_backoff_max_multiplier >= 1.0):
+    invalid.append(
+      f"FLAT_BACKOFF_MAX_MULTIPLIER={cfg.trading.flat_backoff_max_multiplier} (must be >=1.0)"
+    )
   if cfg.trading.price_noise_multiplier < 0:
     invalid.append(f"PRICE_NOISE_MULTIPLIER={cfg.trading.price_noise_multiplier} (must be >=0)")
   if cfg.trading.price_trigger_max_multiplier < 1.0:
