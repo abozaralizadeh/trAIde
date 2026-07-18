@@ -26,6 +26,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .memory import MemoryStore
+from .utils import normalize_symbol as _normalize_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -217,6 +218,7 @@ class DashboardPublisher:
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
+      "pendingOrders": self._sanitize_pending_orders(snapshot),
       "closedPositions": self._closed_position_lifecycles(memory),
       "coins": self._sanitize_coins(coins),
       "feed": [self._sanitize_decision(d) for d in decisions],
@@ -381,6 +383,39 @@ class DashboardPublisher:
         "lastTs": int(time.time()),
       })
 
+    return out
+
+  def _sanitize_pending_orders(self, snapshot) -> List[Dict[str, Any]]:
+    """Resting (unfilled) limit/entry orders waiting to trigger — public-safe: symbol, side, type,
+    limit price, venue, entry-vs-reduce, and age only. Never size/quantity (privacy). Entries the bot
+    placed are tagged (`traide-entry-`) so the dashboard can show what it's waiting to open."""
+    out: List[Dict[str, Any]] = []
+    if snapshot is None:
+      return out
+    groups = (
+      ("spot", getattr(snapshot, "spot_pending_orders", None) or []),
+      ("futures", getattr(snapshot, "futures_pending_orders", None) or []),
+    )
+    for venue, orders in groups:
+      for o in orders:
+        if not isinstance(o, dict):
+          continue
+        raw_sym = str(o.get("symbol") or "")
+        disp = self._futures_to_display(raw_sym) if venue == "futures" else _normalize_symbol(raw_sym)
+        if not disp:
+          continue
+        reduce_only = bool(o.get("reduceOnly")) or bool(o.get("closeOrder"))
+        out.append({
+          "symbol": disp,
+          "side": (str(o.get("side") or "")).lower(),
+          "type": (str(o.get("type") or "limit")).lower(),
+          "venue": venue,
+          "price": _round(o.get("price")),
+          "kind": "reduce" if reduce_only else "entry",
+          "botEntry": str(o.get("clientOid") or "").startswith("traide-entry-"),
+          "ts": _normalize_ts_sec(o.get("createdAt") or o.get("orderTime") or o.get("ts")),
+        })
+    out.sort(key=lambda r: r.get("ts") or 0, reverse=True)
     return out
 
   def _bracket_for(self, stop_orders, display_symbol, side, mark):

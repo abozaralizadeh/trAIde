@@ -111,3 +111,32 @@ class _FakeMem:
     self._decisions = decisions
   def latest_items(self, kind, limit=5):
     return {"items": list(self._decisions)}
+
+
+class TestPendingOrders:
+  def test_pending_orders_public_safe_and_normalized(self):
+    pub = _publisher()
+    snap = SimpleNamespace(
+      spot_pending_orders=[
+        {"symbol": "ETH-USDT", "side": "buy", "type": "limit", "price": "1700", "size": "0.5", "createdAt": 1_784_000_000_000},
+      ],
+      futures_pending_orders=[
+        {"symbol": "XBTUSDTM", "side": "sell", "type": "limit", "price": "62000", "size": "3",
+         "clientOid": "traide-entry-abc", "createdAt": 1_784_000_100_000},
+        {"symbol": "SOLUSDTM", "side": "buy", "type": "limit", "price": "78", "reduceOnly": True, "createdAt": 1_784_000_050_000},
+      ],
+    )
+    out = pub._sanitize_pending_orders(snap)
+    # newest first
+    assert [o["symbol"] for o in out] == ["BTC-USDT", "SOL-USDT", "ETH-USDT"]
+    btc = out[0]
+    assert btc["side"] == "sell" and btc["venue"] == "futures" and btc["kind"] == "entry" and btc["botEntry"] is True
+    assert btc["price"] == 62000 and btc["ts"] == 1_784_000_100  # ms->s
+    # no size/quantity ever leaks
+    assert all("size" not in o and "quantity" not in o for o in out)
+    # reduce-only flagged
+    assert next(o for o in out if o["symbol"] == "SOL-USDT")["kind"] == "reduce"
+
+  def test_pending_orders_empty(self):
+    pub = _publisher()
+    assert pub._sanitize_pending_orders(SimpleNamespace(spot_pending_orders=[], futures_pending_orders=[])) == []
