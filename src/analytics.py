@@ -511,8 +511,14 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     entry_hint = "No clear directional bias; consider range-bound strategies or reduce size significantly."
 
   if daily_exhausted:
-    if daily_bias_raw in ("bullish", "bearish"):
-      entry_hint += f" DAILY EXHAUSTED: 1D {daily_bias_raw} RSI extreme — do NOT open continuation trades. Counter-trend only with a strong reversal signal."
+    if daily_bias_raw == "bearish":
+      entry_hint += (
+        " DAILY BEARISH EXHAUSTED: do not chase a fresh dump, but a high-confidence continuation "
+        "SHORT is eligible after a rally/retest when both 1h and 15m are bearish; the code gate "
+        "will enforce confirmation and reduced sizing."
+      )
+    elif daily_bias_raw == "bullish":
+      entry_hint += " DAILY EXHAUSTED: 1D bullish RSI extreme — do NOT open continuation longs. Counter-trend only with a strong reversal signal."
     else:
       entry_hint += " DAILY EXHAUSTED: 1D ADX weak/choppy — prefer mean-reversion, avoid trend-continuation entries."
   elif daily_gate_applied:

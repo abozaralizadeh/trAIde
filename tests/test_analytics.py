@@ -127,6 +127,19 @@ def test_summarize_multi_timeframe_daily_confirms_boosts_strength():
     assert "Daily trend confirms" in result["entry_hint"]
 
 
+def test_exhausted_bearish_daily_surfaces_confirmed_trend_short_exception():
+    snapshots = [
+        {"interval": "1day", "trend_bias": "bearish", "rsi": 20, "adx": 30, "volatility": "normal"},
+        {"interval": "4hour", "trend_bias": "bearish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "bearish", "volatility": "normal"},
+        {"interval": "15min", "trend_bias": "bearish", "volatility": "normal"},
+    ]
+    result = summarize_multi_timeframe(snapshots)
+    assert result["daily_exhausted"] is True
+    assert result["daily_bias_raw"] == "bearish"
+    assert "continuation SHORT is eligible" in result["entry_hint"]
+
+
 def test_summarize_multi_timeframe_daily_neutral_no_effect():
     """1D neutral does not gate or boost."""
     snapshots = [

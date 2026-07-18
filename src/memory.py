@@ -4,6 +4,7 @@ import copy
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -28,6 +29,10 @@ MAX_TEMPORARY_NOTES = 20
 MAX_PERMANENT_NOTES = 10
 MAX_PENDING_AGENT_EVENTS = 200
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
+_ATR_QUARANTINE_RE = re.compile(
+  r"daily ATR\s+([0-9]+(?:\.[0-9]+)?)%\s+exceeds\s+([0-9]+(?:\.[0-9]+)?)%",
+  re.IGNORECASE,
+)
 
 
 def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
@@ -38,6 +43,10 @@ def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
     last_run_ts = max(0.0, float(raw.get("lastRunTs") or 0.0))
   except (TypeError, ValueError):
     last_run_ts = 0.0
+  try:
+    unproductive_runs = min(100, max(0, int(raw.get("unproductiveRuns") or 0)))
+  except (TypeError, ValueError):
+    unproductive_runs = 0
 
   reviewed_prices: Dict[str, float] = {}
   for symbol, price in (raw.get("reviewedPrices") or {}).items() if isinstance(raw.get("reviewedPrices"), dict) else []:
@@ -85,9 +94,27 @@ def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
 
   return {
     "lastRunTs": last_run_ts,
+    "unproductiveRuns": unproductive_runs,
     "reviewedPrices": reviewed_prices,
     "priceObservations": observations,
   }
+
+
+def _adaptive_quarantine_seconds(reason: str) -> int:
+  """Back off unsafe candidates in proportion to how far their volatility exceeded the gate."""
+  text = str(reason or "")
+  if "automatic risk quarantine" not in text.lower():
+    return 0
+  match = _ATR_QUARANTINE_RE.search(text)
+  if not match:
+    return 24 * 3600
+  observed = float(match.group(1))
+  limit = max(1e-9, float(match.group(2)))
+  excess_ratio = max(1.0, observed / limit)
+  # A marginal breach rests for roughly half a day; severe/data-scale discontinuities rest up to
+  # one week. The retry time adapts to the evidence and expires automatically without maintenance.
+  hours = min(7 * 24.0, max(12.0, 12.0 * excess_ratio * excess_ratio))
+  return int(hours * 3600)
 
 
 class MemoryStore:
@@ -467,6 +494,31 @@ class MemoryStore:
       if coins:
         return [c["symbol"] for c in coins if c.get("status", "active") == "active"]
       return default or []
+
+  def get_quarantined_coins(self, now: int | None = None) -> list[Dict[str, Any]]:
+    """Return automatic risk quarantines whose adaptive retry window has not expired."""
+    current = int(time.time() if now is None else now)
+    with self._lock:
+      data = self._prune(self._read())
+      quarantined: list[Dict[str, Any]] = []
+      for coin in data.get("coins", []) or []:
+        if coin.get("status") != "removed":
+          continue
+        reason = str(coin.get("reason") or "")
+        duration = _adaptive_quarantine_seconds(reason)
+        if duration <= 0:
+          continue
+        removed_at = int(coin.get("ts") or 0)
+        retry_after = removed_at + duration
+        if retry_after <= current:
+          continue
+        quarantined.append({
+          "symbol": coin.get("symbol"),
+          "reason": reason,
+          "retryAfter": retry_after,
+          "remainingHours": round((retry_after - current) / 3600.0, 1),
+        })
+      return sorted(quarantined, key=lambda item: item["retryAfter"])
 
   def has_coins(self) -> bool:
     with self._lock:
@@ -1240,16 +1292,32 @@ class MemoryStore:
     trades = [trade for trade in all_trade_records if trade.get("filled") is not False]
     submissions = [trade for trade in all_trade_records if trade.get("filled") is False]
 
+    def _limit_execution_stats(records: list[Dict[str, Any]]) -> Dict[str, Any]:
+      limit_records = [
+        trade for trade in records
+        if trade.get("orderId") not in (None, "") or trade.get("clientOid") not in (None, "")
+      ]
+      filled_limits = [trade for trade in limit_records if trade.get("filled") is True]
+      return {
+        "limitOrdersSubmitted": len(limit_records),
+        "limitOrdersFilled": len(filled_limits),
+        "limitFillRate": round(len(filled_limits) / len(limit_records), 3) if limit_records else None,
+      }
+
+    execution_stats = _limit_execution_stats(all_trade_records)
+
     if not trades:
       return {
         "totalTrades": 0,
         "orderSubmissions": len(submissions),
+        **execution_stats,
         "message": "No executed trade history yet.",
       }
 
     overall = self._pnl_stats(decisions)
     overall["totalTrades"] = len(trades)
     overall["orderSubmissions"] = len(submissions)
+    overall.update(execution_stats)
 
     spot_decisions = [d for d in decisions if (d.get("action") or "").startswith("spot_")]
     futures_decisions = [d for d in decisions if (d.get("action") or "").startswith("futures_")]
@@ -1260,6 +1328,8 @@ class MemoryStore:
       block = self._pnl_stats(venue_decisions)
       block["totalTrades"] = len(venue_trades)
       block["orderSubmissions"] = len(venue_submissions)
+      venue = venue_trades + venue_submissions
+      block.update(_limit_execution_stats(venue))
       live_d = [d for d in venue_decisions if not d.get("paper", False)]
       paper_d = [d for d in venue_decisions if d.get("paper", False)]
       live_t = [t for t in venue_trades if not t.get("paper", False)]

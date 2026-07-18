@@ -4433,8 +4433,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   @function_tool
   async def list_coins() -> Dict[str, Any]:
-    """List the current active coin universe (dynamic if enabled)."""
-    return {"coins": memory.get_coins(default=list(allowed_symbols))}
+    """List active coins plus automatic risk quarantines that must not be re-researched yet."""
+    return {
+      "coins": memory.get_coins(default=list(allowed_symbols)),
+      "quarantined": memory.get_quarantined_coins(),
+    }
 
   @function_tool
   async def add_coin(symbol: str, reason: str) -> Dict[str, Any]:
@@ -4442,6 +4445,20 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if not symbol:
       return {"error": "symbol required"}
     norm = _normalize_symbol(symbol)
+    quarantine = next(
+      (item for item in memory.get_quarantined_coins() if item.get("symbol") == norm),
+      None,
+    )
+    if quarantine:
+      return {
+        "rejected": True,
+        "reason": (
+          f"Cannot add {norm}: automatic risk quarantine remains active for "
+          f"{quarantine.get('remainingHours', 0):.1f}h"
+        ),
+        "quarantine": quarantine,
+        "hint": "Do not re-analyze this candidate until retryAfter; scan another liquid contract.",
+      }
     try:
       kucoin.get_ticker(norm)
     except Exception:

@@ -12,6 +12,7 @@ from src.main import (
   _fetch_recent_fills,
   _fill_event_id,
   _next_price_noise_ewma,
+  _productivity_adjusted_flat_cooldown,
   _rebase_reviewed_price_triggers,
 )
 
@@ -41,6 +42,16 @@ class TestAdaptiveAgentCooldown:
   def test_active_book_or_new_event_uses_active_cadence(self):
     assert self._cooldown(active=True) == 300
     assert self._cooldown(events=1) == 300
+
+  def test_repeated_unproductive_runs_back_off_to_derived_hourly_ceiling(self):
+    assert _productivity_adjusted_flat_cooldown(600, 300, 0) == 600
+    assert _productivity_adjusted_flat_cooldown(600, 300, 1) == 1200
+    assert _productivity_adjusted_flat_cooldown(600, 300, 2) == 2400
+    assert _productivity_adjusted_flat_cooldown(600, 300, 3) == 3600
+    assert _productivity_adjusted_flat_cooldown(600, 300, 20) == 3600
+
+  def test_existing_long_flat_cadence_is_never_shortened(self):
+    assert _productivity_adjusted_flat_cooldown(3600, 300, 10) == 3600
 
 
 class TestAdaptivePriceTrigger:

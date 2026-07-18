@@ -571,10 +571,10 @@ Each polling cycle (`POLL_INTERVAL_SEC` seconds):
 5. **Profit protection** -- Ratchets stops to breakeven and caps give-back on live futures positions (code-driven, independent of the agent)
 6. **Event tracking** -- Logs triggered futures TP/SL closes as decisions (with exit price, for the no-chase guard)
 7. **Circuit breakers** -- Checks drawdown and consecutive losses against thresholds
-8. **Agent run** -- If triggers exist or idle threshold reached, starts one non-blocking Trading Agent run; broad Research is an explicit flat-book handoff
+8. **Agent run** -- If triggers exist or idle threshold reached, starts one non-blocking Trading Agent run. Repeated no-action runs automatically back cadence from 10m toward 60m; fills and meaningful state changes contract it again. Pending atomic brackets use flat cadence and deterministic expiry rather than model babysitting
 9. **Wait** -- Sleeps until next cycle
 
-Trigger types: `initial:SYMBOL` (new unreviewed symbol), `price_move:SYMBOL:X.XX%` (meaningful displacement from the last reviewed state), `idle_threshold` (scheduled review). Cadence, reviewed prices, and learned price noise persist across restarts in `agent_memory.json`; deterministic protection still runs every poll.
+Trigger types: `initial:SYMBOL` (new unreviewed symbol), `price_move:SYMBOL:X.XX%` (meaningful displacement from the last reviewed state), `idle_threshold` (scheduled review). Cadence, productivity, reviewed prices, and learned price noise persist across restarts in `agent_memory.json`; deterministic protection still runs every poll. Automatic volatility quarantines also expose adaptive retry times so Research does not repeatedly analyze the same invalid candidate.
 
 ## Project Structure
 

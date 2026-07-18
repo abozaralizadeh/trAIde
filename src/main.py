@@ -102,6 +102,23 @@ def _adaptive_agent_cooldown(
   return max(active, min(flat, flat / (1.0 + urgency_sq)))
 
 
+def _productivity_adjusted_flat_cooldown(
+  flat_cooldown_sec: float,
+  active_cooldown_sec: float,
+  unproductive_runs: int,
+) -> float:
+  """Back off repeated no-action deliberation while retaining a bounded discovery cadence."""
+  base = max(0.0, float(flat_cooldown_sec))
+  if base <= 0:
+    return 0.0
+  # Derive the ceiling from the active cadence instead of adding another tuning knob. With the
+  # defaults this grows 10m -> 20m -> 40m -> 60m after repeated declines, then automatically
+  # contracts when a fill/position proves that the model is finding executable opportunities.
+  ceiling = max(base, max(0.0, float(active_cooldown_sec)) * 12.0)
+  exponent = min(3, max(0, int(unproductive_runs)))
+  return min(ceiling, base * (2 ** exponent))
+
+
 def _adaptive_price_trigger_threshold(
   base_trigger_pct: float,
   noise_ewma_pct: float,
@@ -647,6 +664,7 @@ async def trading_loop(
     last_agent_run_ts = min(now_ts, max(0.0, float(scheduler_state.get("lastRunTs") or 0.0)))
   except (TypeError, ValueError):
     last_agent_run_ts = 0.0
+  unproductive_runs = min(100, max(0, int(scheduler_state.get("unproductiveRuns") or 0)))
   reviewed_prices: Dict[str, float] = dict(scheduler_state.get("reviewedPrices") or {})
   price_observations: Dict[str, Dict[str, Any]] = dict(scheduler_state.get("priceObservations") or {})
   last_prices: Dict[str, float] = {
@@ -658,6 +676,7 @@ async def trading_loop(
   def _persist_agent_scheduler() -> None:
     memory.save_agent_scheduler({
       "lastRunTs": last_agent_run_ts,
+      "unproductiveRuns": unproductive_runs,
       "reviewedPrices": reviewed_prices,
       "priceObservations": price_observations,
     })
@@ -853,6 +872,14 @@ async def trading_loop(
       _persist_agent_scheduler()
       try:
         result = agent_task.result()
+        made_move = _agent_made_a_move(result)
+        if agent_task_event_ids or snapshot.futures_positions:
+          unproductive_runs = 0
+        elif made_move:
+          # A submitted order is useful progress but not proof of edge until it fills.
+          unproductive_runs = max(0, unproductive_runs - 1)
+        else:
+          unproductive_runs = min(100, unproductive_runs + 1)
         # Anchor future triggers to the exact snapshot the successful run reviewed. A move during
         # the model call remains visible and can therefore schedule a genuinely new follow-up.
         reviewed_prices.update(agent_task_prices)
@@ -880,7 +907,7 @@ async def trading_loop(
           consecutive_no_trade_runs = 0
           force_research = False
           last_forced_research_ts = time.time()
-        elif _agent_made_a_move(result):
+        elif made_move:
           consecutive_no_trade_runs = 0
         else:
           consecutive_no_trade_runs += 1
@@ -1152,14 +1179,22 @@ async def trading_loop(
       logger.warning("CIRCUIT BREAKER: %s", snapshot.restriction_reason)
       notifier.send(f"<b>CIRCUIT BREAKER ACTIVE</b>\n{snapshot.restriction_reason}\nAgent restricted to close-only mode.")
 
-    # The model is the most expensive and least deterministic part of the loop.  Code-driven
-    # protection still evaluates every poll; discretionary analysis is throttled by book state.
-    # A fill/close event is actionable and uses the active cadence even if the book is now flat.
-    book_active = bool(snapshot.futures_positions or snapshot.futures_pending_orders or snapshot.spot_pending_orders)
+    # The model is the most expensive and least deterministic part of the loop. Code-driven
+    # protection and deterministic order expiry still evaluate every poll. Only an actual position
+    # uses active model cadence: an exchange-atomic pending bracket is not exposed capital and does
+    # not need the model to babysit/cancel it before its deterministic expiry.
+    capital_exposed = bool(snapshot.futures_positions)
+    pending_orders_active = bool(snapshot.futures_pending_orders or snapshot.spot_pending_orders)
+    open_book = capital_exposed or pending_orders_active
+    effective_flat_cooldown = _productivity_adjusted_flat_cooldown(
+      cfg.trading.flat_agent_cooldown_sec,
+      cfg.trading.active_agent_cooldown_sec,
+      unproductive_runs,
+    )
     cooldown_sec = _adaptive_agent_cooldown(
-      flat_cooldown_sec=cfg.trading.flat_agent_cooldown_sec,
+      flat_cooldown_sec=effective_flat_cooldown,
       active_cooldown_sec=cfg.trading.active_agent_cooldown_sec,
-      book_active=book_active,
+      book_active=capital_exposed,
       new_events_count=pending_events_count,
       trigger_move_pcts=list(pending_trigger_moves.values()),
       price_trigger_pct=cfg.trading.price_change_trigger_pct,
@@ -1172,7 +1207,10 @@ async def trading_loop(
       and (last_agent_run_ts <= 0 or cooldown_elapsed >= max(0.0, cooldown_sec))
     )
     if agent_task is None and run_candidate and not should_run and idle_polls % max(1, cfg.trading.max_idle_polls) == 0:
-      logger.info("Agent run throttled for another %dsec (book_active=%s)", int(cooldown_sec - cooldown_elapsed), book_active)
+      logger.info(
+        "Agent run throttled for another %dsec (capital_exposed=%s pending_orders=%s no_action_runs=%d)",
+        int(cooldown_sec - cooldown_elapsed), capital_exposed, pending_orders_active, unproductive_runs,
+      )
 
     if should_run and not stop_event.is_set():
       run_token = safety.authorize_run()
@@ -1210,7 +1248,7 @@ async def trading_loop(
         kind = str(event.get("kind") or "")
         if kind:
           events_for_agent.setdefault(kind, []).append(event.get("payload"))
-      force_research_for_run = bool(force_research and not book_active)
+      force_research_for_run = bool(force_research and not open_book)
       agent_task_triggers = agent_triggers
       agent_task_forced_research = force_research_for_run
       agent_task_token = run_token

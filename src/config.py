@@ -90,9 +90,9 @@ class TradingConfig:
                                               # position (fraction of entry) until the agent sets a real one (0=off)
   # Model invocation budget: protection remains code-driven every poll, while expensive discretionary
   # analysis runs less often when flat and more often when capital is exposed.
-  # When FLAT and quiet, this is how often the model wakes to HUNT — run the screener, do research,
-  # and open new positions (all model-only tools). 600 = ~every 10 min (the pre-throttle cadence);
-  # the adaptive triggers still suppress redundant runs on watchlist noise between those beats.
+  # When FLAT and quiet, this is the initial model HUNT cadence. Repeated no-action runs back it off
+  # automatically toward an hour; fills and executable activity contract it again. Pending atomic
+  # brackets are managed by deterministic expiry and do not count as exposed capital.
   flat_agent_cooldown_sec: float = 600.0
   active_agent_cooldown_sec: float = 300.0
   # Adaptive price-trigger tuning (the model-call gate). A symbol's per-poll noise EWMA × the noise

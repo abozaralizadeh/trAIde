@@ -477,6 +477,7 @@ def test_agent_scheduler_persists_restart_cadence_and_price_noise(tmp_path):
     first = MemoryStore(path, retention_days=7)
     first.save_agent_scheduler({
         "lastRunTs": 1234.5,
+        "unproductiveRuns": 4,
         "reviewedPrices": {"btcusdt": 50_000, "bad": -1},
         "priceObservations": {
             "btcusdt": {
@@ -492,6 +493,7 @@ def test_agent_scheduler_persists_restart_cadence_and_price_noise(tmp_path):
     restarted = MemoryStore(path, retention_days=7)
     state = restarted.get_agent_scheduler()
     assert state["lastRunTs"] == pytest.approx(1234.5)
+    assert state["unproductiveRuns"] == 4
     assert state["reviewedPrices"] == {"BTC-USDT": 50_000.0}
     assert state["priceObservations"]["BTC-USDT"] == {
         "lastPrice": 50_100.0,
@@ -500,6 +502,28 @@ def test_agent_scheduler_persists_restart_cadence_and_price_noise(tmp_path):
         "updated": 1234,
     }
     assert "INVALID" not in state["priceObservations"]
+
+
+def test_automatic_quarantine_has_adaptive_expiring_retry_window(store, monkeypatch):
+    now = 2_000_000_000
+    monkeypatch.setattr("src.memory.time.time", lambda: now)
+    store.remove_coin(
+        "BANK-USDT",
+        reason="Automatic risk quarantine: daily ATR 12.00% exceeds 9.00% hard limit",
+        exit_plan="retry later",
+    )
+    store.remove_coin(
+        "LAB-USDT",
+        reason="Automatic risk quarantine: daily ATR 1100.00% exceeds 9.00% hard limit",
+        exit_plan="retry later",
+    )
+    store.remove_coin("OLD-USDT", reason="stale", exit_plan="not a quarantine")
+
+    quarantined = {item["symbol"]: item for item in store.get_quarantined_coins(now=now)}
+    assert 20 <= quarantined["BANK-USDT"]["remainingHours"] <= 22
+    assert quarantined["LAB-USDT"]["remainingHours"] == pytest.approx(168.0)
+    assert "OLD-USDT" not in quarantined
+    assert store.get_quarantined_coins(now=now + 8 * 86400) == []
 
 
 def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
@@ -513,6 +537,12 @@ def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
     summary = mem.performance_summary()
     assert summary["totalTrades"] == 0
     assert summary["orderSubmissions"] == 1
+    assert summary["limitOrdersSubmitted"] == 1
+    assert summary["limitOrdersFilled"] == 0
+    assert summary["limitFillRate"] == 0.0
     assert mem.mark_order_filled("order-1") is True
-    assert mem.performance_summary()["totalTrades"] == 1
+    filled_summary = mem.performance_summary()
+    assert filled_summary["totalTrades"] == 1
+    assert filled_summary["limitOrdersFilled"] == 1
+    assert filled_summary["limitFillRate"] == 1.0
     assert mem.positions(venue="futures") == {}
