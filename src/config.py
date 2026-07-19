@@ -81,7 +81,7 @@ class TradingConfig:
   # Risk guardrails (added after the RE-USDT concentration blowup, 2026-06-21):
   max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
-  research_handoff_cooldown_min: float = 120.0 # min minutes between forced Research handoffs (0=off)
+  research_handoff_cooldown_min: float = 30.0 # min minutes between forced Research handoffs (0=off)
   min_futures_rr: float = 1.5                 # reject futures entries whose post-cost reward:risk is below this (0=off)
   screener_min_turnover_usd_24h: float = 5_000_000.0  # market screener liquidity floor (24h USDT turnover)
   atomic_bracket_enabled: bool = True         # attach TP/SL to the entry order (KuCoin st-orders) so a limit
@@ -90,11 +90,13 @@ class TradingConfig:
                                               # position (fraction of entry) until the agent sets a real one (0=off)
   # Model invocation budget: protection remains code-driven every poll, while expensive discretionary
   # analysis runs less often when flat and more often when capital is exposed.
-  # When FLAT and quiet, this is the initial model HUNT cadence. Repeated no-action runs back it off.
+  # When FLAT and quiet, this is the model HUNT cadence. Kept at ~10min so the bot keeps hunting
+  # (screener, research, new entries) — frequent discovery is prioritized over token cost. Repeated
+  # no-action runs back it off only when flat_backoff_max_multiplier is explicitly >1 (default 1=off).
   # Pending atomic brackets are managed by deterministic expiry and do not count as exposed capital.
-  flat_agent_cooldown_sec: float = 3600.0
+  flat_agent_cooldown_sec: float = 600.0
   active_agent_cooldown_sec: float = 300.0
-  flat_backoff_max_multiplier: float = 4.0  # power-of-two no-action backoff cap
+  flat_backoff_max_multiplier: float = 1.0  # 1 disables no-action backoff; >1 opts into power-of-two backoff
   # Adaptive price-trigger tuning (the model-call gate). A symbol's per-poll noise EWMA × the noise
   # multiplier sets its trigger threshold, capped at price_change_trigger_pct × the ceiling multiplier.
   # The ceiling bounds worst-case blindness: at 2.0 (default) any move >= 2× the base trigger always
@@ -329,17 +331,17 @@ def load_config() -> AppConfig:
       max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "6")),
       entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
       min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
-      research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "6")),
+      research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "3")),
       max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
-      research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "120")),
+      research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
       min_futures_rr=float(os.getenv("MIN_FUTURES_RR", "1.5")),
       screener_min_turnover_usd_24h=float(os.getenv("SCREENER_MIN_TURNOVER_USD_24H", "5000000")),
       atomic_bracket_enabled=_as_bool(os.getenv("ATOMIC_BRACKET_ENABLED"), True),
       emergency_sl_pct=float(os.getenv("EMERGENCY_SL_PCT", "0.02")),
-      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "3600")),
+      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "600")),
       active_agent_cooldown_sec=float(os.getenv("ACTIVE_AGENT_COOLDOWN_SEC", "300")),
-      flat_backoff_max_multiplier=float(os.getenv("FLAT_BACKOFF_MAX_MULTIPLIER", "4.0")),
+      flat_backoff_max_multiplier=float(os.getenv("FLAT_BACKOFF_MAX_MULTIPLIER", "1.0")),
       price_noise_multiplier=float(os.getenv("PRICE_NOISE_MULTIPLIER", "4.0")),
       price_trigger_max_multiplier=float(os.getenv("PRICE_TRIGGER_MAX_MULTIPLIER", "2.0")),
     ),

@@ -379,8 +379,8 @@ Self-tuning risk (`src/edge.py`): posture derives from rolling realized closes, 
 | `RELATIVE_STRENGTH_LONGS_ENABLED` | `true` | Allow a narrow all-timeframe bullish exception to the bearish-BTC alt veto |
 | `RELATIVE_STRENGTH_MIN_CONFIDENCE` | `0.82` | Confidence required for that exception |
 | `RELATIVE_STRENGTH_SIZE_FACTOR` | `0.5` | Reduced size applied to an exception trade |
-| `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `6` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |
-| `RESEARCH_HANDOFF_COOLDOWN_MIN` | `120` | Minimum minutes between forced Research handoffs — rate-limits the costly web sweep (`0` = off) |
+| `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `3` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |
+| `RESEARCH_HANDOFF_COOLDOWN_MIN` | `30` | Minimum minutes between forced Research handoffs — rate-limits the costly web sweep (`0` = off) |
 
 ### Regime-Aware Entries
 
@@ -413,8 +413,8 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `POLL_INTERVAL_SEC` | `60` | Seconds between polling cycles |
 | `PRICE_CHANGE_TRIGGER_PCT` | `0.5` | Price move % that triggers an agent run |
 | `MAX_IDLE_POLLS` | `10` | Force agent run after N idle polls |
-| `FLAT_AGENT_COOLDOWN_SEC` | `3600` | Quiet-market maximum interval while flat; triggered move magnitude/breadth automatically reduce it toward the active cadence |
-| `FLAT_BACKOFF_MAX_MULTIPLIER` | `4` | Maximum power-of-two backoff for repeated idle-only no-action runs; price/lifecycle events remain responsive |
+| `FLAT_AGENT_COOLDOWN_SEC` | `600` | Quiet-market HUNT cadence while flat (~10min); triggered move magnitude/breadth automatically reduce it toward the active cadence |
+| `FLAT_BACKOFF_MAX_MULTIPLIER` | `1` | Power-of-two backoff cap for repeated idle-only no-action runs; `1` disables backoff (frequent hunting), `>1` opts in |
 | `ACTIVE_AGENT_COOLDOWN_SEC` | `300` | Minimum interval between model runs with exposed capital or a recent lifecycle/trigger event |
 | `AGENT_MAX_TURNS` | `20` | Max tool-call turns per run; a separate 20-minute wall-clock timeout revokes order authority |
 
