@@ -117,6 +117,36 @@ def _productivity_adjusted_flat_cooldown(
   return base * multiplier
 
 
+def _idle_hunt_due(idle_polls: int, max_idle_polls: int, pending_orders: bool) -> bool:
+  """Pending atomic entries wait for fill/expiry; they do not need idle LLM babysitting."""
+  return not pending_orders and int(idle_polls) >= max(1, int(max_idle_polls))
+
+
+def _crossed_auto_triggers(
+  stored_triggers: list[dict],
+  prices: Dict[str, float],
+) -> list[tuple[dict, float]]:
+  """Return explicit above/below trigger levels currently crossed by live prices."""
+  crossed: list[tuple[dict, float]] = []
+  for trigger in stored_triggers or []:
+    if not isinstance(trigger, dict):
+      continue
+    condition = str(trigger.get("condition") or "").lower()
+    if condition not in {"above", "below"}:
+      continue
+    symbol = normalize_symbol(trigger.get("symbol") or "")
+    try:
+      target = float(trigger.get("targetPrice"))
+      current = float(prices.get(symbol))
+    except (TypeError, ValueError):
+      continue
+    if target <= 0 or current <= 0:
+      continue
+    if (condition == "above" and current >= target) or (condition == "below" and current <= target):
+      crossed.append((trigger, current))
+  return crossed
+
+
 def _adaptive_price_trigger_threshold(
   base_trigger_pct: float,
   noise_ewma_pct: float,
@@ -478,6 +508,25 @@ def _live_extremes_map(snapshot) -> Dict[str, dict]:
   return out
 
 
+def _futures_position_fingerprint(positions: list[dict] | None) -> tuple[tuple[str, float, float], ...]:
+  """Stable lifecycle fingerprint used to flag narratives built from an older position book."""
+  rows: list[tuple[str, float, float]] = []
+  for position in positions or []:
+    if not isinstance(position, dict):
+      continue
+    try:
+      qty = float(position.get("currentQty") or 0.0)
+      entry = float(position.get("avgEntryPrice") or 0.0)
+    except (TypeError, ValueError):
+      continue
+    if not qty:
+      continue
+    symbol = normalize_symbol(position.get("symbol") or "")
+    if symbol:
+      rows.append((symbol, round(qty, 12), round(entry, 12)))
+  return tuple(sorted(rows))
+
+
 def _agent_made_a_move(result: Dict) -> bool:
   """True if the agent placed any order this run (entry, close, or protective stop).
 
@@ -489,6 +538,8 @@ def _agent_made_a_move(result: Dict) -> bool:
     if not isinstance(out, dict):
       continue
     if out.get("rejected") or out.get("skipped") or out.get("error"):
+      continue
+    if out.get("cancelled"):
       continue
     if out.get("orderId") or out.get("orderRequest"):
       return True
@@ -695,6 +746,7 @@ async def trading_loop(
   agent_task_trigger_moves: Dict[str, float] = {}
   agent_task_discrete_triggers: set[str] = set()
   agent_task_prices: Dict[str, float] = {}
+  agent_task_position_fingerprint: tuple[tuple[str, float, float], ...] = ()
   last_complete_fill_poll_ts = 0.0
   # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
   # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
@@ -716,12 +768,16 @@ async def trading_loop(
     cfg.profit_protection, kucoin_futures, notifier=notifier,
     emergency_sl_pct=cfg.trading.emergency_sl_pct, min_rr=cfg.trading.min_futures_rr,
     max_loss_equity_fraction=cfg.trading.risk_per_trade_pct,
+    breakeven_cost_pct=2.0 * (
+      float((memory.latest_fees() or {}).get("futures_taker") or 0.0006)
+      + float(cfg.trading.estimated_slippage_pct or 0.0)
+    ),
   )
   if cfg.profit_protection.enabled:
     logger.info(
       "Profit-lock enabled (dry_run=%s, breakeven@%.1fR, giveback=%.0f%%, no_chase=%s/%.0fmin).",
-      cfg.profit_protection.dry_run, cfg.profit_protection.breakeven_trigger_r,
-      cfg.profit_protection.giveback_pct * 100, cfg.profit_protection.no_chase_enabled,
+      protection.cfg.dry_run, protection.cfg.breakeven_trigger_r,
+      protection.cfg.giveback_pct * 100, protection.cfg.no_chase_enabled,
       cfg.profit_protection.post_win_cooldown_minutes,
     )
 
@@ -781,10 +837,17 @@ async def trading_loop(
         except Exception as exc:
           logger.warning("Unable to expire stale futures entry %s: %s", oid, exc)
       if cancelled_ids:
-        snapshot.futures_pending_orders = [
-          o for o in snapshot.futures_pending_orders
-          if str(o.get("id") or o.get("orderId") or "") not in cancelled_ids
-        ]
+        # Cancellation can race a partial fill and can alter attached child protection. Refresh
+        # authoritative positions/stops before the protection pass; never reason from pre-cancel truth.
+        try:
+          overview, positions, stops = _fetch_futures(cfg, kucoin_futures)
+          snapshot.futures_account = overview or {}
+          snapshot.futures_positions = positions
+          snapshot.futures_stop_orders = stops
+          snapshot.futures_pending_orders = kucoin_futures.list_orders(status="active") or []
+        except Exception as exc:
+          safety.invalidate(f"Post-cancel futures reconciliation failed: {exc}", revoke_active=True)
+          logger.error("Post-cancel futures reconciliation failed; new entries disabled: %s", exc)
 
     spot_usdt = 0.0
     for acct in snapshot.spot_accounts:
@@ -863,6 +926,7 @@ async def trading_loop(
       agent_task_trigger_moves = {}
       agent_task_discrete_triggers = set()
       agent_task_prices = {}
+      agent_task_position_fingerprint = ()
 
     # Harvest a completed single-flight model run without ever pausing the snapshot/protection loop.
     if agent_task is not None and agent_task.done():
@@ -870,6 +934,20 @@ async def trading_loop(
       _persist_agent_scheduler()
       try:
         result = agent_task.result()
+        current_position_fingerprint = _futures_position_fingerprint(snapshot.futures_positions)
+        if current_position_fingerprint != agent_task_position_fingerprint:
+          current_positions = ", ".join(
+            f"{symbol} qty={qty:g} entry={entry:g}"
+            for symbol, qty, entry in current_position_fingerprint
+          ) or "none"
+          result = dict(result)
+          result["stateChangedDuringRun"] = True
+          result["narrative"] = (
+            "LIVE RECONCILIATION: the futures position book changed while this model run was in "
+            f"progress. Current snapshot positions: {current_positions}. Treat any conflicting "
+            "position statement below as historical.\n\n"
+            + str(result.get("narrative") or "")
+          )
         made_move = _agent_made_a_move(result)
         if agent_task_event_ids or snapshot.futures_positions:
           unproductive_runs = 0
@@ -937,6 +1015,7 @@ async def trading_loop(
         agent_task_trigger_moves = {}
         agent_task_discrete_triggers = set()
         agent_task_prices = {}
+        agent_task_position_fingerprint = ()
 
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
@@ -985,6 +1064,32 @@ async def trading_loop(
         "updated": int(time.time()),
       }
       last_prices[symbol] = price
+
+    live_prices = {
+      normalize_symbol(symbol): float(ticker.price)
+      for symbol, ticker in snapshot.tickers.items()
+    }
+    for stored_trigger, observed_price in _crossed_auto_triggers(memory.latest_triggers(), live_prices):
+      symbol = normalize_symbol(stored_trigger.get("symbol") or "")
+      condition = str(stored_trigger.get("condition") or "").lower()
+      target = float(stored_trigger.get("targetPrice"))
+      stable_id = str(stored_trigger.get("triggerId") or "").strip() or (
+        f"{symbol}:{stored_trigger.get('ts')}:{condition}:{target}"
+      )
+      payload = {
+        "trigger": stored_trigger,
+        "observedPrice": observed_price,
+        "crossedAt": int(time.time()),
+      }
+      memory.queue_agent_event("auto_triggers", f"auto:{stable_id}", payload)
+      memory.consume_trigger(stored_trigger)
+      event_label = f"auto_trigger:{symbol}:{condition}:{target:g}"
+      triggers.append(event_label)
+      pending_agent_triggers.add(event_label)
+      logger.info(
+        "Auto-trigger fired for %s: price %.8g is %s %.8g",
+        symbol, observed_price, condition, target,
+      )
     _persist_agent_scheduler()
 
     # Snapshot peak/trough BEFORE the update prunes just-closed positions — otherwise a position's
@@ -1009,7 +1114,12 @@ async def trading_loop(
 
     # Retain throttled moves until the model actually reviews them. Without this queue, a trigger
     # followed by a quiet poll vanished and the adaptive shorter cooldown never got another chance.
-    run_candidate = bool(triggers or pending_trigger_moves or pending_agent_triggers) or idle_polls >= cfg.trading.max_idle_polls
+    idle_hunt_due = _idle_hunt_due(
+      idle_polls,
+      cfg.trading.max_idle_polls,
+      bool(snapshot.futures_pending_orders or snapshot.spot_pending_orders),
+    )
+    run_candidate = bool(triggers or pending_trigger_moves or pending_agent_triggers) or idle_hunt_due
 
     fill_lookback_minutes = 1440 if last_complete_fill_poll_ts <= 0 else max(
       30,
@@ -1032,7 +1142,12 @@ async def trading_loop(
       if fill_id in logged_fill_ids:
         continue
       logged_fill_ids.add(fill_id)
-      memory.mark_order_filled(fill.get("orderId"), fill.get("clientOid"))
+      memory.mark_order_filled(
+        fill.get("orderId"), fill.get("clientOid"),
+        fill_ts=fill.get("createdAt") or fill.get("ts") or fill.get("time"),
+        fill_price=fill.get("price") or fill.get("dealPrice"),
+        fill_size=fill.get("size") or fill.get("filledSize"),
+      )
       if memory.queue_agent_event("spot_fills", fill_id, fill):
         new_spot_fills.append(fill)
     new_futures_fills = []
@@ -1041,7 +1156,12 @@ async def trading_loop(
       if fill_id in logged_fill_ids:
         continue
       logged_fill_ids.add(fill_id)
-      memory.mark_order_filled(fill.get("orderId"), fill.get("clientOid"))
+      memory.mark_order_filled(
+        fill.get("orderId"), fill.get("clientOid"),
+        fill_ts=fill.get("createdAt") or fill.get("ts") or fill.get("time"),
+        fill_price=fill.get("price") or fill.get("dealPrice"),
+        fill_size=fill.get("size") or fill.get("filledSize"),
+      )
       if memory.queue_agent_event("futures_fills", fill_id, fill):
         new_futures_fills.append(fill)
     new_closed_positions = []
@@ -1120,6 +1240,11 @@ async def trading_loop(
         # lifecycle range; sampled unrealized extrema alone missed terminal slippage and fees.
         peak_pnl = pnl if peak_pnl is None else max(float(peak_pnl), pnl)
         trough_pnl = pnl if trough_pnl is None else min(float(trough_pnl), pnl)
+        entry_context = memory.entry_context_for_position(
+          sym,
+          cp.get("openTime") or cp.get("openingTimestamp"),
+          position_side,
+        )
         memory.log_decision(
           sym,
           f"futures_{side}_triggered",
@@ -1135,6 +1260,7 @@ async def trading_loop(
           peak_pnl=peak_pnl,
           trough_pnl=trough_pnl,
           entry_price=entry_price,
+          entry_context=entry_context,
         )
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)
@@ -1238,6 +1364,7 @@ async def trading_loop(
         symbol: float(ticker.price)
         for symbol, ticker in snapshot.tickers.items()
       }
+      agent_task_position_fingerprint = _futures_position_fingerprint(snapshot.futures_positions)
       pending_trigger_moves.clear()
       pending_agent_triggers.clear()
       pending_batch = memory.get_pending_agent_events()

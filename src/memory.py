@@ -7,6 +7,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -175,11 +176,14 @@ class MemoryStore:
         ]
         data["triggers"] = [
           {
+            "triggerId": t.get("triggerId"),
             "symbol": _normalize_symbol(t.get("symbol", "")),
             "direction": t.get("direction"),
             "rationale": t.get("rationale"),
             "targetPrice": t.get("targetPrice"),
             "stopPrice": t.get("stopPrice"),
+            "condition": t.get("condition"),
+            "expiresAt": t.get("expiresAt"),
             "ts": t.get("ts"),
           }
           for t in data.get("triggers", [])
@@ -209,6 +213,10 @@ class MemoryStore:
             "trackPosition": t.get("trackPosition", True),
             "orderId": t.get("orderId"),
             "clientOid": t.get("clientOid"),
+            "fillTs": t.get("fillTs"),
+            "fillPrice": t.get("fillPrice"),
+            "fillSize": t.get("fillSize"),
+            "entryContext": t.get("entryContext") if isinstance(t.get("entryContext"), dict) else None,
             "ts": t.get("ts") or int(time.time()),
             "day": t.get("day"),
           }
@@ -225,7 +233,7 @@ class MemoryStore:
           for event in data.get("pending_agent_events", [])
           if isinstance(event, dict)
           and event.get("id")
-          and event.get("kind") in {"spot_fills", "futures_fills", "closed_positions"}
+          and event.get("kind") in {"spot_fills", "futures_fills", "closed_positions", "auto_triggers"}
           and isinstance(event.get("payload"), dict)
         ]
         data["sentiments"] = [
@@ -252,6 +260,9 @@ class MemoryStore:
             "day": d.get("day"),
             "peakPnl": d.get("peakPnl"),
             "troughPnl": d.get("troughPnl"),
+            "entryPrice": d.get("entryPrice"),
+            "entryContext": d.get("entryContext") if isinstance(d.get("entryContext"), dict) else None,
+            "realizedR": d.get("realizedR"),
             # These fields power the no-chase guard and close deduplication.  Dropping them while
             # sanitizing on startup silently disabled both protections after every process restart.
             "exitPrice": d.get("exitPrice"),
@@ -466,16 +477,25 @@ class MemoryStore:
     rationale: str,
     target_price: Optional[float] = None,
     stop_price: Optional[float] = None,
+    condition: Optional[str] = None,
+    expires_minutes: float = 360.0,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._read()
+      now = int(time.time())
+      condition_norm = str(condition or "").strip().lower() or None
+      if condition_norm not in {None, "above", "below"}:
+        raise ValueError("condition must be 'above' or 'below'")
       entry = {
+        "triggerId": uuid.uuid4().hex,
         "symbol": _normalize_symbol(symbol),
         "direction": direction,
         "rationale": rationale,
         "targetPrice": target_price,
         "stopPrice": stop_price,
-        "ts": int(time.time()),
+        "condition": condition_norm,
+        "expiresAt": now + int(max(1.0, float(expires_minutes)) * 60),
+        "ts": now,
       }
       data.setdefault("triggers", [])
       data["triggers"].append(entry)
@@ -485,7 +505,48 @@ class MemoryStore:
   def latest_triggers(self) -> list[Dict[str, Any]]:
     with self._lock:
       data = self._prune(self._read())
-      return data.get("triggers", []) or []
+      now = int(time.time())
+      current = []
+      for trigger in data.get("triggers", []) or []:
+        expires = trigger.get("expiresAt")
+        if expires is None:
+          expires = int(trigger.get("ts") or 0) + 24 * 3600  # bounded legacy migration
+        try:
+          if int(expires) > now:
+            current.append(trigger)
+        except (TypeError, ValueError):
+          continue
+      if len(current) != len(data.get("triggers", []) or []):
+        data["triggers"] = current
+        self._write(data)
+      return current
+
+  def consume_trigger(self, trigger: Dict[str, Any]) -> bool:
+    """Remove one fired trigger; a queued agent event preserves delivery across restarts."""
+    if not isinstance(trigger, dict):
+      return False
+    trigger_id = str(trigger.get("triggerId") or "").strip()
+
+    def _matches(candidate: Dict[str, Any]) -> bool:
+      if trigger_id:
+        return str(candidate.get("triggerId") or "").strip() == trigger_id
+      return all(
+        candidate.get(key) == trigger.get(key)
+        for key in ("symbol", "ts", "condition", "targetPrice")
+      )
+
+    with self._lock:
+      data = self._read()
+      existing = data.get("triggers", []) or []
+      remaining = [
+        item for item in existing
+        if not (isinstance(item, dict) and _matches(item))
+      ]
+      if len(remaining) == len(existing):
+        return False
+      data["triggers"] = remaining
+      self._write(self._prune(data))
+      return True
 
   def get_coins(self, default: list[str] | None = None) -> list[str]:
     with self._lock:
@@ -577,7 +638,9 @@ class MemoryStore:
         [
           t
           for t in data.get("trades", []) or []
-          if t.get("symbol") == _normalize_symbol(symbol) and (t.get("day") or 0) == day_key
+          if t.get("symbol") == _normalize_symbol(symbol)
+          and (t.get("day") or 0) == day_key
+          and t.get("filled") is not False
         ]
       )
 
@@ -594,6 +657,7 @@ class MemoryStore:
     track_position: bool = True,
     order_id: str | None = None,
     client_oid: str | None = None,
+    entry_context: Dict[str, Any] | None = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -611,6 +675,7 @@ class MemoryStore:
         "trackPosition": bool(track_position),
         "orderId": str(order_id) if order_id not in (None, "") else None,
         "clientOid": str(client_oid) if client_oid not in (None, "") else None,
+        "entryContext": copy.deepcopy(entry_context) if isinstance(entry_context, dict) else None,
         "ts": now,
         "day": day_key,
       }
@@ -660,6 +725,7 @@ class MemoryStore:
     position_open_time: Optional[int | float | str] = None,
     position_side: Optional[str] = None,
     entry_price: Optional[float] = None,
+    entry_context: Optional[Dict[str, Any]] = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -695,6 +761,14 @@ class MemoryStore:
       if entry_price is not None:
         try:
           entry["entryPrice"] = float(entry_price)
+        except (TypeError, ValueError):
+          pass
+      if isinstance(entry_context, dict):
+        entry["entryContext"] = copy.deepcopy(entry_context)
+        try:
+          planned_risk = float(entry_context.get("plannedMaxLossUsd") or 0.0)
+          if pnl is not None and planned_risk > 0:
+            entry["realizedR"] = round(float(pnl) / planned_risk, 6)
         except (TypeError, ValueError):
           pass
       if close_type:
@@ -1026,7 +1100,15 @@ class MemoryStore:
       data = self._read()
     return [str(x) for x in (data.get("seen_fill_ids") or [])]
 
-  def mark_order_filled(self, order_id: Any = None, client_oid: Any = None) -> bool:
+  def mark_order_filled(
+    self,
+    order_id: Any = None,
+    client_oid: Any = None,
+    *,
+    fill_ts: Any = None,
+    fill_price: Any = None,
+    fill_size: Any = None,
+  ) -> bool:
     """Promote a submitted-order record to executed without using it for position reconstruction."""
     refs = {
       str(value) for value in (order_id, client_oid)
@@ -1043,11 +1125,77 @@ class MemoryStore:
           if value not in (None, "")
         }
         if refs & trade_refs:
-          if trade.get("filled") is not True:
-            trade["filled"] = True
-            self._write(data)
+          trade["filled"] = True
+          try:
+            raw_ts = float(fill_ts)
+            if raw_ts > 1e15:
+              raw_ts /= 1e9
+            elif raw_ts > 1e12:
+              raw_ts /= 1e3
+            if raw_ts > 0:
+              trade["fillTs"] = int(raw_ts)
+              # Trade caps/cooldowns follow the execution day, not the submission day. A limit
+              # submitted before UTC midnight can fill afterward.
+              trade["day"] = int(raw_ts // 86400)
+          except (TypeError, ValueError):
+            pass
+          try:
+            if fill_price not in (None, ""):
+              trade["fillPrice"] = float(fill_price)
+          except (TypeError, ValueError):
+            pass
+          try:
+            if fill_size not in (None, ""):
+              trade["fillSize"] = float(fill_size)
+          except (TypeError, ValueError):
+            pass
+          self._write(data)
           return True
     return False
+
+  def entry_context_for_position(
+    self,
+    symbol: str,
+    position_open_time: Any,
+    position_side: str | None,
+    *,
+    window_seconds: int = 7200,
+  ) -> Optional[Dict[str, Any]]:
+    """Return the nearest same-direction filled entry intent for a position lifecycle."""
+    open_ms = self._position_open_time_ms({"positionOpenTime": position_open_time})
+    if open_ms is None:
+      return None
+    open_sec = open_ms / 1000.0
+    wanted_side = str(position_side or "").lower()
+    with self._lock:
+      trades = list(self._read().get("trades") or [])
+    candidates: list[tuple[float, Dict[str, Any]]] = []
+    for trade in trades:
+      if trade.get("symbol") != _normalize_symbol(symbol) or trade.get("filled") is not True:
+        continue
+      context = trade.get("entryContext")
+      if not isinstance(context, dict):
+        continue
+      fallback_side = "long" if str(trade.get("side") or "").lower() == "buy" else "short"
+      trade_side = str(context.get("positionSide") or fallback_side).lower()
+      if wanted_side in {"long", "short"} and trade_side != wanted_side:
+        continue
+      event_ts = float(trade.get("fillTs") or trade.get("ts") or 0.0)
+      delta = open_sec - event_ts
+      if -300 <= delta <= max(0, int(window_seconds)):
+        candidates.append((abs(delta), trade))
+    if not candidates:
+      return None
+    candidates.sort(key=lambda item: item[0])
+    if len(candidates) > 1 and abs(candidates[0][0] - candidates[1][0]) < 1.0:
+      return None
+    trade = candidates[0][1]
+    result = copy.deepcopy(trade["entryContext"])
+    result.setdefault("entryOrderId", trade.get("orderId"))
+    result.setdefault("entryClientOid", trade.get("clientOid"))
+    result.setdefault("fillTs", trade.get("fillTs"))
+    result.setdefault("fillPrice", trade.get("fillPrice"))
+    return result
 
   def record_seen_fill_id(self, fill_id: str, cap: int = 1000) -> None:
     fid = str(fill_id or "").strip()
@@ -1063,7 +1211,7 @@ class MemoryStore:
 
   def queue_agent_event(self, kind: str, event_id: str, payload: Dict[str, Any]) -> bool:
     """Persist a fill/close until a successful model run acknowledges that exact event."""
-    if kind not in {"spot_fills", "futures_fills", "closed_positions"}:
+    if kind not in {"spot_fills", "futures_fills", "closed_positions", "auto_triggers"}:
       return False
     eid = str(event_id or "").strip()
     if not eid or not isinstance(payload, dict):
@@ -1517,8 +1665,8 @@ class MemoryStore:
       data = self._prune(self._read())
       trades = data.get("trades", [])
     for t in sorted(trades, key=lambda t: t.get("ts", 0), reverse=True):
-      if t.get("symbol") == sym:
-        return t.get("ts")
+      if t.get("symbol") == sym and t.get("filled") is not False:
+        return t.get("fillTs") or t.get("ts")
     return None
 
   def last_loss_time(self, symbol: str) -> int | None:

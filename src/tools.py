@@ -29,8 +29,8 @@ from .analytics import (
   compute_indicators,
   summarize_interval,
   summarize_multi_timeframe,
+  validate_candle_data,
 )
-from .edge import symbol_adaptive_rr
 from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
@@ -45,6 +45,7 @@ from .regime import (
   effective_min_confidence,
   is_relative_strength_alt_long,
   oi_price_signal,
+  net_reward_risk_ratio,
   regime_size_factor,
   resolve_gate_deadlock,
   reward_risk_ratio,
@@ -75,6 +76,55 @@ def round_price_to_tick(value: float, tick_size: float) -> float:
     return float(value)
   steps = (Decimal(str(value)) / tick).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
   return float(steps * tick)
+
+
+def round_entry_contracts_down(contracts_raw: float, lot_size: int) -> int:
+  """Round new exposure down so lot sizing cannot undo an adaptive/risk notional cap."""
+  lot = max(1, int(lot_size or 1))
+  try:
+    raw = max(0.0, float(contracts_raw))
+  except (TypeError, ValueError):
+    return 0
+  return int(math.floor(raw / lot) * lot)
+
+
+def entry_cancel_guard_reason(
+  order: Dict[str, Any],
+  gate: Dict[str, Any],
+  *,
+  lease_minutes: float,
+  now: float | None = None,
+) -> str | None:
+  """Block model churn of a valid atomic entry before its deterministic lease expires.
+
+  A fresh completed-candle direction flip is objective invalidation and may release the lease.
+  Manual/protective orders are outside this guard.
+  """
+  if not str(order.get("clientOid") or "").startswith("traide-entry-"):
+    return None
+  raw_created = order.get("createdAt") or order.get("orderTime") or order.get("created_at")
+  try:
+    created = float(raw_created)
+    if created > 1e15:
+      created /= 1e9
+    elif created > 1e12:
+      created /= 1e3
+  except (TypeError, ValueError):
+    return "Tagged entry age is unknown; preserve it until deterministic reconciliation"
+  age_minutes = (float(now if now is not None else time.time()) - created) / 60.0
+  if age_minutes >= max(0.0, float(lease_minutes)):
+    return None
+  side = str(order.get("side") or "").lower()
+  opposing = "bearish" if side == "buy" else "bullish"
+  one_hour = str(gate.get("intraday_bias_1h") or "neutral").lower()
+  daily = str(gate.get("daily_bias") or "neutral").lower()
+  if one_hour == opposing or daily == opposing:
+    return None
+  remaining = max(0.0, float(lease_minutes) - age_minutes)
+  return (
+    f"Atomic entry validity lease has {remaining:.1f}min remaining and no completed 1h/daily "
+    "direction flip invalidates it"
+  )
 
 
 def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
@@ -244,6 +294,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     return round_price_to_tick(value, tick_size)
 
   def _live_entry_price(symbol: str) -> float | None:
+    # New exposure is futures-only: size/deviation/brackets must use the same market that will fill.
+    # Spot/perp basis can be material around squeezes and listings, so spot is fallback only.
+    if kucoin_futures:
+      futures_symbol = _to_futures_symbol(symbol)
+      if futures_symbol:
+        try:
+          mark = _to_float((kucoin_futures.get_mark_price(futures_symbol) or {}).get("value"))
+          if mark > 0:
+            return mark
+        except Exception as exc:
+          logger.warning("Futures mark refresh failed for %s entry; falling back to spot: %s", symbol, exc)
     try:
       price = float(kucoin.get_ticker(symbol).price)
       return price if price > 0 else None
@@ -349,6 +410,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   def _quarantine_symbol(symbol: str, reason: str) -> None:
     """Remove a persistently unsafe candidate from the next run's active universe."""
+    normalized = _normalize_symbol(symbol)
+    existing = next(
+      (item for item in memory.get_quarantined_coins() if item.get("symbol") == normalized),
+      None,
+    )
+    if existing:
+      logger.debug(
+        "AUTO-QUARANTINE unchanged for %s (%.1fh remaining)",
+        normalized, float(existing.get("remainingHours") or 0.0),
+      )
+      return
     if _authority_error():
       logger.warning("AUTO-QUARANTINE skipped for %s because this run no longer has mutation authority", symbol)
       return
@@ -462,6 +534,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return contracts
     max_contracts = int(math.floor((remaining / risk_per_contract) / lot) * lot)
     return min(contracts, max_contracts)
+
+  def _expectancy_entry_factor(symbol: str, side: str) -> float:
+    """Use the weakest relevant learned bucket once; never increase configured risk."""
+    state = _edge_state()
+    direction = "long" if str(side).lower() == "buy" else "short"
+    direction_factor = float((state.get("direction_size_factor") or {}).get(direction, 1.0))
+    symbol_factor = float((state.get("symbol_size_factor") or {}).get(symbol, 1.0))
+    return min(1.0, max(0.0, min(direction_factor, symbol_factor)))
 
 
   # ── Spot trading — market/limit orders, stops & position protection ─────────────────────────────
@@ -1453,8 +1533,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         base_increment = sym_info.get("baseIncrement", "0.00000001")
         base_min_size = _to_float(sym_info.get("baseMinSize"))
         cur_price = float(snapshot.tickers.get(symbol, snapshot.tickers.get(list(snapshot.tickers.keys())[0])).price) if snapshot.tickers else 0.0
-        tp_distance = tp_val - cur_price if cur_price > 0 else 0
-        tp1_price = cur_price + tp_distance * 0.6 if tp_distance > 0 else tp_val
+        spot_info = _spot_position_info(symbol) or {}
+        reference_entry = _to_float(spot_info.get("avgEntry")) or cur_price
+        tp_distance = tp_val - reference_entry if reference_entry > 0 else 0
+        tp1_price = reference_entry + tp_distance * 0.6 if tp_distance > 0 else tp_val
         tp2_price = tp_val
         size_tranche1 = float(_truncate_to_increment(position_size * 0.6, base_increment))
         size_tranche2 = float(_truncate_to_increment(position_size - size_tranche1, base_increment))
@@ -1670,10 +1752,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           continue
         return {"error": "No candles returned", "interval": iv}
       try:
-        df = candles_to_dataframe(candles)
+        raw_df = candles_to_dataframe(candles)
+        quality = validate_candle_data(raw_df, iv, as_of=end_at)
+        if not quality.get("valid"):
+          analysis_errors[iv] = "; ".join(quality.get("errors") or ["invalid candle data"])
+          if iv in ("15min", "1hour"):
+            return {"error": analysis_errors[iv], "interval": iv, "dataQuality": quality}
+          continue
+        df = candles_to_dataframe(candles, interval=iv, as_of=end_at, closed_only=True)
         snapshot = summarize_interval(df, iv)
         snapshot["rows"] = len(df)
         snapshot["source"] = market_source
+        snapshot["lastClosedAt"] = quality.get("latest_close_time")
         snapshots.append(snapshot)
       except Exception as exc:
         if iv in ("4hour", "1day"):
@@ -1692,7 +1782,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         daily_atr_pct = atr_pct
       elif iv == "15min" and atr_pct is not None:
         intraday_atr_pct = atr_pct
-    required_intervals = {"15min", "1hour", "1day"}
+    required_intervals = {"15min", "1hour", "4hour", "1day"}
     present_intervals = {str(snap.get("interval")) for snap in snapshots}
     data_quality_ok = (
       required_intervals.issubset(present_intervals)
@@ -1716,6 +1806,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "daily_bias_raw": summary.get("daily_bias_raw", summary.get("daily_bias", "neutral")),
       "daily_gate_applied": summary.get("daily_gate_applied", False),
       "daily_exhausted": summary.get("daily_exhausted", False),
+      "daily_trend_weak": summary.get("daily_trend_weak", False),
       "overall_bias": summary.get("overall_bias", "neutral"),
       "daily_atr_pct": daily_atr_pct,
       "intraday_atr_pct": intraday_atr_pct,
@@ -2175,6 +2266,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if _streak_fm < 1.0:
         logger.info("LOSS-STREAK THROTTLE: futures %s — sizing to %.0f%% after %d consecutive losses", spot_symbol, _streak_fm * 100, _edge_state()["stats"].get("loss_streak", 0))
         _atr_scale_fm = max(0.30, _atr_scale_fm * _streak_fm)
+      _expectancy_fm = _expectancy_entry_factor(spot_symbol, side)
+      if _expectancy_fm < 1.0:
+        logger.info(
+          "EXPECTANCY THROTTLE: futures %s %s — sizing to %.0f%% of the already risk-adjusted amount",
+          side, spot_symbol, _expectancy_fm * 100,
+        )
+        _atr_scale_fm *= _expectancy_fm
 
     # Anti-stacking: block add-on entries when existing position is losing
     if is_entry and snapshot.futures_positions:
@@ -2418,8 +2516,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
-    contracts = int(math.ceil(contracts_raw / lot) * lot)
+    contracts = (
+      round_entry_contracts_down(contracts_raw, lot)
+      if is_entry else int(math.ceil(contracts_raw / lot) * lot)
+    )
     if is_entry:
+      if contracts < lot:
+        return {
+          "rejected": True,
+          "reason": "Contract minimum exceeds the adaptively sized entry budget",
+          "requestedNotionalUsd": notional_input,
+          "minNotionalUsd": lot * multiplier * price,
+        }
       contracts = _risk_capped_contracts(
         contracts, lot, multiplier, price, _risk_stop_fm, existing_risk_usd=existing_risk_usd,
       )
@@ -2460,11 +2568,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if max_order_qty and isinstance(max_order_qty, (int, float)) and contracts > max_order_qty:
       return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty, "contracts": contracts}
     notional = actual_notional
-    if is_entry and notional > snapshot.max_position_usd * max_leverage_cap:
+    if is_entry and notional > snapshot.max_position_usd:
       return {
         "rejected": True,
         "reason": "Exceeds max notional cap",
-        "cap": snapshot.max_position_usd * max_leverage_cap,
+        "cap": snapshot.max_position_usd,
         "notional": notional,
         "maxLeverage": max_leverage_cap,
       }
@@ -2508,14 +2616,30 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       # RR check (only spot did), which is why losses ran ~4x the wins. Enforced when TP+SL are both set.
       _rr_stop_fm = sl_val or trigger_stop_val
       if cfg.trading.min_futures_rr > 0 and tp_val and _rr_stop_fm:
-        _req_rr_fm = symbol_adaptive_rr(spot_symbol, _edge_state().get("stats", {}), cfg.trading.min_futures_rr, cfg.edge)
+        # Keep the admission target structural.  Weak realized performance is handled by
+        # reducing capital at risk, not by pushing the take-profit farther away and making
+        # it less reachable.
+        _req_rr_fm = cfg.trading.min_futures_rr
         _rr_fm = reward_risk_ratio(side, price, tp_val, _rr_stop_fm)
         if _rr_fm is None:
           logger.warning("RR BLOCK: futures %s %s rejected — TP/SL on the wrong side of entry", side, spot_symbol)
           return {"rejected": True, "reason": "TP/SL on the wrong side of entry — cannot form a valid bracket", "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": "For a long, TP must be above and SL below entry; reverse for a short."}
-        if _rr_fm < _req_rr_fm:
-          logger.warning("RR BLOCK: futures %s %s rejected — reward:risk %.2f < %.2f", side, spot_symbol, _rr_fm, _req_rr_fm)
-          return {"rejected": True, "reason": f"Reward:risk {_rr_fm:.2f} below minimum {_req_rr_fm:.2f}", "rr": _rr_fm, "minRr": _req_rr_fm, "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {_req_rr_fm:.1f}x the stop distance (floor rises while recent trades are net-losing). Skip setups that can't clear it."}
+        _net_rr_fm = net_reward_risk_ratio(
+          side, price, tp_val, _rr_stop_fm,
+          fee_rate=fee_rate, slippage_rate=slippage_rate,
+        )
+        if _net_rr_fm is None or _net_rr_fm < _req_rr_fm:
+          logger.warning(
+            "NET RR BLOCK: futures %s %s rejected — net reward:risk %.2f (gross %.2f) < %.2f",
+            side, spot_symbol, _net_rr_fm or 0.0, _rr_fm, _req_rr_fm,
+          )
+          return {
+            "rejected": True,
+            "reason": f"Net reward:risk {(_net_rr_fm or 0.0):.2f} after costs below minimum {_req_rr_fm:.2f}",
+            "rr": _rr_fm, "netRr": _net_rr_fm, "minRr": _req_rr_fm,
+            "price": price, "takeProfit": tp_val, "stopLoss": _rr_stop_fm,
+            "hint": "Use the true structural target and invalidation, then skip the setup if their post-cost payoff is insufficient; do not distort the stop to pass the gate.",
+          }
     base_size = contracts * multiplier
     expected_tp_pnl = None
     if tp_val and base_size > 0:
@@ -3087,6 +3211,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if _streak_fl < 1.0:
       logger.info("LOSS-STREAK THROTTLE: futures limit %s — sizing to %.0f%% after %d consecutive losses", spot_symbol, _streak_fl * 100, _edge_state()["stats"].get("loss_streak", 0))
       _atr_scale_fl = max(0.30, _atr_scale_fl * _streak_fl)
+    _expectancy_fl = _expectancy_entry_factor(spot_symbol, side_lower)
+    if _expectancy_fl < 1.0:
+      logger.info(
+        "EXPECTANCY THROTTLE: futures limit %s %s — sizing to %.0f%% of the already risk-adjusted amount",
+        side_lower, spot_symbol, _expectancy_fl * 100,
+      )
+      _atr_scale_fl *= _expectancy_fl
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
@@ -3198,7 +3329,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
-    contracts = int(math.ceil(contracts_raw / lot) * lot)
+    contracts = round_entry_contracts_down(contracts_raw, lot)
+    if contracts < lot:
+      return {
+        "rejected": True,
+        "reason": "Contract minimum exceeds the adaptively sized entry budget",
+        "requestedNotionalUsd": notional_input,
+        "minNotionalUsd": lot * multiplier * entry_price_val,
+      }
     contracts = _risk_capped_contracts(
       contracts, lot, multiplier, entry_price_val, float(stop_loss_price),
       existing_risk_usd=existing_risk_usd,
@@ -3228,20 +3366,34 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"rejected": True, "reason": "Below contract minimum notional", "minNotionalUsd": min_notional}
     if max_order_qty and isinstance(max_order_qty, (int, float)) and contracts > max_order_qty:
       return {"rejected": True, "reason": "Exceeds max order size", "maxContracts": max_order_qty}
-    if actual_notional > snapshot.max_position_usd * max_leverage_cap:
-      return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd * max_leverage_cap}
+    if actual_notional > snapshot.max_position_usd:
+      return {"rejected": True, "reason": "Exceeds max notional cap", "cap": snapshot.max_position_usd}
 
     # Reward:risk floor — when a bracket is supplied inline, reject entries that risk more than they
     # aim to make (the futures asymmetry fix; the deferred-bracket path is steered by the prompt).
     if cfg.trading.min_futures_rr > 0 and take_profit_price is not None and stop_loss_price is not None:
-      _req_rr_fl = symbol_adaptive_rr(spot_symbol, _edge_state().get("stats", {}), cfg.trading.min_futures_rr, cfg.edge)
+      # Keep the admission target structural; adaptive edge control shrinks risk instead.
+      _req_rr_fl = cfg.trading.min_futures_rr
       _rr_fl = reward_risk_ratio(side_lower, entry_price_val, take_profit_price, stop_loss_price)
       if _rr_fl is None:
         logger.warning("RR BLOCK: futures limit %s %s rejected — TP/SL on the wrong side of entry", side_lower, spot_symbol)
         return {"rejected": True, "reason": "TP/SL on the wrong side of entry — cannot form a valid bracket", "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": "For a long, TP must be above and SL below entry; reverse for a short."}
-      if _rr_fl < _req_rr_fl:
-        logger.warning("RR BLOCK: futures limit %s %s rejected — reward:risk %.2f < %.2f", side_lower, spot_symbol, _rr_fl, _req_rr_fl)
-        return {"rejected": True, "reason": f"Reward:risk {_rr_fl:.2f} below minimum {_req_rr_fl:.2f}", "rr": _rr_fl, "minRr": _req_rr_fl, "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price, "hint": f"Widen the take-profit or tighten the stop so the TP distance is at least {_req_rr_fl:.1f}x the stop distance (floor rises while recent trades are net-losing). Skip setups that can't clear it."}
+      _net_rr_fl = net_reward_risk_ratio(
+        side_lower, entry_price_val, take_profit_price, stop_loss_price,
+        fee_rate=fee_rate, slippage_rate=slippage_rate,
+      )
+      if _net_rr_fl is None or _net_rr_fl < _req_rr_fl:
+        logger.warning(
+          "NET RR BLOCK: futures limit %s %s rejected — net reward:risk %.2f (gross %.2f) < %.2f",
+          side_lower, spot_symbol, _net_rr_fl or 0.0, _rr_fl, _req_rr_fl,
+        )
+        return {
+          "rejected": True,
+          "reason": f"Net reward:risk {(_net_rr_fl or 0.0):.2f} after costs below minimum {_req_rr_fl:.2f}",
+          "rr": _rr_fl, "netRr": _net_rr_fl, "minRr": _req_rr_fl,
+          "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price,
+          "hint": "Use the true structural target and invalidation, then skip the setup if their post-cost payoff is insufficient; do not distort the stop to pass the gate.",
+        }
 
     base_units = contracts * multiplier
     gross_reward = (
@@ -3263,6 +3415,39 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "expectedRoi": expected_roi,
         "roundTripFriction": round_trip_friction,
       }
+
+    _planned_gross_rr = reward_risk_ratio(
+      side_lower, entry_price_val, take_profit_price, stop_loss_price,
+    )
+    _planned_net_rr = net_reward_risk_ratio(
+      side_lower, entry_price_val, take_profit_price, stop_loss_price,
+      fee_rate=fee_rate, slippage_rate=slippage_rate,
+    )
+    _planned_max_loss = base_units * (
+      abs(entry_price_val - float(stop_loss_price))
+      + (entry_price_val + float(stop_loss_price)) * (fee_rate + slippage_rate)
+    )
+    _entry_context_fl = {
+      "policyVersion": "completed-bars-net-rr-directional-risk-v1",
+      "model": cfg.azure.deployment,
+      "positionSide": "long" if side_lower == "buy" else "short",
+      "entryPrice": entry_price_val,
+      "takeProfitPrice": float(take_profit_price),
+      "stopLossPrice": float(stop_loss_price),
+      "notionalUsd": actual_notional,
+      "plannedGrossRr": _planned_gross_rr,
+      "plannedNetRr": _planned_net_rr,
+      "plannedMaxLossUsd": _planned_max_loss,
+      "confidence": confidence,
+      "regime": {
+        key: _g_fl.get(key)
+        for key in (
+          "daily_bias", "daily_bias_raw", "daily_exhausted", "daily_trend_weak",
+          "intraday_bias_4h", "intraday_bias_1h", "intraday_bias_15m",
+          "market_regime", "strength", "daily_atr_pct", "intraday_atr_pct",
+        )
+      },
+    }
 
     expiry_ts = int(time.time()) + int(cfg.trading.entry_limit_expiry_minutes * 60)
     pending_protection = {"takeProfitPrice": take_profit_price, "stopLossPrice": stop_loss_price}
@@ -3316,11 +3501,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "orderId": order_req.clientOid, "clientOid": order_req.clientOid,
         "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
         "size": contracts, "reduceOnly": False,
+        "createdAt": int(time.time() * 1000),
       }
       record = memory.record_trade(
         spot_symbol, side_lower, actual_notional, paper=True, price=entry_price_val,
         size=contracts * multiplier, venue="futures", filled=False, track_position=False,
         client_oid=order_req.clientOid,
+        entry_context=_entry_context_fl,
       )
       decision = None
       if confidence is not None:
@@ -3390,8 +3577,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "clientOid": order_req.clientOid,
         "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
         "size": contracts, "reduceOnly": False, "acknowledgementUncertain": True,
+        "createdAt": int(time.time() * 1000),
       }
-      return {
+      uncertain_result: Dict[str, Any] = {
         "uncertain": True,
         "pendingLimitEntry": True,
         "reason": f"Atomic bracket acknowledgement was ambiguous: {exc}",
@@ -3399,6 +3587,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "orderRequest": order_req.__dict__,
         "hint": "Do NOT retry in this run. Check live pending orders/position on the next poll; no plain fallback was attempted.",
       }
+      # The request may have reached the exchange. Persist the intent by clientOid so a later fill
+      # can be promoted and attributed; unfilled records do not consume trade caps/cooldowns.
+      try:
+        uncertain_context = dict(_entry_context_fl)
+        uncertain_context["acknowledgementUncertain"] = True
+        uncertain_result["tradeRecord"] = memory.record_trade(
+          spot_symbol, side_lower, actual_notional, paper=False,
+          price=entry_price_val, size=contracts * multiplier, venue="futures", filled=False,
+          track_position=False, client_oid=order_req.clientOid,
+          entry_context=uncertain_context,
+        )
+      except Exception as memory_exc:
+        logger.error("Unable to persist ambiguous futures entry %s: %s", order_req.clientOid, memory_exc)
+        uncertain_result["memoryError"] = str(memory_exc)
+      return uncertain_result
 
     # Exchange acknowledgement is authoritative. Register the pending order before optional local
     # logging so a disk/memory failure can never make the model retry an already-live entry.
@@ -3407,6 +3610,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "orderId": res.get("orderId"), "clientOid": res.get("clientOid") or order_req.clientOid,
       "symbol": futures_symbol, "side": side_lower, "price": entry_price_val,
       "size": contracts, "reduceOnly": False,
+      "createdAt": int(time.time() * 1000),
     }
     try:
       res["tradeRecord"] = memory.record_trade(
@@ -3414,6 +3618,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         price=entry_price_val, size=contracts * multiplier, venue="futures", filled=False,
         track_position=False, order_id=res.get("orderId"),
         client_oid=res.get("clientOid") or order_req.clientOid,
+        entry_context=_entry_context_fl,
       )
       if confidence is not None:
         res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
@@ -3583,6 +3788,31 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"paper": True, "cancelled": {"orderId": order_id, "symbol": symbol}}
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"error": "Futures disabled in config"}
+    candidate = None
+    for order in list(_runtime_futures_pending.values()) + list(snapshot.futures_pending_orders or []):
+      if not isinstance(order, dict):
+        continue
+      refs = {str(order.get(key) or "") for key in ("id", "orderId", "clientOid")}
+      if str(order_id) in refs:
+        candidate = dict(order)
+        break
+    if candidate and not candidate.get("createdAt"):
+      with memory._lock:
+        trades = list(memory._read().get("trades") or [])
+      for trade in reversed(trades):
+        if str(order_id) in {str(trade.get("orderId") or ""), str(trade.get("clientOid") or "")}:
+          candidate["createdAt"] = int(float(trade.get("ts") or 0) * 1000)
+          candidate.setdefault("clientOid", trade.get("clientOid"))
+          break
+    if candidate:
+      normalized = _normalize_symbol(str(candidate.get("symbol") or symbol or ""))
+      lease_reason = entry_cancel_guard_reason(
+        candidate,
+        _gate_for(normalized),
+        lease_minutes=cfg.trading.entry_limit_expiry_minutes,
+      )
+      if lease_reason:
+        return {"rejected": True, "reason": lease_reason, "orderId": order_id, "symbol": normalized}
     try:
       with _exchange_write_lock():
         authority_error = _authority_error()
@@ -4029,8 +4259,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         contract_spec = _get_contract_spec(futures_symbol) or {}
         lot_size = int(contract_spec.get("lotSize") or 1)
         cur_price = mark_price
-        tp_distance = abs(tp_val - cur_price) if cur_price > 0 else 0
-        tp1_price = cur_price + tp_distance * 0.6 * (1 if current_qty > 0 else -1) if tp_distance > 0 else tp_val
+        reference_entry = _to_float(position.get("avgEntryPrice")) or cur_price
+        tp_distance = abs(tp_val - reference_entry) if reference_entry > 0 else 0
+        tp1_price = reference_entry + tp_distance * 0.6 * (1 if current_qty > 0 else -1) if tp_distance > 0 else tp_val
         if tick_size and tick_size > 0:
           tp1_price = _round_price_to_tick(tp1_price, tick_size)
         tp2_price = tp_val
@@ -4410,8 +4641,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     rationale: str,
     target_price: float | None = None,
     stop_price: float | None = None,
+    condition: str | None = None,
+    expires_minutes: float = 360.0,
   ) -> Dict[str, Any]:
-    """Store an auto-buy/sell trigger idea (persists to disk for follow-up by future runs)."""
+    """Store a time-bounded price trigger idea. condition is 'above' or 'below'."""
     authority_error = _authority_error()
     if authority_error:
       return {"rejected": True, "reason": authority_error}
@@ -4424,6 +4657,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       rationale=rationale,
       target_price=target_price,
       stop_price=stop_price,
+      condition=condition,
+      expires_minutes=expires_minutes,
     )
 
   @function_tool

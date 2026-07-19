@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from src.config import RegimeConfig
 from src.regime import (
     is_hostile_regime,
@@ -17,6 +19,7 @@ from src.regime import (
     conviction_size_factor,
     is_relative_strength_alt_long,
     oi_price_signal,
+    net_reward_risk_ratio,
     resolve_gate_deadlock,
     reward_risk_ratio,
     risk_capped_contracts,
@@ -261,6 +264,24 @@ def test_rr_none_on_bad_input_or_side():
     assert reward_risk_ratio("buy", None, 110, 95) is None
     assert reward_risk_ratio("hold", 100, 110, 95) is None
     assert reward_risk_ratio("", 100, 110, 95) is None
+
+
+def test_net_rr_accounts_for_costs_on_winner_and_loser():
+    # Gross is 2R, but 0.16% modeled friction on each leg lowers reward and increases loss.
+    gross = reward_risk_ratio("buy", 100, 102, 99)
+    net = net_reward_risk_ratio(
+        "buy", 100, 102, 99, fee_rate=0.0006, slippage_rate=0.001,
+    )
+    assert gross == 2.0
+    assert net == pytest.approx((2 - (100 + 102) * 0.0016) / (1 + (100 + 99) * 0.0016))
+    assert net < gross
+
+
+def test_net_rr_rejects_cost_consumed_target_and_invalid_bracket():
+    assert net_reward_risk_ratio(
+        "buy", 100, 100.1, 99, fee_rate=0.0006, slippage_rate=0.001,
+    ) == 0.0
+    assert net_reward_risk_ratio("buy", 100, 99, 98, fee_rate=0.0006) is None
 
 
 # ── Conviction sizing: scale size by how far confidence clears the floor ─────────

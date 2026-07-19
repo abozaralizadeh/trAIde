@@ -26,6 +26,7 @@ import logging
 import math
 import time
 import uuid
+from dataclasses import replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, Optional
 
@@ -210,8 +211,15 @@ class ProtectionManager:
     emergency_sl_pct: float = 0.0,
     min_rr: float = 1.5,
     max_loss_equity_fraction: float = 0.0,
+    breakeven_cost_pct: float = 0.0,
   ) -> None:
-    self.cfg = cfg
+    self.cfg = replace(
+      cfg,
+      breakeven_fee_pct=max(
+        float(cfg.breakeven_fee_pct or 0.0),
+        max(0.0, float(breakeven_cost_pct or 0.0)),
+      ),
+    )
     self.kucoin_futures = kucoin_futures
     self.notifier = notifier
     # Safety net: if an open position has NO loss-side stop (e.g. a limit filled between agent runs
@@ -301,6 +309,10 @@ class ProtectionManager:
           self._peak_fe.pop(fsym, None)
           self._emergency_placed_legs.pop(fsym, None)
           self._open_since[fsym] = time.time()
+        # Early-cut depends on both observed age and observed MFE. Peak excursion is process-local,
+        # so trusting an exchange age after restart could call a mature retracing winner "never
+        # worked" and close it immediately. Start both clocks together until lifecycle MFE is
+        # persisted atomically in a future schema.
         opened_min_ago = (time.time() - self._open_since.setdefault(fsym, time.time())) / 60.0
 
         fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)

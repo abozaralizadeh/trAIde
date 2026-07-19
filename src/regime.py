@@ -261,6 +261,45 @@ def reward_risk_ratio(side: str, entry, take_profit, stop_loss):
   return reward / risk
 
 
+def net_reward_risk_ratio(
+  side: str,
+  entry,
+  take_profit,
+  stop_loss,
+  *,
+  fee_rate: float = 0.0,
+  slippage_rate: float = 0.0,
+):
+  """Reward/risk after estimated entry+exit fees and slippage.
+
+  Gross chart distance is not trade expectancy: friction reduces a winner and increases a loser.
+  Rates are per side, matching the execution gate's existing conservative cost model. Returns
+  ``None`` for an invalid bracket and ``0`` when costs consume all projected reward.
+  """
+  gross = reward_risk_ratio(side, entry, take_profit, stop_loss)
+  if gross is None:
+    return None
+  try:
+    e = float(entry)
+    tp = float(take_profit)
+    sl = float(stop_loss)
+    rate = max(0.0, float(fee_rate)) + max(0.0, float(slippage_rate))
+  except (TypeError, ValueError):
+    return None
+  direction = str(side or "").lower()
+  if direction in {"buy", "long"}:
+    gross_reward = tp - e
+    gross_risk = e - sl
+  else:
+    gross_reward = e - tp
+    gross_risk = sl - e
+  net_reward = gross_reward - (e + tp) * rate
+  net_risk = gross_risk + (e + sl) * rate
+  if net_risk <= 0:
+    return None
+  return max(0.0, net_reward) / net_risk
+
+
 def concentration_scale(
   notional_usd: float,
   total_equity_usd: float,

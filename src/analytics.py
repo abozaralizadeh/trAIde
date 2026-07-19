@@ -7,7 +7,19 @@ from typing import Any, Dict, List, Sequence
 import pandas as pd
 
 # Kucoin candle fields: [time, open, close, high, low, volume, turnover]
-INTERVAL_SECONDS: Dict[str, int] = {"1min": 60, "5min": 300, "15min": 900, "1hour": 3600, "4hour": 14400, "1day": 86400}
+INTERVAL_SECONDS: Dict[str, int] = {
+  "1min": 60,
+  "5min": 300,
+  "15min": 900,
+  "30min": 1800,
+  "1hour": 3600,
+  "2hour": 7200,
+  "4hour": 14400,
+  "8hour": 28800,
+  "12hour": 43200,
+  "1day": 86400,
+  "1week": 604800,
+}
 
 
 @dataclass
@@ -24,7 +36,134 @@ class IndicatorSettings:
   stoch_d_length: int = 3
 
 
-def candles_to_dataframe(candles: Sequence[Sequence[Any]]) -> pd.DataFrame:
+def _as_epoch_seconds(as_of: Any | None) -> float:
+  if as_of is None:
+    return float(pd.Timestamp.now(tz="UTC").timestamp())
+  if isinstance(as_of, (int, float)) and not isinstance(as_of, bool):
+    value = float(as_of)
+    # Accept exchange-style millisecond timestamps as well as epoch seconds.
+    return value / 1000.0 if abs(value) >= 1_000_000_000_000 else value
+  timestamp = pd.Timestamp(as_of)
+  if timestamp.tzinfo is None:
+    timestamp = timestamp.tz_localize("UTC")
+  else:
+    timestamp = timestamp.tz_convert("UTC")
+  return float(timestamp.timestamp())
+
+
+def _candle_start_seconds(df: pd.DataFrame) -> pd.Series:
+  if "time" in df.columns:
+    return pd.to_numeric(df["time"], errors="coerce")
+  if "timestamp" in df.columns:
+    timestamps = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    return timestamps.map(lambda value: value.timestamp() if pd.notna(value) else float("nan"))
+  raise ValueError("Candle data must contain a 'time' or 'timestamp' column.")
+
+
+def exclude_open_candles(
+  df: pd.DataFrame,
+  interval: str,
+  as_of: Any | None = None,
+) -> pd.DataFrame:
+  """Return only candles whose full interval had elapsed by ``as_of``.
+
+  Exchange candle timestamps identify the start of a bar.  The current bar can
+  repaint until ``start + interval`` and must not be used as a completed signal.
+  ``as_of`` accepts epoch seconds, epoch milliseconds, or a datetime-like value.
+  """
+  if interval not in INTERVAL_SECONDS:
+    raise ValueError(f"Unsupported candle interval: {interval}")
+  starts = _candle_start_seconds(df)
+  closed = starts.notna() & (starts + INTERVAL_SECONDS[interval] <= _as_epoch_seconds(as_of))
+  return df.loc[closed].copy().reset_index(drop=True)
+
+
+def validate_candle_data(
+  df: pd.DataFrame,
+  interval: str,
+  as_of: Any | None = None,
+  *,
+  max_staleness_intervals: float = 1.5,
+  max_gap_intervals: float = 1.5,
+) -> Dict[str, Any]:
+  """Report timestamp freshness, gaps, and OHLC integrity without mutating data."""
+  if interval not in INTERVAL_SECONDS:
+    raise ValueError(f"Unsupported candle interval: {interval}")
+  if max_staleness_intervals < 0 or max_gap_intervals < 1:
+    raise ValueError("Candle validation thresholds are out of range.")
+
+  interval_seconds = INTERVAL_SECONDS[interval]
+  now_seconds = _as_epoch_seconds(as_of)
+  errors: list[str] = []
+  invalid_ohlc_rows: list[Any] = []
+  gap_count = 0
+  max_gap_seconds = 0.0
+  latest_close_seconds: float | None = None
+
+  if df.empty:
+    errors.append("no candles")
+    starts = pd.Series(dtype="float64")
+  else:
+    starts = _candle_start_seconds(df)
+    if starts.isna().any():
+      errors.append("invalid candle timestamp")
+    valid_starts = starts.dropna().sort_values()
+    if valid_starts.duplicated().any():
+      errors.append("duplicate candle timestamp")
+    if not valid_starts.empty:
+      differences = valid_starts.drop_duplicates().diff().dropna()
+      if not differences.empty:
+        max_gap_seconds = float(differences.max())
+        gap_count = int((differences > interval_seconds * max_gap_intervals).sum())
+        if gap_count:
+          errors.append(f"{gap_count} candle gap(s)")
+
+      closed_starts = valid_starts[valid_starts + interval_seconds <= now_seconds]
+      if closed_starts.empty:
+        errors.append("no closed candles")
+      else:
+        latest_close_seconds = float(closed_starts.iloc[-1] + interval_seconds)
+        stale_by = max(0.0, now_seconds - latest_close_seconds)
+        if stale_by > interval_seconds * max_staleness_intervals:
+          errors.append(f"latest closed candle is stale by {stale_by:.0f}s")
+
+  required_ohlc = ("open", "high", "low", "close")
+  missing_ohlc = [column for column in required_ohlc if column not in df.columns]
+  if missing_ohlc:
+    errors.append(f"missing OHLC column(s): {', '.join(missing_ohlc)}")
+  elif not df.empty:
+    prices = df.loc[:, required_ohlc].apply(pd.to_numeric, errors="coerce")
+    finite = prices.apply(lambda column: column.map(lambda value: pd.notna(value) and math.isfinite(float(value))))
+    valid = finite.all(axis=1)
+    valid &= prices["open"] > 0
+    valid &= prices["close"] > 0
+    valid &= prices["low"] > 0
+    valid &= prices["high"] >= prices[["open", "close", "low"]].max(axis=1)
+    valid &= prices["low"] <= prices[["open", "close", "high"]].min(axis=1)
+    invalid_ohlc_rows = df.index[~valid].tolist()
+    if invalid_ohlc_rows:
+      errors.append(f"invalid OHLC in {len(invalid_ohlc_rows)} row(s)")
+
+  return {
+    "valid": not errors,
+    "errors": errors,
+    "rows": len(df),
+    "closed_rows": int((starts.notna() & (starts + interval_seconds <= now_seconds)).sum()),
+    "open_rows": int((starts.notna() & (starts + interval_seconds > now_seconds)).sum()),
+    "gap_count": gap_count,
+    "max_gap_seconds": max_gap_seconds,
+    "invalid_ohlc_rows": invalid_ohlc_rows,
+    "latest_close_time": latest_close_seconds,
+  }
+
+
+def candles_to_dataframe(
+  candles: Sequence[Sequence[Any]],
+  interval: str | None = None,
+  *,
+  as_of: Any | None = None,
+  closed_only: bool = False,
+) -> pd.DataFrame:
   if not candles:
     raise ValueError("No candle data to analyze.")
   df = pd.DataFrame(
@@ -37,6 +176,10 @@ def candles_to_dataframe(candles: Sequence[Sequence[Any]]) -> pd.DataFrame:
   for col in ["open", "close", "high", "low", "volume", "turnover"]:
     df[col] = pd.to_numeric(df[col], errors="coerce")
   df = df.dropna(subset=["timestamp", "close", "high", "low", "volume"]).sort_values("timestamp").reset_index(drop=True)
+  if closed_only:
+    if interval is None:
+      raise ValueError("interval is required when closed_only=True")
+    df = exclude_open_candles(df, interval, as_of=as_of)
   return df
 
 
@@ -414,21 +557,22 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
   daily_bias_raw = "neutral"
   daily_gate_applied = False
   daily_exhausted = False
+  daily_trend_weak = False
   if daily_snap:
     daily_bias = _direction(daily_snap.get("trend_bias", "neutral"))
-    # Exhaustion detection: if daily RSI is extreme and ADX is weakening, the
-    # daily trend is exhausted — don't use it as a directional gate.
+    # RSI exhaustion and weak/choppy ADX have different trading implications.
+    # Both make the daily direction unsuitable as a hard gate, but low ADX must
+    # not trigger anti-FOMO rules intended for an extended directional move.
     daily_rsi = daily_snap.get("rsi")
     daily_adx = daily_snap.get("adx")
     if daily_bias == "bullish" and daily_rsi is not None and daily_rsi >= 70:
       daily_exhausted = True
     elif daily_bias == "bearish" and daily_rsi is not None and daily_rsi <= 30:
       daily_exhausted = True
-    elif daily_adx is not None and daily_adx < 18:
-      # Weak/choppy daily trend — gate would force trades into chop
-      daily_exhausted = True
+    if daily_adx is not None and daily_adx < 18:
+      daily_trend_weak = True
     daily_bias_raw = daily_bias
-    if daily_exhausted:
+    if daily_exhausted or daily_trend_weak:
       daily_bias = "neutral"
     if daily_bias != "neutral" and overall_bias != "neutral" and daily_bias != overall_bias:
       overall_bias = "neutral"
@@ -520,7 +664,9 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     elif daily_bias_raw == "bullish":
       entry_hint += " DAILY EXHAUSTED: 1D bullish RSI extreme — do NOT open continuation longs. Counter-trend only with a strong reversal signal."
     else:
-      entry_hint += " DAILY EXHAUSTED: 1D ADX weak/choppy — prefer mean-reversion, avoid trend-continuation entries."
+      entry_hint += " DAILY EXHAUSTED: 1D RSI is extreme — avoid chasing the extended move."
+  elif daily_trend_weak:
+    entry_hint += " DAILY TREND WEAK: 1D ADX is below 18, so its directional gate is neutralized; favor range-aware confirmation."
   elif daily_gate_applied:
     entry_hint += f" DAILY GATE: 1D trend is {daily_bias} — opposing intraday bias was overridden to neutral. Do NOT open counter-daily trades."
   elif daily_bias != "neutral":
@@ -579,6 +725,7 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
     "daily_bias_raw": daily_bias_raw,
     "daily_gate_applied": daily_gate_applied,
     "daily_exhausted": daily_exhausted,
+    "daily_trend_weak": daily_trend_weak,
     "timeframe_conflict": tf_conflict,
     "intraday_bias_15m": intraday_bias_15m,
     "intraday_bias_1h": intraday_bias_1h,

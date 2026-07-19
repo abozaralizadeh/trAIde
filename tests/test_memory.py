@@ -316,6 +316,72 @@ def test_record_trade_venue_defaults_to_spot(store):
     assert entry["venue"] == "spot"
 
 
+def test_unfilled_submission_does_not_consume_trade_cap_or_cooldown(store, monkeypatch):
+    monkeypatch.setattr("src.memory.time.time", lambda: 1_800_000_000)
+    pending = store.record_trade(
+        "ZEC-USDT", "buy", 25.0, venue="futures", filled=False,
+        order_id="pending-1", client_oid="traide-entry-pending",
+    )
+    assert store.trades_today("ZEC-USDT") == 0
+    assert store.last_trade_time("ZEC-USDT") is None
+    store.mark_order_filled(
+        pending["orderId"], pending["clientOid"],
+        fill_ts=1_800_000_060_000, fill_price=100.5, fill_size=2,
+    )
+    assert store.trades_today("ZEC-USDT") == 1
+    assert store.last_trade_time("ZEC-USDT") == 1_800_000_060
+
+
+def test_entry_context_survives_restart_and_attributes_realized_r(tmp_path, monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr("src.memory.time.time", lambda: now)
+    path = str(tmp_path / "memory.json")
+    mem = MemoryStore(path, retention_days=90)
+    context = {
+        "policyVersion": "test-v1", "positionSide": "long",
+        "plannedMaxLossUsd": 2.0, "plannedNetRr": 1.7,
+    }
+    mem.record_trade(
+        "ZEC-USDT", "buy", 50.0, venue="futures", filled=False,
+        order_id="entry-order", client_oid="traide-entry-ctx", entry_context=context,
+    )
+    mem.mark_order_filled("entry-order", "traide-entry-ctx", fill_ts=(now + 60) * 1000, fill_price=100)
+    reloaded = MemoryStore(path, retention_days=90)
+    matched = reloaded.entry_context_for_position("ZEC-USDT", (now + 60) * 1000, "long")
+    assert matched["policyVersion"] == "test-v1"
+    assert matched["fillPrice"] == 100.0
+    close = reloaded.log_decision(
+        "ZEC-USDT", "futures_sell_triggered", 0.0, "close", pnl=1.0,
+        position_open_time=(now + 60) * 1000, position_side="long", entry_price=100,
+        entry_context=matched,
+    )
+    assert close["realizedR"] == 0.5
+    persisted = MemoryStore(path, retention_days=90).realized_closes()[-1]
+    assert persisted["entryPrice"] == 100.0
+    assert persisted["entryContext"]["policyVersion"] == "test-v1"
+    assert persisted["realizedR"] == 0.5
+
+
+def test_intraday_triggers_expire_autonomously(store, monkeypatch):
+    now = 1_800_000_000
+    monkeypatch.setattr("src.memory.time.time", lambda: now)
+    trigger = store.save_trigger(
+        "SOL-USDT", "buy", "breakout", target_price=100,
+        condition="above", expires_minutes=60,
+    )
+    assert trigger["expiresAt"] == now + 3600
+    assert trigger["triggerId"]
+    assert len(store.latest_triggers()) == 1
+    assert store.consume_trigger(trigger) is True
+    assert store.latest_triggers() == []
+    store.save_trigger(
+        "SOL-USDT", "buy", "breakout", target_price=100,
+        condition="above", expires_minutes=60,
+    )
+    monkeypatch.setattr("src.memory.time.time", lambda: now + 3601)
+    assert store.latest_triggers() == []
+
+
 def test_old_records_without_venue_default_to_spot(tmp_path):
     import json
     path = tmp_path / "memory.json"
@@ -465,10 +531,15 @@ def test_agent_event_inbox_persists_until_acknowledged(tmp_path):
     first = MemoryStore(path, retention_days=7)
     assert first.queue_agent_event("futures_fills", "futures:fill-1", {"id": "fill-1"}) is True
     assert first.queue_agent_event("futures_fills", "futures:fill-1", {"id": "fill-1"}) is False
+    assert first.queue_agent_event(
+        "auto_triggers", "auto:trigger-1", {"observedPrice": 101.0},
+    ) is True
 
     restarted = MemoryStore(path, retention_days=7)
-    assert [event["id"] for event in restarted.get_pending_agent_events()] == ["futures:fill-1"]
-    assert len(restarted.acknowledge_agent_events(["futures:fill-1"])) == 1
+    assert [event["id"] for event in restarted.get_pending_agent_events()] == [
+        "futures:fill-1", "auto:trigger-1",
+    ]
+    assert len(restarted.acknowledge_agent_events(["futures:fill-1", "auto:trigger-1"])) == 2
     assert restarted.get_pending_agent_events() == []
 
 
@@ -533,7 +604,8 @@ def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
         venue="futures", filled=False, track_position=False, order_id="order-1",
         client_oid="traide-entry-limit-1",
     )
-    assert mem.trades_today("ETH-USDT") == 1
+    # A submitted-but-unfilled limit must not consume the filled-trade cap/cooldown.
+    assert mem.trades_today("ETH-USDT") == 0
     assert mem.positions(venue="futures") == {}
     summary = mem.performance_summary()
     assert summary["totalTrades"] == 0
@@ -542,11 +614,27 @@ def test_pending_limit_record_does_not_create_phantom_position(tmp_path):
     assert summary["limitOrdersFilled"] == 0
     assert summary["limitFillRate"] == 0.0
     assert mem.mark_order_filled("order-1") is True
+    assert mem.trades_today("ETH-USDT") == 1
     filled_summary = mem.performance_summary()
     assert filled_summary["totalTrades"] == 1
     assert filled_summary["limitOrdersFilled"] == 1
     assert filled_summary["limitFillRate"] == 1.0
     assert mem.positions(venue="futures") == {}
+
+
+def test_limit_fill_moves_trade_accounting_to_execution_day(tmp_path, monkeypatch):
+    mem = MemoryStore(str(tmp_path / "memory.json"), retention_days=7)
+    before_midnight = 100 * 86400 - 30
+    after_midnight = 100 * 86400 + 30
+    monkeypatch.setattr("src.memory.time.time", lambda: before_midnight)
+    mem.record_trade(
+        "ETH-USDT", "buy", 20.0, price=2000.0, size=0.01,
+        venue="futures", filled=False, track_position=False, order_id="rollover-order",
+        client_oid="traide-entry-rollover",
+    )
+    assert mem.mark_order_filled("rollover-order", fill_ts=after_midnight)
+    monkeypatch.setattr("src.memory.time.time", lambda: after_midnight)
+    assert mem.trades_today("ETH-USDT") == 1
 
 
 def test_market_reduce_only_close_does_not_affect_limit_fill_stats(tmp_path):

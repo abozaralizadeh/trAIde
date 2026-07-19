@@ -7,14 +7,39 @@ from src.main import (
   _adaptive_price_trigger_threshold,
   _agent_made_a_move,
   _close_event_id,
+  _crossed_auto_triggers,
   _expired_bot_entry_orders,
   _fetch_futures,
   _fetch_recent_fills,
   _fill_event_id,
+  _futures_position_fingerprint,
+  _idle_hunt_due,
   _next_price_noise_ewma,
   _productivity_adjusted_flat_cooldown,
   _rebase_reviewed_price_triggers,
 )
+
+
+def test_futures_position_fingerprint_ignores_pnl_noise_but_detects_lifecycle_changes():
+  first = [{"symbol": "XBTUSDTM", "currentQty": "2", "avgEntryPrice": "100", "unrealisedPnl": 1}]
+  marked = [{"symbol": "XBTUSDTM", "currentQty": "2", "avgEntryPrice": "100", "unrealisedPnl": 9}]
+  partial = [{"symbol": "XBTUSDTM", "currentQty": "1", "avgEntryPrice": "100", "unrealisedPnl": 9}]
+  assert _futures_position_fingerprint(first) == _futures_position_fingerprint(marked)
+  assert _futures_position_fingerprint(first) != _futures_position_fingerprint(partial)
+  assert _futures_position_fingerprint([]) == ()
+
+
+def test_explicit_auto_triggers_fire_only_on_the_requested_side():
+  triggers = [
+    {"symbol": "SOL-USDT", "condition": "above", "targetPrice": 100},
+    {"symbol": "ZEC-USDT", "condition": "below", "targetPrice": 500},
+    {"symbol": "BTC-USDT", "condition": None, "targetPrice": 1},
+  ]
+  crossed = _crossed_auto_triggers(
+    triggers,
+    {"SOL-USDT": 101, "ZEC-USDT": 501, "BTC-USDT": 99_000},
+  )
+  assert [(item[0]["symbol"], item[1]) for item in crossed] == [("SOL-USDT", 101.0)]
 
 
 class TestAdaptiveAgentCooldown:
@@ -54,6 +79,10 @@ class TestAdaptiveAgentCooldown:
     assert _productivity_adjusted_flat_cooldown(600, 2, 4.0) == 2400
     assert _productivity_adjusted_flat_cooldown(600, 20, 4.0) == 2400
     assert _productivity_adjusted_flat_cooldown(600, 3, 1.5) == 900
+
+  def test_pending_atomic_entry_suppresses_idle_only_hunt(self):
+    assert _idle_hunt_due(10, 10, pending_orders=False) is True
+    assert _idle_hunt_due(100, 10, pending_orders=True) is False
 
 
 class TestAdaptivePriceTrigger:
@@ -165,6 +194,11 @@ class TestAgentMadeAMove:
 
   def test_transfer_only_is_not_a_move(self):
     assert not _agent_made_a_move({"tool_results": [{"transfer": {"orderId": "t"}, "amount": 5}]})
+
+  def test_cancellation_is_not_a_productive_trade(self):
+    assert not _agent_made_a_move({
+      "tool_results": [{"cancelled": {"cancelledOrderIds": ["x"]}, "orderId": "x"}],
+    })
 
   def test_empty_is_not_a_move(self):
     assert not _agent_made_a_move({"tool_results": []})

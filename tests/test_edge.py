@@ -1,7 +1,14 @@
 """Tests for the adaptive edge controller (src/edge.py) and the close-dedup data hygiene."""
 
 from src.config import EdgeConfig
-from src.edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_adaptive_rr, symbol_bench_until
+from src.edge import (
+    adaptive_min_rr,
+    edge_stats,
+    expectancy_size_factor,
+    loss_streak_size_factor,
+    symbol_adaptive_rr,
+    symbol_bench_until,
+)
 from src.memory import MemoryStore
 
 
@@ -48,6 +55,45 @@ def test_edge_stats_respects_lookback_window():
 def test_edge_stats_empty():
     s = edge_stats([], 30)
     assert s["n"] == 0 and s["loss_streak"] == 0 and s["per_symbol"] == {}
+
+
+def test_edge_stats_and_sizing_separate_profitable_shorts_from_losing_longs():
+    closes = [
+        _close("ETH-USDT", -0.5, i, close_type="CLOSE_LONG") for i in range(1, 7)
+    ] + [
+        _close("BTC-USDT", 0.4, 100 + i, close_type="CLOSE_SHORT") for i in range(1, 7)
+    ]
+    stats = edge_stats(closes, 30)
+    assert stats["per_direction"]["long"]["net"] == -3.0
+    assert stats["per_direction"]["short"]["net"] == 2.4
+    cfg = _cfg(direction_min_trades=5, negative_expectancy_size_factor=0.5)
+    assert expectancy_size_factor(stats, cfg, direction="long") == 0.5
+    assert expectancy_size_factor(stats, cfg, direction="short") == 1.0
+
+
+def test_expectancy_sizing_waits_for_evidence_and_never_sizes_up():
+    stats = edge_stats([_close("ETH-USDT", -1.0, 1, close_type="CLOSE_LONG")], 30)
+    cfg = _cfg(direction_min_trades=5, negative_expectancy_size_factor=0.25)
+    assert expectancy_size_factor(stats, cfg, direction="long") == 1.0
+
+
+def test_expectancy_sizing_prefers_realized_r_over_dollar_notional():
+    closes = [
+        _close("ETH-USDT", 1.0, 1, close_type="CLOSE_LONG") | {"realizedR": 1.0},
+        _close("ETH-USDT", -10.0, 2, close_type="CLOSE_LONG") | {"realizedR": -0.5},
+    ]
+    stats = edge_stats(closes, 30)
+    cfg = _cfg(direction_min_trades=2, negative_expectancy_size_factor=0.25)
+    # Dollar PnL is -9, but normalized expectancy is +0.25R: size must not depend on notional.
+    assert stats["per_direction"]["long"]["r_net"] == 0.5
+    assert expectancy_size_factor(stats, cfg, direction="long") == 1.0
+
+    inverse = [
+        _close("BTC-USDT", 10.0, 1, close_type="CLOSE_SHORT") | {"realizedR": 0.25},
+        _close("BTC-USDT", -1.0, 2, close_type="CLOSE_SHORT") | {"realizedR": -1.0},
+    ]
+    inverse_stats = edge_stats(inverse, 30)
+    assert expectancy_size_factor(inverse_stats, cfg, direction="short") == 0.25
 
 
 # ── adaptive_min_rr ──────────────────────────────────────────────────────────────

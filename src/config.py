@@ -81,8 +81,8 @@ class TradingConfig:
   # Risk guardrails (added after the RE-USDT concentration blowup, 2026-06-21):
   max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
-  research_handoff_cooldown_min: float = 30.0 # min minutes between forced Research handoffs (0=off)
-  min_futures_rr: float = 1.5                 # reject futures entries whose TP:SL reward:risk is below this (0=off)
+  research_handoff_cooldown_min: float = 120.0 # min minutes between forced Research handoffs (0=off)
+  min_futures_rr: float = 1.5                 # reject futures entries whose post-cost reward:risk is below this (0=off)
   screener_min_turnover_usd_24h: float = 5_000_000.0  # market screener liquidity floor (24h USDT turnover)
   atomic_bracket_enabled: bool = True         # attach TP/SL to the entry order (KuCoin st-orders) so a limit
                                               # fill is protected instantly, not on the next agent run
@@ -90,12 +90,11 @@ class TradingConfig:
                                               # position (fraction of entry) until the agent sets a real one (0=off)
   # Model invocation budget: protection remains code-driven every poll, while expensive discretionary
   # analysis runs less often when flat and more often when capital is exposed.
-  # When FLAT and quiet, this is the initial model HUNT cadence. Repeated no-action runs back it off
-  # only when flat_backoff_max_multiplier is explicitly >1. Pending atomic brackets are managed by
-  # deterministic expiry and do not count as exposed capital.
-  flat_agent_cooldown_sec: float = 600.0
+  # When FLAT and quiet, this is the initial model HUNT cadence. Repeated no-action runs back it off.
+  # Pending atomic brackets are managed by deterministic expiry and do not count as exposed capital.
+  flat_agent_cooldown_sec: float = 3600.0
   active_agent_cooldown_sec: float = 300.0
-  flat_backoff_max_multiplier: float = 1.0  # 1 disables no-action backoff; >1 opts into it
+  flat_backoff_max_multiplier: float = 4.0  # power-of-two no-action backoff cap
   # Adaptive price-trigger tuning (the model-call gate). A symbol's per-poll noise EWMA × the noise
   # multiplier sets its trigger threshold, capped at price_change_trigger_pct × the ceiling multiplier.
   # The ceiling bounds worst-case blindness: at 2.0 (default) any move >= 2× the base trigger always
@@ -108,9 +107,10 @@ class TradingConfig:
 class EdgeConfig:
   """Adaptive edge controller (src/edge.py) — risk posture derived from rolling realized results.
 
-  Self-tuning by design: when the last N trades are net-losing the bot demands more
-  reward per unit risk, benches symbols that keep losing, and shrinks size during loss
-  streaks — then relaxes back automatically once realized expectancy turns positive.
+  Self-tuning by design: when recent evidence is net-losing the bot reduces capital at
+  risk, benches symbols that keep losing, and shrinks size during loss streaks — then
+  relaxes back automatically once realized expectancy turns positive. Legacy adaptive-RR
+  fields remain loadable for backward compatibility, but are not used by live admission.
   """
   enabled: bool = True
   lookback_trades: int = 30        # rolling window of realized closes the stats are computed over
@@ -127,6 +127,8 @@ class EdgeConfig:
   bench_cooldown_max_mult: int = 4    # max multiplier on the bench rest for a persistently-losing symbol
   streak_threshold: int = 2        # consecutive realized losses that trigger the size throttle
   streak_size_factor: float = 0.5  # entry-size multiplier while on a losing streak
+  direction_min_trades: int = 5    # evidence required before long/short-specific adaptation
+  negative_expectancy_size_factor: float = 0.5  # explore smaller on a losing direction; auto-restores
 
 
 @dataclass
@@ -313,7 +315,9 @@ def load_config() -> AppConfig:
       min_profit_roi_pct=float(os.getenv("MIN_PROFIT_ROI_PCT", "0.008")),
       estimated_slippage_pct=float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.001")),
       range_trading_enabled=_as_bool(os.getenv("RANGE_TRADING_ENABLED"), True),
-      partial_tp_enabled=_as_bool(os.getenv("PARTIAL_TP_ENABLED"), True),
+      # Off by default: a 60% tranche at 60% of target compresses a 1.5R admitted setup to
+      # only 1.14R gross while the full stop remains. It stays available as an explicit opt-in.
+      partial_tp_enabled=_as_bool(os.getenv("PARTIAL_TP_ENABLED"), False),
       kelly_sizing_enabled=_as_bool(os.getenv("KELLY_SIZING_ENABLED"), True),
       kelly_min_trades=int(os.getenv("KELLY_MIN_TRADES", "30")),
       prefer_limit_orders=_as_bool(os.getenv("PREFER_LIMIT_ORDERS"), True),
@@ -325,17 +329,17 @@ def load_config() -> AppConfig:
       max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "6")),
       entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
       min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
-      research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "3")),
+      research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "6")),
       max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
-      research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
+      research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "120")),
       min_futures_rr=float(os.getenv("MIN_FUTURES_RR", "1.5")),
       screener_min_turnover_usd_24h=float(os.getenv("SCREENER_MIN_TURNOVER_USD_24H", "5000000")),
       atomic_bracket_enabled=_as_bool(os.getenv("ATOMIC_BRACKET_ENABLED"), True),
       emergency_sl_pct=float(os.getenv("EMERGENCY_SL_PCT", "0.02")),
-      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "600")),
+      flat_agent_cooldown_sec=float(os.getenv("FLAT_AGENT_COOLDOWN_SEC", "3600")),
       active_agent_cooldown_sec=float(os.getenv("ACTIVE_AGENT_COOLDOWN_SEC", "300")),
-      flat_backoff_max_multiplier=float(os.getenv("FLAT_BACKOFF_MAX_MULTIPLIER", "1.0")),
+      flat_backoff_max_multiplier=float(os.getenv("FLAT_BACKOFF_MAX_MULTIPLIER", "4.0")),
       price_noise_multiplier=float(os.getenv("PRICE_NOISE_MULTIPLIER", "4.0")),
       price_trigger_max_multiplier=float(os.getenv("PRICE_TRIGGER_MAX_MULTIPLIER", "2.0")),
     ),
@@ -375,6 +379,8 @@ def load_config() -> AppConfig:
       bench_cooldown_max_mult=int(os.getenv("EDGE_BENCH_COOLDOWN_MAX_MULT", "4")),
       streak_threshold=int(os.getenv("EDGE_STREAK_THRESHOLD", "2")),
       streak_size_factor=float(os.getenv("EDGE_STREAK_SIZE_FACTOR", "0.5")),
+      direction_min_trades=int(os.getenv("EDGE_DIRECTION_MIN_TRADES", "5")),
+      negative_expectancy_size_factor=float(os.getenv("EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR", "0.5")),
     ),
     regime=RegimeConfig(
       throttle_enabled=_as_bool(os.getenv("REGIME_THROTTLE_ENABLED"), True),
@@ -490,6 +496,12 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"PRICE_NOISE_MULTIPLIER={cfg.trading.price_noise_multiplier} (must be >=0)")
   if cfg.trading.price_trigger_max_multiplier < 1.0:
     invalid.append(f"PRICE_TRIGGER_MAX_MULTIPLIER={cfg.trading.price_trigger_max_multiplier} (must be >=1.0 so the ceiling never drops below the base trigger)")
+  if cfg.edge.direction_min_trades < 1:
+    invalid.append(f"EDGE_DIRECTION_MIN_TRADES={cfg.edge.direction_min_trades} (must be >=1)")
+  if not (0.0 < cfg.edge.negative_expectancy_size_factor <= 1.0):
+    invalid.append(
+      f"EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR={cfg.edge.negative_expectancy_size_factor} (must be >0 and <=1.0)"
+    )
   if not (0.0 <= cfg.regime.relative_strength_min_confidence <= 1.0):
     invalid.append(f"RELATIVE_STRENGTH_MIN_CONFIDENCE={cfg.regime.relative_strength_min_confidence} (must be 0.0–1.0)")
   if not (0.0 < cfg.regime.relative_strength_size_factor <= 1.0):

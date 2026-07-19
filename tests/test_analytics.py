@@ -1,7 +1,15 @@
 import math
 import pytest
 import pandas as pd
-from src.analytics import candles_to_dataframe, compute_indicators, summarize_interval, summarize_multi_timeframe, classify_regime
+from src.analytics import (
+    candles_to_dataframe,
+    classify_regime,
+    compute_indicators,
+    exclude_open_candles,
+    summarize_interval,
+    summarize_multi_timeframe,
+    validate_candle_data,
+)
 
 
 def _make_candles(n: int = 60) -> list:
@@ -26,6 +34,32 @@ def test_candles_to_dataframe_basic():
 def test_candles_to_dataframe_empty():
     with pytest.raises(ValueError):
         candles_to_dataframe([])
+
+
+def test_exclude_open_candles_uses_interval_close_time():
+    candles = [
+        [str(ts), "100", "100", "101", "99", "10", "1000"]
+        for ts in (0, 60, 120, 180)
+    ]
+    df = candles_to_dataframe(candles)
+
+    closed = exclude_open_candles(df, "1min", as_of=180)
+
+    assert closed["time"].tolist() == [0, 60, 120]
+    assert len(candles_to_dataframe(candles, "1min", as_of=180, closed_only=True)) == 3
+
+
+def test_validate_candle_data_reports_gaps_staleness_and_bad_ohlc():
+    candles = [
+        ["0", "100", "100", "101", "99", "10", "1000"],
+        ["120", "100", "101", "99", "98", "10", "1000"],
+    ]
+    report = validate_candle_data(candles_to_dataframe(candles), "1min", as_of=400)
+
+    assert report["valid"] is False
+    assert report["gap_count"] == 1
+    assert report["invalid_ohlc_rows"] == [1]
+    assert any("stale" in error for error in report["errors"])
 
 
 def test_compute_indicators_columns():
@@ -138,6 +172,26 @@ def test_exhausted_bearish_daily_surfaces_confirmed_trend_short_exception():
     assert result["daily_exhausted"] is True
     assert result["daily_bias_raw"] == "bearish"
     assert "continuation SHORT is eligible" in result["entry_hint"]
+
+
+def test_weak_daily_adx_neutralizes_gate_without_marking_exhaustion():
+    snapshots = [
+        {"interval": "1day", "trend_bias": "bearish", "rsi": 50, "adx": 17.9, "volatility": "normal"},
+        {"interval": "4hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "1hour", "trend_bias": "bullish", "volatility": "normal"},
+        {"interval": "15min", "trend_bias": "bullish", "volatility": "normal"},
+    ]
+
+    result = summarize_multi_timeframe(snapshots)
+
+    assert result["overall_bias"] == "bullish"
+    assert result["daily_bias_raw"] == "bearish"
+    assert result["daily_bias"] == "neutral"
+    assert result["daily_trend_weak"] is True
+    assert result["daily_exhausted"] is False
+    assert result["daily_gate_applied"] is False
+    assert "DAILY TREND WEAK" in result["entry_hint"]
+    assert "DAILY EXHAUSTED" not in result["entry_hint"]
 
 
 def test_summarize_multi_timeframe_daily_neutral_no_effect():

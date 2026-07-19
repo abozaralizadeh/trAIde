@@ -189,7 +189,7 @@ flowchart LR
 
 ### Risk Management
 - **Circuit breakers**: Auto-restrict to close-only mode when daily drawdown, consecutive losses, or portfolio heat exceed thresholds
-- **Staged take-profit**: Splits TP into 2 tranches (60%/40%) to lock in partial gains
+- **Optional staged take-profit**: Can split TP into 60%/40% tranches, but defaults off because early realization compresses the admitted reward:risk
 - **Kelly criterion sizing**: Quarter-Kelly position sizing from rolling trade performance (requires minimum trade history)
 - **Post-loss cooldown**: Blocks new entries on a symbol for a configurable period after a loss
 - **Profit-lock (breakeven ratchet + give-back cap)**: Enforced in code every poll, independent of the LLM (`src/protection.py`). Once a position's favorable excursion reaches `PROFIT_LOCK_BREAKEVEN_TRIGGER_R`× its initial risk, the stop is ratcheted to a fee-adjusted breakeven so the trade can no longer turn into a loss. If price then gives back ≥ `PROFIT_LOCK_GIVEBACK_PCT` of its peak run, the position is market-closed (reduce-only) to lock the remaining gain. Stops a profitable trade from round-tripping into a loss when the agent fails to tighten protection itself. Set `PROFIT_LOCK_DRY_RUN=true` to log intended actions without placing orders.
@@ -199,8 +199,8 @@ flowchart LR
 - **Lifecycle risk + concentration caps**: Every add-on shares the original position's stop-defined risk and projected same-symbol exposure budgets. Caps are reapplied after contract-lot rounding; an exchange minimum that exceeds either budget is rejected. Add-ons require a live fee-adjusted breakeven stop and may never loosen it or average down.
 - **Correlation gate + relative-strength exception**: Blocks ordinary non-major alt longs while BTC's daily regime is bearish. A rotating leader may pass only when its 1D/4H/1H/15M trends are all bullish, strength is high, and confidence clears `RELATIVE_STRENGTH_MIN_CONFIDENCE`; it is then reduced by `RELATIVE_STRENGTH_SIZE_FACTOR`. No symbol is hardcoded.
 - **New-listing guard**: Blocks futures entries on contracts younger than `MIN_FUTURES_LISTING_AGE_DAYS` (via the contract's first-open date). Freshly-listed perps are thin and ultra-volatile — RE-USDT had a ~100% intraday range on day one.
-- **Minimum reward:risk (futures)**: Rejects any futures entry whose take-profit distance is less than `MIN_FUTURES_RR` × the stop-loss distance (checked when both are supplied at entry). Previously the R:R floor existed only on the spot path, so futures brackets were being set with stops *wider* than targets — the direct cause of losses running ~4× the wins at a high win rate. Dollar risk is meant to be controlled by position size, not by widening the stop past the target.
-- **Adaptive edge controller** (`src/edge.py`): the bot's risk posture is derived from its own **rolling realized results** instead of static parameters, so it self-tightens when losing and relaxes when earning — no manual re-tuning as regimes change. Code-enforced actions, each logged and surfaced to the agent in an `edgeReport`: (1) **per-symbol R:R floor** — a symbol whose own recent net is negative must clear a higher reward:risk (`base + EDGE_RR_STEP`, capped at `EDGE_RR_CAP`), while fresh/winning symbols trade at the base floor. This is *per-symbol* so one losing name (e.g. a chopping ETH) can't starve the diversified trades a screener finds; (2) **severity-scaled symbol bench** — a symbol with `EDGE_BENCH_MIN_LOSSES`+ losses (and negative net) in its recent closes is quarantined from new entries, and the rest scales with loss count (`EDGE_BENCH_COOLDOWN_HOURS × min(losses, EDGE_BENCH_COOLDOWN_MAX_MULT)`) so a persistent loser sits out progressively longer, then auto-lifts — this rotates capital away from what's bleeding toward what's working; (3) **loss-streak throttle** — after `EDGE_STREAK_THRESHOLD` consecutive losses, entries are sized down by `EDGE_STREAK_SIZE_FACTOR` until a win (anti-martingale, a soft stage before the consecutive-loss circuit breaker).
+- **Minimum reward:risk (futures)**: Rejects any futures entry whose **post-cost** reward:risk is below `MIN_FUTURES_RR`, including estimated entry/exit fees and slippage. Dollar risk is controlled by position size, not by widening the stop or inventing a farther target.
+- **Adaptive edge controller** (`src/edge.py`): derives risk posture from rolling realized results and automatically relaxes when evidence recovers. Code-enforced actions surfaced in `edgeReport`: (1) **direction/symbol risk scaling** — a sufficiently sampled losing long/short direction or symbol trades at `EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR`; (2) **severity-scaled symbol bench** — a repeatedly losing symbol is quarantined for an automatically scaled cooldown; (3) **loss-streak throttle** — consecutive losses reduce all new-entry size. Targets stay structural: weak results reduce capital at risk instead of moving take-profits farther away.
 - **Give-back arming at 1R** (`PROFIT_LOCK_GIVEBACK_ARM_R`): the give-back cap only acts once a run has reached this multiple of the trade's *own* initial risk (stop distance) — sub-1R wobble belongs to the original stop. Stops the cap from strangling winners into fee-scale scratch closes while losses ride to the full stop.
 - **Trend-aligned shorts**: In a confirmed downtrend the anti-FOMO gate would otherwise force the bot to only ever long oversold bounces. With `TREND_ALIGNED_SHORTS_ENABLED`, a short into an exhausted-bearish daily is permitted **when 1h and 15m both confirm** the downtrend is resuming and confidence clears a higher bar (`TREND_SHORT_MIN_CONFIDENCE`) — letting the bot trade *with* the trend, not only against bounces.
 - **Reversal longs**: The daily gate is a *lagging* signal — it reads bearish through the bottom of a move, so the bot is structurally forbidden from catching a reversal (in the Jul 2–5 2026 chop it sat out an +11% ETH bounce, blocked from every long). With `REVERSAL_LONGS_ENABLED`, a long against a bearish daily is permitted **only when 1h and 15m have both turned bullish** and confidence clears a high bar (`REVERSAL_LONG_MIN_CONFIDENCE`, default 0.80) — a confirmed turn, not knife-catching. Majors only (non-major alt longs stay blocked by the correlation gate), and the reward:risk floor still applies to whatever passes.
@@ -297,7 +297,7 @@ The agent runs in a continuous loop: polls KuCoin, tracks price changes, perform
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PARTIAL_TP_ENABLED` | `true` | Split take-profit into staged tranches (60%/40%) |
+| `PARTIAL_TP_ENABLED` | `false` | Opt in to 60%/40% staged take-profit; off by default because the current staging geometry reduces realized reward:risk |
 | `KELLY_SIZING_ENABLED` | `true` | Use Kelly criterion for adaptive position sizing |
 | `KELLY_MIN_TRADES` | `30` | Minimum trade history before Kelly sizing activates |
 | `PREFER_LIMIT_ORDERS` | `true` | Legacy spot-entry preference; new spot exposure is currently disabled |
@@ -353,22 +353,21 @@ Blast-radius and selection guards added after the RE-USDT concentration blowup (
 |----------|---------|-------------|
 | `MAX_POSITION_EQUITY_PCT` | `0.5` | Cap a single position's notional at this fraction of total equity, regardless of leverage (`0` = off) |
 | `MIN_FUTURES_LISTING_AGE_DAYS` | `7` | Block futures entries on contracts younger than this many days — thin/volatile fresh listings (`0` = off) |
-| `MIN_FUTURES_RR` | `1.5` | Reject futures entries whose take-profit distance is below this × the stop distance (`0` = off) |
+| `MIN_FUTURES_RR` | `1.5` | Reject futures entries whose post-cost reward:risk (fees and estimated slippage included) is below this (`0` = off) |
 | `SCREENER_MIN_TURNOVER_USD_24H` | `5000000` | Market screener (`scan_futures_market`) liquidity floor: only surface perps with at least this 24h USDT turnover |
 
 ### Adaptive Edge Controller
 
-Self-tuning risk (`src/edge.py`): posture derives from the rolling realized closes, tightens while losing, and relaxes back automatically when expectancy turns positive. The current stats, required R:R, benched symbols, and size factor are injected into the agent's context each run (`edgeReport`) so it proposes trades that pass the gates.
+Self-tuning risk (`src/edge.py`): posture derives from rolling realized closes, tightens while losing, and relaxes automatically when expectancy recovers. Once attributed history is sufficient it uses realized R (net PnL / planned maximum loss), so larger notionals cannot dominate the learning signal; legacy dollar PnL is only a migration fallback. The live RR gate remains structural and cost-aware, while the controller adapts risk rather than stretching targets.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ADAPTIVE_EDGE_ENABLED` | `true` | Master switch for the adaptive edge controller |
 | `EDGE_LOOKBACK_TRADES` | `30` | Rolling window of realized closes the stats are computed over |
 | `EDGE_MIN_TRADES` | `8` | Minimum closes before adaptive actions kick in (below this, static behavior) |
-| `EDGE_RR_STEP` | `0.5` | Added to `MIN_FUTURES_RR` while rolling expectancy is negative |
-| `EDGE_RR_CAP` | `2.5` | Ceiling for the adaptive R:R floor |
-| `EDGE_RR_STALE_HOURS` | `18` | If no realized close in this long, the R:R raise decays back to base — prevents a losing streak from freezing recovery permanently (a raised floor that stops all trading gets no wins to lower itself) |
-| `EDGE_SYMBOL_RR_MIN_TRADES` | `2` | Min closes on a symbol before its *own* R:R floor is raised (the floor is per-symbol, so a fresh coin isn't punished for another's losses) |
+| `EDGE_DIRECTION_MIN_TRADES` | `5` | Minimum closes before a long/short direction or symbol's expectancy can reduce its risk |
+| `EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR` | `0.5` | Entry-size multiplier for a sufficiently sampled losing direction/symbol; never enlarges risk |
+| `EDGE_RR_STEP`, `EDGE_RR_CAP`, `EDGE_RR_STALE_HOURS`, `EDGE_SYMBOL_RR_MIN_TRADES` | legacy | Retained for configuration compatibility and offline comparisons; live admission no longer stretches targets after losses |
 | `EDGE_BENCH_LOOKBACK` | `5` | Per-symbol recent closes examined for the bench |
 | `EDGE_BENCH_MIN_LOSSES` | `3` | Losses within that window (with negative net) that bench the symbol |
 | `EDGE_BENCH_COOLDOWN_HOURS` | `12` | Base bench rest; scaled by loss count so a persistent loser sits out longer |
@@ -380,8 +379,8 @@ Self-tuning risk (`src/edge.py`): posture derives from the rolling realized clos
 | `RELATIVE_STRENGTH_LONGS_ENABLED` | `true` | Allow a narrow all-timeframe bullish exception to the bearish-BTC alt veto |
 | `RELATIVE_STRENGTH_MIN_CONFIDENCE` | `0.82` | Confidence required for that exception |
 | `RELATIVE_STRENGTH_SIZE_FACTOR` | `0.5` | Reduced size applied to an exception trade |
-| `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `3` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |
-| `RESEARCH_HANDOFF_COOLDOWN_MIN` | `30` | Minimum minutes between forced Research handoffs — rate-limits the costly web sweep (`0` = off) |
+| `RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS` | `6` | Force a Research handoff after this many consecutive no-trade runs to refresh the coin list (`0` = off) |
+| `RESEARCH_HANDOFF_COOLDOWN_MIN` | `120` | Minimum minutes between forced Research handoffs — rate-limits the costly web sweep (`0` = off) |
 
 ### Regime-Aware Entries
 
@@ -415,7 +414,8 @@ Code-enforced entry adjustments that work alongside the daily gate (`src/regime.
 | `PRICE_CHANGE_TRIGGER_PCT` | `0.5` | Price move % that triggers an agent run |
 | `MAX_IDLE_POLLS` | `10` | Force agent run after N idle polls |
 | `FLAT_AGENT_COOLDOWN_SEC` | `3600` | Quiet-market maximum interval while flat; triggered move magnitude/breadth automatically reduce it toward the active cadence |
-| `ACTIVE_AGENT_COOLDOWN_SEC` | `300` | Minimum interval between model runs with an open/pending book or a recent event |
+| `FLAT_BACKOFF_MAX_MULTIPLIER` | `4` | Maximum power-of-two backoff for repeated idle-only no-action runs; price/lifecycle events remain responsive |
+| `ACTIVE_AGENT_COOLDOWN_SEC` | `300` | Minimum interval between model runs with exposed capital or a recent lifecycle/trigger event |
 | `AGENT_MAX_TURNS` | `20` | Max tool-call turns per run; a separate 20-minute wall-clock timeout revokes order authority |
 
 ### KuCoin
@@ -571,10 +571,10 @@ Each polling cycle (`POLL_INTERVAL_SEC` seconds):
 5. **Profit protection** -- Ratchets stops to breakeven and caps give-back on live futures positions (code-driven, independent of the agent)
 6. **Event tracking** -- Logs triggered futures TP/SL closes as decisions (with exit price, for the no-chase guard)
 7. **Circuit breakers** -- Checks drawdown and consecutive losses against thresholds
-8. **Agent run** -- If triggers exist or idle threshold reached, starts one non-blocking Trading Agent run. Flat hunting stays at `FLAT_AGENT_COOLDOWN_SEC` by default; optional no-action backoff is explicitly enabled with `FLAT_BACKOFF_MAX_MULTIPLIER > 1`. Pending atomic brackets use flat cadence and deterministic expiry rather than model babysitting
+8. **Agent run** -- If triggers exist or the idle threshold is reached, starts one non-blocking Trading Agent run. Idle-only no-action cycles back off automatically up to `FLAT_BACKOFF_MAX_MULTIPLIER`; price/fill/risk events stay responsive. A pending atomic entry suppresses idle hunting and is managed by its deterministic lease/expiry instead of model babysitting
 9. **Wait** -- Sleeps until next cycle
 
-Trigger types: `initial:SYMBOL` (new unreviewed symbol), `price_move:SYMBOL:X.XX%` (meaningful displacement from the last reviewed state), `idle_threshold` (scheduled review). Cadence, productivity, reviewed prices, and learned price noise persist across restarts in `agent_memory.json`; deterministic protection still runs every poll. Automatic volatility quarantines also expose adaptive retry times so Research does not repeatedly analyze the same invalid candidate.
+Trigger types: `initial:SYMBOL` (new unreviewed symbol), `price_move:SYMBOL:X.XX%` (meaningful displacement), `auto_trigger:SYMBOL:above|below:PRICE` (one-shot, expiring explicit level), and `idle_threshold` (scheduled review). Crossed explicit triggers are persisted as pending events before consumption, so a restart cannot lose them. Cadence, productivity, reviewed prices, and learned price noise persist across restarts in `agent_memory.json`; deterministic protection still runs every poll.
 
 Execution-quality metrics count a resting limit entry only when its recorded `clientOid` starts with `traide-entry-`. Market and reduce-only close order IDs are excluded from `limitFillRate`.
 

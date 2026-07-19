@@ -53,7 +53,7 @@ from .kucoin import (
   KucoinOrderRequest,
   KucoinTicker,
 )
-from .edge import adaptive_min_rr, edge_stats, loss_streak_size_factor, symbol_adaptive_rr, symbol_bench_until
+from .edge import expectancy_size_factor, edge_stats, loss_streak_size_factor, symbol_bench_until
 from .memory import MemoryStore
 from .protection import should_block_chase
 from .regime import (
@@ -525,7 +525,7 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
     "drawdownPctFutures": snapshot.drawdown_pct_futures,
     "totalUsdt": snapshot.total_usdt,
     "futuresPositions": snapshot.futures_positions,
-    "guidance": "If you place an order, prefer market orders sized in USDT funds.",
+    "guidance": "New exposure must use an atomic-bracket futures limit; market orders are close/emergency-only.",
     "stops": {
       "spot": snapshot.spot_stop_orders,
       "futures": snapshot.futures_stop_orders,
@@ -759,6 +759,8 @@ def run_trading_agent(
       "stats": {},
       "required_rr": cfg.trading.min_futures_rr,
       "size_factor": 1.0,
+      "direction_size_factor": {},
+      "symbol_size_factor": {},
       "bench": {},
     }
     try:
@@ -766,8 +768,18 @@ def run_trading_agent(
         closes = memory.realized_closes(limit=max(cfg.edge.lookback_trades * 2, 50))
         stats = edge_stats(closes, cfg.edge.lookback_trades)
         state["stats"] = stats
-        state["required_rr"] = adaptive_min_rr(stats, cfg.trading.min_futures_rr, cfg.edge)
+        # Keep targets structural. Stretching TP farther because old trades lost made fills/targets
+        # less reachable; weak evidence now adapts capital-at-risk instead (below).
+        state["required_rr"] = cfg.trading.min_futures_rr
         state["size_factor"] = loss_streak_size_factor(stats.get("loss_streak", 0), cfg.edge)
+        state["direction_size_factor"] = {
+          direction: expectancy_size_factor(stats, cfg.edge, direction=direction)
+          for direction in (stats.get("per_direction") or {})
+        }
+        state["symbol_size_factor"] = {
+          symbol: expectancy_size_factor(stats, cfg.edge, symbol=symbol)
+          for symbol in (stats.get("per_symbol") or {})
+        }
         bench: Dict[str, int] = {}
         now = int(time.time())
         for sym in {c.get("symbol") for c in closes if c.get("symbol")}:
@@ -775,13 +787,15 @@ def run_trading_agent(
           if until > now:
             bench[sym] = until
         state["bench"] = bench
-        if state["required_rr"] > cfg.trading.min_futures_rr:
-          logger.info("ADAPTIVE EDGE: rolling expectancy %.4f < 0 over %d closes — RR floor raised %.1f → %.1f",
-                      stats.get("expectancy", 0.0), stats.get("n", 0), cfg.trading.min_futures_rr, state["required_rr"])
         if bench:
           logger.info("ADAPTIVE EDGE: benched symbols: %s", ", ".join(f"{s} ({(u - now) / 3600:.1f}h left)" for s, u in bench.items()))
         if state["size_factor"] < 1.0:
           logger.info("ADAPTIVE EDGE: loss streak %d — entry size factor %.2f", stats.get("loss_streak", 0), state["size_factor"])
+        reduced_directions = {
+          key: value for key, value in state["direction_size_factor"].items() if value < 1.0
+        }
+        if reduced_directions:
+          logger.info("ADAPTIVE EDGE: negative direction expectancy — risk factors %s", reduced_directions)
     except Exception as exc:
       logger.warning("Adaptive edge computation failed (falling back to static guards): %s", exc)
     _edge_cache["v"] = state
@@ -1236,7 +1250,7 @@ def run_trading_agent(
     "- Treat this as higher quality only after volume confirmation; request normal size and let code-enforced risk/volatility limits size it.\n"
     "- REQUIRED CONFIRMATION: volume on the breakout candle ≥ 1.5× the 20-candle average. "
     "If volume is weak, decline_trade — false breakouts ('head fakes') are common.\n"
-    "- TP: use the nearest credible futures structural target that clears requiredRrBySymbol; a runner may extend "
+    "- TP: use the nearest credible futures structural target that clears edgeReport.baseRr after costs; a runner may extend "
     "toward 2-3× stop distance only when structure and volume support it. "
     "Squeezes resolve in extended moves; don't cap the target at the minimum reward:risk — let it run to 2-3×.\n"
     "- Daily exhaustion normally blocks continuation. Narrow exception: an exhausted-BEARISH daily may still take a "
@@ -1295,6 +1309,8 @@ def run_trading_agent(
     "For longs, prefer pullback entries when RSI < 40 or bullish divergence is present.\n"
     "- If current price is already at or through the optimal level, do not chase with a market order; wait for a "
     "valid pullback limit or decline the setup. Market tools remain close/emergency-only.\n"
+    "- A fresh breakout impulse is not executable as a passive entry here. Trade only its first confirmed retest/pullback "
+    "with an atomic bracket; do not simulate breakout execution by placing a wrong-side/marketable limit.\n"
     "- NEVER set entry_price at or worse than the current price for a new entry "
     "(do NOT short at current price when price just dumped — wait for the bounce to resistance).\n\n"
 
@@ -1333,16 +1349,16 @@ def run_trading_agent(
     "**TP/SL rules (mandatory on every new entry):**\n"
     "- Stop-loss: ATR-based (1.5–2.5x ATR from entry) OR 1.0–2.0% if ATR is unavailable. Place the SL where "
     "your thesis is invalidated, then control dollar risk with SIZE — NOT by widening the stop past the target.\n"
-    f"- Take-profit: {cfg.trading.min_futures_rr:.1f}R is only the base floor. Read edgeReport.requiredRrBySymbol; "
-    "the code HARD-REJECTS a futures entry below that symbol's current adaptive floor. The nearest realistic structural "
+    f"- Take-profit: {cfg.trading.min_futures_rr:.1f}R is the minimum POST-COST floor. Read edgeReport.baseRr; "
+    "the code HARD-REJECTS an entry whose reward/risk after estimated fees and slippage is below the floor. The nearest realistic structural "
     "target and true invalidation must naturally clear it. If they do not, SKIP — never distort either level to force a fill.\n"
     "- For FUTURES limit entries: ALWAYS pass BOTH take_profit_price and stop_loss_price in the SAME "
     "place_futures_limit_order call. They are attached to the order (KuCoin bracket) and arm the instant "
     "it fills — so decide entry + TP + SL together, up front. Do NOT defer protection to a later run; a "
     "fill between runs would otherwise sit unprotected. (Spot limit entries still bracket on the next run.)\n"
     + (
-    f"- FOR RANGE TRADES: TP toward the BB midline (mean), SL beyond the BB band. Still respect the adaptive "
-    f"requiredRrBySymbol floor (never below base {cfg.trading.min_futures_rr:.1f}R) — if the mean-reversion target is too close to justify the stop, "
+    f"- FOR RANGE TRADES: TP toward the BB midline (mean), SL beyond the BB band. Still respect the structural "
+    f"post-cost floor in edgeReport.baseRr (currently {cfg.trading.min_futures_rr:.1f}R) — if the mean-reversion target is too close to justify the stop, "
     "skip the trade. Never set a range trade TP beyond the opposite BB band.\n\n"
     if cfg.trading.range_trading_enabled else "\n") +
 
@@ -1396,6 +1412,8 @@ def run_trading_agent(
     "- When resuming from a Research Agent handoff, read researchContext (latestPlan/recentResearch) and act on findings.\n"
     "- Remove coins that have gone stale (no volatility, no catalyst, no edge) to keep the list focused. "
     "Use remove_coin with a documented reason.\n\n"
+    "- When flat and waiting for a precise price event, save a condition ('above'/'below') with set_auto_trigger and a "
+    "short expiry appropriate to the thesis. Never leave an intraday trigger alive for days.\n\n"
 
     "## CRITICAL — Handle rejections without brute-forcing them:\n"
     "Read the reason and reassess once. A risk, data-quality, cooldown, concentration, or edge rejection means rotate "
@@ -1412,6 +1430,9 @@ def run_trading_agent(
     "size, leverage, or risk solely to pass a minimum-profit check.\n"
     "- **Daily gate rejection**: the 1D trend opposes your trade direction. Do NOT retry the same direction — trade WITH the daily trend or move to another symbol.\n"
     "- **Trade interval cooldown**: you traded this symbol too recently. Move to another symbol or wait.\n\n"
+    "- **Pending atomic entry**: do not cancel/replace it before its deterministic lease expires merely because a later "
+    "model run calls it stale. Early cancellation is allowed only after a completed 1h/daily direction flip objectively "
+    "invalidates the thesis; code enforces this.\n\n"
     "**Multi-step execution is expected.** If you want to open a futures trade but funds are in spot:\n"
     "1. Sell an unneeded spot position (place_market_order with rationale 'portfolio review')\n"
     "2. Transfer the freed USDT to futures (transfer_funds)\n"
@@ -1501,15 +1522,16 @@ def run_trading_agent(
       "BTC daily, 'losers'/'short'; then deep-validate the top few with analyze_market_context + fetch_orderbook.\n"
       "- Do NOT stay anchored to BTC/ETH/SOL out of habit. If the scan surfaces a more liquid, cleaner setup "
       "(strong trend, catalyst, good structure) that clears the bars, ADD it for the Trading Agent to evaluate.\n"
-      "- You OWN the active coin list. Call list_coins to see it, then keep only the best qualified opportunities; a "
-      "narrow or unchanged list is correct when nothing new clears the quality bars:\n"
+      "- You OWN the active coin list. It is a watchlist, not a claim that every name is immediately enterable. Maintain "
+      "roughly 4-6 liquid, mature, structurally distinct candidates when the scan provides them, so one temporary timeframe "
+      "conflict cannot deadlock execution:\n"
       "  - add_coin(symbol, reason) for LIQUID, ESTABLISHED pairs with a real catalyst or strong technical setup. Verify liquidity with analyze_market_context/fetch_orderbook before adding.\n"
-      "  - remove_coin(symbol, reason, exit_plan) for stale symbols: no volatility, no catalyst, repeated losses, or chronically blocked by the daily/regime gates.\n"
+      "  - remove_coin(symbol, reason, exit_plan) for structural problems: lost liquidity, invalid data, repeated losses, or a stale multi-day thesis. Do not remove a sound liquid candidate solely for a temporary 15m/1h disagreement.\n"
       "- HARD QUALITY BARS for any coin you add (they mirror code-level gates — adding a coin that violates them just wastes the Trading Agent's run):\n"
       "  * LIQUIDITY: deep book + meaningful 24h volume. Reject thin micro-caps.\n"
       "  * MATURITY: do NOT add freshly-listed perpetuals (< ~7 days old). New listings are thin and swing 50-100% intraday — exactly how the RE-USDT position blew up.\n"
       "  * CORRELATION: when BTC's daily trend is bearish, do NOT add altcoins as LONG candidates (alts are high-beta to BTC; longing them into a BTC downtrend loses). Surface only SHORT candidates or majors in a bearish BTC regime.\n"
-      "- NEVER add a coin just to give the Trading Agent 'something to trade'. A narrow list with no setup is fine — standing aside beats forcing a low-quality trade.\n"
+      "- NEVER add a coin just to force a trade. A diversified watchlist may contain names waiting for confirmation; the Trading Agent still stands aside until one clears every gate.\n"
       "- When you are handed off because the Trading Agent is STUCK (declining run after run), prune the dead weight and add new opportunities ONLY if they clear every bar above; if nothing qualifies, say so plainly in your research note and hand back.\n"
       "- You must still NEVER place orders or set TP/SL — that is the Trading Agent's job. You only curate the list and log research.\n\n"
       "- Log findings via log_research (topic, summary, actions) so the main agent can decide.\n"
@@ -1623,31 +1645,32 @@ def run_trading_agent(
     _edge_now = _edge_state()
     _edge_stats_now = _edge_now.get("stats") or {}
     _per_sym = _edge_stats_now.get("per_symbol", {})
-    # Per-symbol RR floor: a losing symbol must clear a higher bar; fresh/winning ones stay at base.
-    _rr_by_symbol = {s: symbol_adaptive_rr(s, _edge_stats_now, cfg.trading.min_futures_rr, cfg.edge) for s in _per_sym}
-    # Realized reward:risk actually achieved vs the RR you INTEND at entry. A big gap means your TPs
-    # aren't being reached — they're set too far for the tape while stops run full — so pull targets in.
+    # Realized reward:risk actually achieved vs the RR intended at entry. A gap is diagnostic of
+    # entry/management quality; it is not permission to compress a structural target.
     _aw = float(_edge_stats_now.get("avg_win") or 0.0)
     _al = abs(float(_edge_stats_now.get("avg_loss") or 0.0))
     _realized_rr = round(_aw / _al, 2) if _al > 0 else None
     user_state_obj["edgeReport"] = {
       "rolling": {k: _edge_stats_now.get(k) for k in ("n", "wins", "losses", "win_rate", "avg_win", "avg_loss", "payoff", "profit_factor", "net", "expectancy", "loss_streak")},
       "perSymbol": _per_sym,
-      "requiredRrBySymbol": _rr_by_symbol,
+      "perDirection": _edge_stats_now.get("per_direction", {}),
       "baseRr": cfg.trading.min_futures_rr,
       "realizedRewardRisk": _realized_rr,
       "entrySizeFactor": _edge_now.get("size_factor"),
+      "entrySizeFactorByDirection": _edge_now.get("direction_size_factor", {}),
+      "entrySizeFactorBySymbol": _edge_now.get("symbol_size_factor", {}),
       "benchedSymbols": {s: f"{max(0, u - int(time.time())) / 3600:.1f}h left" for s, u in (_edge_now.get("bench") or {}).items()},
       "note": (
-        "ENFORCED IN CODE this run, per symbol: a futures entry below that symbol's requiredRrBySymbol "
-        "is rejected, benched symbols are rejected outright, and entry size is scaled by entrySizeFactor. "
-        "The RR floor and bench are SYMBOL-SPECIFIC — a symbol you keep losing on (negative net in perSymbol) "
-        "must clear a higher bar and gets rested longer, while fresh names default to baseRr. So DIVERSIFY: "
+        "ENFORCED IN CODE this run: the structural net reward:risk floor is checked after "
+        "estimated fees and slippage, benched symbols are rejected, and risk is scaled by loss streak plus "
+        "long/short and symbol expectancy factors. "
+        "The RR floor stays structural rather than moving targets farther away after losses. The bench and risk "
+        "scaling are SYMBOL-SPECIFIC — a symbol you keep losing on gets smaller and rests longer. So DIVERSIFY: "
         "rotate off losing/benched symbols toward the liquid movers scan_futures_market surfaces. "
         "REALITY CHECK: realizedRewardRisk is what your closed trades ACTUALLY achieved (avg win / avg loss), but "
         "a gap from planned RR is diagnostic rather than an instruction to compress every bracket. Select entries where "
         "the nearest reachable structural target (VWAP, POC, prior swing, band mid) and the true invalidation naturally "
-        "clear requiredRrBySymbol. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor."
+        "clear edgeReport.baseRr after costs. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor."
       ),
     }
   except Exception as _edge_exc:
@@ -1661,11 +1684,13 @@ def run_trading_agent(
       events["futuresFills"] = recent_fills["futures_fills"]
     if recent_fills.get("closed_positions"):
       events["closedPositions"] = recent_fills["closed_positions"]
+    if recent_fills.get("auto_triggers"):
+      events["autoTriggers"] = recent_fills["auto_triggers"]
     if events:
       user_state_obj["recentEvents"] = events
       user_state_obj["recentEventsNote"] = (
-        "NEW since last round: orders were filled or positions were closed "
-        "(likely by triggered TP/SL). Review the PnL and adjust your strategy accordingly."
+        "NEW since last round: an order/position lifecycle event or an explicit price trigger fired. "
+        "Re-check live structure before acting; a trigger invites evaluation and never bypasses risk gates."
       )
 
   # Detect stale/ineffective stop orders
@@ -1790,6 +1815,8 @@ def run_trading_agent(
       return None
     if output.get("skipped"):
       return f"decline: {output.get('reason','unspecified')} (conf={output.get('confidence')})"
+    if output.get("cancelled"):
+      return f"cancelled order: {output.get('orderId') or output.get('symbol') or 'unknown'}"
     if output.get("paper") and output.get("orderRequest"):
       req = output.get("orderRequest", {})
       rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")

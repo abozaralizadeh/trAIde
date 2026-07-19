@@ -107,6 +107,33 @@ def test_short_breakeven_symmetry():
     assert d["stopPrice"] == 100.0 * (1 - 0.0015)  # below entry for a short
 
 
+def test_manager_breakeven_buffer_covers_configured_roundtrip_cost():
+    mgr = ProtectionManager(
+        _cfg(breakeven_fee_pct=0.0015), None, breakeven_cost_pct=0.0032,
+    )
+    assert mgr.cfg.breakeven_fee_pct == pytest.approx(0.0032)
+
+
+def test_manager_does_not_apply_exchange_age_without_persisted_peak():
+    mgr = ProtectionManager(_cfg(), None)
+    snapshot = SimpleNamespace(
+        futures_enabled=True,
+        futures_account={"accountEquity": 1000},
+        futures_positions=[{
+            "symbol": "ETHUSDTM", "currentQty": 1, "avgEntryPrice": 100,
+            "markPrice": 96.5, "unrealisedPnl": -3.5,
+            "openingTimestamp": int((time.time() - 3600) * 1000),
+        }],
+        futures_stop_orders=[{
+            "symbol": "ETHUSDTM", "side": "sell", "stop": "down",
+            "stopPrice": 95, "reduceOnly": True,
+        }],
+        total_usdt=1000,
+    )
+    # First post-restart observation has no trustworthy historical MFE, so early-cut must wait.
+    assert mgr.run(snapshot) == []
+
+
 # ── decide_protection: give-back cap ─────────────────────────────────────────────
 
 

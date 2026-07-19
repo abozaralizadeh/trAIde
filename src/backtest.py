@@ -7,7 +7,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from .analytics import candles_to_dataframe, compute_indicators
+from .analytics import INTERVAL_SECONDS, candles_to_dataframe, compute_indicators
 from .config import load_config
 from .kucoin import KucoinClient
 
@@ -66,9 +66,10 @@ def _simulate(df: pd.DataFrame, params: Dict[str, float]) -> BacktestResult:
       exit_reason = None
       exit_price = price
       if hit_stop and hit_target:
-        # Favor target first when both touched; adjust if desired
-        exit_reason = "both-hit-target-priority"
-        exit_price = position["target"]
+        # OHLC bars do not reveal intrabar ordering.  Resolve the ambiguity
+        # conservatively so the backtest cannot manufacture target-first wins.
+        exit_reason = "both-hit-stop-priority"
+        exit_price = position["stop"]
       elif hit_target:
         exit_reason = "target"
         exit_price = position["target"]
@@ -125,14 +126,32 @@ def _simulate(df: pd.DataFrame, params: Dict[str, float]) -> BacktestResult:
   )
 
 
+def _lookback_points(interval: str, lookback_hours: int) -> int:
+  if interval not in INTERVAL_SECONDS:
+    raise ValueError(f"Unsupported candle interval: {interval}")
+  return min(500, max(50, int(lookback_hours * 3600 / INTERVAL_SECONDS[interval])))
+
+
+def _prepare_backtest_frame(
+  data: Sequence[Sequence[object]],
+  interval: str,
+  points: int,
+  *,
+  as_of: object | None = None,
+) -> pd.DataFrame:
+  """Sort exchange-newest-first candles, remove the repainting bar, then take the latest window."""
+  frame = candles_to_dataframe(data, interval=interval, as_of=as_of, closed_only=True)
+  return frame.iloc[-max(1, int(points)):].reset_index(drop=True)
+
+
 def run_backtest(symbol: str, interval: str = "1hour", lookback_hours: int = 240, **params: float) -> BacktestResult:
   cfg = load_config()
   client = KucoinClient(cfg)
-  points = min(500, max(50, int(lookback_hours * 3600 / 3600)))  # coarse bound
+  points = _lookback_points(interval, lookback_hours)
   data = client.get_candles(symbol, interval=interval, start_at=None, end_at=None)
   if not data:
     raise RuntimeError("No candles returned for backtest.")
-  df = candles_to_dataframe(data[-points:])
+  df = _prepare_backtest_frame(data, interval, points)
   return _simulate(df, params)
 
 
@@ -148,11 +167,11 @@ def run_sweep(
 ) -> List[Tuple[Dict[str, float], BacktestResult]]:
   cfg = load_config()
   client = KucoinClient(cfg)
-  points = min(500, max(50, int(lookback_hours * 3600 / 3600)))
+  points = _lookback_points(interval, lookback_hours)
   data = client.get_candles(symbol, interval=interval, start_at=None, end_at=None)
   if not data:
     raise RuntimeError("No candles returned for sweep.")
-  df = candles_to_dataframe(data[-points:])
+  df = _prepare_backtest_frame(data, interval, points)
 
   results: List[Tuple[Dict[str, float], BacktestResult]] = []
   for brsi, stopm, targm, macd in product(buy_rsi, stop_atr_mult, target_atr_mult, min_macd_hist):

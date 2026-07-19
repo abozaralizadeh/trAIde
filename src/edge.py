@@ -8,9 +8,12 @@ so the bot tightens up when it is losing and relaxes back when it is earning —
 human re-tuning:
 
   - edge_stats:               rolling win rate / payoff / expectancy / loss streak / per-symbol PnL
-  - adaptive_min_rr:          raise the futures reward:risk floor while expectancy is negative
+  - expectancy_size_factor:  shrink risk for a losing direction or symbol
   - symbol_bench_until:       bench a symbol that keeps losing (auto-lifts after a cooldown)
   - loss_streak_size_factor:  shrink size during a losing streak (anti-martingale)
+
+The older adaptive RR helpers remain for compatibility and offline comparisons, but the live
+entry path deliberately keeps targets structural and adapts capital at risk instead.
 
 Everything is a pure function over realized-close dicts ({symbol, pnl, ts, closeType}),
 unit-tested in tests/test_edge.py. Call sites live in src/agent.py; config in EdgeConfig.
@@ -18,6 +21,7 @@ unit-tested in tests/test_edge.py. Call sites live in src/agent.py; config in Ed
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Dict, List
 
@@ -31,6 +35,23 @@ def _f(value: Any) -> float | None:
     return float(value)
   except (TypeError, ValueError):
     return None
+
+
+def _position_side(close: Dict[str, Any]) -> str | None:
+  explicit = str(close.get("positionSide") or "").strip().lower()
+  if explicit in {"long", "short"}:
+    return explicit
+  close_type = str(close.get("closeType") or "").upper()
+  if "LONG" in close_type:
+    return "long"
+  if "SHORT" in close_type:
+    return "short"
+  action = str(close.get("action") or "").lower()
+  if action.startswith("futures_sell"):
+    return "long"
+  if action.startswith("futures_buy"):
+    return "short"
+  return None
 
 
 def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
@@ -58,14 +79,49 @@ def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
       break
 
   per_symbol: Dict[str, Dict[str, Any]] = {}
+  per_direction: Dict[str, Dict[str, Any]] = {}
   for c in window:
+    pnl = float(c["pnl"])
     sym = str(c.get("symbol") or "?")
-    row = per_symbol.setdefault(sym, {"n": 0, "net": 0.0, "losses": 0, "last_close_ts": 0})
+    row = per_symbol.setdefault(
+      sym,
+      {"n": 0, "net": 0.0, "losses": 0, "r_n": 0, "r_net": 0.0, "last_close_ts": 0},
+    )
     row["n"] += 1
-    row["net"] = round(row["net"] + float(c["pnl"]), 6)
+    row["net"] = round(row["net"] + pnl, 6)
     row["last_close_ts"] = int(c.get("ts") or 0)
-    if float(c["pnl"]) < 0:
+    if pnl < 0:
       row["losses"] += 1
+    realized_r = _f(c.get("realizedR"))
+    if realized_r is not None and math.isfinite(realized_r):
+      row["r_n"] += 1
+      row["r_net"] = round(row["r_net"] + realized_r, 6)
+    direction = _position_side(c)
+    if direction:
+      drow = per_direction.setdefault(
+        direction,
+        {
+          "n": 0, "net": 0.0, "wins": 0, "losses": 0,
+          "r_n": 0, "r_net": 0.0, "last_close_ts": 0,
+        },
+      )
+      drow["n"] += 1
+      drow["net"] = round(drow["net"] + pnl, 6)
+      drow["last_close_ts"] = int(c.get("ts") or 0)
+      if pnl > 0:
+        drow["wins"] += 1
+      elif pnl < 0:
+        drow["losses"] += 1
+      if realized_r is not None and math.isfinite(realized_r):
+        drow["r_n"] += 1
+        drow["r_net"] = round(drow["r_net"] + realized_r, 6)
+
+  for row in list(per_symbol.values()) + list(per_direction.values()):
+    row["r_expectancy"] = round(row["r_net"] / row["r_n"], 5) if row["r_n"] else None
+  for row in per_direction.values():
+    row["expectancy"] = round(row["net"] / row["n"], 5) if row["n"] else 0.0
+    decided_count = row["wins"] + row["losses"]
+    row["win_rate"] = round(row["wins"] / decided_count, 3) if decided_count else 0.0
 
   win_rate = (len(wins) / decided) if decided else 0.0
   avg_win = (gross_win / len(wins)) if wins else 0.0
@@ -85,7 +141,52 @@ def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
     "loss_streak": streak,
     "last_close_ts": last_close_ts,
     "per_symbol": per_symbol,
+    "per_direction": per_direction,
   }
+
+
+def expectancy_size_factor(
+  stats: Dict[str, Any],
+  cfg: EdgeConfig,
+  *,
+  direction: str | None = None,
+  symbol: str | None = None,
+) -> float:
+  """Risk multiplier for a losing evidence bucket; it never increases configured risk.
+
+  Target stretching is a poor response to weak realized results because it can make take-profits
+  less reachable. This controller instead keeps structural targets intact and reduces capital at
+  risk until the relevant long/short or symbol bucket recovers. Insufficient samples stay at full
+  configured risk rather than pretending a tiny sample is conclusive.
+  """
+  if not cfg.enabled:
+    return 1.0
+  row: Dict[str, Any] | None
+  minimum = max(1, int(cfg.direction_min_trades))
+  if symbol:
+    row = (stats.get("per_symbol") or {}).get(symbol)
+    minimum = max(minimum, int(cfg.symbol_rr_min_trades))
+  elif direction:
+    row = (stats.get("per_direction") or {}).get(str(direction).lower())
+  else:
+    row = stats
+    minimum = max(minimum, int(cfg.min_trades))
+  if not row:
+    return 1.0
+  # Realized R makes outcomes comparable across notionals. During migration, fall back to legacy
+  # dollar PnL until a full attributed sample exists; never mix dollars and R in one estimate.
+  r_count = int(row.get("r_n") or 0)
+  if r_count >= minimum:
+    count = r_count
+    outcome = float(row.get("r_net") or 0.0)
+  else:
+    count = int(row.get("n") or 0)
+    outcome = float(row.get("net") or 0.0)
+  if count < minimum:
+    return 1.0
+  if outcome < 0:
+    return min(1.0, max(0.0, float(cfg.negative_expectancy_size_factor)))
+  return 1.0
 
 
 def adaptive_min_rr(stats: Dict[str, Any], base_rr: float, cfg: EdgeConfig, now: float | None = None) -> float:
