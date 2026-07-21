@@ -189,3 +189,8 @@ cython_debug/
 .env.local
 .claude
 .env.backup
+
+.supervisor_conversation.json
+traide.log.1
+traide.log.2
+traide.log.3
