@@ -239,6 +239,51 @@ def run_supervisor_agent(
     return result
 
   @function_tool
+  async def get_open_orders(symbol: str | None = None) -> Dict[str, Any]:
+    """List LIVE resting (unfilled) orders on the exchange — futures + spot — straight from KuCoin.
+
+    Use this to answer "is there still a pending/limit order for X?" A resting limit entry is NOT a
+    position and NOT a fill, so get_positions/get_recent_fills will not show it — check HERE. Bot-placed
+    entries are tagged `botEntry` (clientOid starts with 'traide-entry-'). If this returns no order for a
+    symbol, there is genuinely no resting order for it, regardless of what the last recorded decision said
+    (a 'hold_pending' decision can predate the order expiring via its TTL — reconcile against this tool,
+    which is the live source of truth, not the decision feed)."""
+    result: Dict[str, Any] = {}
+
+    def _shape(o: Dict[str, Any]) -> Dict[str, Any]:
+      coid = str(o.get("clientOid") or "")
+      return {
+        "symbol": o.get("symbol"),
+        "side": o.get("side"),
+        "type": o.get("type"),
+        "price": o.get("price"),
+        "size": o.get("size"),
+        "orderId": o.get("id") or o.get("orderId"),
+        "reduceOnly": bool(o.get("reduceOnly")) or bool(o.get("closeOrder")),
+        "botEntry": coid.startswith("traide-entry-"),
+        "createdAt": o.get("createdAt") or o.get("orderTime") or o.get("ts"),
+      }
+
+    if kucoin_futures:
+      try:
+        fo = kucoin_futures.list_orders(status="active", symbol=symbol) or []
+        result["futuresOpenOrders"] = [_shape(o) for o in fo if isinstance(o, dict)]
+      except Exception as exc:
+        result["futuresOpenOrdersError"] = str(exc)
+    if kucoin:
+      try:
+        so = kucoin.list_orders(status="active", symbol=symbol) or []
+        result["spotOpenOrders"] = [_shape(o) for o in so if isinstance(o, dict)]
+      except Exception as exc:
+        result["spotOpenOrdersError"] = str(exc)
+    result["note"] = (
+      "Live resting orders only. Empty lists = no pending orders (any prior 'hold_pending' decision is "
+      "stale and the order has filled or expired). orderMargin in the futures overview reflects margin "
+      "reserved for these resting orders."
+    )
+    return result
+
+  @function_tool
   async def get_closed_positions(symbol: str | None = None) -> Dict[str, Any]:
     """Get closed futures positions with realized PnL (TP/SL triggered, manual close, liquidation)."""
     if not kucoin_futures:
@@ -342,6 +387,7 @@ def run_supervisor_agent(
     "- Read source code files\n"
     "- View non-secret configuration\n"
     "- Fetch live KuCoin account balances and positions\n"
+    "- List live resting/open orders (get_open_orders) — use this for any 'is there a pending/limit order?' question\n"
     "- View recent trade fills and closed futures positions with realized PnL\n"
     "- Write notes to the trading agent:\n"
     "  - **Temporary notes**: read once by the trading agent on its next run, then auto-deleted\n"
@@ -350,6 +396,10 @@ def run_supervisor_agent(
     "## Guidelines:\n"
     "- Keep responses concise — Telegram messages are limited to 4096 characters.\n"
     "- When asked about status, positions, or performance, always use the appropriate tools to fetch live data.\n"
+    "- A resting limit order is NOT a position or a fill. To confirm whether a pending/limit order still "
+    "exists, call get_open_orders (the live source of truth) — do NOT infer it from get_positions, "
+    "get_recent_fills, orderMargin, or a stale 'hold_pending' decision. A 'hold_pending' decision can predate "
+    "the order expiring via its TTL, so reconcile it against get_open_orders before reporting.\n"
     "- You cannot place trades directly. Use notes to influence the trading agent's behavior.\n"
     "- If asked to analyze something, use the available tools to gather data first, then provide your analysis.\n"
     "- You have conversation memory. Use prior context when relevant, but always fetch fresh data via tools.\n\n"
@@ -386,6 +436,7 @@ def run_supervisor_agent(
       list_source_files,
       get_config_summary,
       get_account_snapshot,
+      get_open_orders,
       get_recent_fills,
       get_closed_positions,
       fetch_funding_rate,
