@@ -1342,7 +1342,15 @@ def run_trading_agent(
     "- Ask yourself: 'If I get filled here, where is price most likely to go FIRST — toward my target, or back to the "
     "value zone where I could have entered cheaper?' If the honest answer is 'back to value', place the limit there.\n"
     "- This is your judgement, not a code rule: there is NO hard extension block. Own the entry-timing decision and "
-    "state your target arrival price and why it is the highest-EV point.\n\n"
+    "state your target arrival price and why it is the highest-EV point.\n"
+    "- STRONG TREND THAT WON'T PULL BACK (the ONDO case): a pullback entry is only higher-EV if the pullback actually "
+    "arrives. On a confirmed strong-trend leader that keeps running without retracing — you see repeated `entryExpiries` "
+    "on it, and/or price sustains 1-2 ATR beyond the level without a deep pullback — 'wait for the pullback' has become "
+    "'miss the whole move'. Resolve it the way desks do: SCALE IN. Take a REDUCED-SIZE (e.g. ~40-60%) bracketed "
+    "marketable CONTINUATION entry now so you participate, then add the remainder on a shallow flag/consolidation "
+    "pullback if one appears. Do NOT re-place the same never-filling pullback limit run after run — either take the "
+    "reduced continuation or explicitly stand down and rotate to a leader that IS offering a clean entry. Keep this "
+    "gated to an intact trend (daily+intraday aligned); a weakening/rolling-over trend gets no continuation chase.\n\n"
 
     "**Entry signal — trade when the 1h trend_bias is clear (bullish or bearish):**\n"
     "- Strong setup (request normal risk size): 1h AND 15m both agree on direction, RSI 40–65, MACD confirms; "
@@ -1733,11 +1741,27 @@ def run_trading_agent(
       events["closedPositions"] = recent_fills["closed_positions"]
     if recent_fills.get("auto_triggers"):
       events["autoTriggers"] = recent_fills["auto_triggers"]
+    if recent_fills.get("entry_expired"):
+      events["entryExpiries"] = recent_fills["entry_expired"]
     if events:
       user_state_obj["recentEvents"] = events
+      _expiry_note = ""
+      _expiries = events.get("entryExpiries") or []
+      if _expiries:
+        from collections import Counter as _Counter
+        _by_sym = _Counter(str(e.get("symbol") or "?") for e in _expiries if isinstance(e, dict))
+        _worst = _by_sym.most_common(1)[0] if _by_sym else None
+        _expiry_note = (
+          " entryExpiries lists your OWN limit entries that expired UNFILLED since last round"
+          + (f" ({_worst[0]} ×{_worst[1]})" if _worst else "")
+          + " — a resting pullback limit that keeps expiring on a still-trending leader means the "
+            "pullback is not coming: do NOT just re-place the same never-filling limit; take a "
+            "reduced-size bracketed marketable CONTINUATION entry or stand down and rotate."
+        )
       user_state_obj["recentEventsNote"] = (
         "NEW since last round: an order/position lifecycle event or an explicit price trigger fired. "
         "Re-check live structure before acting; a trigger invites evaluation and never bypasses risk gates."
+        + _expiry_note
       )
 
   # Detect stale/ineffective stop orders
