@@ -145,6 +145,65 @@ def edge_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
   }
 
 
+def entry_quality_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str, Any]:
+  """Post-trade ENTRY-QUALITY aggregation over recent closes — decision-support, never a gate.
+
+  For each close, from data already recorded, it derives:
+    - mae_r:   max adverse excursion in R = |troughPnl| / planned risk — how far price went AGAINST the
+               entry before the trade worked. A high value means a better arrival price was available
+               (the pullback), i.e. the entry was early/chased.
+    - mfe_r:   max favorable excursion in R = peakPnl / planned risk.
+    - entry_extension_atr: how stretched the entry was vs the 15m VWAP at fill (stamped in entryContext).
+
+  These are fed back to the model so it sharpens its own entry timing (rest the limit at the pullback
+  when recent entries show high adverse excursion / high extension). It imposes NO restriction: entry
+  timing stays the model's judgement and improves as the model improves. Zeroed when no usable sample.
+  """
+  usable: List[Dict[str, Any]] = []
+  for c in closes or []:
+    ctx = c.get("entryContext") if isinstance(c.get("entryContext"), dict) else {}
+    planned_risk = _f(ctx.get("plannedMaxLossUsd"))
+    trough = _f(c.get("troughPnl"))
+    if planned_risk is None or planned_risk <= 0 or trough is None:
+      continue
+    peak = _f(c.get("peakPnl"))
+    mae_r = max(0.0, -trough) / planned_risk
+    mfe_r = (max(0.0, peak) / planned_risk) if peak is not None else None
+    realized_r = _f(c.get("realizedR"))
+    ext = _f(ctx.get("entryExtensionAtr"))
+    usable.append({
+      "ts": c.get("ts") or 0,
+      "symbol": c.get("symbol"),
+      "mae_r": round(mae_r, 3),
+      "mfe_r": round(mfe_r, 3) if mfe_r is not None else None,
+      "realized_r": round(realized_r, 3) if realized_r is not None else None,
+      "entry_extension_atr": round(ext, 2) if ext is not None else None,
+    })
+  usable.sort(key=lambda r: r["ts"])
+  window = usable[-max(1, int(lookback)):] if usable else []
+  if not window:
+    return {"n": 0}
+
+  def _avg(vals: List[float]) -> float | None:
+    vals = [v for v in vals if v is not None]
+    return round(sum(vals) / len(vals), 3) if vals else None
+
+  mae_vals = [r["mae_r"] for r in window]
+  ext_vals = [r["entry_extension_atr"] for r in window if r["entry_extension_atr"] is not None]
+  # "Better entry was available" = the trade dipped a meaningful fraction of its risk against the fill
+  # before working; a purely descriptive label (not a threshold that blocks anything).
+  better_entry = [r for r in window if r["mae_r"] >= 0.5]
+  worst = max(window, key=lambda r: r["mae_r"]) if window else None
+  return {
+    "n": len(window),
+    "avg_mae_r": _avg(mae_vals),
+    "avg_mfe_r": _avg([r["mfe_r"] for r in window]),
+    "avg_entry_extension_atr": _avg(ext_vals) if ext_vals else None,
+    "better_entry_rate": round(len(better_entry) / len(window), 3),
+    "worst_entry": {"symbol": worst["symbol"], "mae_r": worst["mae_r"], "entry_extension_atr": worst["entry_extension_atr"]} if worst else None,
+  }
+
+
 def expectancy_size_factor(
   stats: Dict[str, Any],
   cfg: EdgeConfig,

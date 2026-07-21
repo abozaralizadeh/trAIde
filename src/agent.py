@@ -53,7 +53,7 @@ from .kucoin import (
   KucoinOrderRequest,
   KucoinTicker,
 )
-from .edge import expectancy_size_factor, edge_stats, loss_streak_size_factor, symbol_bench_until
+from .edge import expectancy_size_factor, edge_stats, entry_quality_stats, loss_streak_size_factor, symbol_bench_until
 from .memory import MemoryStore
 from .protection import should_block_chase
 from .regime import (
@@ -768,6 +768,8 @@ def run_trading_agent(
         closes = memory.realized_closes(limit=max(cfg.edge.lookback_trades * 2, 50))
         stats = edge_stats(closes, cfg.edge.lookback_trades)
         state["stats"] = stats
+        # Post-trade entry-quality feedback (decision-support the agent reflects on; not a gate).
+        state["entry_quality"] = entry_quality_stats(closes, cfg.edge.lookback_trades)
         # Keep targets structural. Stretching TP farther because old trades lost made fills/targets
         # less reachable; weak evidence now adapts capital-at-risk instead (below).
         state["required_rr"] = cfg.trading.min_futures_rr
@@ -1691,6 +1693,17 @@ def run_trading_agent(
       "entrySizeFactorByDirection": _edge_now.get("direction_size_factor", {}),
       "entrySizeFactorBySymbol": _edge_now.get("symbol_size_factor", {}),
       "benchedSymbols": {s: f"{max(0, u - int(time.time())) / 3600:.1f}h left" for s, u in (_edge_now.get("bench") or {}).items()},
+      # Post-trade ENTRY-QUALITY feedback: learn from your own fills. avgMaeR = how far price typically
+      # went AGAINST your entries before they worked (in R); avgEntryExtensionAtr = how stretched your
+      # entries were vs the 15m VWAP. This is a mirror, not a rule — use it to sharpen arrival timing.
+      "entryQuality": {
+        "n": (_edge_now.get("entry_quality") or {}).get("n", 0),
+        "avgMaeR": (_edge_now.get("entry_quality") or {}).get("avg_mae_r"),
+        "avgMfeR": (_edge_now.get("entry_quality") or {}).get("avg_mfe_r"),
+        "avgEntryExtensionAtr": (_edge_now.get("entry_quality") or {}).get("avg_entry_extension_atr"),
+        "betterEntryRate": (_edge_now.get("entry_quality") or {}).get("better_entry_rate"),
+        "worstEntry": (_edge_now.get("entry_quality") or {}).get("worst_entry"),
+      },
       "note": (
         "ENFORCED IN CODE this run: the structural net reward:risk floor is checked after "
         "estimated fees and slippage, benched symbols are rejected, and risk is scaled by loss streak plus "
@@ -1701,7 +1714,10 @@ def run_trading_agent(
         "REALITY CHECK: realizedRewardRisk is what your closed trades ACTUALLY achieved (avg win / avg loss), but "
         "a gap from planned RR is diagnostic rather than an instruction to compress every bracket. Select entries where "
         "the nearest reachable structural target (VWAP, POC, prior swing, band mid) and the true invalidation naturally "
-        "clear edgeReport.baseRr after costs. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor."
+        "clear edgeReport.baseRr after costs. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor. "
+        "ENTRY-QUALITY LEARNING: if entryQuality.avgMaeR is high (say > ~0.5R) or avgEntryExtensionAtr is high, your "
+        "recent entries were CHASING — price kept dipping back to a better price after you filled. Respond by resting "
+        "limits at the pullback/retest anchors in entryMap rather than filling at the current stretched price."
       ),
     }
   except Exception as _edge_exc:

@@ -1,9 +1,12 @@
 """Tests for the adaptive edge controller (src/edge.py) and the close-dedup data hygiene."""
 
+import pytest
+
 from src.config import EdgeConfig
 from src.edge import (
     adaptive_min_rr,
     edge_stats,
+    entry_quality_stats,
     expectancy_size_factor,
     loss_streak_size_factor,
     symbol_adaptive_rr,
@@ -302,3 +305,54 @@ def test_open_interest_trend_uses_aged_observation(tmp_path):
     assert observed["changePct"] == 10.0
     assert observed["priceTrend"] == "up"
     assert observed["priceChangePct"] == 2.0
+
+
+# ── entry_quality_stats: post-trade entry-timing feedback (decision-support, not a gate) ──
+
+
+def _qclose(symbol, pnl, planned_risk, trough, peak, ext=None, realized_r=None, ts=0):
+    ctx = {"plannedMaxLossUsd": planned_risk}
+    if ext is not None:
+        ctx["entryExtensionAtr"] = ext
+    d = {"symbol": symbol, "pnl": pnl, "troughPnl": trough, "peakPnl": peak, "entryContext": ctx, "ts": ts}
+    if realized_r is not None:
+        d["realizedR"] = realized_r
+    return d
+
+
+def test_entry_quality_flags_chased_entries():
+    # Two entries that each dipped ~0.8R against the fill before working → high MAE, "better entry" flagged.
+    closes = [
+        _qclose("ONDO-USDT", pnl=0.5, planned_risk=1.0, trough=-0.8, peak=1.2, ext=6.0, realized_r=0.5, ts=1),
+        _qclose("SOL-USDT", pnl=0.4, planned_risk=1.0, trough=-0.9, peak=1.0, ext=3.0, realized_r=0.4, ts=2),
+    ]
+    s = entry_quality_stats(closes, lookback=30)
+    assert s["n"] == 2
+    assert s["avg_mae_r"] == pytest.approx(0.85)
+    assert s["better_entry_rate"] == pytest.approx(1.0)      # both dipped >= 0.5R
+    assert s["avg_entry_extension_atr"] == pytest.approx(4.5)
+    assert s["worst_entry"]["symbol"] == "SOL-USDT"          # deepest adverse excursion
+
+
+def test_entry_quality_clean_entries_have_low_mae():
+    # Entries that barely went against the fill (well-timed) → low MAE, nothing flagged.
+    closes = [
+        _qclose("ADA-USDT", pnl=1.0, planned_risk=1.0, trough=-0.1, peak=1.5, ext=0.5, ts=1),
+        _qclose("ADA-USDT", pnl=1.2, planned_risk=1.0, trough=0.0, peak=1.6, ext=-0.2, ts=2),
+    ]
+    s = entry_quality_stats(closes, lookback=30)
+    assert s["avg_mae_r"] == pytest.approx(0.05)
+    assert s["better_entry_rate"] == pytest.approx(0.0)
+
+
+def test_entry_quality_skips_rows_without_risk_or_trough():
+    # No planned risk or no trough → not usable; empty sample returns {n: 0}.
+    assert entry_quality_stats([{"symbol": "X", "pnl": 1.0}], lookback=30) == {"n": 0}
+    assert entry_quality_stats([], lookback=30) == {"n": 0}
+
+
+def test_entry_quality_extension_optional():
+    # Missing entryExtensionAtr on all rows → avg is None but MAE stats still compute.
+    closes = [_qclose("X-USDT", pnl=0.5, planned_risk=1.0, trough=-0.3, peak=0.8, ts=1)]
+    s = entry_quality_stats(closes, lookback=30)
+    assert s["n"] == 1 and s["avg_entry_extension_atr"] is None and s["avg_mae_r"] == pytest.approx(0.3)
