@@ -69,6 +69,37 @@ def conviction_size_factor(confidence, min_confidence, cfg: RegimeConfig) -> flo
   return min_factor + frac * (1.0 - min_factor)
 
 
+def combined_size_factor(factors, floor: float = 0.5) -> float:
+  """Combine soft position-size multipliers by taking the WORST single signal, not their product.
+
+  The old admission path multiplied regime × relative-strength × conviction × loss-streak ×
+  expectancy into one running scale. Each is an independent "be a bit cautious" read of 0.5-0.6,
+  so five of them compounded a 1% risk budget down to ~0.03% — every position became fee-dust that
+  could not clear round-trip costs even when the trade was right (the account's small wins / big
+  losses shape). Taking the minimum applies only the single most cautious signal, floored so a real
+  edge is still sized to matter. Hard dollar-risk caps (ATR, risk budget, concentration, heat) are
+  applied separately downstream and still shrink from here — this only governs the *soft* stack.
+
+  ``factors`` may contain ``None`` (ignored). Each is clamped to [0, 1]. Empty → 1.0 (no shrink).
+  ``floor`` bounds the combined result from below (1.0 disables soft shrink entirely).
+  """
+  vals = []
+  for f in factors or ():
+    try:
+      if f is None:
+        continue
+      vals.append(min(1.0, max(0.0, float(f))))
+    except (TypeError, ValueError):
+      continue
+  if not vals:
+    return 1.0
+  try:
+    lo = min(1.0, max(0.0, float(floor)))
+  except (TypeError, ValueError):
+    lo = 0.0
+  return max(lo, min(vals))
+
+
 def resolve_gate_deadlock(
   *,
   daily_bias: str,

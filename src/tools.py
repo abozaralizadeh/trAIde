@@ -40,6 +40,7 @@ from .regime import (
   add_on_guard_reason,
   block_alt_long_in_btc_downtrend,
   bracket_risk_scale,
+  combined_size_factor,
   concentration_scale,
   conviction_size_factor,
   effective_min_confidence,
@@ -2226,8 +2227,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         logger.warning("SYMBOL BENCH BLOCK: %s %s rejected — repeated recent losses, benched %.1fh more", side, spot_symbol, _bench_hours)
         return {"rejected": True, "reason": f"Symbol benched: {spot_symbol} lost repeatedly in its recent closes — no entries for {_bench_hours:.1f}h more", "symbol": spot_symbol, "hint": "This symbol keeps stopping out; the setup that looks compliant is not working in the current tape. Trade a different symbol or stand aside — the bench lifts automatically."}
 
-    # Volatility filter: soft-scale position below 1.5× threshold; hard-block above
-    _atr_scale_fm = 1.0
+    # Volatility scale (hard risk adjustment, linear): a high-ATR name gets a wider stop that the
+    # risk budget already sizes down, so squaring the penalty double-counted it and made the market's
+    # strongest movers untradeable at meaningful size exactly when trending. Keep a gentle linear
+    # taper past the soft cap plus a data-quality hard ceiling (price-scale discontinuity).
+    _vol_scale_fm = 1.0
     if is_entry and spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_atr_pct = gate.get("daily_atr_pct")
@@ -2237,42 +2241,31 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           logger.warning("VOLATILITY BLOCK: %s rejected — ATR=%.2f%% exceeds hard limit %.2f%%", spot_symbol, daily_atr_pct, hard_limit)
           _quarantine_symbol(spot_symbol, f"daily ATR {daily_atr_pct:.2f}% exceeds {hard_limit:.2f}% hard limit")
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit", "hint": "Wait for volatility to settle before entering."}
-        _atr_scale_fm = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
-        logger.info("VOLATILITY SOFT GATE: futures %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fm * 100)
+        _vol_scale_fm = max(0.50, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        logger.info("VOLATILITY SOFT GATE: futures %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _vol_scale_fm * 100)
 
-    # Regime throttle (B): shrink size + raise the confidence bar in a hostile (bearish/exhausted) daily.
     _g_fm = _daily_gate_state.get(spot_symbol, {})
-    if is_entry:
-      _atr_scale_fm = max(0.30, _atr_scale_fm * regime_size_factor(_g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime))
-      if _relative_strength_exception(spot_symbol, side, confidence):
-        _atr_scale_fm = max(0.30, _atr_scale_fm * cfg.regime.relative_strength_size_factor)
-        logger.info("RELATIVE-STRENGTH LONG: %s allowed against bearish BTC at %.0f%% size", spot_symbol, cfg.regime.relative_strength_size_factor * 100)
-
+    _atr_scale_fm = _vol_scale_fm
     # Confidence enforcement: reject entries below the (regime-adjusted) minimum confidence
-    if is_entry and confidence is not None:
-      _eff_min_fm = effective_min_confidence(cfg.trading.min_confidence, _g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime)
-      if confidence < _eff_min_fm:
-        return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fm:.2f}", "hint": "Only enter with sufficient conviction; the bar is raised in a bearish/exhausted regime. Analyze another coin or wait for a better setup."}
-      # Conviction sizing: shrink low-conviction entries (confidence barely above the floor), ramping
-      # to full size as conviction rises — targets the full-size low-conviction shorts that drained SOL.
-      _conv_scale_fm = conviction_size_factor(confidence, _eff_min_fm, cfg.regime)
-      if _conv_scale_fm < 1.0:
-        logger.info("CONVICTION SIZING: futures %s conf=%.2f (floor %.2f) — scaling position to %.0f%%", spot_symbol, confidence, _eff_min_fm, _conv_scale_fm * 100)
-        _atr_scale_fm = max(0.30, _atr_scale_fm * _conv_scale_fm)
+    _eff_min_fm = effective_min_confidence(cfg.trading.min_confidence, _g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime)
+    if is_entry and confidence is not None and confidence < _eff_min_fm:
+      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fm:.2f}", "hint": "Only enter with sufficient conviction; the bar is raised in a bearish/exhausted regime. Analyze another coin or wait for a better setup."}
 
-    # Loss-streak throttle: consecutive realized losses shrink the next entry (anti-martingale).
+    # Soft size factors combine by their WORST single signal (regime.combined_size_factor), not by a
+    # product — independent caution reads no longer compound a 1% risk budget into fee-dust.
     if is_entry:
-      _streak_fm = _edge_state()["size_factor"]
-      if _streak_fm < 1.0:
-        logger.info("LOSS-STREAK THROTTLE: futures %s — sizing to %.0f%% after %d consecutive losses", spot_symbol, _streak_fm * 100, _edge_state()["stats"].get("loss_streak", 0))
-        _atr_scale_fm = max(0.30, _atr_scale_fm * _streak_fm)
-      _expectancy_fm = _expectancy_entry_factor(spot_symbol, side)
-      if _expectancy_fm < 1.0:
-        logger.info(
-          "EXPECTANCY THROTTLE: futures %s %s — sizing to %.0f%% of the already risk-adjusted amount",
-          side, spot_symbol, _expectancy_fm * 100,
-        )
-        _atr_scale_fm *= _expectancy_fm
+      _soft_fm = [regime_size_factor(_g_fm.get("daily_bias", "neutral"), _g_fm.get("daily_exhausted", False), cfg.regime)]
+      if _relative_strength_exception(spot_symbol, side, confidence):
+        _soft_fm.append(cfg.regime.relative_strength_size_factor)
+        logger.info("RELATIVE-STRENGTH LONG: %s allowed against bearish BTC", spot_symbol)
+      if confidence is not None:
+        _soft_fm.append(conviction_size_factor(confidence, _eff_min_fm, cfg.regime))
+      _soft_fm.append(_edge_state()["size_factor"])                     # loss-streak
+      _soft_fm.append(_expectancy_entry_factor(spot_symbol, side))       # direction/symbol expectancy
+      _quality_fm = combined_size_factor(_soft_fm, floor=cfg.trading.size_quality_floor)
+      _atr_scale_fm = _vol_scale_fm * _quality_fm
+      logger.info("SIZE FACTORS: futures %s vol=%.2f quality=%.2f (soft=%s floor=%.2f) → %.0f%%",
+                  spot_symbol, _vol_scale_fm, _quality_fm, [round(f, 2) for f in _soft_fm], cfg.trading.size_quality_floor, _atr_scale_fm * 100)
 
     # Anti-stacking: block add-on entries when existing position is losing
     if is_entry and snapshot.futures_positions:
@@ -3177,7 +3170,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.warning("SYMBOL BENCH BLOCK: futures limit %s %s rejected — repeated recent losses, benched %.1fh more", side_lower, spot_symbol, _bench_hours_fl)
       return {"rejected": True, "reason": f"Symbol benched: {spot_symbol} lost repeatedly in its recent closes — no entries for {_bench_hours_fl:.1f}h more", "symbol": spot_symbol, "hint": "This symbol keeps stopping out; the setup that looks compliant is not working in the current tape. Trade a different symbol or stand aside — the bench lifts automatically."}
 
-    _atr_scale_fl = 1.0
+    # Volatility scale (hard risk adjustment, linear — not squared; see the market path for why).
+    _vol_scale_fl = 1.0
     if spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_atr_pct = gate.get("daily_atr_pct")
@@ -3186,38 +3180,28 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         if daily_atr_pct > hard_limit:
           _quarantine_symbol(spot_symbol, f"daily ATR {daily_atr_pct:.2f}% exceeds {hard_limit:.2f}% hard limit")
           return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
-        _atr_scale_fl = max(0.30, (cfg.trading.max_atr_pct_for_entry / daily_atr_pct) ** 2)
-        logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _atr_scale_fl * 100)
+        _vol_scale_fl = max(0.50, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
+        logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _vol_scale_fl * 100)
 
-    # Regime throttle (B): shrink size + raise the confidence bar in a hostile (bearish/exhausted) daily.
     _g_fl = _daily_gate_state.get(spot_symbol, {})
-    _atr_scale_fl = max(0.30, _atr_scale_fl * regime_size_factor(_g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime))
+    # Confidence floor (a hard gate, not a size factor).
+    _eff_min_fl = effective_min_confidence(cfg.trading.min_confidence, _g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)
+    if confidence is not None and confidence < _eff_min_fl:
+      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fl:.2f}"}
+
+    # Soft size factors combine by their WORST single signal (regime.combined_size_factor), not a product.
+    _soft_fl = [regime_size_factor(_g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)]
     if _relative_strength_exception(spot_symbol, side_lower, confidence):
-      _atr_scale_fl = max(0.30, _atr_scale_fl * cfg.regime.relative_strength_size_factor)
-      logger.info("RELATIVE-STRENGTH LONG: futures limit %s allowed against bearish BTC at %.0f%% size", spot_symbol, cfg.regime.relative_strength_size_factor * 100)
-
+      _soft_fl.append(cfg.regime.relative_strength_size_factor)
+      logger.info("RELATIVE-STRENGTH LONG: futures limit %s allowed against bearish BTC", spot_symbol)
     if confidence is not None:
-      _eff_min_fl = effective_min_confidence(cfg.trading.min_confidence, _g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)
-      if confidence < _eff_min_fl:
-        return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fl:.2f}"}
-      # Conviction sizing: shrink low-conviction entries, ramping to full size as conviction rises.
-      _conv_scale_fl = conviction_size_factor(confidence, _eff_min_fl, cfg.regime)
-      if _conv_scale_fl < 1.0:
-        logger.info("CONVICTION SIZING: futures limit %s conf=%.2f (floor %.2f) — scaling position to %.0f%%", spot_symbol, confidence, _eff_min_fl, _conv_scale_fl * 100)
-        _atr_scale_fl = max(0.30, _atr_scale_fl * _conv_scale_fl)
-
-    # Loss-streak throttle: consecutive realized losses shrink the next entry (anti-martingale).
-    _streak_fl = _edge_state()["size_factor"]
-    if _streak_fl < 1.0:
-      logger.info("LOSS-STREAK THROTTLE: futures limit %s — sizing to %.0f%% after %d consecutive losses", spot_symbol, _streak_fl * 100, _edge_state()["stats"].get("loss_streak", 0))
-      _atr_scale_fl = max(0.30, _atr_scale_fl * _streak_fl)
-    _expectancy_fl = _expectancy_entry_factor(spot_symbol, side_lower)
-    if _expectancy_fl < 1.0:
-      logger.info(
-        "EXPECTANCY THROTTLE: futures limit %s %s — sizing to %.0f%% of the already risk-adjusted amount",
-        side_lower, spot_symbol, _expectancy_fl * 100,
-      )
-      _atr_scale_fl *= _expectancy_fl
+      _soft_fl.append(conviction_size_factor(confidence, _eff_min_fl, cfg.regime))
+    _soft_fl.append(_edge_state()["size_factor"])                    # loss-streak
+    _soft_fl.append(_expectancy_entry_factor(spot_symbol, side_lower))  # direction/symbol expectancy
+    _quality_fl = combined_size_factor(_soft_fl, floor=cfg.trading.size_quality_floor)
+    _atr_scale_fl = _vol_scale_fl * _quality_fl
+    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f (soft=%s floor=%.2f) → %.0f%%",
+                spot_symbol, _vol_scale_fl, _quality_fl, [round(f, 2) for f in _soft_fl], cfg.trading.size_quality_floor, _atr_scale_fl * 100)
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
@@ -3258,20 +3242,36 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       take_profit_price = _round_price_to_tick(float(take_profit_price), tick_size)
       stop_loss_price = _round_price_to_tick(float(stop_loss_price), tick_size)
 
+    # Marketable-entry allowance (fill-rate fix): a passive limit resting away from price only filled
+    # ~21% of the time — in a trend the price never comes back, so the bot missed the winners and only
+    # filled when the move failed (adverse selection). A HIGH-CONVICTION entry may now cross the spread
+    # up to `marketable_entry_max_dev_pct` beyond live price to fill immediately, and a resting entry
+    # may sit right at the touch. It is still a limit order, so the atomic TP/SL bracket attaches and
+    # the fill is never naked. Lower-conviction entries keep the passive, min-deviation discipline.
+    _marketable_ok = (
+      cfg.trading.marketable_entry_max_dev_pct > 0
+      and confidence is not None
+      and confidence >= cfg.trading.marketable_entry_min_confidence
+    )
+    deviation = abs(entry_price_val - current_price) / current_price  # used downstream for logging/response
     wrong_side = (side_lower == "buy" and entry_price_val >= current_price) or (side_lower == "sell" and entry_price_val <= current_price)
     if wrong_side:
-      return {
-        "rejected": True,
-        "reason": f"Marketable/wrong-side limit: {side_lower} at {entry_price_val:.8g} versus live {current_price:.8g}",
-        "hint": "A pullback buy must rest below live price; a rally short must rest above it.",
-      }
-
-    deviation = abs(entry_price_val - current_price) / current_price
-    if deviation < cfg.trading.min_entry_deviation_pct:
+      if not (_marketable_ok and deviation <= cfg.trading.marketable_entry_max_dev_pct):
+        return {
+          "rejected": True,
+          "reason": f"Marketable/wrong-side limit: {side_lower} at {entry_price_val:.8g} versus live {current_price:.8g}",
+          "hint": (
+            "A pullback buy must rest below live price; a rally short must rest above it. A "
+            f"high-conviction entry (>= {cfg.trading.marketable_entry_min_confidence:.2f}) may cross up to "
+            f"{cfg.trading.marketable_entry_max_dev_pct*100:.2f}% of price to fill immediately."
+          ),
+        }
+      logger.info("MARKETABLE ENTRY: %s %s crossing %.3f%% at conf %.2f to secure a fill", side_lower, spot_symbol, deviation * 100, confidence)
+    elif deviation < cfg.trading.min_entry_deviation_pct and not _marketable_ok:
       return {
         "rejected": True,
         "reason": f"entry_price {entry_price_val} is within {deviation*100:.3f}% of current price {current_price:.4f} (minimum deviation: {cfg.trading.min_entry_deviation_pct*100:.2f}%)",
-        "hint": "Do not chase with a market entry; wait for a valid pullback/rally limit or decline the setup.",
+        "hint": "Rest a low-conviction entry on a real pullback/rally, or raise confidence to take a marketable fill.",
         "currentPrice": current_price,
         "entryPrice": entry_price_val,
       }

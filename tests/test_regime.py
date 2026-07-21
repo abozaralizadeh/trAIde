@@ -8,6 +8,7 @@ from src.config import RegimeConfig
 from src.regime import (
     is_hostile_regime,
     effective_min_confidence,
+    combined_size_factor,
     regime_size_factor,
     allow_reversal_long,
     allow_reversal_short,
@@ -567,3 +568,37 @@ def test_reversal_short_15m_relaxable_and_disableable():
         daily_bias="bullish", side="sell", bias_1h="bearish", bias_15m="bearish",
         confidence=0.95, cfg=_cfg(reversal_shorts_enabled=False),
     ) is False
+
+
+# ── combined_size_factor: soft factors combine by their WORST signal, not by a product ──
+
+
+def test_combined_size_factor_takes_min_not_product():
+    # Five independent 0.5-0.6 caution reads: the OLD product collapsed to ~0.05; the min is 0.5,
+    # so a real edge is still sized to matter instead of decaying into fee-dust.
+    assert combined_size_factor([0.6, 0.5, 0.6, 0.5, 0.5], floor=0.0) == pytest.approx(0.5)
+
+
+def test_combined_size_factor_floor_applies():
+    # A single very cautious read is clamped up to the floor so the position stays tradable.
+    assert combined_size_factor([0.1, 1.0], floor=0.5) == pytest.approx(0.5)
+
+
+def test_combined_size_factor_no_shrink_when_all_full():
+    assert combined_size_factor([1.0, 1.0, 1.0], floor=0.5) == pytest.approx(1.0)
+
+
+def test_combined_size_factor_ignores_none_and_clamps():
+    # None entries are ignored; out-of-range values are clamped to [0, 1] before combining.
+    assert combined_size_factor([None, 1.5, 0.8], floor=0.0) == pytest.approx(0.8)
+
+
+def test_combined_size_factor_empty_is_full_size():
+    assert combined_size_factor([], floor=0.5) == pytest.approx(1.0)
+    assert combined_size_factor([None], floor=0.5) == pytest.approx(1.0)
+
+
+def test_combined_size_factor_floor_never_raises_above_worst_when_disabled():
+    # floor=1.0 means "no soft shrink at all" — but a genuine worst signal below is still bounded UP
+    # to 1.0 only because floor==1.0; with floor 0 the worst signal passes through unchanged.
+    assert combined_size_factor([0.3], floor=0.0) == pytest.approx(0.3)

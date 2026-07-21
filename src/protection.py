@@ -127,20 +127,39 @@ def decide_protection(
         "peakFe": peak_fe,
       }
 
+  # Trend-adaptive give-back: a trade whose peak favorable run has reached ``trend_runner_r`` × its
+  # own risk is a REVEALED trend winner — its behavior proves the trend, so no external regime feed is
+  # needed. For such runners the give-back cap loosens (arms later, tolerates a deeper pullback) so a
+  # normal trend breather no longer books a small win and misses the rest of the move — the exact
+  # failure that turned a correctly-picked ZEC (+354%/mo) into a net loss across 8 lifecycles. Chop
+  # (a trade that never ran far) keeps the tight defaults that protect small gains.
+  giveback_pct = cfg.giveback_pct
+  giveback_arm_r = cfg.giveback_arm_r
+  is_runner = False
+  if (
+    getattr(cfg, "trend_adaptive_enabled", False)
+    and risk_dist is not None
+    and cfg.trend_runner_r and cfg.trend_runner_r > 0
+    and peak_fe >= cfg.trend_runner_r * risk_dist
+  ):
+    is_runner = True
+    giveback_pct = cfg.trend_giveback_pct
+    giveback_arm_r = cfg.trend_giveback_arm_r
+
   # P1a — give-back cap: lock the gain once a real run retraces too far. Arming is tied to the
   # trade's OWN risk when the stop is known (giveback_arm_r × stop distance): sub-1R wobble is
   # noise the original SL owns, and closing there books fee-scale scratch "wins" while losses
   # ride to the full stop — the asymmetry that kept the account net-negative.
-  if cfg.giveback_pct and cfg.giveback_pct > 0:
+  if giveback_pct and giveback_pct > 0:
     min_fe = cfg.min_favorable_excursion_pct * avg_entry
-    if cfg.giveback_arm_r and cfg.giveback_arm_r > 0 and risk_dist is not None:
-      min_fe = max(min_fe, cfg.giveback_arm_r * risk_dist)
-    if peak_fe >= min_fe and fe_now <= (1.0 - cfg.giveback_pct) * peak_fe:
+    if giveback_arm_r and giveback_arm_r > 0 and risk_dist is not None:
+      min_fe = max(min_fe, giveback_arm_r * risk_dist)
+    if peak_fe >= min_fe and fe_now <= (1.0 - giveback_pct) * peak_fe:
       return {
         "action": "close",
         "reason": (
-          f"gave back >={cfg.giveback_pct:.0%} of peak run "
-          f"(peak +{peak_fe:.4f} px, now +{fe_now:.4f} px)"
+          f"gave back >={giveback_pct:.0%} of peak run "
+          f"(peak +{peak_fe:.4f} px, now +{fe_now:.4f} px{', trend-runner' if is_runner else ''})"
         ),
         "peakFe": peak_fe,
         "feNow": fe_now,
