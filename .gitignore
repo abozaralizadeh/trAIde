@@ -188,3 +188,4 @@ cython_debug/
 .agent_memory.json
 .env.local
 .claude
+.env.backup
