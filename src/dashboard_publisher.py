@@ -34,8 +34,10 @@ logger = logging.getLogger(__name__)
 # "watching" — dropping it keeps the dashboard's Watching panel from fixating on an old level (a
 # single Jul-10 SOL trigger kept showing for a week once retention was extended to 90 days).
 _TRIGGER_FRESHNESS_SEC = 12 * 3600
-# How many most-recent closed positions to publish with full open→close lifecycle detail.
-_CLOSED_DETAIL_LIMIT = 3
+# How many most-recent closed positions to publish with full open→close lifecycle detail. Kept
+# generous so the dashboard's "recently closed" history persists for a while rather than vanishing
+# after a couple of trades (decisions themselves are retained ~90d, so this is the real limiter).
+_CLOSED_DETAIL_LIMIT = 12
 
 try:
   from azure.data.tables import TableServiceClient, UpdateMode
@@ -581,10 +583,13 @@ class DashboardPublisher:
     closed, and — visible from the candles between those points — whether a better exit was missed.
     Prices are already disclosed by the live position charts; no size/balance/identity is exposed.
     """
-    items = memory.latest_items("decisions", limit=80).get("items", [])
+    # Read from the dedicated realized-close bucket (retained ~200 deep), NOT the 50-item decisions
+    # feed — that feed is dominated by decline/hold snapshots, so closed trades scrolled out of it
+    # within hours and the "recently closed" panel went empty. This keeps real history around.
+    items = memory.realized_closes(limit=max(limit * 4, 60))
     rows: List[Dict[str, Any]] = []
     for d in items:
-      if d.get("pnl") is None or not MemoryStore._is_realized_close(d.get("action") or ""):
+      if d.get("pnl") is None:
         continue
       close_ts = d.get("ts")
       if not close_ts:
@@ -593,6 +598,19 @@ class DashboardPublisher:
       close_type = str(d.get("closeType") or "")
       side = "long" if "LONG" in close_type.upper() else ("short" if "SHORT" in close_type.upper() else (d.get("positionSide") or ""))
       m = re.search(r"ROE\s*(-?\d+(?:\.\d+)?)\s*%", d.get("reason") or "")
+      # Entry/exit-quality feedback, derived as unitless R-multiples + ATR extension (no dollars ever):
+      #   realizedR       — outcome in units of the trade's own initial risk
+      #   maeR / mfeR     — how far price went against / for the entry before close (|trough|,peak / risk)
+      #   entryExtensionAtr — how stretched the entry was vs the 15m VWAP at fill (chase vs pullback)
+      # These let the dashboard show WHY a trade worked or not and whether a better entry was available.
+      ctx = d.get("entryContext") if isinstance(d.get("entryContext"), dict) else {}
+      planned_risk = _f(ctx.get("plannedMaxLossUsd"))
+      trough = _f(d.get("troughPnl"))
+      peak = _f(d.get("peakPnl"))
+      mae_r = round(max(0.0, -trough) / planned_risk, 2) if (planned_risk and planned_risk > 0 and trough is not None) else None
+      mfe_r = round(max(0.0, peak) / planned_risk, 2) if (planned_risk and planned_risk > 0 and peak is not None) else None
+      realized_r = _f(d.get("realizedR"))
+      entry_ext = _f(ctx.get("entryExtensionAtr"))
       rows.append({
         "symbol": d.get("symbol"),
         "side": side,
@@ -603,6 +621,11 @@ class DashboardPublisher:
         "win": bool(_f(d.get("pnl")) and _f(d.get("pnl")) > 0),
         "roePct": round(float(m.group(1)), 4) if m else None,
         "closeType": close_type or None,
+        "realizedR": round(realized_r, 2) if realized_r is not None else None,
+        "maeR": mae_r,
+        "mfeR": mfe_r,
+        "entryExtensionAtr": round(entry_ext, 2) if entry_ext is not None else None,
+        "betterEntryAvailable": (mae_r is not None and mae_r >= 0.5),
       })
     rows.sort(key=lambda r: r["closeTs"], reverse=True)
     return rows[:limit]

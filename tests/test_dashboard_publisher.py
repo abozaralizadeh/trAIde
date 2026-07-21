@@ -94,7 +94,9 @@ class TestClosedLifecycles:
     rows = pub._closed_position_lifecycles(_FakeMem([
       {"action": "futures_buy_triggered", "symbol": "ZEC-USDT", "pnl": -3.7, "ts": 1_784_003_600,
        "closeType": "CLOSE_LONG", "positionOpenTime": 1_784_000_000_000, "exitPrice": 560.0,
-       "entryPrice": 590.0, "reason": "TP/SL triggered (CLOSE_LONG, ROE -5.56%)"},
+       "entryPrice": 590.0, "reason": "TP/SL triggered (CLOSE_LONG, ROE -5.56%)",
+       "realizedR": -1.0, "troughPnl": -3.7, "peakPnl": 0.4,
+       "entryContext": {"plannedMaxLossUsd": 3.7, "entryExtensionAtr": 3.2}},
       {"action": "futures_sell_triggered", "symbol": "XRP-USDT", "pnl": 0.3, "ts": 1_784_010_000,
        "closeType": "CLOSE_SHORT", "exitPrice": 1.05, "reason": "TP/SL triggered (CLOSE_SHORT, ROE 2.0%)"},
       {"action": "hold_short", "symbol": "ETH-USDT", "pnl": -0.1, "ts": 1_784_011_000},  # not a realized close
@@ -104,6 +106,11 @@ class TestClosedLifecycles:
     assert zec["side"] == "long" and zec["win"] is False and zec["roePct"] == -5.56
     assert zec["openTs"] == 1_784_000_000 and zec["closeTs"] == 1_784_003_600  # ms normalized to seconds
     assert zec["entryPrice"] == 590.0 and zec["exitPrice"] == 560.0
+    # Entry/exit-quality feedback (unitless R + ATR; no dollars): ZEC ran fully against the entry.
+    assert zec["realizedR"] == -1.0 and zec["maeR"] == 1.0 and zec["mfeR"] == round(0.4 / 3.7, 2)
+    assert zec["entryExtensionAtr"] == 3.2 and zec["betterEntryAvailable"] is True
+    # XRP has no entryContext → feedback fields degrade to None/False without error.
+    assert rows[0]["realizedR"] is None and rows[0]["maeR"] is None and rows[0]["betterEntryAvailable"] is False
 
 
 class _FakeMem:
@@ -111,6 +118,15 @@ class _FakeMem:
     self._decisions = decisions
   def latest_items(self, kind, limit=5):
     return {"items": list(self._decisions)}
+  def realized_closes(self, limit=100, symbol=None):
+    from src.memory import MemoryStore
+    rows = [
+      d for d in self._decisions
+      if isinstance(d, dict) and d.get("pnl") is not None
+      and MemoryStore._is_realized_close(str(d.get("action") or ""))
+    ]
+    rows.sort(key=lambda d: d.get("ts") or 0)
+    return rows[-max(1, int(limit)):]
 
 
 class TestPendingOrders:

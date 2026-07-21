@@ -3480,6 +3480,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "plannedNetRr": _planned_net_rr,
       "plannedMaxLossUsd": _planned_max_loss,
       "confidence": confidence,
+      # How stretched the entry was vs the 15m VWAP (ATR units) — stamped so the post-trade entry-quality
+      # review can tell a well-timed pullback entry from a late chase, with no hard gate at entry time.
+      "entryExtensionAtr": overextension_atr(
+        side_lower, entry_price_val, _g_fl.get("intraday_vwap"), _g_fl.get("intraday_atr_abs"),
+      ),
       "regime": {
         key: _g_fl.get(key)
         for key in (
