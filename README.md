@@ -523,6 +523,7 @@ Talk back to the bot. The Supervisor Agent listens for your Telegram messages, p
 
 ### What it can do
 - **Query status** -- ask about positions, balances, performance, win rate, recent trades, or recent decisions. It fetches live data from KuCoin and agent memory.
+- **Check resting orders** -- `get_open_orders` lists live unfilled limit/entry orders straight from the exchange. A pending limit entry is neither a position nor a fill, so this is the authoritative source for "is there still a pending order for X?" — it reconciles against a stale `hold_pending` decision that may predate the order's TTL expiry.
 - **Read & search logs** -- ask it to check logs for errors, search for a specific symbol, or show the last N lines.
 - **Read source code** -- inspect any file in the `src/` directory.
 - **View configuration** -- see all non-secret config values (API keys are never exposed).
