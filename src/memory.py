@@ -233,7 +233,7 @@ class MemoryStore:
           for event in data.get("pending_agent_events", [])
           if isinstance(event, dict)
           and event.get("id")
-          and event.get("kind") in {"spot_fills", "futures_fills", "closed_positions", "auto_triggers"}
+          and event.get("kind") in {"spot_fills", "futures_fills", "closed_positions", "auto_triggers", "entry_expired"}
           and isinstance(event.get("payload"), dict)
         ]
         data["sentiments"] = [
@@ -1210,8 +1210,8 @@ class MemoryStore:
         self._write(data)
 
   def queue_agent_event(self, kind: str, event_id: str, payload: Dict[str, Any]) -> bool:
-    """Persist a fill/close until a successful model run acknowledges that exact event."""
-    if kind not in {"spot_fills", "futures_fills", "closed_positions", "auto_triggers"}:
+    """Persist a fill/close/expiry until a successful model run acknowledges that exact event."""
+    if kind not in {"spot_fills", "futures_fills", "closed_positions", "auto_triggers", "entry_expired"}:
       return False
     eid = str(event_id or "").strip()
     if not eid or not isinstance(payload, dict):

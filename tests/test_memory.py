@@ -543,6 +543,20 @@ def test_agent_event_inbox_persists_until_acknowledged(tmp_path):
     assert restarted.get_pending_agent_events() == []
 
 
+def test_entry_expired_event_queues_and_survives_restart(tmp_path):
+    # entry_expired must pass BOTH whitelists (queue_agent_event source + the read-time sanitizer) so
+    # the agent can see its own unfilled limits die and stop re-placing a never-filling pullback limit.
+    path = str(tmp_path / "memory.json")
+    first = MemoryStore(path, retention_days=7)
+    assert first.queue_agent_event(
+        "entry_expired", "ONDOUSDTM:469075", {"symbol": "ONDO-USDT", "side": "buy", "price": 0.3968},
+    ) is True
+    restarted = MemoryStore(path, retention_days=7)
+    events = restarted.get_pending_agent_events()
+    expiries = [e for e in events if e.get("kind") == "entry_expired"]
+    assert len(expiries) == 1 and expiries[0]["payload"]["symbol"] == "ONDO-USDT"
+
+
 def test_agent_scheduler_persists_restart_cadence_and_price_noise(tmp_path):
     path = str(tmp_path / "memory.json")
     first = MemoryStore(path, retention_days=7)

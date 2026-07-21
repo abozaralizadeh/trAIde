@@ -834,6 +834,21 @@ async def trading_loop(
             kucoin_futures.cancel_order(oid, symbol=order.get("symbol"))
           cancelled_ids.add(oid)
           logger.info("Expired stale futures entry %s (%s) after %.0fmin", oid, order.get("symbol"), cfg.trading.entry_limit_expiry_minutes)
+          # Surface the expiry to the agent's next run. Without this, unfilled expiries were only
+          # logged, never recorded — so the agent kept re-placing a pullback limit on a running
+          # trend, blind to the fact its last attempts never filled (the ONDO churn). Seeing repeated
+          # entryExpiries on one symbol is the signal to take a continuation entry or stand down.
+          try:
+            fsym = str(order.get("symbol") or "")
+            memory.queue_agent_event("entry_expired", oid, {
+              "symbol": normalize_symbol(fsym),
+              "futuresSymbol": fsym,
+              "side": order.get("side"),
+              "price": order.get("price"),
+              "reason": f"unfilled limit entry expired after {cfg.trading.entry_limit_expiry_minutes:.0f}min",
+            })
+          except Exception:
+            pass
         except Exception as exc:
           logger.warning("Unable to expire stale futures entry %s: %s", oid, exc)
       if cancelled_ids:
