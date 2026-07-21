@@ -36,37 +36,46 @@ def _cfg(**overrides) -> ProfitProtectionConfig:
 # ── decide_protection: early invalidation (P1c) ─────────────────────────────────
 
 
-def test_early_cut_fires_when_never_green_and_failing():
-    # Long entry 100, stop 95 (risk 5). Never went green (peak 0.1), now -3.5 px = 70% to stop, 25min in.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=96.5, sl_price=95.0, peak_fe=0.1,
+def test_early_cut_fires_when_never_green_and_almost_at_stop():
+    # Long entry 100, stop 95 (risk 5). Never green (peak 0.1), now -4.5 px = 90% to stop (>= 0.85), 25min.
+    # The cut only front-runs an almost-certain stop, not normal pre-breakout heat.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=95.5, sl_price=95.0, peak_fe=0.1,
                           cfg=_cfg(), opened_min_ago=25.0)
     assert d["action"] == "close" and "early invalidation" in d["reason"]
 
 
+def test_early_cut_does_not_fire_inside_winners_mae_band():
+    # The NEAR lesson: never green, 70% to stop (0.70R MAE) — this is INSIDE the band winners breathe
+    # (~0.57R here), so cutting it stops out trades that are still right. Must NOT fire at 0.85 threshold.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=96.5, sl_price=95.0, peak_fe=0.1,
+                          cfg=_cfg(), opened_min_ago=100.0)
+    assert d["action"] == "none"
+
+
 def test_early_cut_skipped_within_grace():
     # Same failing trade but only 10min old (< 20min grace) → not cut yet.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=96.5, sl_price=95.0, peak_fe=0.1,
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=95.5, sl_price=95.0, peak_fe=0.1,
                           cfg=_cfg(), opened_min_ago=10.0)
     assert d["action"] == "none"
 
 
 def test_early_cut_skipped_if_trade_went_green():
     # Peak reached +0.5 (> 0.3% of 100) → it "worked", so early-cut must NOT fire even if now underwater.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=96.5, sl_price=95.0, peak_fe=0.5,
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=95.5, sl_price=95.0, peak_fe=0.5,
                           cfg=_cfg(), opened_min_ago=25.0)
     assert d["action"] == "none"
 
 
 def test_early_cut_skipped_if_not_yet_failing():
-    # Never green, but only -1 px = 20% to the stop (< 60% threshold) → give it room, no cut.
+    # Never green, but only -1 px = 20% to the stop (< 0.85 threshold) → give it room, no cut.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=99.0, sl_price=95.0, peak_fe=0.05,
                           cfg=_cfg(), opened_min_ago=25.0)
     assert d["action"] == "none"
 
 
 def test_early_cut_short_symmetry():
-    # Short entry 100, stop 105 (risk 5). Never green, now 103.5 = 70% to stop, 25min → cut.
-    d = decide_protection(side_long=False, avg_entry=100.0, mark=103.5, sl_price=105.0, peak_fe=0.1,
+    # Short entry 100, stop 105 (risk 5). Never green, now 104.3 = 86% to stop (>= 0.85), 25min → cut.
+    d = decide_protection(side_long=False, avg_entry=100.0, mark=104.3, sl_price=105.0, peak_fe=0.1,
                           cfg=_cfg(), opened_min_ago=25.0)
     assert d["action"] == "close" and "early invalidation" in d["reason"]
 

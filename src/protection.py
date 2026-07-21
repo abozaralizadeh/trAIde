@@ -105,10 +105,13 @@ def decide_protection(
     if rd > 0:
       risk_dist = rd
 
-  # P1c — early invalidation: cut a trade that NEVER went meaningfully green and is now failing toward
-  # its stop. MFE/MAE data shows winners stay green from entry while losers go against immediately, so
-  # this shrinks the loser (and front-runs a stop that's likely to hit / gap through) without touching
-  # winners. Only fires past a grace, when the trade never worked, and it's already most of the way down.
+  # P1c — early invalidation: cut a trade that NEVER went meaningfully green and is now ALMOST at its
+  # stop. This is a *time/heat stop*, and MAE research (John Sweeney; QuantifiedStrategies) is explicit:
+  # the cut must sit OUTSIDE the adverse-excursion band of your WINNING trades, or it stops you out when
+  # you're right. The bot's own winners breathe ~0.57R of MAE, so `early_cut_mae_frac` is 0.85 — the cut
+  # only fires when price is nearly at the stop (front-running an almost-certain hit / gap), NOT at the
+  # 0.6R that once killed live trend trades (e.g. NEAR, cut mid-coil right before a +4% breakout).
+  # Trend setups need room to base; this leaves normal pre-breakout heat alone.
   if (
     cfg.early_cut_enabled
     and opened_min_ago is not None and opened_min_ago >= cfg.early_cut_grace_min
