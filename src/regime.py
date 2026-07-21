@@ -100,6 +100,32 @@ def combined_size_factor(factors, floor: float = 0.5) -> float:
   return max(lo, min(vals))
 
 
+def overextension_atr(side: str, price, vwap, atr) -> float | None:
+  """How far a price sits beyond the intraday VWAP anchor, in ATR units, in a trade's direction.
+
+  Positive = extended in the trade's direction (a long above VWAP / a short below it) → later in the
+  move, likelier to pull back before continuing; negative = on the favorable side (a pullback below
+  VWAP for a long). This is a *decision-support measurement*, surfaced to the agent so it can plan the
+  highest-EV entry (target the pullback/retest, not chase the peak) — deliberately NOT a hard gate:
+  entry timing is the model's judgement, bounded by the risk caps, and improves as the model does.
+  Returns ``None`` on missing/invalid inputs so callers can simply omit it from context.
+  """
+  try:
+    p = float(price)
+    v = float(vwap)
+    a = float(atr)
+  except (TypeError, ValueError):
+    return None
+  if a <= 0 or p <= 0 or v <= 0 or not (math.isfinite(p) and math.isfinite(v) and math.isfinite(a)):
+    return None
+  s = (side or "").lower()
+  if s in ("buy", "long"):
+    return (p - v) / a
+  if s in ("sell", "short"):
+    return (v - p) / a
+  return None
+
+
 def resolve_gate_deadlock(
   *,
   daily_bias: str,

@@ -9,6 +9,7 @@ from src.regime import (
     is_hostile_regime,
     effective_min_confidence,
     combined_size_factor,
+    overextension_atr,
     regime_size_factor,
     allow_reversal_long,
     allow_reversal_short,
@@ -602,3 +603,22 @@ def test_combined_size_factor_floor_never_raises_above_worst_when_disabled():
     # floor=1.0 means "no soft shrink at all" — but a genuine worst signal below is still bounded UP
     # to 1.0 only because floor==1.0; with floor 0 the worst signal passes through unchanged.
     assert combined_size_factor([0.3], floor=0.0) == pytest.approx(0.3)
+
+
+# ── Over-extension measurement (decision-support surfaced to the agent, not a gate) ──
+
+
+def test_overextension_atr_direction_aware():
+    # Long 3 ATR above VWAP = +3 extension (late in the leg); a short at the same price is on its
+    # favorable side = -3. Pullback long below VWAP is negative (entering at/before value).
+    assert overextension_atr("buy", 130.0, 100.0, 10.0) == pytest.approx(3.0)
+    assert overextension_atr("sell", 130.0, 100.0, 10.0) == pytest.approx(-3.0)
+    assert overextension_atr("buy", 95.0, 100.0, 10.0) == pytest.approx(-0.5)
+    assert overextension_atr("sell", 70.0, 100.0, 10.0) == pytest.approx(3.0)
+
+
+def test_overextension_atr_none_on_missing_or_bad_inputs():
+    assert overextension_atr("buy", 130.0, None, 10.0) is None      # no VWAP anchor
+    assert overextension_atr("buy", 130.0, 100.0, None) is None     # no ATR scale
+    assert overextension_atr("buy", 130.0, 100.0, 0.0) is None      # non-positive ATR
+    assert overextension_atr("hold", 130.0, 100.0, 10.0) is None    # unknown side

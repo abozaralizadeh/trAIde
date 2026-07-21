@@ -47,6 +47,7 @@ from .regime import (
   is_relative_strength_alt_long,
   oi_price_signal,
   net_reward_risk_ratio,
+  overextension_atr,
   regime_size_factor,
   resolve_gate_deadlock,
   reward_risk_ratio,
@@ -1776,6 +1777,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # Extract daily ATR% and 15m ATR% for volatility filtering
     daily_atr_pct = None
     intraday_atr_pct = None
+    intraday_vwap = None
+    intraday_atr_abs = None
+    intraday_rsi_15m = None
+    intraday_close = None
+    intraday_bb_mid = None
     for snap in snapshots:
       iv = snap.get("interval")
       atr_pct = snap.get("atr_pct")
@@ -1783,6 +1789,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         daily_atr_pct = atr_pct
       elif iv == "15min" and atr_pct is not None:
         intraday_atr_pct = atr_pct
+      if iv == "15min":
+        # Anchors + scale for the entry-planning map surfaced to the agent (decision-support, not a gate).
+        intraday_vwap = snap.get("vwap")
+        intraday_atr_abs = snap.get("atr")
+        intraday_rsi_15m = snap.get("rsi")
+        intraday_close = snap.get("close")
+        intraday_bb_mid = snap.get("bb_mid")
     required_intervals = {"15min", "1hour", "4hour", "1day"}
     present_intervals = {str(snap.get("interval")) for snap in snapshots}
     data_quality_ok = (
@@ -1811,6 +1824,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "overall_bias": summary.get("overall_bias", "neutral"),
       "daily_atr_pct": daily_atr_pct,
       "intraday_atr_pct": intraday_atr_pct,
+      "intraday_vwap": intraday_vwap,
+      "intraday_atr_abs": intraday_atr_abs,
+      "intraday_rsi_15m": intraday_rsi_15m,
       "squeeze_breakout": summary.get("squeeze_breakout"),
       "timeframe_conflict": summary.get("timeframe_conflict", False),
       "intraday_bias_15m": summary.get("intraday_bias_15m", "neutral"),
@@ -1821,6 +1837,31 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "analyzed_at": time.time(),
       "data_quality_ok": data_quality_ok,
       "analysis_errors": analysis_errors,
+    }
+
+    # Entry-planning map (decision-support, NOT a gate): how far current price sits beyond the 15m VWAP
+    # anchor in each direction (in ATR units) plus the nearest pullback/retest anchors, so the agent can
+    # reason about the highest-EV entry — target the pullback toward VWAP / band-mid / a structural
+    # retest rather than chasing a stretched peak, or wait for a better arrival price. The DECISION stays
+    # the model's (and improves as the model does); code only supplies the measurements.
+    _ext_long = overextension_atr("buy", intraday_close, intraday_vwap, intraday_atr_abs)
+    _ext_short = overextension_atr("sell", intraday_close, intraday_vwap, intraday_atr_abs)
+    summary["entryMap"] = {
+      "price": intraday_close,
+      "vwap15m": intraday_vwap,
+      "bbMid15m": intraday_bb_mid,
+      "atr15m": intraday_atr_abs,
+      "rsi15m": intraday_rsi_15m,
+      "extensionAtrLong": round(_ext_long, 2) if _ext_long is not None else None,
+      "extensionAtrShort": round(_ext_short, 2) if _ext_short is not None else None,
+      "note": (
+        "extensionAtr* = how many 15m ATRs price sits beyond the 15m VWAP in that direction. A large "
+        "positive value means price is LATE/stretched in that direction — the highest-EV entry is usually "
+        "a limit resting back at a pullback/retest anchor (vwap15m, bbMid15m, a prior breakout shelf, or a "
+        "38-62% fib of the last impulse), NOT a chase at the current peak. Near zero / negative means you "
+        "are entering at or before value — a fill now is reasonable. Use this to PLAN the arrival price; it "
+        "is guidance, not a limit."
+      ),
     }
     result: Dict[str, Any] = {
       "symbol": symbol,
