@@ -182,7 +182,13 @@ class ProfitProtectionConfig:
   early_cut_enabled: bool = True
   early_cut_grace_min: float = 20.0        # give a fresh entry this long to work before it can be cut
   early_cut_min_favorable_pct: float = 0.003  # if peak excursion never reached this (frac of entry), it "never worked"
-  early_cut_mae_frac: float = 0.6          # ...and it's this far toward the stop → cut the remaining distance
+  # ...and it's this far toward the stop → cut the remaining distance. Raised 0.6→0.85 (Jul 2026) on
+  # MAE research + the bot's own data: a stop/time-cut must sit OUTSIDE the adverse-excursion band of
+  # your WINNING trades or it stops you out when you're right (winners here breathe ~0.57R of MAE; a
+  # cut at 0.6R sat inside that band and killed real trend trades — e.g. NEAR, cut at 0.65R moments
+  # before a +4% run). At 0.85 the early-cut only front-runs a stop that's nearly certain to hit,
+  # which is its legitimate purpose; normal pre-breakout heat is left alone.
+  early_cut_mae_frac: float = 0.85
   # Trend-adaptive exits (Jul 2026 profitability fix): the fixed 1R breakeven + 35% give-back cap is a
   # mean-reversion harness — it shook the bot out of exactly the high-ATR *trends* it correctly picked
   # (ZEC ran +354%/mo; the bot netted a loss across 8 lifecycles, cutting winners at fee-scale while
