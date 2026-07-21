@@ -78,6 +78,24 @@ class TradingConfig:
   entry_limit_expiry_minutes: float
   min_entry_deviation_pct: float
   research_handoff_after_no_trade_runs: int  # force a Research handoff after N no-trade runs (0=off)
+  # Sizing coherence (Jul 2026 profitability fix): the soft position-size multipliers (regime,
+  # conviction, relative-strength, loss-streak, expectancy) used to COMPOUND multiplicatively, so
+  # five independent "be a bit cautious" 0.5-0.6 reads collapsed a 1% risk budget to ~0.03% — every
+  # position became fee-dust that couldn't clear round-trip costs even on a win. They are now combined
+  # by taking the single WORST signal (a min), floored here, so a real edge is still sized to matter.
+  # Hard dollar-risk caps (ATR, risk budget, concentration, heat) still shrink independently.
+  size_quality_floor: float = 0.5  # never shrink the *combined soft* factor below this (1.0 disables soft shrink)
+  # Fee-aware minimum: on a small account, a sub-floor notional cannot make a fee-clearing profit even
+  # when right. If a compliant setup sizes below this, the entry is bumped UP to it (still bounded by
+  # the risk budget / concentration / heat caps, which can veto). 0 = off (pure risk-budget sizing).
+  min_entry_notional_usd: float = 0.0
+  # Marketable entries (fill-rate fix): passive-only limits resting >=min_entry_deviation away were
+  # only ~21% filled — in a trend the price never comes back, so the bot systematically missed the
+  # winners and only filled when the move failed. A high-conviction entry may now cross up to this
+  # fraction of price to fill immediately; the atomic bracket still attaches, so it is never naked.
+  # 0 disables (pure passive-limit behavior).
+  marketable_entry_max_dev_pct: float = 0.0015  # allow crossing up to 0.15% for a high-conviction fill
+  marketable_entry_min_confidence: float = 0.75  # confidence bar to permit a marketable (crossing) entry
   # Risk guardrails (added after the RE-USDT concentration blowup, 2026-06-21):
   max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
@@ -165,6 +183,17 @@ class ProfitProtectionConfig:
   early_cut_grace_min: float = 20.0        # give a fresh entry this long to work before it can be cut
   early_cut_min_favorable_pct: float = 0.003  # if peak excursion never reached this (frac of entry), it "never worked"
   early_cut_mae_frac: float = 0.6          # ...and it's this far toward the stop → cut the remaining distance
+  # Trend-adaptive exits (Jul 2026 profitability fix): the fixed 1R breakeven + 35% give-back cap is a
+  # mean-reversion harness — it shook the bot out of exactly the high-ATR *trends* it correctly picked
+  # (ZEC ran +354%/mo; the bot netted a loss across 8 lifecycles, cutting winners at fee-scale while
+  # losers rode to the full stop). When the entry was taken in a STRONG, TRENDING regime, the guards
+  # loosen so a winner can run: the breakeven ratchet arms later and the give-back cap tolerates a
+  # deeper pullback (or an ATR chandelier trail takes over). The tight defaults still govern chop.
+  trend_adaptive_enabled: bool = True
+  trend_runner_r: float = 2.0        # a trade whose peak favorable run reaches this many R is a revealed trend
+                                     # winner — no external regime feed needed; its OWN behavior proves it
+  trend_giveback_pct: float = 0.55   # once a runner, tolerate giving back this much of peak (vs giveback_pct in chop)
+  trend_giveback_arm_r: float = 2.5  # ...and only arm the (loosened) give-back cap after this much favorable run
 
 
 @dataclass
@@ -327,11 +356,15 @@ def load_config() -> AppConfig:
       post_loss_cooldown_minutes=float(os.getenv("POST_LOSS_COOLDOWN_MINUTES", "30")),
       max_entry_leverage=float(os.getenv("MAX_ENTRY_LEVERAGE", "3")),
       min_trade_interval_minutes=float(os.getenv("MIN_TRADE_INTERVAL_MINUTES", "10")),
-      max_24h_volatility_pct=float(os.getenv("MAX_24H_VOLATILITY_PCT", "25")),
-      max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "6")),
-      entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "30")),
-      min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.002")),
+      max_24h_volatility_pct=float(os.getenv("MAX_24H_VOLATILITY_PCT", "30")),
+      max_atr_pct_for_entry=float(os.getenv("MAX_ATR_PCT_FOR_ENTRY", "9")),
+      entry_limit_expiry_minutes=float(os.getenv("ENTRY_LIMIT_EXPIRY_MINUTES", "15")),
+      min_entry_deviation_pct=float(os.getenv("MIN_ENTRY_DEVIATION_PCT", "0.0005")),
       research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "3")),
+      size_quality_floor=float(os.getenv("SIZE_QUALITY_FLOOR", "0.5")),
+      min_entry_notional_usd=float(os.getenv("MIN_ENTRY_NOTIONAL_USD", "0")),
+      marketable_entry_max_dev_pct=float(os.getenv("MARKETABLE_ENTRY_MAX_DEV_PCT", "0.0015")),
+      marketable_entry_min_confidence=float(os.getenv("MARKETABLE_ENTRY_MIN_CONFIDENCE", "0.75")),
       max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
       research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
@@ -366,6 +399,10 @@ def load_config() -> AppConfig:
       early_cut_grace_min=float(os.getenv("EARLY_CUT_GRACE_MIN", "20")),
       early_cut_min_favorable_pct=float(os.getenv("EARLY_CUT_MIN_FAVORABLE_PCT", "0.003")),
       early_cut_mae_frac=float(os.getenv("EARLY_CUT_MAE_FRAC", "0.6")),
+      trend_adaptive_enabled=_as_bool(os.getenv("PROFIT_LOCK_TREND_ADAPTIVE"), True),
+      trend_runner_r=float(os.getenv("PROFIT_LOCK_TREND_RUNNER_R", "2.0")),
+      trend_giveback_pct=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_PCT", "0.55")),
+      trend_giveback_arm_r=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_ARM_R", "2.5")),
     ),
     edge=EdgeConfig(
       enabled=_as_bool(os.getenv("ADAPTIVE_EDGE_ENABLED"), True),

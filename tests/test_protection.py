@@ -138,8 +138,29 @@ def test_manager_does_not_apply_exchange_age_without_persisted_peak():
 
 
 def test_giveback_close_after_real_run():
-    # Ran to +10 px, gave back to +4 px (>50% of peak) → close to lock the gain.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=10.0, cfg=_cfg())
+    # Chop (sub-runner): ran to +8 px = 1.6R (risk 5), gave back to +4 (50% > 35%) → close to lock the gain.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=8.0, cfg=_cfg())
+    assert d["action"] == "close"
+
+
+def test_trend_runner_holds_through_normal_giveback():
+    """A revealed trend winner (peak run >= trend_runner_r) tolerates a deeper pullback so it can keep
+    running — the ZEC lesson. Risk 5; peak 15 px = 3R (runner). Gave back to +8 (~47% < 55% trend cap)
+    → do NOT close; instead lock breakeven and let it run."""
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=108.0, sl_price=95.0, peak_fe=15.0, cfg=_cfg())
+    assert d["action"] == "move_breakeven"
+
+
+def test_trend_runner_closes_on_deep_giveback():
+    # Same 3R runner, but now gave back to +6 (60% > 55% trend cap) → close to lock the bulk of the gain.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=106.0, sl_price=95.0, peak_fe=15.0, cfg=_cfg())
+    assert d["action"] == "close"
+
+
+def test_trend_adaptive_off_keeps_tight_giveback():
+    # With trend adaptivity disabled, a 3R run that gives back >35% closes (legacy mean-reversion behavior).
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=15.0,
+                          cfg=_cfg(trend_adaptive_enabled=False))
     assert d["action"] == "close"
 
 
