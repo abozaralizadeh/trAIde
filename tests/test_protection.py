@@ -146,9 +146,16 @@ def test_manager_does_not_apply_exchange_age_without_persisted_peak():
 # ── decide_protection: give-back cap ─────────────────────────────────────────────
 
 
+# The give-back tests exercise the LEGACY path (trail_enabled=False); trailing is the new default and
+# supersedes the give-back close (see the trailing-ratchet tests below).
+def _gb(**overrides) -> ProfitProtectionConfig:
+    overrides.setdefault("trail_enabled", False)
+    return _cfg(**overrides)
+
+
 def test_giveback_close_after_real_run():
     # Chop (sub-runner): ran to +8 px = 1.6R (risk 5), gave back to +4 (50% > 35%) → close to lock the gain.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=8.0, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=8.0, cfg=_gb())
     assert d["action"] == "close"
 
 
@@ -156,31 +163,31 @@ def test_trend_runner_holds_through_normal_giveback():
     """A revealed trend winner (peak run >= trend_runner_r) tolerates a deeper pullback so it can keep
     running — the ZEC lesson. Risk 5; peak 15 px = 3R (runner). Gave back to +8 (~47% < 55% trend cap)
     → do NOT close; instead lock breakeven and let it run."""
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=108.0, sl_price=95.0, peak_fe=15.0, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=108.0, sl_price=95.0, peak_fe=15.0, cfg=_gb())
     assert d["action"] == "move_breakeven"
 
 
 def test_trend_runner_closes_on_deep_giveback():
     # Same 3R runner, but now gave back to +6 (60% > 55% trend cap) → close to lock the bulk of the gain.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=106.0, sl_price=95.0, peak_fe=15.0, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=106.0, sl_price=95.0, peak_fe=15.0, cfg=_gb())
     assert d["action"] == "close"
 
 
 def test_trend_adaptive_off_keeps_tight_giveback():
     # With trend adaptivity disabled, a 3R run that gives back >35% closes (legacy mean-reversion behavior).
     d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=15.0,
-                          cfg=_cfg(trend_adaptive_enabled=False))
+                          cfg=_gb(trend_adaptive_enabled=False))
     assert d["action"] == "close"
 
 
 def test_no_giveback_when_peak_too_small():
     # Peak of 0.2 px is below the 0.3% min FE on a 100-priced asset → ignore noise.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=99.9, sl_price=95.0, peak_fe=0.2, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=99.9, sl_price=95.0, peak_fe=0.2, cfg=_gb())
     assert d["action"] == "none"
 
 
 def test_giveback_disabled_when_pct_zero():
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=10.0, cfg=_cfg(giveback_pct=0.0))
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=10.0, cfg=_gb(giveback_pct=0.0))
     # With give-back off it should fall through to breakeven (peak 10 >= 1R of 5).
     assert d["action"] == "move_breakeven"
 
@@ -191,20 +198,71 @@ def test_giveback_disabled_when_pct_zero():
 def test_giveback_not_armed_below_one_r_run():
     """Sub-1R wobble is the original SL's job — the cap must not book fee-scale scratch wins.
     Risk = 5 px; peak ran only 2 px (0.4R, but > the 0.5% pct floor) then retraced fully."""
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.1, sl_price=95.0, peak_fe=2.0, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.1, sl_price=95.0, peak_fe=2.0, cfg=_gb())
     assert d["action"] == "none"
 
 
 def test_giveback_armed_after_one_r_run():
     # Risk = 5 px; ran to 6 px (1.2R) then gave back >35% → close.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=6.0, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=6.0, cfg=_gb())
     assert d["action"] == "close"
 
 
 def test_giveback_pct_arming_when_no_stop_known():
     # Without a live stop the 1R arming can't be computed → falls back to pct arming (old behavior).
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.5, sl_price=None, peak_fe=2.0, cfg=_cfg())
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=100.5, sl_price=None, peak_fe=2.0, cfg=_gb())
     assert d["action"] == "close"
+
+
+# ── decide_protection: trailing ratchet (default — lets winners run to TP instead of capping) ──
+
+
+def test_trail_ratchets_stop_up_and_lets_winner_run():
+    # Risk 5 (anchored via risk_override, since the live stop is already at breakeven); peak +10 (2R),
+    # price still near peak (mark 109). Trail 1R → stop to +1R (105), NOT a close, so the trade keeps
+    # running toward its TP instead of being capped at a give-back.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=109.0, sl_price=100.15, peak_fe=10.0,
+                          cfg=_cfg(), risk_override=5.0)
+    assert d["action"] == "move_breakeven"
+    assert abs(d["stopPrice"] - 105.0) < 1e-6   # peak(110) - 1R(5)
+
+
+def test_trail_first_move_locks_breakeven_at_arm():
+    # Just armed (peak +5 = 1R). Trail level = peak(105) - 1R(5) = 100 → floored at fee-breakeven, mark 104.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=5.0, cfg=_cfg())
+    assert d["action"] == "move_breakeven"
+    assert d["stopPrice"] >= 100.0   # at/above breakeven, never below entry
+
+
+def test_trail_closes_when_price_retraces_past_trail():
+    # Ran to +15 (3R, peak 115) then fell to 108. Trail stop = 110; mark 108 <= 110 → breached → close,
+    # locking ~+2R (far better than riding back to breakeven).
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=108.0, sl_price=100.15, peak_fe=15.0,
+                          cfg=_cfg(), risk_override=5.0)
+    assert d["action"] == "close" and "trailing stop hit" in d["reason"]
+
+
+def test_trail_short_symmetry():
+    # Short: entry 100, risk 5, peak +10 (price fell to 90). Trail 1R → stop to 95 (+1R locked); mark 91.
+    d = decide_protection(side_long=False, avg_entry=100.0, mark=91.0, sl_price=99.85, peak_fe=10.0,
+                          cfg=_cfg(), risk_override=5.0)
+    assert d["action"] == "move_breakeven"
+    assert abs(d["stopPrice"] - 95.0) < 1e-6   # peak(90) + 1R(5)
+
+
+def test_trail_no_churn_on_tiny_advance():
+    # Stop already at 104.9; new trail level 105 is only +0.1 (< 0.25R=1.25 min step) → no re-place.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=109.0, sl_price=104.9, peak_fe=10.0,
+                          cfg=_cfg(), risk_override=5.0)
+    assert d["action"] == "none"
+
+
+def test_trail_survives_stop_at_breakeven_via_risk_override():
+    # The bug this guards: once the stop sits at/above entry the live sl yields no positive risk, which
+    # used to disable every R-rule on a winner. With risk_override the trail keeps advancing.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=112.0, sl_price=100.15, peak_fe=12.0,
+                          cfg=_cfg(), risk_override=5.0)
+    assert d["action"] == "move_breakeven" and abs(d["stopPrice"] - 107.0) < 1e-6  # peak(112)-1R(5)
 
 
 def test_giveback_arm_r_zero_reverts_to_pct_arming():
