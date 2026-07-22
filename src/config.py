@@ -200,6 +200,16 @@ class ProfitProtectionConfig:
                                      # winner — no external regime feed needed; its OWN behavior proves it
   trend_giveback_pct: float = 0.55   # once a runner, tolerate giving back this much of peak (vs giveback_pct in chop)
   trend_giveback_arm_r: float = 2.5  # ...and only arm the (loosened) give-back cap after this much favorable run
+  # Trailing ratchet (Jul 2026 profitability fix): the fixed give-back MARKET-CLOSE was capping every
+  # winner at ~1.1R gross — it exits the instant price retraces X% of peak, so a normal wobble-then-
+  # continue never reaches the 1.5-2R bracket TP, and fees then shrink that 1.1R to ~0.4R net (the
+  # account's "wins < losses in R" problem). Replaced with a self-normalizing R-based TRAILING STOP:
+  # once the trade arms (>= breakeven_trigger_r), the stop ratchets up to lock (peak - trail_distance_r
+  # × own-risk), never below fee-breakeven, and NEVER moves against the trade. Because it's a resting
+  # stop (not a market close) the trade rides through shallow pullbacks to its TP or trails a runner —
+  # letting winners run while breakeven-lock still guarantees no loss. R units = no ATR feed, no % to tune.
+  trail_enabled: bool = True
+  trail_distance_r: float = 1.0      # trail the stop this many R below the running peak (>=1 avoids noise stop-outs)
 
 
 @dataclass
@@ -404,11 +414,13 @@ def load_config() -> AppConfig:
       early_cut_enabled=_as_bool(os.getenv("EARLY_CUT_ENABLED"), True),
       early_cut_grace_min=float(os.getenv("EARLY_CUT_GRACE_MIN", "20")),
       early_cut_min_favorable_pct=float(os.getenv("EARLY_CUT_MIN_FAVORABLE_PCT", "0.003")),
-      early_cut_mae_frac=float(os.getenv("EARLY_CUT_MAE_FRAC", "0.6")),
+      early_cut_mae_frac=float(os.getenv("EARLY_CUT_MAE_FRAC", "0.85")),
       trend_adaptive_enabled=_as_bool(os.getenv("PROFIT_LOCK_TREND_ADAPTIVE"), True),
       trend_runner_r=float(os.getenv("PROFIT_LOCK_TREND_RUNNER_R", "2.0")),
       trend_giveback_pct=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_PCT", "0.55")),
       trend_giveback_arm_r=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_ARM_R", "2.5")),
+      trail_enabled=_as_bool(os.getenv("PROFIT_LOCK_TRAIL_ENABLED"), True),
+      trail_distance_r=float(os.getenv("PROFIT_LOCK_TRAIL_DISTANCE_R", "1.0")),
     ),
     edge=EdgeConfig(
       enabled=_as_bool(os.getenv("ADAPTIVE_EDGE_ENABLED"), True),

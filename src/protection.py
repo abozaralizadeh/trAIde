@@ -81,6 +81,7 @@ def decide_protection(
   peak_fe: float,
   cfg: ProfitProtectionConfig,
   opened_min_ago: Optional[float] = None,
+  risk_override: Optional[float] = None,
 ) -> Dict[str, Any]:
   """Decide what protective action (if any) a position needs. Pure function.
 
@@ -92,6 +93,10 @@ def decide_protection(
     peak_fe: peak favourable excursion in price terms (>=0 once the trade has been green).
     cfg: thresholds.
     opened_min_ago: minutes since the position opened, for the early-invalidation cut (None skips it).
+    risk_override: the ORIGINAL risk distance (entry − initial stop, in price). Once the stop ratchets
+      to breakeven the live ``sl_price`` no longer yields a positive risk, which would silently disable
+      every R-based rule (trail/give-back/breakeven) exactly when the trade is winning; the caller
+      passes the lifecycle's initial risk here so R stays anchored to the trade's real 1R.
 
   Returns a dict with ``action`` in {"none", "move_breakeven", "close"} plus context.
   """
@@ -100,7 +105,9 @@ def decide_protection(
 
   fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)
   risk_dist = None
-  if sl_price is not None and sl_price > 0:
+  if risk_override is not None and risk_override > 0:
+    risk_dist = float(risk_override)          # stable 1R, survives the stop moving to breakeven
+  elif sl_price is not None and sl_price > 0:
     rd = (avg_entry - sl_price) if side_long else (sl_price - avg_entry)
     if rd > 0:
       risk_dist = rd
@@ -149,10 +156,54 @@ def decide_protection(
     giveback_pct = cfg.trend_giveback_pct
     giveback_arm_r = cfg.trend_giveback_arm_r
 
-  # P1a — give-back cap: lock the gain once a real run retraces too far. Arming is tied to the
-  # trade's OWN risk when the stop is known (giveback_arm_r × stop distance): sub-1R wobble is
-  # noise the original SL owns, and closing there books fee-scale scratch "wins" while losses
-  # ride to the full stop — the asymmetry that kept the account net-negative.
+  # P1a-trail — trailing ratchet (preferred): once the trade arms (>= breakeven_trigger_r × own risk),
+  # ratchet the STOP up to lock (peak - trail_distance_r × risk), never below fee-breakeven and never
+  # against the trade. Unlike the give-back market-close it does NOT exit on a shallow retrace, so the
+  # trade rides through a normal wobble to its bracket TP or trails a genuine runner — fixing the
+  # "every winner capped at ~1.1R gross → ~0.4R net after fees" problem. The give-back close below is
+  # kept only for when trailing is disabled (backward-compatible).
+  if getattr(cfg, "trail_enabled", False) and risk_dist is not None and peak_fe >= cfg.breakeven_trigger_r * risk_dist:
+    trail_r = max(0.0, float(getattr(cfg, "trail_distance_r", 1.0)))
+    be = avg_entry * (1.0 + cfg.breakeven_fee_pct) if side_long else avg_entry * (1.0 - cfg.breakeven_fee_pct)
+    # peak price = entry ± peak_fe; trailing stop sits trail_r×risk back from that peak, floored at breakeven.
+    # Only re-place the stop on a meaningful advance (>= 0.25R), so a slowly-creeping peak doesn't
+    # cancel+replace the stop every poll — an internal churn guard, not a strategy parameter.
+    min_step = 0.25 * risk_dist
+    if side_long:
+      new_stop = max(be, (avg_entry + peak_fe) - trail_r * risk_dist)
+      breached = mark <= new_stop           # price already retraced past the trail → lock it now
+      improves = (new_stop - sl_price) > min_step if sl_price is not None else True
+    else:
+      new_stop = min(be, (avg_entry - peak_fe) + trail_r * risk_dist)
+      breached = mark >= new_stop
+      improves = (sl_price - new_stop) > min_step if sl_price is not None else True
+    locked_r = (abs(new_stop - avg_entry) / risk_dist) if risk_dist else 0.0
+    at_be = abs(new_stop - be) <= 1e-9
+    if breached:
+      return {
+        "action": "close",
+        "reason": (
+          f"trailing stop hit — price retraced {trail_r:.1f}R from peak +{peak_fe:.4f} px; "
+          f"locking {'breakeven' if at_be else f'+{locked_r:.1f}R'}"
+        ),
+        "peakFe": peak_fe,
+        "feNow": fe_now,
+      }
+    if improves:
+      return {
+        "action": "move_breakeven",
+        "stopPrice": new_stop,
+        "reason": (
+          f"trailing ratchet — stop to {'breakeven' if at_be else f'+{locked_r:.1f}R locked'} "
+          f"(peak +{peak_fe:.4f} px, trail {trail_r:.1f}R); let the winner run to TP or trail the trend"
+        ),
+        "riskDist": risk_dist,
+      }
+    return {"action": "none", "reason": "trailing stop already at computed level", "feNow": fe_now}
+
+  # P1a — give-back cap (used only when trailing is disabled): lock the gain once a real run retraces
+  # too far. Arming is tied to the trade's OWN risk (giveback_arm_r × stop distance): sub-arm wobble is
+  # noise the original SL owns.
   if giveback_pct and giveback_pct > 0:
     min_fe = cfg.min_favorable_excursion_pct * avg_entry
     if giveback_arm_r and giveback_arm_r > 0 and risk_dist is not None:
@@ -254,6 +305,7 @@ class ProtectionManager:
     # per-trade equity budget here so a missing/gapped stop cannot produce an unbounded loss.
     self.max_loss_equity_fraction = max(0.0, _to_float(max_loss_equity_fraction) or 0.0)
     self._peak_fe: Dict[str, float] = {}      # futures symbol -> peak favourable excursion (px)
+    self._init_risk: Dict[str, float] = {}    # futures symbol -> original risk distance (entry−initial stop, px)
     self._peak_side: Dict[str, bool] = {}     # futures symbol -> side_long (to reset on flip)
     self._position_lifecycle: Dict[str, tuple[Any, ...]] = {}
     self._tick_cache: Dict[str, float] = {}   # futures symbol -> tick size
@@ -329,6 +381,7 @@ class ProtectionManager:
           self._position_lifecycle[fsym] = lifecycle
           self._peak_side[fsym] = side_long
           self._peak_fe.pop(fsym, None)
+          self._init_risk.pop(fsym, None)
           self._emergency_placed_legs.pop(fsym, None)
           self._open_since[fsym] = time.time()
         # Early-cut depends on both observed age and observed MFE. Peak excursion is process-local,
@@ -342,6 +395,15 @@ class ProtectionManager:
         self._peak_fe[fsym] = peak_fe
 
         sl_price = self._current_stop_price(fsym, side_long, stops)
+
+        # Capture the lifecycle's ORIGINAL risk (entry − initial loss-side stop) the first time a
+        # below-entry stop is seen, and keep it. Once the stop later ratchets to breakeven the live
+        # distance goes to zero, so without this anchor every R-based rule would silently switch off
+        # on winners. Only overwrite while still an actual risk stop (below entry for a long).
+        if sl_price is not None and sl_price > 0:
+          _rd = (avg_entry - sl_price) if side_long else (sl_price - avg_entry)
+          if _rd > 0 and fsym not in self._init_risk:
+            self._init_risk[fsym] = _rd
 
         # Safety net: never leave a filled position naked. If no loss-side stop exists, attach an
         # emergency bracket — but only after a short grace so a just-attached (st-orders) bracket has
@@ -383,6 +445,7 @@ class ProtectionManager:
           peak_fe=peak_fe,
           cfg=self.cfg,
           opened_min_ago=opened_min_ago,
+          risk_override=self._init_risk.get(fsym),
         )
         action = decision.get("action")
         if action == "none":
@@ -398,6 +461,9 @@ class ProtectionManager:
           self._peak_fe.pop(sym, None)
           self._peak_side.pop(sym, None)
           self._position_lifecycle.pop(sym, None)
+      for sym in list(self._init_risk.keys()):
+        if sym not in open_symbols:
+          self._init_risk.pop(sym, None)
       for sym in list(self._naked_since.keys()):
         if sym not in open_symbols:
           self._naked_since.pop(sym, None)
