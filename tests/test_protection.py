@@ -92,14 +92,15 @@ def test_early_cut_disabled_or_no_age():
 
 
 def test_no_action_before_one_r():
-    # Long up only +0.5R, stop still below: nothing to do yet.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=102.5, sl_price=95.0, peak_fe=2.5, cfg=_cfg())
+    # Long up only +0.4R (below the 0.5R trail arm), stop still below: nothing to do yet.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=2.0, cfg=_cfg())
     assert d["action"] == "none"
 
 
 def test_move_to_breakeven_at_one_r():
-    # peak favourable excursion == initial risk (5 px) → ratchet stop to fee-adjusted breakeven.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=5.0, cfg=_cfg())
+    # peak favourable excursion == initial risk (5 px = 1R) with the give-back (trail-disabled) path:
+    # the P1b breakeven ratchet moves the stop to fee-adjusted breakeven.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=5.0, cfg=_gb())
     assert d["action"] == "move_breakeven"
     assert d["stopPrice"] == 100.0 * 1.0015  # above entry by the fee buffer
 
@@ -111,7 +112,7 @@ def test_no_breakeven_when_stop_already_protective():
 
 
 def test_short_breakeven_symmetry():
-    d = decide_protection(side_long=False, avg_entry=100.0, mark=96.0, sl_price=105.0, peak_fe=5.0, cfg=_cfg())
+    d = decide_protection(side_long=False, avg_entry=100.0, mark=96.0, sl_price=105.0, peak_fe=5.0, cfg=_gb())
     assert d["action"] == "move_breakeven"
     assert d["stopPrice"] == 100.0 * (1 - 0.0015)  # below entry for a short
 
@@ -219,19 +220,27 @@ def test_giveback_pct_arming_when_no_stop_known():
 
 def test_trail_ratchets_stop_up_and_lets_winner_run():
     # Risk 5 (anchored via risk_override, since the live stop is already at breakeven); peak +10 (2R),
-    # price still near peak (mark 109). Trail 1R → stop to +1R (105), NOT a close, so the trade keeps
-    # running toward its TP instead of being capped at a give-back.
+    # price still near peak (mark 109). Lock = max(50% of peak=5, peak−0.75R=6.25) = 6.25 → stop +6.25
+    # (106.25), NOT a close, so the trade keeps running toward its TP instead of being capped.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=109.0, sl_price=100.15, peak_fe=10.0,
                           cfg=_cfg(), risk_override=5.0)
     assert d["action"] == "move_breakeven"
-    assert abs(d["stopPrice"] - 105.0) < 1e-6   # peak(110) - 1R(5)
+    assert abs(d["stopPrice"] - 106.25) < 1e-6   # max(0.5*10, 10 - 0.75*5) = 6.25 above entry
 
 
-def test_trail_first_move_locks_breakeven_at_arm():
-    # Just armed (peak +5 = 1R). Trail level = peak(105) - 1R(5) = 100 → floored at fee-breakeven, mark 104.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=5.0, cfg=_cfg())
+def test_trail_arms_and_locks_fraction_below_one_r():
+    # THE give-back fix: a trade that peaks at +0.8R (below the old 1R arm) now arms at 0.6R and locks
+    # 50% of the run (+0.4R), instead of riding all the way back to a full stop-out (the ERA +0.85R→−0.05
+    # and ONDO +0.80R→+0.44 round-trips). Risk 5 px, peak +4 (0.8R), mark 103.5.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=103.5, sl_price=95.0, peak_fe=4.0, cfg=_cfg())
     assert d["action"] == "move_breakeven"
-    assert d["stopPrice"] >= 100.0   # at/above breakeven, never below entry
+    assert abs(d["stopPrice"] - 102.0) < 1e-6   # max(0.5*4=2, 4-0.75*5=0.25) = 2 above entry
+
+
+def test_trail_does_not_arm_below_arm_threshold():
+    # Peak +0.4R (2.0 px) is below the 0.5R arm → the trail stays dormant, the original SL still owns it.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=2.0, cfg=_cfg())
+    assert d["action"] == "none"
 
 
 def test_trail_closes_when_price_retraces_past_trail():
@@ -243,16 +252,17 @@ def test_trail_closes_when_price_retraces_past_trail():
 
 
 def test_trail_short_symmetry():
-    # Short: entry 100, risk 5, peak +10 (price fell to 90). Trail 1R → stop to 95 (+1R locked); mark 91.
+    # Short: entry 100, risk 5, peak +10 (price fell to 90). Lock = max(0.5*10=5, 10-0.75*5=6.25) = 6.25
+    # → stop to 93.75 (+1.25R locked); mark 91.
     d = decide_protection(side_long=False, avg_entry=100.0, mark=91.0, sl_price=99.85, peak_fe=10.0,
                           cfg=_cfg(), risk_override=5.0)
     assert d["action"] == "move_breakeven"
-    assert abs(d["stopPrice"] - 95.0) < 1e-6   # peak(90) + 1R(5)
+    assert abs(d["stopPrice"] - 93.75) < 1e-6   # entry - max(0.5*10, 10 - 0.75*5)
 
 
 def test_trail_no_churn_on_tiny_advance():
-    # Stop already at 104.9; new trail level 105 is only +0.1 (< 0.25R=1.25 min step) → no re-place.
-    d = decide_protection(side_long=True, avg_entry=100.0, mark=109.0, sl_price=104.9, peak_fe=10.0,
+    # Stop already at 105.5; new trail level 106.25 is only +0.75 (< 0.25R=1.25 min step) → no re-place.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=109.0, sl_price=105.5, peak_fe=10.0,
                           cfg=_cfg(), risk_override=5.0)
     assert d["action"] == "none"
 
@@ -262,7 +272,7 @@ def test_trail_survives_stop_at_breakeven_via_risk_override():
     # used to disable every R-rule on a winner. With risk_override the trail keeps advancing.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=112.0, sl_price=100.15, peak_fe=12.0,
                           cfg=_cfg(), risk_override=5.0)
-    assert d["action"] == "move_breakeven" and abs(d["stopPrice"] - 107.0) < 1e-6  # peak(112)-1R(5)
+    assert d["action"] == "move_breakeven" and abs(d["stopPrice"] - 108.25) < 1e-6  # max(0.5*12, 12-0.75*5)
 
 
 def test_giveback_arm_r_zero_reverts_to_pct_arming():
@@ -534,7 +544,7 @@ def test_tick_rounding_supports_arbitrary_increments(tick, price, expected):
 )
 def test_excursion_lifecycle_resets_on_open_time_quantity_or_average_change(changed):
     mgr = ProtectionManager(
-        _cfg(breakeven_trigger_r=100.0, giveback_pct=0.0, early_cut_enabled=False),
+        _cfg(breakeven_trigger_r=100.0, giveback_pct=0.0, early_cut_enabled=False, trail_enabled=False),
         kucoin_futures=object(),
     )
     stop = {
