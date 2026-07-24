@@ -209,7 +209,21 @@ class ProfitProtectionConfig:
   # stop (not a market close) the trade rides through shallow pullbacks to its TP or trails a runner —
   # letting winners run while breakeven-lock still guarantees no loss. R units = no ATR feed, no % to tune.
   trail_enabled: bool = True
-  trail_distance_r: float = 1.0      # trail the stop this many R below the running peak (>=1 avoids noise stop-outs)
+  # Jul 23 2026 give-back fix: the trail used to ARM only at breakeven_trigger_r (1R) and trail a full
+  # 1R behind the peak. But the account's real trades peak on a 0.3–1.7R scale — 16 of 19 recent closes
+  # peaked BELOW +1R, so the trail never armed and they round-tripped from green to a FULL stop-out
+  # (ERA +0.85R→−0.05, ONDO +0.80R→+0.44, RE +1.72R→+0.78 giving back ~1R). Two changes, both still
+  # pure-R (no ATR/%/per-symbol tuning, self-normalizing): (1) arm the trail at `trail_arm_r` (0.6R) so
+  # a trade that has shown a real edge locks in profit long before +1R; (2) lock the GREATER of a
+  # fraction of the peak run (`trail_lock_frac`) and the fixed-R trail — the fraction captures the
+  # mid-size runs (peak 0.6–1.5R) that dominate the sample, the fixed-R trail captures genuine big
+  # runners. Floored at fee-breakeven, never moves against the trade, resting stop (rides wobbles to TP).
+  trail_arm_r: float = 0.5           # arm the trailing ratchet once peak run reaches this many R (was 1R via breakeven_trigger_r).
+                                     # 0.5R = the trade has shown half its own risk as profit (a real edge, beyond noise). NOT
+                                     # tuned lower: a replay of the chop sample favored 0.3R, but that overfits to a reversing
+                                     # tape and would scratch genuine trend runners when trends return (the ZEC lesson).
+  trail_lock_frac: float = 0.5       # lock at least this fraction of the peak favourable run once armed
+  trail_distance_r: float = 0.75     # ...or trail this many R below the peak, whichever locks MORE
 
 
 @dataclass
@@ -420,7 +434,9 @@ def load_config() -> AppConfig:
       trend_giveback_pct=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_PCT", "0.55")),
       trend_giveback_arm_r=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_ARM_R", "2.5")),
       trail_enabled=_as_bool(os.getenv("PROFIT_LOCK_TRAIL_ENABLED"), True),
-      trail_distance_r=float(os.getenv("PROFIT_LOCK_TRAIL_DISTANCE_R", "1.0")),
+      trail_arm_r=float(os.getenv("PROFIT_LOCK_TRAIL_ARM_R", "0.5")),
+      trail_lock_frac=float(os.getenv("PROFIT_LOCK_TRAIL_LOCK_FRAC", "0.5")),
+      trail_distance_r=float(os.getenv("PROFIT_LOCK_TRAIL_DISTANCE_R", "0.75")),
     ),
     edge=EdgeConfig(
       enabled=_as_bool(os.getenv("ADAPTIVE_EDGE_ENABLED"), True),

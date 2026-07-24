@@ -162,19 +162,24 @@ def decide_protection(
   # trade rides through a normal wobble to its bracket TP or trails a genuine runner — fixing the
   # "every winner capped at ~1.1R gross → ~0.4R net after fees" problem. The give-back close below is
   # kept only for when trailing is disabled (backward-compatible).
-  if getattr(cfg, "trail_enabled", False) and risk_dist is not None and peak_fe >= cfg.breakeven_trigger_r * risk_dist:
-    trail_r = max(0.0, float(getattr(cfg, "trail_distance_r", 1.0)))
+  trail_arm_r = float(getattr(cfg, "trail_arm_r", cfg.breakeven_trigger_r))
+  if getattr(cfg, "trail_enabled", False) and risk_dist is not None and peak_fe >= trail_arm_r * risk_dist:
+    trail_r = max(0.0, float(getattr(cfg, "trail_distance_r", 0.75)))
+    lock_frac = max(0.0, min(1.0, float(getattr(cfg, "trail_lock_frac", 0.5))))
     be = avg_entry * (1.0 + cfg.breakeven_fee_pct) if side_long else avg_entry * (1.0 - cfg.breakeven_fee_pct)
-    # peak price = entry ± peak_fe; trailing stop sits trail_r×risk back from that peak, floored at breakeven.
+    # Lock the GREATER of (a) a fraction of the peak run and (b) a fixed R-trail below the peak. (a)
+    # captures the mid-size runs (peak 0.6–1.5R) that used to give everything back before reaching the
+    # old 1R arm; (b) captures genuine big runners tightly. Floored at fee-breakeven.
+    lock_fe = max(lock_frac * peak_fe, peak_fe - trail_r * risk_dist)
     # Only re-place the stop on a meaningful advance (>= 0.25R), so a slowly-creeping peak doesn't
     # cancel+replace the stop every poll — an internal churn guard, not a strategy parameter.
     min_step = 0.25 * risk_dist
     if side_long:
-      new_stop = max(be, (avg_entry + peak_fe) - trail_r * risk_dist)
+      new_stop = max(be, avg_entry + lock_fe)
       breached = mark <= new_stop           # price already retraced past the trail → lock it now
       improves = (new_stop - sl_price) > min_step if sl_price is not None else True
     else:
-      new_stop = min(be, (avg_entry - peak_fe) + trail_r * risk_dist)
+      new_stop = min(be, avg_entry - lock_fe)
       breached = mark >= new_stop
       improves = (sl_price - new_stop) > min_step if sl_price is not None else True
     locked_r = (abs(new_stop - avg_entry) / risk_dist) if risk_dist else 0.0
@@ -183,7 +188,7 @@ def decide_protection(
       return {
         "action": "close",
         "reason": (
-          f"trailing stop hit — price retraced {trail_r:.1f}R from peak +{peak_fe:.4f} px; "
+          f"trailing stop hit — price retraced past the lock from peak +{peak_fe:.4f} px; "
           f"locking {'breakeven' if at_be else f'+{locked_r:.1f}R'}"
         ),
         "peakFe": peak_fe,
@@ -195,7 +200,7 @@ def decide_protection(
         "stopPrice": new_stop,
         "reason": (
           f"trailing ratchet — stop to {'breakeven' if at_be else f'+{locked_r:.1f}R locked'} "
-          f"(peak +{peak_fe:.4f} px, trail {trail_r:.1f}R); let the winner run to TP or trail the trend"
+          f"(peak +{peak_fe:.4f} px, lock {lock_frac:.0%}/{trail_r:.2f}R); let the winner run to TP or trail the trend"
         ),
         "riskDist": risk_dist,
       }
