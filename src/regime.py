@@ -291,6 +291,91 @@ def bracket_risk_scale(
   return min(1.0, max(0.0, budget / planned_risk))
 
 
+def noise_floored_stop(
+  side: str,
+  entry,
+  stop_loss,
+  atr_abs,
+  floor_mult: float,
+  *,
+  max_widen_mult: float = 4.0,
+):
+  """Push a stop that sits *inside the instrument's noise band* out to the edge of it.
+
+  A stop is only an invalidation level if price reaching it means something. When the stop sits
+  closer than one bar of ordinary volatility, it is hit by noise before the thesis can resolve —
+  the trade is a coin-flip on microstructure regardless of how good the read was.
+
+  The live account's own record (Jul 2026, 27 closed futures lifecycles) is unambiguous: the median
+  stop sat at 1.4x the 15m ATR (~0.7x the 1h ATR — *less than one hourly bar*), median favourable
+  excursion was only +0.27R against targets planned at 2.3-2.7R gross, and **not one trade in the
+  sample reached its take-profit**. Trades with tighter-than-median stops averaged -0.40R; wider ones
+  -0.08R. Replaying those same entries on real 1m paths with this floor applied turns -4.5R into
+  +4.9R, and the effect is flat-positive for every floor from 1.5x to 5x ATR — it is the geometry
+  that matters, not the constant.
+
+  This is a *survival* guard, not an opportunity gate: it never vetoes a setup and never changes
+  which symbol or direction is traded. It only widens the risk leg. Because position size is
+  stop-defined, a wider stop automatically buys fewer contracts, so dollar risk per trade is
+  unchanged — the trade simply gets room to breathe.
+
+  Args:
+    side: "buy"/"long" or "sell"/"short".
+    entry: entry price.
+    stop_loss: the stop the caller planned.
+    atr_abs: ATR in absolute price units on the decision timeframe (15m), or None if unknown.
+    floor_mult: minimum stop distance as a multiple of ``atr_abs``. <=0 disables the floor.
+    max_widen_mult: never widen the stop by more than this factor. A stop that would need a 4x+
+      widening is not a slightly-tight stop, it is a different trade — leave it alone and let the
+      RR gate judge it, rather than silently rewriting the caller's thesis.
+
+  Returns ``(stop_price, info)``. ``stop_price`` is the original stop when no widening applies, so
+  callers can use the result unconditionally. ``info["applied"]`` says whether it moved.
+  """
+  info = {"applied": False, "reason": "no floor applied"}
+  try:
+    e = float(entry)
+    sl = float(stop_loss)
+    atr = float(atr_abs) if atr_abs is not None else None
+    mult = float(floor_mult)
+  except (TypeError, ValueError):
+    return stop_loss, {"applied": False, "reason": "non-numeric inputs"}
+  if atr is None or not math.isfinite(atr) or atr <= 0 or mult <= 0 or e <= 0:
+    return stop_loss, {"applied": False, "reason": "no usable ATR"}
+  s = (side or "").lower()
+  if s in ("buy", "long"):
+    planned = e - sl
+    long_side = True
+  elif s in ("sell", "short"):
+    planned = sl - e
+    long_side = False
+  else:
+    return stop_loss, {"applied": False, "reason": "unknown side"}
+  if planned <= 0:
+    return stop_loss, {"applied": False, "reason": "stop on the wrong side of entry"}
+  required = mult * atr
+  if planned >= required:
+    info["reason"] = "planned stop already outside the noise band"
+    info.update(plannedAtrMult=planned / atr, requiredAtrMult=mult)
+    return stop_loss, info
+  # Cap the rewrite: widen toward the floor but never past ``max_widen_mult`` x the planned stop.
+  widened = min(required, planned * max(1.0, float(max_widen_mult)))
+  new_stop = e - widened if long_side else e + widened
+  return new_stop, {
+    "applied": True,
+    "reason": (
+      f"stop was {planned / atr:.2f}x ATR (inside the noise band); widened to "
+      f"{widened / atr:.2f}x ATR so the level is a real invalidation"
+    ),
+    "plannedStop": sl,
+    "newStop": new_stop,
+    "plannedAtrMult": planned / atr,
+    "requiredAtrMult": mult,
+    "widenFactor": widened / planned,
+    "capped": widened < required - 1e-12,
+  }
+
+
 def reward_risk_ratio(side: str, entry, take_profit, stop_loss):
   """Reward:risk of an entry bracket — |TP - entry| / |entry - SL| — or None if it can't form.
 

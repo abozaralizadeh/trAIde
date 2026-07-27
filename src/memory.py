@@ -1075,6 +1075,20 @@ class MemoryStore:
     rows = self._authoritative_realized_rows(rows)
     return rows[-max(1, int(limit)):]
 
+  def recent_fills(self, limit: int = 100) -> list[Dict[str, Any]]:
+    """Recent FILLED entry orders, oldest→newest — the sample the friction estimate calibrates on.
+
+    Only rows that actually filled carry a usable (planned price, achieved fill price) pair, which is
+    what ``edge.measured_slippage_pct`` turns into a measured slippage instead of a hand-set constant.
+    """
+    with self._lock:
+      data = self._read()
+    rows = [
+      t for t in (data.get("trades") or [])
+      if isinstance(t, dict) and t.get("filled") and t.get("fillPrice") is not None
+    ]
+    return rows[-max(1, int(limit)):]
+
   def get_seen_close_ids(self) -> list[str]:
     """Exchange close-position IDs already recorded as decisions (persists across restarts)."""
     with self._lock:

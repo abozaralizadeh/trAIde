@@ -53,7 +53,15 @@ from .kucoin import (
   KucoinOrderRequest,
   KucoinTicker,
 )
-from .edge import expectancy_size_factor, edge_stats, entry_quality_stats, loss_streak_size_factor, symbol_bench_until
+from .edge import (
+  adaptive_stop_atr_mult,
+  expectancy_size_factor,
+  edge_stats,
+  entry_quality_stats,
+  loss_streak_size_factor,
+  measured_slippage_pct,
+  symbol_bench_until,
+)
 from .memory import MemoryStore
 from .protection import should_block_chase
 from .regime import (
@@ -762,7 +770,29 @@ def run_trading_agent(
       "direction_size_factor": {},
       "symbol_size_factor": {},
       "bench": {},
+      # Self-calibrating execution geometry (see edge.measured_slippage_pct / adaptive_stop_atr_mult).
+      # Both start at their configured prior and only move once there is a real sample, so a cold
+      # start behaves exactly like the static config.
+      "slippage_pct": cfg.trading.estimated_slippage_pct,
+      "stop_atr_floor_mult": cfg.trading.stop_atr_floor_mult,
     }
+    try:
+      if cfg.trading.slippage_autotune_enabled:
+        slip = measured_slippage_pct(
+          memory.recent_fills(limit=100),
+          cfg.trading.estimated_slippage_pct,
+          min_samples=cfg.trading.slippage_autotune_min_samples,
+        )
+        state["slippage_pct"] = slip["value"]
+        state["slippage_detail"] = slip
+        if slip["source"] == "measured" and slip["value"] < cfg.trading.estimated_slippage_pct:
+          logger.info(
+            "ADAPTIVE FRICTION: measured slippage %.4f%%/side over %d fills (prior %.4f%%) — "
+            "RR gates no longer charge phantom cost",
+            slip["value"] * 100, slip["n"], cfg.trading.estimated_slippage_pct * 100,
+          )
+    except Exception as exc:
+      logger.warning("Slippage autotune failed (using configured prior): %s", exc)
     try:
       if cfg.edge.enabled:
         closes = memory.realized_closes(limit=max(cfg.edge.lookback_trades * 2, 50))
@@ -770,6 +800,16 @@ def run_trading_agent(
         state["stats"] = stats
         # Post-trade entry-quality feedback (decision-support the agent reflects on; not a gate).
         state["entry_quality"] = entry_quality_stats(closes, cfg.edge.lookback_trades)
+        # Noise floor on stop distance, tuned from the adverse heat the bot's own WINNERS survive.
+        if cfg.trading.stop_atr_floor_adaptive and cfg.trading.stop_atr_floor_mult > 0:
+          floor = adaptive_stop_atr_mult(closes, cfg.trading.stop_atr_floor_mult, lookback=cfg.edge.lookback_trades)
+          state["stop_atr_floor_mult"] = floor["value"]
+          state["stop_atr_floor_detail"] = floor
+          if floor["source"] == "measured":
+            logger.info(
+              "ADAPTIVE STOP FLOOR: %.2f→%.2f x ATR15m — %s",
+              cfg.trading.stop_atr_floor_mult, floor["value"], floor.get("reason", ""),
+            )
         # Keep targets structural. Stretching TP farther because old trades lost made fills/targets
         # less reachable; weak evidence now adapts capital-at-risk instead (below).
         state["required_rr"] = cfg.trading.min_futures_rr
@@ -1715,6 +1755,19 @@ def run_trading_agent(
         "betterEntryRate": (_edge_now.get("entry_quality") or {}).get("better_entry_rate"),
         "worstEntry": (_edge_now.get("entry_quality") or {}).get("worst_entry"),
       },
+      # How far price ACTUALLY travels in your favour, so targets are planned against the tape that
+      # exists rather than the one you want. medianMfeR is the typical best-case excursion; the
+      # mfeReachedRate buckets are the share of trades that ever reached each R milestone.
+      "targetReachability": {
+        "medianMfeR": (_edge_now.get("entry_quality") or {}).get("median_mfe_r"),
+        "mfeReachedRate": (_edge_now.get("entry_quality") or {}).get("mfe_reached_rate", {}),
+      },
+      # Execution geometry the code is enforcing this run, so proposed brackets match what will be placed.
+      "executionGeometry": {
+        "stopAtrFloorMult": _edge_now.get("stop_atr_floor_mult"),
+        "slippagePctPerSide": _edge_now.get("slippage_pct"),
+        "slippageSource": (_edge_now.get("slippage_detail") or {}).get("source", "prior"),
+      },
       "note": (
         "ENFORCED IN CODE this run: the structural net reward:risk floor is checked after "
         "estimated fees and slippage, benched symbols are rejected, and risk is scaled by loss streak plus "
@@ -1728,7 +1781,18 @@ def run_trading_agent(
         "clear edgeReport.baseRr after costs. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor. "
         "ENTRY-QUALITY LEARNING: if entryQuality.avgMaeR is high (say > ~0.5R) or avgEntryExtensionAtr is high, your "
         "recent entries were CHASING — price kept dipping back to a better price after you filled. Respond by resting "
-        "limits at the pullback/retest anchors in entryMap rather than filling at the current stretched price."
+        "limits at the pullback/retest anchors in entryMap rather than filling at the current stretched price. "
+        "TARGET REACHABILITY: read targetReachability before you set a TP. If mfeReachedRate['2R'] is near zero, a 2R "
+        "target is not ambitious — it is unreachable on this tape, and planning it forces the stop inward to keep the "
+        "ratio, which is how a correct read still loses. Pick the nearest STRUCTURAL target that the recent excursion "
+        "distribution actually supports; if that target cannot clear baseRr against a stop placed at true invalidation, "
+        "the honest answer is to skip the setup, not to shrink the stop. "
+        "STOP GEOMETRY: executionGeometry.stopAtrFloorMult is a floor the CODE applies — a stop closer than that many "
+        "15m ATRs is widened before sizing (position size shrinks to hold dollar risk constant). Place invalidation "
+        "outside the noise band yourself and this never has to fire. "
+        "DIRECTIONAL HONESTY: compare perDirection long vs short. If one direction has taken most of your entries and "
+        "carries the losses, that is the tape telling you the bias is yours, not the market's — the fix is to require "
+        "the same evidence for a long as for a short, and to stand aside when neither side offers it."
       ),
     }
   except Exception as _edge_exc:

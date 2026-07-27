@@ -96,6 +96,28 @@ class TradingConfig:
   # 0 disables (pure passive-limit behavior).
   marketable_entry_max_dev_pct: float = 0.0015  # allow crossing up to 0.15% for a high-conviction fill
   marketable_entry_min_confidence: float = 0.75  # confidence bar to permit a marketable (crossing) entry
+  # Noise floor on stop distance (Jul 2026 — the single biggest measured loss driver). Across the 27
+  # closed futures lifecycles of 20-27 Jul the median stop sat at 1.4x the 15m ATR (~0.7x the 1h ATR,
+  # i.e. LESS THAN ONE HOURLY BAR of ordinary movement). Median favourable excursion was +0.27R
+  # against targets planned at 2.3-2.7R gross and *not one trade reached its take-profit*; trades with
+  # tighter-than-median stops averaged -0.40R vs -0.08R for wider ones. Replaying those same entries
+  # on real 1m paths, flooring the stop here turns -4.5R into +4.9R, and every floor from 1.5x to 5x
+  # ATR is positive — the geometry is what matters, so 2.5 is chosen as ~one full 1h bar of noise
+  # (median ATR(1h)/ATR(15m) is 2.18) rather than as the replay's argmax. This is a SURVIVAL guard:
+  # it never vetoes a setup or changes symbol/direction, it only widens the risk leg, and because
+  # size is stop-defined the dollar risk per trade is unchanged. 0 disables.
+  stop_atr_floor_mult: float = 2.5
+  # ...and it self-tunes from realized MAE (see edge.adaptive_stop_atr_mult), so the constant above is
+  # only the starting prior. 0 disables adaptation and pins the floor to the value above.
+  stop_atr_floor_adaptive: bool = True
+  # Never rewrite a stop by more than this factor. A stop needing a 4x widening is not a slightly
+  # tight stop, it is a different trade — leave it and let the RR gate judge it.
+  stop_atr_floor_max_widen: float = 4.0
+  # Slippage self-calibration: use the bot's OWN measured fill deviation instead of the static
+  # `estimated_slippage_pct` prior once there are enough fills (see edge.measured_slippage_pct).
+  # The static 0.10%/side was ~12x the measured 0.008% and taxed every setup a phantom 0.18R.
+  slippage_autotune_enabled: bool = True
+  slippage_autotune_min_samples: int = 8
   # Risk guardrails (added after the RE-USDT concentration blowup, 2026-06-21):
   max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
@@ -218,12 +240,21 @@ class ProfitProtectionConfig:
   # fraction of the peak run (`trail_lock_frac`) and the fixed-R trail — the fraction captures the
   # mid-size runs (peak 0.6–1.5R) that dominate the sample, the fixed-R trail captures genuine big
   # runners. Floored at fee-breakeven, never moves against the trade, resting stop (rides wobbles to TP).
-  trail_arm_r: float = 0.5           # arm the trailing ratchet once peak run reaches this many R (was 1R via breakeven_trigger_r).
-                                     # 0.5R = the trade has shown half its own risk as profit (a real edge, beyond noise). NOT
-                                     # tuned lower: a replay of the chop sample favored 0.3R, but that overfits to a reversing
-                                     # tape and would scratch genuine trend runners when trends return (the ZEC lesson).
-  trail_lock_frac: float = 0.5       # lock at least this fraction of the peak favourable run once armed
-  trail_distance_r: float = 0.75     # ...or trail this many R below the peak, whichever locks MORE
+  # Jul 27 2026 correction — the Jul 23 tuning above was measured and it made things WORSE. Arming at
+  # 0.5R and locking 50% of the peak meant the trail engaged on *noise-scale* excursions (the sample's
+  # median favourable excursion is 0.27R) and then took half of it. LIVE: 27 trades, 37% win rate,
+  # avg win +0.38R vs avg loss -0.60R, net -6.4R. Replaying those same entries on real 1m paths under
+  # the planned bracket isolates the exit rule: 63% win rate but avg win +0.35R vs avg loss -1.05R, a
+  # 0.33 payoff ratio, net -4.5R. No win rate survives that payoff. Trail-arm sweep on the same paths:
+  #   arm 0.40R -0.17R | 0.50R +0.39R | 0.75R -0.24R | 1.00R +2.72R | 1.25R +2.25R | 1.50R +1.97R
+  # The principle the numbers are pointing at: a trailing stop must not arm until the trade has earned
+  # back its OWN risk. Before +1R a "profit" is inside the noise the stop was drawn around, so locking
+  # it is not protecting a gain — it is converting a live thesis into a coin-flip. Arm at 1R, then trail
+  # a full 1R behind the peak and lock only a third of the run, so a winner keeps room to become a
+  # runner. Still pure-R and self-normalizing: no ATR feed, no per-symbol tuning, no maintenance.
+  trail_arm_r: float = 1.0           # arm only once the trade has made back its own risk
+  trail_lock_frac: float = 0.33      # lock at least this fraction of the peak favourable run once armed
+  trail_distance_r: float = 1.0      # ...or trail this many R below the peak, whichever locks MORE
 
 
 @dataclass
@@ -395,6 +426,11 @@ def load_config() -> AppConfig:
       min_entry_notional_usd=float(os.getenv("MIN_ENTRY_NOTIONAL_USD", "0")),
       marketable_entry_max_dev_pct=float(os.getenv("MARKETABLE_ENTRY_MAX_DEV_PCT", "0.0015")),
       marketable_entry_min_confidence=float(os.getenv("MARKETABLE_ENTRY_MIN_CONFIDENCE", "0.75")),
+      stop_atr_floor_mult=float(os.getenv("STOP_ATR_FLOOR_MULT", "2.5")),
+      stop_atr_floor_adaptive=_as_bool(os.getenv("STOP_ATR_FLOOR_ADAPTIVE"), True),
+      stop_atr_floor_max_widen=float(os.getenv("STOP_ATR_FLOOR_MAX_WIDEN", "4.0")),
+      slippage_autotune_enabled=_as_bool(os.getenv("SLIPPAGE_AUTOTUNE_ENABLED"), True),
+      slippage_autotune_min_samples=int(os.getenv("SLIPPAGE_AUTOTUNE_MIN_SAMPLES", "8")),
       max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
       research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),
@@ -434,9 +470,9 @@ def load_config() -> AppConfig:
       trend_giveback_pct=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_PCT", "0.55")),
       trend_giveback_arm_r=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_ARM_R", "2.5")),
       trail_enabled=_as_bool(os.getenv("PROFIT_LOCK_TRAIL_ENABLED"), True),
-      trail_arm_r=float(os.getenv("PROFIT_LOCK_TRAIL_ARM_R", "0.5")),
-      trail_lock_frac=float(os.getenv("PROFIT_LOCK_TRAIL_LOCK_FRAC", "0.5")),
-      trail_distance_r=float(os.getenv("PROFIT_LOCK_TRAIL_DISTANCE_R", "0.75")),
+      trail_arm_r=float(os.getenv("PROFIT_LOCK_TRAIL_ARM_R", "1.0")),
+      trail_lock_frac=float(os.getenv("PROFIT_LOCK_TRAIL_LOCK_FRAC", "0.33")),
+      trail_distance_r=float(os.getenv("PROFIT_LOCK_TRAIL_DISTANCE_R", "1.0")),
     ),
     edge=EdgeConfig(
       enabled=_as_bool(os.getenv("ADAPTIVE_EDGE_ENABLED"), True),

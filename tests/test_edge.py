@@ -5,7 +5,9 @@ import pytest
 from src.config import EdgeConfig
 from src.edge import (
     adaptive_min_rr,
+    adaptive_stop_atr_mult,
     edge_stats,
+    measured_slippage_pct,
     entry_quality_stats,
     expectancy_size_factor,
     loss_streak_size_factor,
@@ -356,3 +358,145 @@ def test_entry_quality_extension_optional():
     closes = [_qclose("X-USDT", pnl=0.5, planned_risk=1.0, trough=-0.3, peak=0.8, ts=1)]
     s = entry_quality_stats(closes, lookback=30)
     assert s["n"] == 1 and s["avg_entry_extension_atr"] is None and s["avg_mae_r"] == pytest.approx(0.3)
+
+
+# ── Self-calibrating friction: measure slippage instead of assuming it ──────────
+
+
+def _fill(planned, filled_at, filled=True):
+    return {"price": planned, "fillPrice": filled_at, "filled": filled}
+
+
+def test_measured_slippage_replaces_an_overstated_prior():
+    """The live case: config assumed 0.10%/side while real fills deviated ~0.01%.
+
+    That 12x overstatement round-trips to 0.32% of notional and, at the account's median
+    risk/notional of 1.3%, charges every setup a phantom 0.18R — which forced ~2.7R gross targets
+    that the tape never reached. With enough fills the estimate must collapse to what was measured.
+    """
+    fills = [_fill(100.0, 100.0 * (1 + 0.0001)) for _ in range(20)]
+    out = measured_slippage_pct(fills, prior=0.001)
+    assert out["source"] == "measured"
+    assert out["value"] == pytest.approx(0.0001, rel=0.05)
+    assert out["value"] < 0.001
+
+
+def test_measured_slippage_keeps_prior_until_the_sample_is_real():
+    out = measured_slippage_pct([_fill(100.0, 100.0)] * 3, prior=0.001, min_samples=8)
+    assert out["source"] == "prior" and out["value"] == 0.001
+
+
+def test_measured_slippage_uses_a_conservative_percentile_not_the_mean():
+    # 8 tight fills (0.02%) and 2 bad ones (0.5%). The mean (0.116%) averages the tail away; the
+    # upper percentile keeps it, so the estimate stays conservative rather than optimistic.
+    fills = [_fill(100.0, 100.02) for _ in range(8)] + [_fill(100.0, 100.5) for _ in range(2)]
+    out = measured_slippage_pct(fills, prior=0.01, min_samples=8, percentile=0.9)
+    assert out["mean"] == pytest.approx(0.00116, rel=1e-3)
+    assert out["value"] == pytest.approx(0.005, rel=1e-3)
+    assert out["value"] > out["mean"]
+
+
+def test_measured_slippage_can_rise_but_is_capped():
+    # Adapts in BOTH directions — if execution degrades the estimate rises — but a data glitch
+    # can't drive friction to an absurd value.
+    fills = [_fill(100.0, 101.0) for _ in range(20)]     # 1% deviation, way past the prior
+    out = measured_slippage_pct(fills, prior=0.001, cap_mult=3.0)
+    assert out["value"] == pytest.approx(0.003)
+    assert out["capped"] is True
+
+
+def test_measured_slippage_ignores_unfilled_and_malformed_rows():
+    fills = [_fill(100.0, 100.02, filled=False), {"price": None, "fillPrice": 1, "filled": True},
+             {"price": 0, "fillPrice": 0, "filled": True}]
+    assert measured_slippage_pct(fills, prior=0.001)["source"] == "prior"
+
+
+def test_measured_slippage_never_claims_zero_friction():
+    out = measured_slippage_pct([_fill(100.0, 100.0) for _ in range(20)], prior=0.001, floor=0.0001)
+    assert out["value"] == pytest.approx(0.0001)
+
+
+# ── Self-tuning stop noise floor from realized MAE ──────────────────────────────
+
+
+def _mae_close(mae_r, realized_r, ts=1000, risk=1.0):
+    """A close whose winners' adverse heat drives the floor (MAE = |troughPnl| / planned risk)."""
+    return {
+        "symbol": "X-USDT", "ts": ts, "pnl": realized_r * risk, "realizedR": realized_r,
+        "troughPnl": -mae_r * risk, "peakPnl": max(0.0, realized_r) * risk,
+        "entryContext": {"plannedMaxLossUsd": risk},
+    }
+
+
+def test_stop_floor_widens_when_winners_eat_heavy_adverse_heat():
+    # Winners routinely dipping 0.8R before working means the stop sits inside the working range.
+    closes = [_mae_close(0.8, 1.5, ts=i) for i in range(12)]
+    out = adaptive_stop_atr_mult(closes, base_mult=2.5, min_samples=10, step=0.5)
+    assert out["value"] == pytest.approx(3.0)
+    assert out["source"] == "measured"
+
+
+def test_stop_floor_never_tightens_on_low_winner_heat():
+    """Low heat among winners is survivorship, not slack — the learner must NOT read it as permission.
+
+    On the live account winners averaged 0.17R of adverse heat precisely *because* the 1.4x-ATR stop
+    had already eliminated everything that breathed. A symmetric rule would have tightened the floor
+    and made the original failure worse, so adaptation is widen-only and low heat holds the floor.
+    """
+    closes = [_mae_close(0.1, 1.5, ts=i) for i in range(12)]
+    out = adaptive_stop_atr_mult(closes, base_mult=2.5, min_samples=10, step=0.5)
+    assert out["value"] == pytest.approx(2.5)
+    assert out["source"] == "base"
+
+
+def test_stop_floor_holds_in_the_healthy_band():
+    closes = [_mae_close(0.45, 1.5, ts=i) for i in range(12)]
+    assert adaptive_stop_atr_mult(closes, base_mult=2.5, min_samples=10)["value"] == pytest.approx(2.5)
+
+
+def test_stop_floor_ignores_losers_when_measuring_heat():
+    # Losers end at ~1R of adverse excursion by construction; only WINNERS carry information about how
+    # much room a working trade needs, so a pile of full stop-outs must not itself widen the floor.
+    closes = [_mae_close(1.0, -1.0, ts=i) for i in range(30)] + [_mae_close(0.1, 1.5, ts=100 + i) for i in range(12)]
+    out = adaptive_stop_atr_mult(closes, base_mult=2.5, min_samples=10, step=0.5)
+    assert out["value"] == pytest.approx(2.5)     # driven by the winners' 0.1R, not the losers' 1.0R
+
+
+def test_stop_floor_falls_back_to_base_without_a_sample():
+    assert adaptive_stop_atr_mult([], base_mult=2.5)["value"] == pytest.approx(2.5)
+    assert adaptive_stop_atr_mult([_mae_close(0.9, 1.0)], base_mult=2.5, min_samples=10)["value"] == pytest.approx(2.5)
+
+
+def test_stop_floor_disabled_when_base_is_zero():
+    assert adaptive_stop_atr_mult([_mae_close(0.9, 1.0, ts=i) for i in range(12)], base_mult=0.0)["source"] == "disabled"
+
+
+def test_stop_floor_moves_by_at_most_one_step_and_respects_max():
+    closes = [_mae_close(2.0, 1.5, ts=i) for i in range(12)]
+    out = adaptive_stop_atr_mult(closes, base_mult=3.8, min_samples=10, step=0.5, max_mult=4.0)
+    assert out["value"] == pytest.approx(4.0)     # clamped, not 4.3
+
+
+def test_entry_quality_reports_target_reachability():
+    """The check the bot was missing: is the planned target inside the distribution price delivers?
+
+    Live sample: median MFE 0.27R with brackets planned at 2.3-2.7R gross, and 0% of trades ever
+    reached 2R — so every take-profit was unreachable by construction and the ratio was held up by
+    dragging the stop inward instead. Surfacing the buckets lets the model plan against the real tape.
+    """
+    closes = (
+        [_mae_close(0.2, 0.3, ts=i) | {"peakPnl": 0.3} for i in range(6)]      # peaked +0.3R
+        + [_mae_close(0.2, 1.2, ts=10 + i) | {"peakPnl": 1.2} for i in range(4)]  # peaked +1.2R
+    )
+    q = entry_quality_stats(closes, lookback=30)
+    assert q["n"] == 10
+    assert q["mfe_reached_rate"]["0.5R"] == pytest.approx(0.4)
+    assert q["mfe_reached_rate"]["1R"] == pytest.approx(0.4)
+    assert q["mfe_reached_rate"]["2R"] == pytest.approx(0.0)
+    assert q["median_mfe_r"] == pytest.approx(0.3)   # 6 of 10 peaked at 0.3R
+
+
+def test_entry_quality_reachability_empty_without_mfe_data():
+    q = entry_quality_stats([{"symbol": "X", "ts": 1, "troughPnl": -0.5,
+                              "entryContext": {"plannedMaxLossUsd": 1.0}}], lookback=30)
+    assert q["mfe_reached_rate"] == {} and q["median_mfe_r"] is None

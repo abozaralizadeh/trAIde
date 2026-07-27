@@ -194,13 +194,161 @@ def entry_quality_stats(closes: List[Dict[str, Any]], lookback: int) -> Dict[str
   # before working; a purely descriptive label (not a threshold that blocks anything).
   better_entry = [r for r in window if r["mae_r"] >= 0.5]
   worst = max(window, key=lambda r: r["mae_r"]) if window else None
+  # TARGET REACHABILITY — how far price ACTUALLY travelled in your favour, as a share of trades that
+  # reached each R milestone. This is the check the bot was missing: over 27 live lifecycles the median
+  # favourable excursion was 0.27R while every bracket was planned at 2.3-2.7R gross, so **no trade
+  # ever reached its take-profit**. A target beyond the distribution below is not ambitious, it is
+  # unreachable — and it drags the stop in tight to keep the RR ratio, which is how a good read still
+  # loses. Decision-support only: nothing here vetoes a setup.
+  mfe_vals = sorted(r["mfe_r"] for r in window if r["mfe_r"] is not None)
+  reached = {}
+  if mfe_vals:
+    for level in (0.5, 1.0, 1.5, 2.0, 3.0):
+      reached[f"{level:g}R"] = round(sum(1 for v in mfe_vals if v >= level) / len(mfe_vals), 3)
+  median_mfe = mfe_vals[len(mfe_vals) // 2] if mfe_vals else None
   return {
     "n": len(window),
     "avg_mae_r": _avg(mae_vals),
     "avg_mfe_r": _avg([r["mfe_r"] for r in window]),
+    "median_mfe_r": round(median_mfe, 3) if median_mfe is not None else None,
+    "mfe_reached_rate": reached,
     "avg_entry_extension_atr": _avg(ext_vals) if ext_vals else None,
     "better_entry_rate": round(len(better_entry) / len(window), 3),
     "worst_entry": {"symbol": worst["symbol"], "mae_r": worst["mae_r"], "entry_extension_atr": worst["entry_extension_atr"]} if worst else None,
+  }
+
+
+def _percentile(values: List[float], pct: float) -> float | None:
+  """Nearest-rank percentile. Small, dependency-free, and good enough for <100 samples."""
+  vals = sorted(v for v in values if v is not None and math.isfinite(v))
+  if not vals:
+    return None
+  idx = max(0, min(len(vals) - 1, int(math.ceil(pct * len(vals))) - 1))
+  return vals[idx]
+
+
+def measured_slippage_pct(
+  fills: List[Dict[str, Any]],
+  prior: float,
+  *,
+  min_samples: int = 8,
+  percentile: float = 0.8,
+  floor: float = 0.0001,
+  cap_mult: float = 3.0,
+) -> Dict[str, Any]:
+  """Per-side slippage estimated from the bot's OWN fills, instead of a hand-set constant.
+
+  Every RR gate, net-profit check and fee-adjusted breakeven prices friction as
+  ``fee_rate + estimated_slippage_pct`` *per side*. A number set once and never revisited silently
+  becomes the strategy: the live config assumed 0.10%/side while measured entry slippage was
+  **0.008% mean / 0.025% p90** — a ~12x overstatement. Round-trip that is 0.32% of notional against
+  a real ~0.08%, and at the account's median risk/notional (1.3%) it charges every setup a phantom
+  **0.18R**. To still clear a 1.5 net-RR floor the model had to plan ~2.7R *gross* targets, which at
+  the same time pushed stops in tight — and the sample's median favourable excursion was 0.27R, so
+  no trade ever reached one. Overstating costs does not make a bot conservative; it makes it plan
+  trades that cannot win.
+
+  So: measure it. Uses a high percentile (not the mean) so the estimate stays conservative, needs
+  ``min_samples`` fills before it displaces the prior, and is clamped to ``[floor, cap_mult*prior]``
+  so neither a data glitch nor a run of perfect fills can drive friction to an absurd value. It
+  adapts in BOTH directions — if execution genuinely degrades the estimate rises on its own.
+
+  Args:
+    fills: trade records with a planned ``price`` and an achieved ``fillPrice``.
+    prior: the configured ``estimated_slippage_pct`` — used when the sample is too thin.
+  Returns ``{"value", "source", "n", ...}``; ``value`` is always usable.
+  """
+  prior_val = _f(prior)
+  prior_val = max(0.0, prior_val if prior_val is not None else 0.0)
+  devs: List[float] = []
+  for t in fills or []:
+    if not t.get("filled"):
+      continue
+    want = _f(t.get("price"))
+    got = _f(t.get("fillPrice"))
+    if want is None or got is None or want <= 0 or got <= 0:
+      continue
+    devs.append(abs(got - want) / want)
+  if len(devs) < max(1, int(min_samples)):
+    return {"value": prior_val, "source": "prior", "n": len(devs), "prior": prior_val}
+  measured = _percentile(devs, percentile)
+  if measured is None:
+    return {"value": prior_val, "source": "prior", "n": len(devs), "prior": prior_val}
+  cap = prior_val * max(1.0, float(cap_mult)) if prior_val > 0 else max(float(floor), measured)
+  value = min(max(float(measured), float(floor)), cap)
+  return {
+    "value": value,
+    "source": "measured",
+    "n": len(devs),
+    "prior": prior_val,
+    "p80": round(measured, 6),
+    "mean": round(sum(devs) / len(devs), 6),
+    "capped": value < measured - 1e-12,
+  }
+
+
+def adaptive_stop_atr_mult(
+  closes: List[Dict[str, Any]],
+  base_mult: float,
+  *,
+  lookback: int = 30,
+  min_samples: int = 10,
+  step: float = 0.5,
+  max_mult: float = 4.0,
+) -> Dict[str, Any]:
+  """Widen (or relax) the noise floor on stop distance from the bot's own MAE record.
+
+  Classic MAE analysis (Sweeney): a stop belongs just *outside* the adverse excursion that your
+  WINNING trades routinely survive. If winners habitually dip most of the way to the stop before
+  working, the stop is inside the noise and is converting winners into losers at random.
+
+  **The adaptation is deliberately one-directional — it can widen, never tighten.** The two readings
+  are not symmetric evidence. Winners surviving deep heat is a *direct* observation that the stop
+  nearly killed a trade that then worked. Winners showing little heat is *ambiguous*: it means either
+  the stop has room to spare, or the stop already eliminated everything that breathed, leaving a
+  survivor pool biased toward trades that went green immediately. Under a too-tight stop those two
+  are indistinguishable — and on this account's real data they are actively misleading (winners
+  averaged 0.17R of heat precisely *because* the 1.4x-ATR stop truncated the rest, which a symmetric
+  rule would have read as permission to tighten further). The consequences are asymmetric too: a stop
+  inside the noise destroys the strategy, while a slightly generous one only costs some position size.
+  So the learner adds room on evidence and otherwise leaves the configured floor alone; lowering the
+  floor stays an explicit operator decision via ``stop_atr_floor_mult``.
+
+  The signal is already recorded per close (``troughPnl`` / ``plannedMaxLossUsd``), so the floor tunes
+  itself instead of being a constant someone has to revisit. Moves by at most one ``step`` per
+  evaluation so the geometry drifts rather than lurches, and falls back to ``base_mult`` until there
+  is a real sample.
+  """
+  base = _f(base_mult) or 0.0
+  if base <= 0:
+    return {"value": base, "source": "disabled", "n": 0}
+  quality = entry_quality_stats(closes or [], lookback)
+  winners = [c for c in (closes or []) if (_f(c.get("realizedR")) or 0.0) > 0]
+  wq = entry_quality_stats(winners, lookback)
+  n = int(wq.get("n") or 0)
+  if n < max(1, int(min_samples)):
+    return {"value": base, "source": "base", "n": n, "avg_mae_r_winners": wq.get("avg_mae_r")}
+  winner_mae = _f(wq.get("avg_mae_r"))
+  if winner_mae is None:
+    return {"value": base, "source": "base", "n": n}
+  # Winners eating >=0.6R of heat on average means the stop sits inside the working range: add room.
+  # Anything less is not trustworthy evidence in the other direction (see the docstring): hold.
+  if winner_mae >= 0.6:
+    value = min(float(max_mult), base + float(step))
+    why = f"winners average {winner_mae:.2f}R of adverse heat — stop sits inside the working range"
+  else:
+    value = base
+    why = (
+      f"winners average {winner_mae:.2f}R of adverse heat — holding the configured floor "
+      "(low heat under a tight stop is survivorship, not evidence of slack)"
+    )
+  return {
+    "value": value,
+    "source": "measured" if value != base else "base",
+    "n": n,
+    "avg_mae_r_winners": winner_mae,
+    "avg_mae_r_all": quality.get("avg_mae_r"),
+    "reason": why,
   }
 
 

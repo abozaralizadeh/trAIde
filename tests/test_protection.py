@@ -92,7 +92,7 @@ def test_early_cut_disabled_or_no_age():
 
 
 def test_no_action_before_one_r():
-    # Long up only +0.4R (below the 0.5R trail arm), stop still below: nothing to do yet.
+    # Long up only +0.4R (below the 1R trail arm), stop still below: nothing to do yet.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=2.0, cfg=_cfg())
     assert d["action"] == "none"
 
@@ -220,25 +220,36 @@ def test_giveback_pct_arming_when_no_stop_known():
 
 def test_trail_ratchets_stop_up_and_lets_winner_run():
     # Risk 5 (anchored via risk_override, since the live stop is already at breakeven); peak +10 (2R),
-    # price still near peak (mark 109). Lock = max(50% of peak=5, peak−0.75R=6.25) = 6.25 → stop +6.25
-    # (106.25), NOT a close, so the trade keeps running toward its TP instead of being capped.
+    # price still near peak (mark 109). Lock = max(33% of peak=3.3, peak−1R=5) = 5 → stop +5 (105),
+    # NOT a close, so the trade keeps running toward its TP instead of being capped.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=109.0, sl_price=100.15, peak_fe=10.0,
                           cfg=_cfg(), risk_override=5.0)
     assert d["action"] == "move_breakeven"
-    assert abs(d["stopPrice"] - 106.25) < 1e-6   # max(0.5*10, 10 - 0.75*5) = 6.25 above entry
+    assert abs(d["stopPrice"] - 105.0) < 1e-6   # max(0.33*10, 10 - 1.0*5) = 5 above entry
 
 
-def test_trail_arms_and_locks_fraction_below_one_r():
-    # THE give-back fix: a trade that peaks at +0.8R (below the old 1R arm) now arms at 0.6R and locks
-    # 50% of the run (+0.4R), instead of riding all the way back to a full stop-out (the ERA +0.85R→−0.05
-    # and ONDO +0.80R→+0.44 round-trips). Risk 5 px, peak +4 (0.8R), mark 103.5.
+def test_trail_does_not_arm_before_one_r():
+    """A sub-1R 'profit' is inside the noise the stop was drawn around — the trail must ignore it.
+
+    This is the Jul 27 2026 correction. Arming at 0.5R and locking half the peak meant the ratchet
+    engaged on noise-scale excursions (the live sample's median favourable excursion was 0.27R) and
+    booked a fraction of it. Live: 27 trades, 37% win rate, avg win +0.38R vs avg loss -0.60R, net
+    -6.4R. Replaying those entries on real 1m paths isolates the exit rule — 63% winners but a 0.35 /
+    -1.05 payoff, net -4.5R. Peak +4 (0.8R) must now leave the trade alone.
+    """
     d = decide_protection(side_long=True, avg_entry=100.0, mark=103.5, sl_price=95.0, peak_fe=4.0, cfg=_cfg())
+    assert d["action"] == "none"
+
+
+def test_trail_arms_exactly_at_one_r():
+    # Peak +5 (exactly 1R) arms the trail; lock = max(0.33*5=1.65, 5-1.0*5=0) = 1.65 above entry.
+    d = decide_protection(side_long=True, avg_entry=100.0, mark=104.0, sl_price=95.0, peak_fe=5.0, cfg=_cfg())
     assert d["action"] == "move_breakeven"
-    assert abs(d["stopPrice"] - 102.0) < 1e-6   # max(0.5*4=2, 4-0.75*5=0.25) = 2 above entry
+    assert abs(d["stopPrice"] - 101.65) < 1e-6
 
 
 def test_trail_does_not_arm_below_arm_threshold():
-    # Peak +0.4R (2.0 px) is below the 0.5R arm → the trail stays dormant, the original SL still owns it.
+    # Peak +0.4R (2.0 px) is below the 1R arm → the trail stays dormant, the original SL still owns it.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=102.0, sl_price=95.0, peak_fe=2.0, cfg=_cfg())
     assert d["action"] == "none"
 
@@ -252,12 +263,12 @@ def test_trail_closes_when_price_retraces_past_trail():
 
 
 def test_trail_short_symmetry():
-    # Short: entry 100, risk 5, peak +10 (price fell to 90). Lock = max(0.5*10=5, 10-0.75*5=6.25) = 6.25
-    # → stop to 93.75 (+1.25R locked); mark 91.
+    # Short: entry 100, risk 5, peak +10 (price fell to 90). Lock = max(0.33*10=3.3, 10-1.0*5=5) = 5
+    # → stop to 95.0 (+1R locked); mark 91.
     d = decide_protection(side_long=False, avg_entry=100.0, mark=91.0, sl_price=99.85, peak_fe=10.0,
                           cfg=_cfg(), risk_override=5.0)
     assert d["action"] == "move_breakeven"
-    assert abs(d["stopPrice"] - 93.75) < 1e-6   # entry - max(0.5*10, 10 - 0.75*5)
+    assert abs(d["stopPrice"] - 95.0) < 1e-6   # entry - max(0.33*10, 10 - 1.0*5)
 
 
 def test_trail_no_churn_on_tiny_advance():
@@ -272,7 +283,7 @@ def test_trail_survives_stop_at_breakeven_via_risk_override():
     # used to disable every R-rule on a winner. With risk_override the trail keeps advancing.
     d = decide_protection(side_long=True, avg_entry=100.0, mark=112.0, sl_price=100.15, peak_fe=12.0,
                           cfg=_cfg(), risk_override=5.0)
-    assert d["action"] == "move_breakeven" and abs(d["stopPrice"] - 108.25) < 1e-6  # max(0.5*12, 12-0.75*5)
+    assert d["action"] == "move_breakeven" and abs(d["stopPrice"] - 107.0) < 1e-6  # max(0.33*12, 12-1.0*5)
 
 
 def test_giveback_arm_r_zero_reverts_to_pct_arming():

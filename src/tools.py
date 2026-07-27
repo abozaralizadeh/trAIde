@@ -47,6 +47,7 @@ from .regime import (
   is_relative_strength_alt_long,
   oi_price_signal,
   net_reward_risk_ratio,
+  noise_floored_stop,
   overextension_atr,
   regime_size_factor,
   resolve_gate_deadlock,
@@ -545,6 +546,39 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     symbol_factor = float((state.get("symbol_size_factor") or {}).get(symbol, 1.0))
     return min(1.0, max(0.0, min(direction_factor, symbol_factor)))
 
+  def _slippage_rate() -> float:
+    """Per-side slippage: the bot's own measured fill deviation, or the configured prior."""
+    try:
+      return float(_edge_state().get("slippage_pct", cfg.trading.estimated_slippage_pct))
+    except Exception:
+      return float(cfg.trading.estimated_slippage_pct)
+
+  def _floor_stop_to_noise(
+    spot_symbol: str, side: str, entry: float, stop_loss: float, *, context: str,
+  ) -> tuple[float, Dict[str, Any]]:
+    """Widen a stop that sits inside the instrument's 15m noise band (see regime.noise_floored_stop).
+
+    Uses the 15m ATR already captured by the daily-gate analysis, so no extra market call. Returns
+    the (possibly unchanged) stop plus the decision info for the entry context. Never raises.
+    """
+    try:
+      mult = float(_edge_state().get("stop_atr_floor_mult", cfg.trading.stop_atr_floor_mult))
+    except Exception:
+      mult = float(cfg.trading.stop_atr_floor_mult)
+    if mult <= 0:
+      return stop_loss, {"applied": False, "reason": "stop floor disabled"}
+    atr_abs = _gate_for(spot_symbol).get("intraday_atr_abs")
+    new_stop, info = noise_floored_stop(
+      side, entry, stop_loss, atr_abs, mult, max_widen_mult=cfg.trading.stop_atr_floor_max_widen,
+    )
+    if info.get("applied"):
+      logger.info(
+        "STOP NOISE FLOOR: %s %s %s — stop %.8g → %.8g (%.2f→%.2f x ATR15m); size shrinks to hold "
+        "risk constant", context, side, spot_symbol, float(stop_loss), float(new_stop),
+        info.get("plannedAtrMult", 0.0), mult,
+      )
+    return new_stop, info
+
 
   # ── Spot trading — market/limit orders, stops & position protection ─────────────────────────────
   @function_tool
@@ -671,7 +705,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if funds_val <= 0 or not symbol:
       return {"error": "Invalid funds or symbol"}
     fee_rate = fees.get("spot_taker", 0.001)
-    slippage_rate = cfg.trading.estimated_slippage_pct
+    slippage_rate = _slippage_rate()
     funds_with_fee = funds_val * (1 + fee_rate + slippage_rate)
     if funds_val > snapshot.max_position_usd:
       return {"rejected": True, "reason": "Exceeds maxPositionUsd"}
@@ -2405,6 +2439,24 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         price = _to_float(snapshot.tickers[spot_symbol].price)
     if price is None or price <= 0:
       return {"error": "Invalid or missing live price"}
+
+    # Noise floor on the risk leg — applied before the add-on/risk/RR chain so every downstream
+    # calculation prices the stop the trade will actually rest on (see regime.noise_floored_stop).
+    _stop_floor_fm: Dict[str, Any] = {"applied": False, "reason": "not an entry"}
+    if is_entry:
+      _floor_src = _to_float(stop_loss_price)
+      if _floor_src is None:
+        _floor_src = _to_float(stop_price)
+      if _floor_src is not None and _floor_src > 0:
+        _floored, _stop_floor_fm = _floor_stop_to_noise(
+          spot_symbol, side, price, _floor_src, context="futures market",
+        )
+        if _stop_floor_fm.get("applied"):
+          if _to_float(stop_loss_price) is not None:
+            stop_loss_price = _floored
+          else:
+            stop_price = _floored
+
     existing_risk_usd = 0.0
     existing_notional_usd = 0.0
     if is_entry:
@@ -2444,7 +2496,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     max_order_qty = contract.get("maxOrderQty")
     contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
     fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
-    slippage_rate = cfg.trading.estimated_slippage_pct
+    slippage_rate = _slippage_rate()
     leverage_caps = [
       c for c in (
         snapshot.max_leverage,
@@ -3277,6 +3329,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if current_price is None:
       return {"error": "Unable to fetch current live price for deviation check"}
 
+    # Noise floor on the risk leg, applied BEFORE tick rounding, the RR gate and sizing, so the whole
+    # chain prices the stop the trade will actually rest on.
+    stop_loss_price, _stop_floor_fl = _floor_stop_to_noise(
+      spot_symbol, side_lower, entry_price_val, float(stop_loss_price), context="futures limit",
+    )
+
     tick_size = _to_float(contract.get("tickSize")) or 0.0
     if tick_size > 0:
       entry_price_val = _round_price_to_tick(entry_price_val, tick_size)
@@ -3322,7 +3380,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     max_order_qty = contract.get("maxOrderQty")
     contract_max_leverage = _to_float(contract.get("maxLeverage")) or None
     fee_rate = _to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006)
-    slippage_rate = cfg.trading.estimated_slippage_pct
+    slippage_rate = _slippage_rate()
     if multiplier <= 0:
       return {"error": "Invalid contract multiplier", "contract": contract}
 
@@ -3485,6 +3543,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "entryExtensionAtr": overextension_atr(
         side_lower, entry_price_val, _g_fl.get("intraday_vwap"), _g_fl.get("intraday_atr_abs"),
       ),
+      # Stop geometry actually used, so post-trade review can tell a noise-floored stop from the
+      # model's original and judge whether the floor is set where it needs to be.
+      "stopAtrMult": (
+        abs(entry_price_val - float(stop_loss_price)) / float(_g_fl["intraday_atr_abs"])
+        if _to_float(_g_fl.get("intraday_atr_abs")) else None
+      ),
+      "stopFloorApplied": bool(_stop_floor_fl.get("applied")),
+      "plannedStopBeforeFloor": _stop_floor_fl.get("plannedStop"),
       "regime": {
         key: _g_fl.get(key)
         for key in (

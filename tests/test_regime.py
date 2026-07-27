@@ -9,6 +9,7 @@ from src.regime import (
     is_hostile_regime,
     effective_min_confidence,
     combined_size_factor,
+    noise_floored_stop,
     overextension_atr,
     regime_size_factor,
     allow_reversal_long,
@@ -622,3 +623,66 @@ def test_overextension_atr_none_on_missing_or_bad_inputs():
     assert overextension_atr("buy", 130.0, 100.0, None) is None     # no ATR scale
     assert overextension_atr("buy", 130.0, 100.0, 0.0) is None      # non-positive ATR
     assert overextension_atr("hold", 130.0, 100.0, 10.0) is None    # unknown side
+
+
+# ── Noise floor on stop distance (survival geometry, never an opportunity veto) ──
+
+
+def test_noise_floor_widens_a_stop_inside_the_noise_band():
+    # THE Jul 2026 loss driver: entry 100, stop 99 (1.0 px) against a 15m ATR of 1.0 px = 1.0x ATR.
+    # The live median was 1.4x — inside one hourly bar of ordinary movement, so routine noise took the
+    # trade out before the thesis could resolve. Floored to 2.5x ATR the stop becomes a real level.
+    stop, info = noise_floored_stop("buy", 100.0, 99.0, 1.0, 2.5)
+    assert info["applied"] is True
+    assert stop == pytest.approx(97.5)
+    assert info["plannedAtrMult"] == pytest.approx(1.0)
+
+
+def test_noise_floor_short_symmetry():
+    stop, info = noise_floored_stop("sell", 100.0, 101.0, 1.0, 2.5)
+    assert info["applied"] is True
+    assert stop == pytest.approx(102.5)
+
+
+def test_noise_floor_leaves_an_already_wide_stop_untouched():
+    # A stop already outside the band is the model's business — the floor only ever widens.
+    stop, info = noise_floored_stop("buy", 100.0, 96.0, 1.0, 2.5)
+    assert info["applied"] is False
+    assert stop == 96.0
+    assert info["plannedAtrMult"] == pytest.approx(4.0)
+
+
+def test_noise_floor_caps_the_rewrite():
+    # A stop needing a 10x widening is a different trade, not a slightly tight one: widen at most
+    # max_widen_mult and let the RR gate judge the result rather than silently rewriting the thesis.
+    stop, info = noise_floored_stop("buy", 100.0, 99.9, 1.0, 2.5, max_widen_mult=2.0)
+    assert info["applied"] is True
+    assert stop == pytest.approx(99.8)      # 0.1 px widened to 0.2 px, not to 2.5 px
+    assert info["capped"] is True
+
+
+def test_noise_floor_is_inert_without_usable_inputs():
+    # No ATR, disabled multiplier, bad side, or a stop on the wrong side of entry → pass through
+    # unchanged, so the caller can apply it unconditionally.
+    assert noise_floored_stop("buy", 100.0, 99.0, None, 2.5)[0] == 99.0
+    assert noise_floored_stop("buy", 100.0, 99.0, 0.0, 2.5)[0] == 99.0
+    assert noise_floored_stop("buy", 100.0, 99.0, 1.0, 0.0)[0] == 99.0
+    assert noise_floored_stop("hold", 100.0, 99.0, 1.0, 2.5)[0] == 99.0
+    assert noise_floored_stop("buy", 100.0, 101.0, 1.0, 2.5)[0] == 101.0   # stop above entry on a long
+    assert noise_floored_stop("buy", 100.0, "x", 1.0, 2.5)[0] == "x"
+
+
+def test_noise_floor_keeps_dollar_risk_constant_via_sizing():
+    # The floor widens the stop; bracket_risk_scale then buys proportionally fewer units, so the
+    # trade gets room to breathe at the SAME dollar risk. This is why it is not a risk increase.
+    # Notional is large enough that the risk budget binds in both cases (bracket_risk_scale only
+    # ever shrinks, so an already-small notional would pass through at 1.0 and prove nothing).
+    entry, equity, risk_fraction, notional = 100.0, 1000.0, 0.02, 5000.0
+    tight_scale = bracket_risk_scale(entry=entry, stop_loss=99.0, notional_usd=notional,
+                                     equity_usd=equity, risk_fraction=risk_fraction)
+    floored, _ = noise_floored_stop("buy", entry, 99.0, 1.0, 2.5)
+    wide_scale = bracket_risk_scale(entry=entry, stop_loss=floored, notional_usd=notional,
+                                    equity_usd=equity, risk_fraction=risk_fraction)
+    assert notional * tight_scale * (entry - 99.0) / entry == pytest.approx(equity * risk_fraction)
+    assert notional * wide_scale * (entry - floored) / entry == pytest.approx(equity * risk_fraction)
+    assert wide_scale < tight_scale     # wider stop ⇒ smaller position, same dollar risk
