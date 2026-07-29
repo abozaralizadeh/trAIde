@@ -40,9 +40,11 @@ from .regime import (
   add_on_guard_reason,
   block_alt_long_in_btc_downtrend,
   bracket_risk_scale,
+  coherent_risk_fraction,
   combined_size_factor,
   concentration_scale,
   conviction_size_factor,
+  risk_targeted_notional,
   effective_min_confidence,
   is_relative_strength_alt_long,
   oi_price_signal,
@@ -462,7 +464,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     """Final post-rounding risk cap; returns 0 when even one lot exceeds the budget."""
     return risk_capped_contracts(
       contracts, lot, multiplier, entry, stop_loss,
-      snapshot.total_usdt, cfg.trading.risk_per_trade_pct,
+      snapshot.total_usdt, _effective_risk_fraction(),
       existing_risk_usd=existing_risk_usd,
     )
 
@@ -486,7 +488,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   def _existing_futures_risk_usd() -> float:
     """Stop-defined open risk plus a conservative reservation for each pending entry."""
-    per_trade_budget = float(snapshot.total_usdt) * float(cfg.trading.risk_per_trade_pct)
+    per_trade_budget = float(snapshot.total_usdt) * _effective_risk_fraction()
     total = 0.0
     for pos in snapshot.futures_positions or []:
       try:
@@ -552,6 +554,46 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return float(_edge_state().get("slippage_pct", cfg.trading.estimated_slippage_pct))
     except Exception:
       return float(cfg.trading.estimated_slippage_pct)
+
+  def _effective_risk_fraction() -> float:
+    """Risk-per-trade fraction that is coherent with the daily-drawdown circuit breaker."""
+    out = coherent_risk_fraction(
+      cfg.trading.risk_per_trade_pct,
+      cfg.circuit_breaker.max_daily_drawdown_pct,
+      cfg.circuit_breaker.max_consecutive_losses,
+    )
+    return float(out.get("value") or 0.0)
+
+  def _risk_targeted_notional(
+    spot_symbol: str, entry: float, stop_loss: Any, soft_factor: float, requested: float, *, context: str,
+  ) -> float:
+    """Size the entry TO its risk budget instead of merely capping a guessed notional.
+
+    ``bracket_risk_scale`` only shrinks, so the actual bet was whatever notional the model named —
+    which on the live account produced an 18.9x spread in real dollar risk, uncorrelated with
+    conviction or outcome (winners were the small bets, losers the large ones: the last 9 trades were
+    +0.50R but -$0.12). Conviction still moves size, but through ``soft_factor`` — the regime /
+    confidence / expectancy multipliers — rather than through an arbitrary number, so "size is the
+    conviction lever" still holds while the *unit* of risk becomes constant. Falls back to the
+    requested notional whenever a target cannot be computed. Never raises above the risk budget.
+    """
+    if not cfg.trading.risk_targeted_sizing:
+      return requested
+    fraction = _effective_risk_fraction()
+    if fraction <= 0:
+      return requested
+    target = risk_targeted_notional(
+      entry=entry, stop_loss=stop_loss, equity_usd=snapshot.total_usdt,
+      risk_fraction=fraction * max(0.0, float(soft_factor)),
+    )
+    if target is None or target <= 0:
+      return requested
+    if requested > 0 and abs(target - requested) / requested > 0.05:
+      logger.info(
+        "RISK-TARGETED SIZE: %s %s notional %.2f → %.2f (risk %.2f%% x quality %.2f of %.2f equity)",
+        context, spot_symbol, requested, target, fraction * 100, soft_factor, snapshot.total_usdt,
+      )
+    return target
 
   def _floor_stop_to_noise(
     spot_symbol: str, side: str, entry: float, stop_loss: float, *, context: str,
@@ -2477,19 +2519,26 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if notional_input <= 0:
         return {"rejected": True, "reason": "Projected same-symbol concentration cap leaves no room for another entry"}
 
-    # Risk is defined by the bracket, not notional or leverage.  Shrink any model-requested size
-    # whose stop loss would exceed the configured fraction of account equity.
+    # Risk is defined by the bracket, not notional or leverage. Size TO the risk budget (constant
+    # dollar risk per trade), then still apply the cap below as a belt-and-braces guard.
     _risk_stop_fm = _to_float(stop_loss_price) or _to_float(stop_price)
+    if is_entry:
+      _target_fm = _risk_targeted_notional(
+        spot_symbol, price, _risk_stop_fm, _atr_scale_fm, notional_input, context="futures",
+      )
+      # The risk target sets the bet size, but it must never re-inflate a position the blast-radius
+      # cap already shrank, so keep the smaller of the two when that cap bound.
+      notional_input = min(_target_fm, notional_input) if _conc_scale < 1.0 else _target_fm
     _risk_scale_fm = bracket_risk_scale(
       entry=price,
       stop_loss=_risk_stop_fm,
       notional_usd=notional_input,
       equity_usd=max(0.0, snapshot.total_usdt - existing_risk_usd / max(cfg.trading.risk_per_trade_pct, 1e-9)),
-      risk_fraction=cfg.trading.risk_per_trade_pct,
+      risk_fraction=_effective_risk_fraction(),
     ) if is_entry else 1.0
     if _risk_scale_fm < 1.0:
       logger.info("RISK-BUDGET CAP: futures %s notional %.2f → %.2f (risk <= %.2f%% equity)",
-                  spot_symbol, notional_input, notional_input * _risk_scale_fm, cfg.trading.risk_per_trade_pct * 100)
+                  spot_symbol, notional_input, notional_input * _risk_scale_fm, _effective_risk_fraction() * 100)
       notional_input *= _risk_scale_fm
 
     lot_size = int(contract.get("lotSize") or 1)
@@ -2621,7 +2670,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         return {
           "rejected": True,
           "reason": "Contract minimum exceeds the configured per-trade risk budget",
-          "riskBudgetUsd": snapshot.total_usdt * cfg.trading.risk_per_trade_pct,
+          "riskBudgetUsd": snapshot.total_usdt * _effective_risk_fraction(),
         }
       contracts = _heat_capped_contracts(contracts, lot, multiplier, price, _risk_stop_fm)
       if contracts < lot:
@@ -3398,16 +3447,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     leverage_clamped = lev < lev_requested - 1e-9
 
     notional_input = float(notional_usd or 0) * _atr_scale_fl
+    # Size TO the risk budget (constant dollar risk per trade) rather than only capping a guessed
+    # notional; the cap below then stays as a belt-and-braces guard.
+    notional_input = _risk_targeted_notional(
+      spot_symbol, entry_price_val, stop_loss_price, _atr_scale_fl, notional_input, context="futures limit",
+    )
     _risk_scale_fl = bracket_risk_scale(
       entry=entry_price_val,
       stop_loss=stop_loss_price,
       notional_usd=notional_input,
       equity_usd=snapshot.total_usdt,
-      risk_fraction=cfg.trading.risk_per_trade_pct,
+      risk_fraction=_effective_risk_fraction(),
     )
     if _risk_scale_fl < 1.0:
       logger.info("RISK-BUDGET CAP: futures limit %s notional %.2f → %.2f (risk <= %.2f%% equity)",
-                  spot_symbol, notional_input, notional_input * _risk_scale_fl, cfg.trading.risk_per_trade_pct * 100)
+                  spot_symbol, notional_input, notional_input * _risk_scale_fl, _effective_risk_fraction() * 100)
       notional_input *= _risk_scale_fl
     # Concentration cap: shrink notional to <= max_position_equity_pct of total equity (blast-radius guard).
     _conc_scale = concentration_scale(
@@ -3444,7 +3498,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {
         "rejected": True,
         "reason": "Contract minimum exceeds the configured per-trade risk budget",
-        "riskBudgetUsd": snapshot.total_usdt * cfg.trading.risk_per_trade_pct,
+        "riskBudgetUsd": snapshot.total_usdt * _effective_risk_fraction(),
       }
     contracts = _heat_capped_contracts(contracts, lot, multiplier, entry_price_val, float(stop_loss_price))
     if contracts < lot:

@@ -118,6 +118,15 @@ class TradingConfig:
   # The static 0.10%/side was ~12x the measured 0.008% and taxed every setup a phantom 0.18R.
   slippage_autotune_enabled: bool = True
   slippage_autotune_min_samples: int = 8
+  # Risk-targeted sizing (Jul 29 2026). Position size used to be whatever notional the model named,
+  # merely CAPPED at the risk budget — and capping is not sizing. Realized dollar risk across the 35
+  # recorded lifecycles ranged over 18.9x ($0.06 to $1.17 on a ~$68 account) with no relation to
+  # conviction or outcome; the winners were systematically the small bets and the losers the large
+  # ones, so the last 9 trades came in at +0.50R but -$0.12. A positive edge only turns into money if
+  # every trade bets the same fraction of it. Size is now computed FROM the risk budget and the stop
+  # distance; conviction still moves it, but through the regime/confidence/expectancy multipliers
+  # rather than an arbitrary number, so "size is the conviction lever" still holds.
+  risk_targeted_sizing: bool = True
   # Risk guardrails (added after the RE-USDT concentration blowup, 2026-06-21):
   max_position_equity_pct: float = 0.5        # cap a single position's notional at this fraction of total equity (0=off)
   min_futures_listing_age_days: float = 7.0   # block entries on futures contracts younger than this (0=off)
@@ -431,6 +440,7 @@ def load_config() -> AppConfig:
       stop_atr_floor_max_widen=float(os.getenv("STOP_ATR_FLOOR_MAX_WIDEN", "4.0")),
       slippage_autotune_enabled=_as_bool(os.getenv("SLIPPAGE_AUTOTUNE_ENABLED"), True),
       slippage_autotune_min_samples=int(os.getenv("SLIPPAGE_AUTOTUNE_MIN_SAMPLES", "8")),
+      risk_targeted_sizing=_as_bool(os.getenv("RISK_TARGETED_SIZING"), True),
       max_position_equity_pct=float(os.getenv("MAX_POSITION_EQUITY_PCT", "0.5")),
       min_futures_listing_age_days=float(os.getenv("MIN_FUTURES_LISTING_AGE_DAYS", "7")),
       research_handoff_cooldown_min=float(os.getenv("RESEARCH_HANDOFF_COOLDOWN_MIN", "30")),

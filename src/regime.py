@@ -376,6 +376,80 @@ def noise_floored_stop(
   }
 
 
+def coherent_risk_fraction(
+  configured_fraction,
+  max_daily_drawdown_pct,
+  max_consecutive_losses,
+):
+  """The risk-per-trade fraction that is actually consistent with the circuit breakers.
+
+  A per-trade risk budget and a daily drawdown stop are not independent settings: if one trade risks
+  R% and the day halts at D%, the bot can only absorb D/R losers before it stops trading. The live
+  config asked for 2% per trade against a 3% daily stop — **two losses would end the day**, on an
+  account taking 5-9 trades a day. That inconsistency went unnoticed for months only because realized
+  risk was never actually 2% (it averaged 0.52%, because sizing merely *capped* at the budget instead
+  of targeting it), so the drawdown stop never had a chance to bite.
+
+  Deriving the fraction from limits the operator already set keeps the two coherent with no extra
+  knob to maintain: allow ``max_consecutive_losses`` full stop-outs plus one before the daily stop
+  trips. With 3% / (3+1) that is 0.75%. Never raises above ``configured_fraction`` — the configured
+  value stays a ceiling, so this can only make the posture more survivable.
+  """
+  try:
+    configured = float(configured_fraction)
+  except (TypeError, ValueError):
+    return {"value": 0.0, "source": "invalid"}
+  if configured <= 0:
+    return {"value": 0.0, "source": "disabled"}
+  try:
+    drawdown = float(max_daily_drawdown_pct) / 100.0
+    losses = int(max_consecutive_losses)
+  except (TypeError, ValueError):
+    return {"value": configured, "source": "configured"}
+  if drawdown <= 0 or losses <= 0:
+    return {"value": configured, "source": "configured"}
+  derived = drawdown / (losses + 1)
+  if derived >= configured:
+    return {"value": configured, "source": "configured", "derived": derived}
+  return {
+    "value": derived,
+    "source": "derived",
+    "configured": configured,
+    "reason": (
+      f"{drawdown:.1%} daily drawdown stop / {losses + 1} tolerated stop-outs = {derived:.2%} per trade "
+      f"(configured {configured:.2%} would halt the day after {max(1, int(drawdown / configured))} losses)"
+    ),
+  }
+
+
+def risk_targeted_notional(*, entry, stop_loss, equity_usd, risk_fraction):
+  """Notional that puts exactly ``risk_fraction`` of equity at risk for this stop distance.
+
+  The counterpart to :func:`bracket_risk_scale`, which only ever *shrinks* a model-requested size.
+  Capping alone is not sizing: it leaves the actual bet to whatever notional the model happened to
+  name, so the live account's realized risk ranged over **18.9x** (min $0.06, max $1.17 on a ~$68
+  account) with no relation to conviction or outcome. The cost of that is not theoretical — across the
+  35 recorded lifecycles the winners were systematically the small bets and the losers the large ones,
+  so the last 9 trades came in at **+0.50R but -$0.12**. A positive edge only becomes money if every
+  trade bets the same fraction of it.
+
+  Returns ``None`` when inputs cannot form a sizing decision, so callers keep their previous behavior.
+  """
+  try:
+    e = float(entry)
+    sl = float(stop_loss)
+    equity = float(equity_usd)
+    fraction = float(risk_fraction)
+  except (TypeError, ValueError):
+    return None
+  if e <= 0 or sl <= 0 or equity <= 0 or fraction <= 0:
+    return None
+  stop_fraction = abs(e - sl) / e
+  if stop_fraction <= 0:
+    return None
+  return (equity * fraction) / stop_fraction
+
+
 def reward_risk_ratio(side: str, entry, take_profit, stop_loss):
   """Reward:risk of an entry bracket — |TP - entry| / |entry - SL| — or None if it can't form.
 

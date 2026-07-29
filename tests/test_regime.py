@@ -18,6 +18,7 @@ from src.regime import (
     add_on_guard_reason,
     block_alt_long_in_btc_downtrend,
     bracket_risk_scale,
+    coherent_risk_fraction,
     concentration_scale,
     conviction_size_factor,
     is_relative_strength_alt_long,
@@ -26,6 +27,7 @@ from src.regime import (
     resolve_gate_deadlock,
     reward_risk_ratio,
     risk_capped_contracts,
+    risk_targeted_notional,
 )
 from src.memory import MemoryStore
 
@@ -686,3 +688,72 @@ def test_noise_floor_keeps_dollar_risk_constant_via_sizing():
     assert notional * tight_scale * (entry - 99.0) / entry == pytest.approx(equity * risk_fraction)
     assert notional * wide_scale * (entry - floored) / entry == pytest.approx(equity * risk_fraction)
     assert wide_scale < tight_scale     # wider stop ⇒ smaller position, same dollar risk
+
+
+# ── Risk-targeted sizing: capping is not sizing ─────────────────────────────────
+
+
+def test_risk_targeted_notional_puts_the_budget_at_risk():
+    # $1000 equity, 0.75% budget = $7.50 of risk. A 2%-wide stop needs a $375 position to risk $7.50.
+    n = risk_targeted_notional(entry=100.0, stop_loss=98.0, equity_usd=1000.0, risk_fraction=0.0075)
+    assert n == pytest.approx(375.0)
+    assert n * (2.0 / 100.0) == pytest.approx(7.50)
+
+
+def test_risk_targeted_notional_holds_dollar_risk_constant_across_stop_widths():
+    """The property that was missing live: the same bet regardless of how wide the stop is.
+
+    Realized risk on the live account ranged over 18.9x ($0.06 to $1.17 on ~$68) because sizing only
+    CAPPED a model-guessed notional. Winners were the small bets and losers the large ones, so the
+    last 9 trades were +0.50R but -$0.12 in dollars.
+    """
+    budget = 1000.0 * 0.0075
+    for stop in (99.5, 98.0, 95.0, 90.0):
+        n = risk_targeted_notional(entry=100.0, stop_loss=stop, equity_usd=1000.0, risk_fraction=0.0075)
+        assert n * (abs(100.0 - stop) / 100.0) == pytest.approx(budget)
+
+
+def test_risk_targeted_notional_is_side_agnostic():
+    # A short's stop sits above entry; the risk distance is what matters, not its direction.
+    assert risk_targeted_notional(entry=100.0, stop_loss=102.0, equity_usd=1000.0, risk_fraction=0.0075) \
+        == pytest.approx(risk_targeted_notional(entry=100.0, stop_loss=98.0, equity_usd=1000.0, risk_fraction=0.0075))
+
+
+def test_risk_targeted_notional_none_on_unusable_inputs():
+    for kw in ({"entry": 0.0}, {"stop_loss": 0.0}, {"equity_usd": 0.0}, {"risk_fraction": 0.0},
+               {"stop_loss": 100.0}, {"entry": "x"}):
+        base = dict(entry=100.0, stop_loss=98.0, equity_usd=1000.0, risk_fraction=0.0075)
+        base.update(kw)
+        assert risk_targeted_notional(**base) is None
+
+
+def test_coherent_risk_fraction_reconciles_per_trade_risk_with_the_daily_stop():
+    """The live config asked 2%/trade against a 3% daily stop — two losers would end the day.
+
+    It went unnoticed because realized risk was never 2% (it averaged 0.52%), so the drawdown stop
+    never had a chance to bite. Deriving from limits already set keeps the two coherent.
+    """
+    out = coherent_risk_fraction(0.02, 3.0, 3)
+    assert out["value"] == pytest.approx(0.0075)     # 3% / (3 losses + 1)
+    assert out["source"] == "derived"
+    assert out["configured"] == 0.02
+
+
+def test_coherent_risk_fraction_never_raises_above_the_configured_ceiling():
+    # Already-conservative config: a generous drawdown stop must not inflate risk per trade.
+    out = coherent_risk_fraction(0.005, 10.0, 3)
+    assert out["value"] == pytest.approx(0.005) and out["source"] == "configured"
+
+
+def test_coherent_risk_fraction_degrades_safely():
+    assert coherent_risk_fraction(0.02, 0.0, 3)["value"] == pytest.approx(0.02)   # no drawdown stop set
+    assert coherent_risk_fraction(0.02, 3.0, 0)["value"] == pytest.approx(0.02)   # no loss limit set
+    assert coherent_risk_fraction(0.0, 3.0, 3)["value"] == 0.0                    # risk disabled
+    assert coherent_risk_fraction("x", 3.0, 3)["value"] == 0.0                    # non-numeric
+
+
+def test_coherent_fraction_survives_the_configured_number_of_losses():
+    # The point of the derivation: max_consecutive_losses stop-outs must not trip the daily halt.
+    frac = coherent_risk_fraction(0.02, 3.0, 3)["value"]
+    assert 3 * frac < 0.03      # three full losses stay inside the 3% daily budget
+    assert 4 * frac <= 0.03     # the fourth exactly reaches it
