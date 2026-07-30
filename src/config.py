@@ -94,8 +94,17 @@ class TradingConfig:
   # winners and only filled when the move failed. A high-conviction entry may now cross up to this
   # fraction of price to fill immediately; the atomic bracket still attaches, so it is never naked.
   # 0 disables (pure passive-limit behavior).
-  marketable_entry_max_dev_pct: float = 0.0015  # allow crossing up to 0.15% for a high-conviction fill
-  marketable_entry_min_confidence: float = 0.75  # confidence bar to permit a marketable (crossing) entry
+  # Jul 30 2026, measured on real paths: only 3 of 80 expired plans fitted the old 0.15% band while the
+  # median cross needed is 0.82%, so the band blocked almost every fill it was meant to enable. Raised
+  # to 1% as an OUTER SANITY BOUND — the binding test is now the post-cost RR gate evaluated at the
+  # crossed price (see the marketable-entry block in tools.py), which is both principled and already
+  # implemented. Extending the entry TTL instead is NOT the answer: the same replay shows later fills
+  # lose (-0.37R mean at a 4h TTL) because a limit that fills late only fills when price came to it.
+  marketable_entry_max_dev_pct: float = 0.01
+  # 0 = no extra confidence bar beyond the global min_confidence. Confidence turned out to be a weak
+  # filter for crossings (+0.050R mean at conf>=0.80) versus the RR-after-cross test (+0.388R), so the
+  # old 0.75 bar mostly rejected profitable fills. Set >0 to re-impose a conviction floor.
+  marketable_entry_min_confidence: float = 0.0
   # Noise floor on stop distance (Jul 2026 — the single biggest measured loss driver). Across the 27
   # closed futures lifecycles of 20-27 Jul the median stop sat at 1.4x the 15m ATR (~0.7x the 1h ATR,
   # i.e. LESS THAN ONE HOURLY BAR of ordinary movement). Median favourable excursion was +0.27R
@@ -433,8 +442,8 @@ def load_config() -> AppConfig:
       research_handoff_after_no_trade_runs=int(os.getenv("RESEARCH_HANDOFF_AFTER_NO_TRADE_RUNS", "3")),
       size_quality_floor=float(os.getenv("SIZE_QUALITY_FLOOR", "0.5")),
       min_entry_notional_usd=float(os.getenv("MIN_ENTRY_NOTIONAL_USD", "0")),
-      marketable_entry_max_dev_pct=float(os.getenv("MARKETABLE_ENTRY_MAX_DEV_PCT", "0.0015")),
-      marketable_entry_min_confidence=float(os.getenv("MARKETABLE_ENTRY_MIN_CONFIDENCE", "0.75")),
+      marketable_entry_max_dev_pct=float(os.getenv("MARKETABLE_ENTRY_MAX_DEV_PCT", "0.01")),
+      marketable_entry_min_confidence=float(os.getenv("MARKETABLE_ENTRY_MIN_CONFIDENCE", "0")),
       stop_atr_floor_mult=float(os.getenv("STOP_ATR_FLOOR_MULT", "2.5")),
       stop_atr_floor_adaptive=_as_bool(os.getenv("STOP_ATR_FLOOR_ADAPTIVE"), True),
       stop_atr_floor_max_widen=float(os.getenv("STOP_ATR_FLOOR_MAX_WIDEN", "4.0")),

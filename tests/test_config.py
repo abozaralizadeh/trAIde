@@ -124,3 +124,31 @@ def test_invalid_flat_backoff_max_multiplier():
     cfg = _make_valid_config(flat_backoff_max_multiplier=0.99)
     with pytest.raises(ValueError, match="FLAT_BACKOFF_MAX_MULTIPLIER"):
         validate_config(cfg)
+
+
+def test_marketable_entry_defaults_let_the_rr_gate_be_the_binding_test():
+    """Crossing to fill is gated by post-cost RR, not by a conviction bar or a tiny fixed band.
+
+    Measured on real 1m paths over the 82 expired limits (Jul 30 2026): only 3 of 80 plans fitted the
+    old 0.15% band while the median cross needed is 0.82%, so the band blocked nearly every fill it
+    existed to enable. Filtering crossings by confidence >= 0.80 returns +0.050R mean; filtering by
+    "still clears the RR floor from the crossed price" returns +0.388R. Confidence was a weak proxy for
+    the thing that actually matters, so the band is now only an outer bound and the RR gate decides.
+    """
+    from src.config import TradingConfig
+    defaults = TradingConfig.__dataclass_fields__
+    assert defaults["marketable_entry_max_dev_pct"].default == 0.01
+    assert defaults["marketable_entry_min_confidence"].default == 0.0
+
+
+def test_entry_ttl_stays_short_because_late_fills_are_adverse():
+    """The TTL must NOT be lengthened to chase fill rate.
+
+    Replaying the same expired limits at longer TTLs fills more orders but those extra fills lose:
+    -0.79R mean at 30min, -0.30R at 60min, -0.39R at 120min, -0.37R at 240min. A resting limit that
+    fills late only fills because price came to it — i.e. the move went against the thesis. The short
+    TTL is doing real work; throughput has to come from crossing, not from waiting.
+    """
+    # Assert the SHIPPED loader default, not the local fixture (which sets its own value).
+    from src.config import load_config
+    assert load_config().trading.entry_limit_expiry_minutes <= 20

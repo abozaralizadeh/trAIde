@@ -3390,16 +3390,24 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       take_profit_price = _round_price_to_tick(float(take_profit_price), tick_size)
       stop_loss_price = _round_price_to_tick(float(stop_loss_price), tick_size)
 
-    # Marketable-entry allowance (fill-rate fix): a passive limit resting away from price only filled
-    # ~21% of the time — in a trend the price never comes back, so the bot missed the winners and only
-    # filled when the move failed (adverse selection). A HIGH-CONVICTION entry may now cross the spread
-    # up to `marketable_entry_max_dev_pct` beyond live price to fill immediately, and a resting entry
-    # may sit right at the touch. It is still a limit order, so the atomic TP/SL bracket attaches and
-    # the fill is never naked. Lower-conviction entries keep the passive, min-deviation discipline.
-    _marketable_ok = (
-      cfg.trading.marketable_entry_max_dev_pct > 0
-      and confidence is not None
-      and confidence >= cfg.trading.marketable_entry_min_confidence
+    # Marketable-entry allowance (fill-rate fix): a passive limit resting away from price filled only
+    # ~18% of the time — in a trend the price never comes back, so the bot missed the winners and only
+    # filled when the move failed (adverse selection). Confirmed on real paths: replaying the 82
+    # expired limits, *extending* the TTL fills more but those extra fills LOSE (-0.37R mean at 4h) —
+    # waiting longer just buys more adverse selection. Crossing to fill immediately is the opposite:
+    # the same 82 plans taken at the live price return +13.05R over 80 trades (+0.163R mean, 65% win).
+    #
+    # What makes a cross safe is NOT conviction — it is whether the bracket still has edge from the
+    # worse entry. Measured: filtering those crossings by confidence >= 0.80 yields +0.050R mean;
+    # filtering by "still clears the RR floor after crossing" yields +0.388R. So the confidence bar was
+    # a crude proxy that mostly blocked good fills (only 3 of 80 plans fit the old 0.15% band, while
+    # the median cross needed is 0.82%). The binding test is now the POST-COST RR GATE that already
+    # runs below on this same `entry_price_val` — pay up for a fill exactly as long as the trade still
+    # clears its structural floor from the price you actually pay. `marketable_entry_max_dev_pct` stays
+    # only as an outer sanity bound, and the atomic TP/SL bracket still attaches, so a fill is never naked.
+    _marketable_ok = cfg.trading.marketable_entry_max_dev_pct > 0 and (
+      cfg.trading.marketable_entry_min_confidence <= 0
+      or (confidence is not None and confidence >= cfg.trading.marketable_entry_min_confidence)
     )
     deviation = abs(entry_price_val - current_price) / current_price  # used downstream for logging/response
     wrong_side = (side_lower == "buy" and entry_price_val >= current_price) or (side_lower == "sell" and entry_price_val <= current_price)
@@ -3409,12 +3417,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "rejected": True,
           "reason": f"Marketable/wrong-side limit: {side_lower} at {entry_price_val:.8g} versus live {current_price:.8g}",
           "hint": (
-            "A pullback buy must rest below live price; a rally short must rest above it. A "
-            f"high-conviction entry (>= {cfg.trading.marketable_entry_min_confidence:.2f}) may cross up to "
-            f"{cfg.trading.marketable_entry_max_dev_pct*100:.2f}% of price to fill immediately."
+            "A pullback buy must rest below live price; a rally short must rest above it. An entry may "
+            f"cross up to {cfg.trading.marketable_entry_max_dev_pct*100:.2f}% of price to fill immediately, "
+            "provided the bracket still clears the post-cost reward:risk floor from that worse entry."
           ),
         }
-      logger.info("MARKETABLE ENTRY: %s %s crossing %.3f%% at conf %.2f to secure a fill", side_lower, spot_symbol, deviation * 100, confidence)
+      logger.info("MARKETABLE ENTRY: %s %s crossing %.3f%% to secure a fill (post-cost RR gate still applies)",
+                  side_lower, spot_symbol, deviation * 100)
     elif deviation < cfg.trading.min_entry_deviation_pct and not _marketable_ok:
       return {
         "rejected": True,
