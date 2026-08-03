@@ -28,6 +28,7 @@ from src.regime import (
     reward_risk_ratio,
     risk_capped_contracts,
     risk_targeted_notional,
+    scale_target_to_widened_stop,
 )
 from src.memory import MemoryStore
 
@@ -757,3 +758,65 @@ def test_coherent_fraction_survives_the_configured_number_of_losses():
     frac = coherent_risk_fraction(0.02, 3.0, 3)["value"]
     assert 3 * frac < 0.03      # three full losses stay inside the 3% daily budget
     assert 4 * frac <= 0.03     # the fourth exactly reaches it
+
+
+# ── Stop floor must stay reward:risk-NEUTRAL ────────────────────────────────────
+
+
+def test_floor_alone_destroys_rr_which_is_why_the_target_must_scale():
+    """The regression this pair of functions exists to prevent.
+
+    Widening only the risk leg mechanically lowers RR, and the admission gate then rejects the trade.
+    Measured live on 2026-08-02: the median gross RR of rejected setups fell 1.79 -> 1.23 and the order
+    rate dropped 72%, cancelling the cost-model fix. Entry 100, stop 99 (1x ATR), target 102 => RR 2.0.
+    """
+    entry, tp = 100.0, 102.0
+    floored, info = noise_floored_stop("buy", entry, 99.0, 1.0, 2.5)
+    assert info["applied"] and info["widenFactor"] == pytest.approx(2.5)
+    rr_unscaled = reward_risk_ratio("buy", entry, tp, floored)
+    assert rr_unscaled == pytest.approx(0.8)          # 2.0 -> 0.8: the trade now fails a 1.5 floor
+    scaled = scale_target_to_widened_stop("buy", entry, tp, info["widenFactor"])
+    assert reward_risk_ratio("buy", entry, scaled, floored) == pytest.approx(2.0)   # R-multiple preserved
+
+
+def test_scaled_target_keeps_r_multiple_for_shorts():
+    entry, tp = 100.0, 98.0
+    floored, info = noise_floored_stop("sell", entry, 101.0, 1.0, 2.5)
+    scaled = scale_target_to_widened_stop("sell", entry, tp, info["widenFactor"])
+    assert scaled == pytest.approx(95.0)
+    assert reward_risk_ratio("sell", entry, scaled, floored) == pytest.approx(
+        reward_risk_ratio("sell", entry, tp, 101.0))
+
+
+def test_scaled_target_respects_the_widen_cap():
+    # When the floor is capped, the target scales by the SAME capped factor — never more.
+    floored, info = noise_floored_stop("buy", 100.0, 99.9, 1.0, 2.5, max_widen_mult=2.0)
+    assert info["widenFactor"] == pytest.approx(2.0)
+    assert scale_target_to_widened_stop("buy", 100.0, 101.0, info["widenFactor"]) == pytest.approx(102.0)
+
+
+def test_scaled_target_is_inert_when_nothing_widened():
+    # No widening, unknown side, bad inputs, or a target on the wrong side => unchanged.
+    assert scale_target_to_widened_stop("buy", 100.0, 102.0, 1.0) == 102.0
+    assert scale_target_to_widened_stop("buy", 100.0, 102.0, 0.5) == 102.0
+    assert scale_target_to_widened_stop("hold", 100.0, 102.0, 2.0) == 102.0
+    assert scale_target_to_widened_stop("buy", 100.0, 98.0, 2.0) == 98.0     # target below entry on a long
+    assert scale_target_to_widened_stop("buy", 100.0, "x", 2.0) == "x"
+
+
+def test_floored_bracket_holds_dollar_risk_constant_while_preserving_rr():
+    """The whole point: the floor becomes SMALLER SIZE, not worse economics and not more risk."""
+    entry, equity, frac, notional = 100.0, 1000.0, 0.0075, 5000.0
+    floored, info = noise_floored_stop("buy", entry, 99.0, 1.0, 2.5)
+    scaled = scale_target_to_widened_stop("buy", entry, 102.0, info["widenFactor"])
+    # RR unchanged...
+    assert reward_risk_ratio("buy", entry, scaled, floored) == pytest.approx(
+        reward_risk_ratio("buy", entry, 102.0, 99.0))
+    # ...and dollar risk unchanged, because size falls by the same factor.
+    tight = bracket_risk_scale(entry=entry, stop_loss=99.0, notional_usd=notional,
+                               equity_usd=equity, risk_fraction=frac)
+    wide = bracket_risk_scale(entry=entry, stop_loss=floored, notional_usd=notional,
+                              equity_usd=equity, risk_fraction=frac)
+    assert notional * tight * 0.01 == pytest.approx(equity * frac)
+    assert notional * wide * (entry - floored) / entry == pytest.approx(equity * frac)
+    assert wide == pytest.approx(tight / info["widenFactor"])

@@ -376,6 +376,50 @@ def noise_floored_stop(
   }
 
 
+def scale_target_to_widened_stop(side: str, entry, take_profit, widen_factor):
+  """Keep a bracket's planned R-multiple when the noise floor rescales the risk leg.
+
+  The stop floor was measured live on 2026-08-02 and produced an interaction I did not anticipate:
+  widening the risk leg while leaving the target where the model put it **mechanically destroys
+  reward:risk**, and the admission gate then rejects the trade. Over the first 12.5 live hours the
+  median *gross* RR of rejected setups fell 1.79 -> 1.23 even though the cost-model fix had cut the
+  friction drag 0.62 -> 0.28; the two changes cancelled, rejections stayed flat at 0.19/run, and the
+  order rate dropped 72%.
+
+  The resolution is that the floor is a statement about the *scale of movement*, not about the thesis.
+  If the model's stop sat inside the noise band, its target was drawn on that same too-tight scale —
+  so when code rescales risk by ``widen_factor`` the reward leg has to travel with it, leaving the
+  intended R-multiple untouched and the floor RR-neutral. Position size still shrinks, so dollar risk
+  per trade is unchanged; the trade simply gets proportional room on both legs. This is not "moving
+  the target to pass the gate": the R-multiple the model chose is preserved exactly, only the unit of
+  R changes. Replaying the recorded lifecycles, holding the target at a constant multiple of the
+  *floored* stop scores +4.12R against +4.09R for the unscaled target — outcomes are insensitive to
+  target distance over 0.8-2.0R, so this restores throughput without trading away exit quality.
+
+  Returns the (possibly unchanged) take-profit, so callers can apply it unconditionally.
+  """
+  try:
+    e = float(entry)
+    tp = float(take_profit)
+    factor = float(widen_factor)
+  except (TypeError, ValueError):
+    return take_profit
+  if not math.isfinite(factor) or factor <= 1.0 or e <= 0:
+    return take_profit
+  s = (side or "").lower()
+  if s in ("buy", "long"):
+    reward = tp - e
+    if reward <= 0:
+      return take_profit
+    return e + reward * factor
+  if s in ("sell", "short"):
+    reward = e - tp
+    if reward <= 0:
+      return take_profit
+    return e - reward * factor
+  return take_profit
+
+
 def coherent_risk_fraction(
   configured_fraction,
   max_daily_drawdown_pct,

@@ -51,6 +51,7 @@ from .regime import (
   net_reward_risk_ratio,
   noise_floored_stop,
   overextension_atr,
+  scale_target_to_widened_stop,
   regime_size_factor,
   resolve_gate_deadlock,
   reward_risk_ratio,
@@ -620,6 +621,29 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         info.get("plannedAtrMult", 0.0), mult,
       )
     return new_stop, info
+
+  def _floor_bracket_to_noise(
+    spot_symbol: str, side: str, entry: float, stop_loss: Any, take_profit: Any, *, context: str,
+  ) -> tuple[float, Any, Dict[str, Any]]:
+    """Apply the noise floor to the WHOLE bracket, so widening risk doesn't destroy reward:risk.
+
+    Widening only the risk leg mechanically lowers RR and the admission gate then rejects the trade —
+    measured live on 2026-08-02, the median gross RR of rejected setups fell 1.79→1.23 and the order
+    rate dropped 72%. Scaling the target by the same factor keeps the model's intended R-multiple, so
+    the floor is RR-neutral and expresses itself purely as smaller size (see
+    regime.scale_target_to_widened_stop).
+    """
+    new_stop, info = _floor_stop_to_noise(spot_symbol, side, entry, stop_loss, context=context)
+    new_tp = take_profit
+    if info.get("applied") and cfg.trading.stop_floor_scales_target:
+      new_tp = scale_target_to_widened_stop(side, entry, take_profit, info.get("widenFactor"))
+      if new_tp != take_profit:
+        info["scaledTakeProfit"] = new_tp
+        logger.info(
+          "STOP NOISE FLOOR: %s %s %s — target %.8g → %.8g (x%.2f) to preserve the planned R-multiple",
+          context, side, spot_symbol, float(take_profit), float(new_tp), float(info.get("widenFactor") or 1.0),
+        )
+    return new_stop, new_tp, info
 
 
   # ── Spot trading — market/limit orders, stops & position protection ─────────────────────────────
@@ -2482,22 +2506,25 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if price is None or price <= 0:
       return {"error": "Invalid or missing live price"}
 
-    # Noise floor on the risk leg — applied before the add-on/risk/RR chain so every downstream
-    # calculation prices the stop the trade will actually rest on (see regime.noise_floored_stop).
+    # Noise floor on the bracket — applied before the add-on/risk/RR chain so every downstream
+    # calculation prices the stop the trade will actually rest on. The target travels with the stop so
+    # widening risk cannot turn into an RR rejection (see regime.scale_target_to_widened_stop).
     _stop_floor_fm: Dict[str, Any] = {"applied": False, "reason": "not an entry"}
     if is_entry:
       _floor_src = _to_float(stop_loss_price)
       if _floor_src is None:
         _floor_src = _to_float(stop_price)
       if _floor_src is not None and _floor_src > 0:
-        _floored, _stop_floor_fm = _floor_stop_to_noise(
-          spot_symbol, side, price, _floor_src, context="futures market",
+        _floored, _scaled_tp, _stop_floor_fm = _floor_bracket_to_noise(
+          spot_symbol, side, price, _floor_src, take_profit_price, context="futures market",
         )
         if _stop_floor_fm.get("applied"):
           if _to_float(stop_loss_price) is not None:
             stop_loss_price = _floored
           else:
             stop_price = _floored
+          if take_profit_price is not None:
+            take_profit_price = _scaled_tp
 
     existing_risk_usd = 0.0
     existing_notional_usd = 0.0
@@ -3378,10 +3405,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if current_price is None:
       return {"error": "Unable to fetch current live price for deviation check"}
 
-    # Noise floor on the risk leg, applied BEFORE tick rounding, the RR gate and sizing, so the whole
-    # chain prices the stop the trade will actually rest on.
-    stop_loss_price, _stop_floor_fl = _floor_stop_to_noise(
-      spot_symbol, side_lower, entry_price_val, float(stop_loss_price), context="futures limit",
+    # Noise floor on the bracket, applied BEFORE tick rounding, the RR gate and sizing, so the whole
+    # chain prices the stop the trade will actually rest on. The target scales with the stop, so the
+    # floor never turns into an RR rejection — it expresses itself as smaller size.
+    stop_loss_price, take_profit_price, _stop_floor_fl = _floor_bracket_to_noise(
+      spot_symbol, side_lower, entry_price_val, float(stop_loss_price), float(take_profit_price),
+      context="futures limit",
     )
 
     tick_size = _to_float(contract.get("tickSize")) or 0.0

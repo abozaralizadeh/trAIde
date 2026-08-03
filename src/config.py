@@ -122,6 +122,14 @@ class TradingConfig:
   # Never rewrite a stop by more than this factor. A stop needing a 4x widening is not a slightly
   # tight stop, it is a different trade — leave it and let the RR gate judge it.
   stop_atr_floor_max_widen: float = 4.0
+  # When the noise floor widens the risk leg, scale the TARGET by the same factor so the bracket keeps
+  # its planned R-multiple. Measured live on 2026-08-02: widening only the stop dropped the median
+  # gross RR of rejected setups from 1.79 to 1.23, cancelling the cost-model fix (friction drag was
+  # correctly cut 0.62 -> 0.28) and cutting the order rate 72% — the floor was being converted into RR
+  # rejections instead of into smaller size. Preserving the R-multiple makes it RR-neutral. Replay says
+  # this costs nothing in exit quality (+4.12R scaled vs +4.09R unscaled; outcomes are flat across
+  # 0.8-2.0R of target distance). Set false to widen the stop only.
+  stop_floor_scales_target: bool = True
   # Slippage self-calibration: use the bot's OWN measured fill deviation instead of the static
   # `estimated_slippage_pct` prior once there are enough fills (see edge.measured_slippage_pct).
   # The static 0.10%/side was ~12x the measured 0.008% and taxed every setup a phantom 0.18R.
@@ -447,6 +455,7 @@ def load_config() -> AppConfig:
       stop_atr_floor_mult=float(os.getenv("STOP_ATR_FLOOR_MULT", "2.5")),
       stop_atr_floor_adaptive=_as_bool(os.getenv("STOP_ATR_FLOOR_ADAPTIVE"), True),
       stop_atr_floor_max_widen=float(os.getenv("STOP_ATR_FLOOR_MAX_WIDEN", "4.0")),
+      stop_floor_scales_target=_as_bool(os.getenv("STOP_FLOOR_SCALES_TARGET"), True),
       slippage_autotune_enabled=_as_bool(os.getenv("SLIPPAGE_AUTOTUNE_ENABLED"), True),
       slippage_autotune_min_samples=int(os.getenv("SLIPPAGE_AUTOTUNE_MIN_SAMPLES", "8")),
       risk_targeted_sizing=_as_bool(os.getenv("RISK_TARGETED_SIZING"), True),
