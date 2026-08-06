@@ -3635,6 +3635,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "entryExtensionAtr": overextension_atr(
         side_lower, entry_price_val, _g_fl.get("intraday_vwap"), _g_fl.get("intraday_atr_abs"),
       ),
+      # The LIVE price when the call was made — not the limit price. Signal edge must be measured from
+      # here or the resting discount is scored as prediction (see edge.signal_edge_stats).
+      "marketPriceAtSignal": current_price,
       # Stop geometry actually used, so post-trade review can tell a noise-floored stop from the
       # model's original and judge whether the floor is set where it needs to be.
       "stopAtrMult": (

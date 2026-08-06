@@ -55,6 +55,7 @@ from .kucoin import (
 )
 from .edge import (
   adaptive_stop_atr_mult,
+  signal_edge_stats,
   expectancy_size_factor,
   edge_stats,
   entry_quality_stats,
@@ -800,6 +801,22 @@ def run_trading_agent(
         state["stats"] = stats
         # Post-trade entry-quality feedback (decision-support the agent reflects on; not a gate).
         state["entry_quality"] = entry_quality_stats(closes, cfg.edge.lookback_trades)
+        # SIGNAL EDGE: does the direction call predict, independent of exits and fills? This is the
+        # only statistic that decides whether the strategy can be profitable at all.
+        try:
+          _cost = 2.0 * (float(fees.get("futures_taker", 0.0006)) + float(state.get("slippage_pct") or 0.0))
+          state["signal_edge"] = signal_edge_stats(memory.signal_probes(limit=200), cost_pct=_cost)
+          _se = state["signal_edge"]
+          if _se.get("verdict") == "no edge":
+            logger.warning(
+              "SIGNAL EDGE: no measurable directional edge over %d probes (best %s: %+.3f%% vs %.3f%% cost) "
+              "— exits and sizing cannot fix a signal that does not predict",
+              _se.get("n", 0), _se.get("best_horizon"),
+              (_se.get("by_horizon") or {}).get(_se.get("best_horizon") or "", {}).get("mean_pct", 0.0),
+              _cost * 100,
+            )
+        except Exception as _sig_exc:
+          logger.debug("Signal-edge stats unavailable: %s", _sig_exc)
         # Noise floor on stop distance, tuned from the adverse heat the bot's own WINNERS survive.
         if cfg.trading.stop_atr_floor_adaptive and cfg.trading.stop_atr_floor_mult > 0:
           floor = adaptive_stop_atr_mult(closes, cfg.trading.stop_atr_floor_mult, lookback=cfg.edge.lookback_trades)
@@ -1758,6 +1775,9 @@ def run_trading_agent(
       # How far price ACTUALLY travels in your favour, so targets are planned against the tape that
       # exists rather than the one you want. medianMfeR is the typical best-case excursion; the
       # mfeReachedRate buckets are the share of trades that ever reached each R milestone.
+      # Does the DIRECTION CALL predict, measured from the market price at signal time? Independent of
+      # fills and exits. If verdict is "no edge", the problem is setup selection, not trade management.
+      "signalEdge": _edge_now.get("signal_edge", {"verdict": "insufficient data"}),
       "targetReachability": {
         "medianMfeR": (_edge_now.get("entry_quality") or {}).get("median_mfe_r"),
         "mfeReachedRate": (_edge_now.get("entry_quality") or {}).get("mfe_reached_rate", {}),

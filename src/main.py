@@ -1084,6 +1084,14 @@ async def trading_loop(
       normalize_symbol(symbol): float(ticker.price)
       for symbol, ticker in snapshot.tickers.items()
     }
+    # Settle signal-edge probes from the snapshot we already have: stamp the forward price on any
+    # entry signal whose measurement horizon has elapsed. This is the feedback loop that tells the bot
+    # whether its DIRECTION CALLS predict, as opposed to whether its exits were lucky — see
+    # memory.settle_signal_probes / edge.signal_edge_stats. Read-only w.r.t. trading behaviour.
+    try:
+      memory.settle_signal_probes(live_prices)
+    except Exception as exc:
+      logger.debug("Signal-probe settle skipped: %s", exc)
     for stored_trigger, observed_price in _crossed_auto_triggers(memory.latest_triggers(), live_prices):
       symbol = normalize_symbol(stored_trigger.get("symbol") or "")
       condition = str(stored_trigger.get("condition") or "").lower()

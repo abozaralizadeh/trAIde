@@ -1096,6 +1096,66 @@ class MemoryStore:
     rows = self._authoritative_realized_rows(rows)
     return rows[-max(1, int(limit)):]
 
+  def settle_signal_probes(self, prices: Dict[str, Any], horizons_min: tuple = (60, 240)) -> int:
+    """Stamp the forward price on any entry signal whose measurement horizon has elapsed.
+
+    This closes the feedback loop the bot never had. It has always measured *outcomes* (win rate,
+    realized R) — but an outcome conflates three different things: whether the direction call was
+    right, whether the fill was any good, and whether the exit was well managed. Six rounds of exit,
+    cost and sizing fixes all landed correctly and the account still bled, because none of them could
+    answer the only question that decides profitability: **does the direction call predict?**
+
+    Measured offline on 2026-08-06 over 96 recorded signals, forward return from the *market* price at
+    signal time was -0.135% at 1h (t=-2.02, hit rate 35%) against a random-time null of -0.025% — no
+    edge, and significantly negative in the dominant configuration. Storing the probe makes that
+    measurable continuously and in-process, so a future model that genuinely predicts will show it.
+
+    Cheap by construction: it reuses the per-poll ticker snapshot, writes only when a horizon elapses,
+    and never raises. Returns the number of probes settled.
+    """
+    if not prices:
+      return 0
+    now = int(time.time())
+    settled = 0
+    with self._lock:
+      data = self._read()
+      for row in data.get("trades") or []:
+        if not isinstance(row, dict):
+          continue
+        ctx = row.get("entryContext")
+        if not isinstance(ctx, dict) or not ctx.get("marketPriceAtSignal"):
+          continue
+        probe = ctx.setdefault("signalProbe", {})
+        ts0 = row.get("ts") or 0
+        for horizon in horizons_min:
+          key = f"m{int(horizon)}"
+          if key in probe or now < ts0 + int(horizon) * 60:
+            continue
+          px = prices.get(row.get("symbol"))
+          px = getattr(px, "price", px)
+          try:
+            px = float(px)
+          except (TypeError, ValueError):
+            continue
+          if px <= 0:
+            continue
+          probe[key] = px
+          settled += 1
+      if settled:
+        self._write(data)
+    return settled
+
+  def signal_probes(self, limit: int = 200) -> list[Dict[str, Any]]:
+    """Entry signals carrying a market-price-at-signal stamp, for edge measurement."""
+    with self._lock:
+      data = self._read()
+    out = []
+    for row in (data.get("trades") or []):
+      ctx = row.get("entryContext") if isinstance(row, dict) else None
+      if isinstance(ctx, dict) and ctx.get("marketPriceAtSignal"):
+        out.append(row)
+    return out[-max(1, int(limit)):]
+
   def recent_fills(self, limit: int = 100) -> list[Dict[str, Any]]:
     """Recent FILLED entry orders, oldest→newest — the sample the friction estimate calibrates on.
 

@@ -8,6 +8,7 @@ from src.edge import (
     adaptive_stop_atr_mult,
     edge_stats,
     measured_slippage_pct,
+    signal_edge_stats,
     entry_quality_stats,
     expectancy_size_factor,
     loss_streak_size_factor,
@@ -500,3 +501,61 @@ def test_entry_quality_reachability_empty_without_mfe_data():
     q = entry_quality_stats([{"symbol": "X", "ts": 1, "troughPnl": -0.5,
                               "entryContext": {"plannedMaxLossUsd": 1.0}}], lookback=30)
     assert q["mfe_reached_rate"] == {} and q["median_mfe_r"] is None
+
+
+# ── Signal edge: does the direction call predict, independent of exits? ─────────
+
+
+def _probe(side, base, fwd_1h, fwd_4h=None):
+    ctx = {"positionSide": side, "marketPriceAtSignal": base, "signalProbe": {"m60": fwd_1h}}
+    if fwd_4h is not None:
+        ctx["signalProbe"]["m240"] = fwd_4h
+    return {"symbol": "X-USDT", "entryContext": ctx}
+
+
+def test_signal_edge_detects_a_real_edge():
+    # Longs that reliably go up 1% in an hour, well past a 0.10% round-trip cost.
+    probes = [_probe("long", 100.0, 101.0) for _ in range(25)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["verdict"] == "edge"
+    assert out["by_horizon"]["60m"]["mean_pct"] == pytest.approx(1.0)
+    assert out["by_horizon"]["60m"]["hit_rate"] == pytest.approx(1.0)
+
+
+def test_signal_edge_calls_a_coin_flip_no_edge():
+    """The live finding: 96 signals, ~0% forward return, i.e. nothing for exits to protect."""
+    probes = ([_probe("long", 100.0, 100.05) for _ in range(13)]
+              + [_probe("long", 100.0, 99.95) for _ in range(12)])
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["verdict"] == "no edge"
+    assert abs(out["by_horizon"]["60m"]["mean_pct"]) < 0.05
+
+
+def test_signal_edge_scores_shorts_by_direction():
+    # A short is right when price FALLS; the sign must follow the traded direction.
+    probes = [_probe("short", 100.0, 99.0) for _ in range(25)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["60m"]["mean_pct"] == pytest.approx(1.0)
+    assert out["verdict"] == "edge"
+
+
+def test_signal_edge_requires_a_real_sample_before_judging():
+    probes = [_probe("long", 100.0, 101.0) for _ in range(5)]
+    assert signal_edge_stats(probes, min_samples=20)["verdict"] == "insufficient data"
+    assert signal_edge_stats([])["verdict"] == "insufficient data"
+
+
+def test_signal_edge_needs_the_cost_hurdle_cleared_not_merely_positive():
+    # +0.05% per trade is positive but does not pay a 0.10% round trip: that is not a tradeable edge.
+    probes = [_probe("long", 100.0, 100.05) for _ in range(25)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["60m"]["mean_pct"] > 0
+    assert out["by_horizon"]["60m"]["net_of_cost_pct"] < 0
+    assert out["verdict"] == "no edge"
+
+
+def test_signal_edge_ignores_probes_without_a_market_price_stamp():
+    # Measuring from the LIMIT price scores the resting discount as prediction. Rows lacking the
+    # market-price stamp must be excluded rather than silently measured from the wrong base.
+    bad = [{"symbol": "X-USDT", "entryContext": {"positionSide": "long", "signalProbe": {"m60": 101.0}}}]
+    assert signal_edge_stats(bad)["n"] == 0

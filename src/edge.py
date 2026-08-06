@@ -287,6 +287,73 @@ def measured_slippage_pct(
   }
 
 
+def signal_edge_stats(
+  probes: List[Dict[str, Any]],
+  *,
+  cost_pct: float = 0.001,
+  horizons_min: tuple = (60, 240),
+  min_samples: int = 20,
+) -> Dict[str, Any]:
+  """Does the agent's DIRECTION CALL predict? The one question that decides profitability.
+
+  Every other statistic in this module measures an *outcome*, which conflates three separate things:
+  whether the direction was right, whether the fill was any good, and whether the exit was managed
+  well. That conflation is why six rounds of correct exit/cost/sizing fixes did not stop the bleeding.
+  This measures the signal alone: forward return from the MARKET price at signal time, signed by the
+  traded direction, so neither the limit-order discount nor the exit logic can flatter it.
+
+  (Measuring from the *limit* price instead inflates the result badly — it scores the discount the
+  order was resting at as if it were prediction. Doing that on this account's data showed a spurious
+  +1.24%/15m at a 92% hit rate; measured correctly from market price it was -0.007%, i.e. nothing.)
+
+  A signal is only worth trading when its mean forward return clears the round-trip cost. Below that,
+  no exit or sizing scheme can produce profit — it can only lose more slowly. ``verdict`` is therefore
+  the honest summary: "edge" / "no edge" / "insufficient data".
+  """
+  out: Dict[str, Any] = {"n": 0, "verdict": "insufficient data", "cost_pct": cost_pct}
+  by_h: Dict[str, List[float]] = {}
+  for row in probes or []:
+    ctx = row.get("entryContext") if isinstance(row, dict) else None
+    if not isinstance(ctx, dict):
+      continue
+    base = _f(ctx.get("marketPriceAtSignal"))
+    side = str(ctx.get("positionSide") or "").lower()
+    probe = ctx.get("signalProbe")
+    if not base or base <= 0 or side not in {"long", "short"} or not isinstance(probe, dict):
+      continue
+    for horizon in horizons_min:
+      px = _f(probe.get(f"m{int(horizon)}"))
+      if px is None or px <= 0:
+        continue
+      ret = (px - base) / base
+      by_h.setdefault(f"{int(horizon)}m", []).append(ret if side == "long" else -ret)
+  if not by_h:
+    return out
+  detail = {}
+  best = None
+  for key, vals in by_h.items():
+    mean = sum(vals) / len(vals)
+    hit = sum(1 for v in vals if v > 0) / len(vals)
+    detail[key] = {
+      "n": len(vals),
+      "mean_pct": round(mean * 100, 4),
+      "hit_rate": round(hit, 3),
+      "net_of_cost_pct": round((mean - cost_pct) * 100, 4),
+    }
+    if best is None or mean > best[1]:
+      best = (key, mean, len(vals))
+  out["n"] = max(d["n"] for d in detail.values())
+  out["by_horizon"] = detail
+  out["best_horizon"] = best[0] if best else None
+  if out["n"] < max(1, int(min_samples)):
+    out["verdict"] = "insufficient data"
+  elif best and best[1] > cost_pct:
+    out["verdict"] = "edge"
+  else:
+    out["verdict"] = "no edge"
+  return out
+
+
 def adaptive_stop_atr_mult(
   closes: List[Dict[str, Any]],
   base_mult: float,
