@@ -25,6 +25,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from .edge import family_size_factor, measured_slippage_pct, signal_edge_stats
 from .memory import MemoryStore
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -217,6 +218,7 @@ class DashboardPublisher:
       "paperTrading": bool(cfg.trading.paper_trading),
       "disclosure": self.cfg.disclosure,
       "kpis": self._sanitize_perf(perf),
+      "strategyEdge": self._build_strategy_edge(memory, cfg),
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
@@ -242,6 +244,48 @@ class DashboardPublisher:
     }
 
   # ----- sanitizers (whitelist only) --------------------------------------
+
+  def _build_strategy_edge(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
+    """Does the direction call predict, and which playbook is currently paying?
+
+    This is the honest headline for the whole system: outcomes (win rate, PnL) conflate the direction
+    call with fill quality and exit management, so they cannot say *why* the bot is winning or losing.
+    ``signalEdge`` measures the signal alone — forward return from the market price at signal time,
+    signed by the traded direction — against the round-trip cost it has to clear.
+
+    Everything published here is percentages, counts and verdicts. No balance, equity, position size
+    or account identifier is involved, so it is safe under the default `normalized` disclosure policy
+    and is published in every mode. Never raises: the dashboard must not be able to take the bot down.
+    """
+    out: Dict[str, Any] = {"verdict": "insufficient data", "n": 0}
+    try:
+      prior = float(getattr(cfg.trading, "estimated_slippage_pct", 0.001) or 0.0)
+      slip = measured_slippage_pct(
+        memory.recent_fills(limit=100), prior,
+        min_samples=int(getattr(cfg.trading, "slippage_autotune_min_samples", 8)),
+      )
+      # Same cost basis the entry gates use, so the dashboard verdict matches the bot's own.
+      cost = 2.0 * (0.0006 + float(slip.get("value") or 0.0))
+      stats = signal_edge_stats(memory.signal_probes(limit=200), cost_pct=cost)
+      out = {
+        "verdict": stats.get("verdict", "insufficient data"),
+        "n": int(stats.get("n") or 0),
+        "costPct": _round(cost * 100, 4),
+        "bestHorizon": stats.get("best_horizon"),
+        "byHorizon": stats.get("by_horizon") or {},
+        "byFamily": stats.get("by_family") or {},
+        "slippagePctPerSide": _round(float(slip.get("value") or 0.0) * 100, 4),
+        "slippageSource": slip.get("source"),
+      }
+      # Surface the risk multiplier each family is currently earning, so the dashboard explains WHY
+      # capital is where it is rather than just reporting the outcome.
+      out["familyRiskFactor"] = {
+        fam: _round(family_size_factor(stats, fam), 3)
+        for fam in (out["byFamily"] or {})
+      }
+    except Exception as exc:  # pragma: no cover - defensive; publishing must never break the loop
+      logger.debug("strategyEdge unavailable: %s", exc)
+    return out
 
   def _allow_usd(self) -> bool:
     return self.cfg.disclosure in ("absolute", "both")

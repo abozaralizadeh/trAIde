@@ -9,6 +9,8 @@ from src.edge import (
     edge_stats,
     measured_slippage_pct,
     signal_edge_stats,
+    family_size_factor,
+    infer_setup_family,
     entry_quality_stats,
     expectancy_size_factor,
     loss_streak_size_factor,
@@ -559,3 +561,52 @@ def test_signal_edge_ignores_probes_without_a_market_price_stamp():
     # market-price stamp must be excluded rather than silently measured from the wrong base.
     bad = [{"symbol": "X-USDT", "entryContext": {"positionSide": "long", "signalProbe": {"m60": 101.0}}}]
     assert signal_edge_stats(bad)["n"] == 0
+
+
+# ── Per-family scoring: let capital follow whichever playbook actually pays ─────
+
+
+def _fam_probe(side, base, fwd, family):
+    return {"entryContext": {"positionSide": side, "marketPriceAtSignal": base,
+                             "setupFamily": family, "signalProbe": {"m60": fwd}}}
+
+
+def test_families_are_scored_independently():
+    probes = ([_fam_probe("short", 100.0, 100.05, "continuation") for _ in range(25)]
+              + [_fam_probe("long", 100.0, 101.0, "fade_extreme") for _ in range(25)])
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_family"]["continuation"]["verdict"] == "no edge"
+    assert out["by_family"]["fade_extreme"]["verdict"] == "edge"
+
+
+def test_risk_follows_the_family_that_pays():
+    probes = ([_fam_probe("short", 100.0, 100.05, "continuation") for _ in range(25)]
+              + [_fam_probe("long", 100.0, 101.0, "fade_extreme") for _ in range(25)])
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert family_size_factor(out, "continuation") == pytest.approx(0.5)
+    assert family_size_factor(out, "fade_extreme") == pytest.approx(1.0)
+
+
+def test_an_untested_family_keeps_full_risk_so_it_can_earn_its_evidence():
+    # "insufficient data" is not a bad family, it is an unmeasured one. Shrinking it would prevent it
+    # from ever gathering the sample that judges it.
+    probes = [_fam_probe("long", 100.0, 101.0, "breakout") for _ in range(5)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_family"]["breakout"]["verdict"] == "insufficient data"
+    assert family_size_factor(out, "breakout") == pytest.approx(1.0)
+    assert family_size_factor(out, "never_seen") == pytest.approx(1.0)
+
+
+def test_family_sizing_never_enlarges_risk():
+    probes = [_fam_probe("long", 100.0, 105.0, "fade_extreme") for _ in range(25)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert family_size_factor(out, "fade_extreme") <= 1.0
+
+
+def test_family_inferred_when_the_model_did_not_declare_one():
+    aligned = {"positionSide": "short", "regime": {"intraday_bias_4h": "bearish", "intraday_bias_1h": "bearish"}}
+    against = {"positionSide": "long", "regime": {"intraday_bias_4h": "bearish", "intraday_bias_1h": "bearish"}}
+    assert infer_setup_family(aligned) == "continuation"
+    assert infer_setup_family(against) == "fade_extreme"
+    assert infer_setup_family({"setupFamily": "breakout"}) == "breakout"   # declaration always wins
+    assert infer_setup_family({}) == "other"

@@ -287,6 +287,64 @@ def measured_slippage_pct(
   }
 
 
+SETUP_FAMILIES = ("continuation", "fade_extreme", "breakout", "range_edge", "other")
+
+
+def infer_setup_family(entry_context: Dict[str, Any]) -> str:
+  """Best-effort family label when the model did not declare one, from data already stamped.
+
+  Only used as a fallback so historical and untagged entries still group somewhere sensible; the
+  model's own declaration always wins.
+  """
+  ctx = entry_context if isinstance(entry_context, dict) else {}
+  declared = str(ctx.get("setupFamily") or "").strip().lower()
+  if declared in SETUP_FAMILIES:
+    return declared
+  regime = ctx.get("regime") if isinstance(ctx.get("regime"), dict) else {}
+  side = str(ctx.get("positionSide") or "").lower()
+  bias_4h = str(regime.get("intraday_bias_4h") or "").lower()
+  bias_1h = str(regime.get("intraday_bias_1h") or "").lower()
+  want = "bullish" if side == "long" else "bearish"
+  if bias_4h == want and bias_1h == want:
+    return "continuation"
+  if bias_4h and bias_4h != want:
+    return "fade_extreme"
+  return "other"
+
+
+def family_size_factor(
+  signal_edge: Dict[str, Any],
+  family: str,
+  *,
+  no_edge_factor: float = 0.5,
+  min_samples: int = 20,
+) -> float:
+  """Risk multiplier for a setup family, from its OWN measured forward-return edge.
+
+  The point of tagging families is that the bot no longer needs anybody to decide whether it should
+  be trend-following or fading — it measures each playbook separately and lets capital follow whatever
+  currently pays. Measured on the live universe (50d, 12 symbols, 4h holding, net of a 0.10% round
+  trip): the continuation family returned -0.017% gross over 3,408 samples, i.e. flat, and flat does
+  not cover costs. Fading extremes was positive in both halves of the period but only t~1.0-1.6 over
+  135 independent events — suggestive, not established. Neither of those is a fact to hardcode; both
+  are hypotheses this factor keeps score on.
+
+  Never enlarges risk (mirrors ``expectancy_size_factor``): a family that clears the cost hurdle simply
+  keeps full configured risk. An unproven family is left at 1.0 so it can gather the evidence that
+  judges it — otherwise a new playbook could never earn its way in.
+  """
+  fam = str(family or "other").strip().lower()
+  by_family = (signal_edge or {}).get("by_family") or {}
+  row = by_family.get(fam)
+  if not isinstance(row, dict):
+    return 1.0
+  if int(row.get("n") or 0) < max(1, int(min_samples)):
+    return 1.0
+  if row.get("verdict") == "no edge":
+    return max(0.0, min(1.0, float(no_edge_factor)))
+  return 1.0
+
+
 def signal_edge_stats(
   probes: List[Dict[str, Any]],
   *,
@@ -312,6 +370,7 @@ def signal_edge_stats(
   """
   out: Dict[str, Any] = {"n": 0, "verdict": "insufficient data", "cost_pct": cost_pct}
   by_h: Dict[str, List[float]] = {}
+  by_fam: Dict[str, List[float]] = {}
   for row in probes or []:
     ctx = row.get("entryContext") if isinstance(row, dict) else None
     if not isinstance(ctx, dict):
@@ -321,12 +380,30 @@ def signal_edge_stats(
     probe = ctx.get("signalProbe")
     if not base or base <= 0 or side not in {"long", "short"} or not isinstance(probe, dict):
       continue
+    family = infer_setup_family(ctx)
     for horizon in horizons_min:
       px = _f(probe.get(f"m{int(horizon)}"))
       if px is None or px <= 0:
         continue
       ret = (px - base) / base
-      by_h.setdefault(f"{int(horizon)}m", []).append(ret if side == "long" else -ret)
+      signed = ret if side == "long" else -ret
+      by_h.setdefault(f"{int(horizon)}m", []).append(signed)
+      # Family scoring uses ONE horizon so a setup is not counted twice with different holding periods.
+      if int(horizon) == int(horizons_min[0]):
+        by_fam.setdefault(family, []).append(signed)
+  if by_fam:
+    fam_out = {}
+    for fam, vals in by_fam.items():
+      mean = sum(vals) / len(vals)
+      fam_out[fam] = {
+        "n": len(vals),
+        "mean_pct": round(mean * 100, 4),
+        "hit_rate": round(sum(1 for v in vals if v > 0) / len(vals), 3),
+        "net_of_cost_pct": round((mean - cost_pct) * 100, 4),
+        "verdict": ("insufficient data" if len(vals) < max(1, int(min_samples))
+                    else ("edge" if mean > cost_pct else "no edge")),
+      }
+    out["by_family"] = fam_out
   if not by_h:
     return out
   detail = {}

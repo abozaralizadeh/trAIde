@@ -420,6 +420,51 @@ def scale_target_to_widened_stop(side: str, entry, take_profit, widen_factor):
   return take_profit
 
 
+def allow_fade_extreme(
+  *,
+  side: str,
+  setup_family: str | None,
+  rsi: float | None,
+  cfg: RegimeConfig,
+) -> bool:
+  """Permit a declared FADE-EXTREME entry past the trend-alignment gates.
+
+  The bot could only ever express one playbook. Its `market_regime` label read "trending" on 68 of 69
+  recorded entries, so the mean-reversion hints never fired; the daily gate blocks counter-daily
+  entries; and the 1h-alignment gate blocks any entry the 1h opposes. A fade of an oversold extreme
+  has the 1h opposing it *by definition* — that is what makes it a fade — so the architecture made the
+  setup unreachable. Meanwhile the family it could express, trend continuation, measured -0.017% gross
+  over 3,408 samples on the live universe: flat, and flat does not cover a 0.10% round trip.
+
+  This does not assert that fading works. Measured on the same 50 days it was positive in both halves
+  but only t~1.0-1.6 over 135 independent events — suggestive, not established, and mean reversion
+  always flatters itself in a range. The point is to let the setup REACH the model so
+  `edge.signal_edge_stats` can score it per family and risk can follow whatever actually pays. An
+  unmeasurable hypothesis can never be disproved either.
+
+  The extreme test uses the textbook RSI 30/70 bands rather than anything fitted to this sample, and
+  requires the extreme to be *against* the entry direction — buying only into oversold, selling only
+  into overbought. Everything downstream (stop floor, RR floor, risk budget, family sizing) still
+  applies, so this widens what may be proposed, never what may be risked.
+  """
+  if not getattr(cfg, "fade_extreme_enabled", False):
+    return False
+  if str(setup_family or "").strip().lower() != "fade_extreme":
+    return False
+  try:
+    value = float(rsi)
+  except (TypeError, ValueError):
+    return False
+  if not math.isfinite(value):
+    return False
+  s = (side or "").lower()
+  if s in ("buy", "long"):
+    return value <= float(getattr(cfg, "fade_extreme_oversold_rsi", 30.0))
+  if s in ("sell", "short"):
+    return value >= float(getattr(cfg, "fade_extreme_overbought_rsi", 70.0))
+  return False
+
+
 def coherent_risk_fraction(
   configured_fraction,
   max_daily_drawdown_pct,

@@ -156,3 +156,72 @@ class TestPendingOrders:
   def test_pending_orders_empty(self):
     pub = _publisher()
     assert pub._sanitize_pending_orders(SimpleNamespace(spot_pending_orders=[], futures_pending_orders=[])) == []
+
+
+class TestStrategyEdgePanel:
+  """The dashboard should show WHY the bot is winning or losing, not just that it is.
+
+  Outcomes (win rate, PnL) conflate the direction call with fill quality and exit management, so they
+  cannot answer whether the strategy has an edge at all. strategyEdge measures the signal alone and
+  reports which playbook is currently paying its costs.
+  """
+
+  @staticmethod
+  def _memory(probes, fills=()):
+    return SimpleNamespace(
+      signal_probes=lambda limit=200: list(probes),
+      recent_fills=lambda limit=100: list(fills),
+    )
+
+  @staticmethod
+  def _cfg():
+    return SimpleNamespace(trading=SimpleNamespace(
+      estimated_slippage_pct=0.001, slippage_autotune_min_samples=8,
+    ))
+
+  @staticmethod
+  def _probe(side, base, fwd, family):
+    return {"entryContext": {"positionSide": side, "marketPriceAtSignal": base,
+                             "setupFamily": family, "signalProbe": {"m60": fwd}}}
+
+  def test_reports_per_family_verdicts_and_risk_factors(self):
+    pub = _publisher()
+    probes = ([self._probe("short", 100.0, 100.05, "continuation") for _ in range(25)]
+              + [self._probe("long", 100.0, 102.0, "fade_extreme") for _ in range(25)])
+    out = pub._build_strategy_edge(self._memory(probes), self._cfg())
+    assert out["byFamily"]["continuation"]["verdict"] == "no edge"
+    assert out["byFamily"]["fade_extreme"]["verdict"] == "edge"
+    # ...and the multiplier that explains where capital is going.
+    assert out["familyRiskFactor"]["continuation"] == 0.5
+    assert out["familyRiskFactor"]["fade_extreme"] == 1.0
+
+  def test_publishes_no_money_figures_under_normalized_disclosure(self):
+    """Percentages, counts and verdicts only — nothing here can leak balance or position size."""
+    pub = _publisher("normalized")
+    probes = [self._probe("long", 100.0, 101.0, "continuation") for _ in range(25)]
+    out = pub._build_strategy_edge(self._memory(probes), self._cfg())
+    banned = {"equity", "balance", "notional", "usd", "size", "accountid"}
+    def _keys(obj, acc):
+      if isinstance(obj, dict):
+        for k, v in obj.items():
+          acc.add(str(k).lower()); _keys(v, acc)
+      elif isinstance(obj, list):
+        for v in obj:
+          _keys(v, acc)
+      return acc
+    keys = _keys(out, set())
+    assert not any(b in k for k in keys for b in banned), keys
+
+  def test_degrades_quietly_when_there_is_nothing_to_measure(self):
+    pub = _publisher()
+    out = pub._build_strategy_edge(self._memory([]), self._cfg())
+    assert out["verdict"] == "insufficient data" and out["n"] == 0
+
+  def test_never_raises_into_the_publish_loop(self):
+    pub = _publisher()
+    broken = SimpleNamespace(
+      signal_probes=lambda limit=200: (_ for _ in ()).throw(RuntimeError("boom")),
+      recent_fills=lambda limit=100: [],
+    )
+    out = pub._build_strategy_edge(broken, self._cfg())
+    assert out["verdict"] == "insufficient data"

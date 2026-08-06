@@ -296,6 +296,17 @@ class RegimeConfig:
   # high-beta to BTC; longing them into a BTC downtrend is what blew up on RE-USDT, 2026-06-21).
   alt_long_block_enabled: bool = True
   alt_majors: tuple = ("BTC", "ETH")  # symbols exempt from the alt-long gate (they have their own daily gate)
+  # Fade-extreme playbook (Aug 2026). The bot could only ever express trend continuation: its regime
+  # label read "trending" on 68 of 69 entries, the daily gate blocks counter-daily entries, and the 1h
+  # gate blocks anything the 1h opposes — which a fade has against it by definition. Measured on the
+  # live universe (50d, 12 symbols) continuation returned -0.017% gross over 3,408 samples: flat, and
+  # flat does not cover a 0.10% round trip. This does NOT assert that fading works (same test: positive
+  # in both halves but only t~1.0-1.6 over 135 independent events). It lets the setup reach the model
+  # so signal_edge_stats can score it per family and risk can follow whatever actually pays. RSI bands
+  # are the textbook 30/70, deliberately not fitted to this sample.
+  fade_extreme_enabled: bool = True
+  fade_extreme_oversold_rsi: float = 30.0
+  fade_extreme_overbought_rsi: float = 70.0
   # A blanket BTC/alt veto misses genuine relative-strength leaders.  Permit only an alt whose own
   # daily, 4h, 1h and 15m trends are all bullish at high confidence, then size it down.  This is a
   # signal-based exception, not a symbol allow-list, so it adapts as leadership rotates.
@@ -526,6 +537,9 @@ def load_config() -> AppConfig:
       trend_shorts_enabled=_as_bool(os.getenv("TREND_ALIGNED_SHORTS_ENABLED"), True),
       trend_short_min_confidence=float(os.getenv("TREND_SHORT_MIN_CONFIDENCE", "0.78")),
       trend_short_require_15m=_as_bool(os.getenv("TREND_SHORT_REQUIRE_15M"), True),
+      fade_extreme_enabled=_as_bool(os.getenv("FADE_EXTREME_ENABLED"), True),
+      fade_extreme_oversold_rsi=float(os.getenv("FADE_EXTREME_OVERSOLD_RSI", "30")),
+      fade_extreme_overbought_rsi=float(os.getenv("FADE_EXTREME_OVERBOUGHT_RSI", "70")),
       alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
       alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
       relative_strength_longs_enabled=_as_bool(os.getenv("RELATIVE_STRENGTH_LONGS_ENABLED"), True),

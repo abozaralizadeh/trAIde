@@ -34,6 +34,7 @@ from .analytics import (
 from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
+  allow_fade_extreme,
   allow_reversal_long,
   allow_reversal_short,
   allow_trend_aligned_short,
@@ -57,6 +58,7 @@ from .regime import (
   reward_risk_ratio,
   risk_capped_contracts,
 )
+from .edge import family_size_factor
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
   logger,
@@ -3150,10 +3152,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     rationale: str | None = None,
     take_profit_price: float | None = None,
     stop_loss_price: float | None = None,
+    setup_family: str | None = None,
   ) -> Dict[str, Any]:
     """Place a futures limit entry order at a technically derived target price.
     Use for new entries where you want to wait for price to reach a key level
     (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
+
+    ALWAYS pass `setup_family` — which PLAYBOOK this trade belongs to. One of:
+      "continuation"  — trading with an established trend (timeframes agree, you expect it to persist)
+      "fade_extreme"  — fading a stretched move back toward value (oversold bounce, overbought fade)
+      "breakout"      — entering on a break of a range/level, expecting expansion
+      "range_edge"    — buying support / selling resistance inside a defined range
+      "other"         — none of the above
+    Each family keeps its OWN measured forward-return score (edgeReport.signalEdge.by_family), and
+    risk flows toward whichever is currently paying its costs. This is how the bot learns which
+    approach works in the current market without anyone hand-picking one — so label honestly. A
+    mislabelled trade corrupts the scoreboard that decides where your risk goes.
     Rejects if entry_price is too close to current price; wait for a genuine limit level instead
     of chasing. Futures market orders are reserved for closes and emergencies.
     ALWAYS pass take_profit_price AND stop_loss_price: they are attached to the order and arm
@@ -3291,8 +3305,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("REVERSAL SHORT ALLOWED: futures limit %s %s — bullish daily but 1h/15m confirm a roll-over (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+          elif allow_fade_extreme(
+            side=side_lower, setup_family=setup_family,
+            rsi=gate.get("intraday_rsi_15m"), cfg=cfg.regime,
+          ):
+            logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the daily gate — 15m RSI %.1f is at an extreme against the entry (family scoring decides its risk)",
+                        side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
           else:
-            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), or switch symbol."}
+            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), declare setup_family='fade_extreme' at a genuine RSI extreme, or switch symbol."}
       intraday_bias_1h_fl = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes_fl = (
         (intraday_bias_1h_fl == "bearish" and side_lower == "buy") or
@@ -3305,9 +3325,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           confidence=confidence, cfg=cfg.regime,
         ):
           logger.info("DEADLOCK BREAK: futures limit %s %s — daily-aligned entry allowed past stalling 1h counter-bounce (daily=%s, 1h=%s, conf=%.2f)", side_lower, spot_symbol, daily_bias, intraday_bias_1h_fl, confidence or 0.0)
+        elif allow_fade_extreme(
+          side=side_lower, setup_family=setup_family,
+          rsi=gate.get("intraday_rsi_15m"), cfg=cfg.regime,
+        ):
+          # A fade has the 1h against it BY DEFINITION — that is what makes it a fade. Requiring
+          # alignment here is what made the playbook unreachable.
+          logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the 1h gate — 15m RSI %.1f at an extreme",
+                      side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
         else:
           logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)
-          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. The daily trend is in correction. Wait for 1h alignment."}
+          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. Wait for 1h alignment, or declare setup_family='fade_extreme' if this is a deliberate fade of an RSI extreme."}
       tf_conflict_fl = gate.get("timeframe_conflict", False)
       intraday_bias_15m_fl = gate.get("intraday_bias_15m", "neutral")
       if tf_conflict_fl and intraday_bias_15m_fl != "neutral":
@@ -3367,6 +3395,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       _soft_fl.append(conviction_size_factor(confidence, _eff_min_fl, cfg.regime))
     _soft_fl.append(_edge_state()["size_factor"])                    # loss-streak
     _soft_fl.append(_expectancy_entry_factor(spot_symbol, side_lower))  # direction/symbol expectancy
+    # Per-SETUP-FAMILY measured edge: capital follows whichever playbook currently pays its costs.
+    # Nothing here decides that trend-following or fading is "right" — each family keeps its own score
+    # and an unproven one is left at full risk so it can earn the evidence that judges it.
+    _family_fl = str(setup_family or "").strip().lower() or None
+    _soft_fl.append(family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other"))
     _quality_fl = combined_size_factor(_soft_fl, floor=cfg.trading.size_quality_floor)
     _atr_scale_fl = _vol_scale_fl * _quality_fl
     logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f (soft=%s floor=%.2f) → %.0f%%",
@@ -3638,6 +3671,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       # The LIVE price when the call was made — not the limit price. Signal edge must be measured from
       # here or the resting discount is scored as prediction (see edge.signal_edge_stats).
       "marketPriceAtSignal": current_price,
+      # Which playbook this trade belongs to, so signal edge can be scored per family.
+      "setupFamily": _family_fl,
       # Stop geometry actually used, so post-trade review can tell a noise-floored stop from the
       # model's original and judge whether the floor is set where it needs to be.
       "stopAtrMult": (

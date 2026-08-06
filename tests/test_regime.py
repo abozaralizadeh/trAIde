@@ -6,6 +6,7 @@ import pytest
 
 from src.config import RegimeConfig
 from src.regime import (
+    allow_fade_extreme,
     is_hostile_regime,
     effective_min_confidence,
     combined_size_factor,
@@ -820,3 +821,44 @@ def test_floored_bracket_holds_dollar_risk_constant_while_preserving_rr():
     assert notional * tight * 0.01 == pytest.approx(equity * frac)
     assert notional * wide * (entry - floored) / entry == pytest.approx(equity * frac)
     assert wide == pytest.approx(tight / info["widenFactor"])
+
+
+# ── Fade-extreme: let the other playbook REACH the model so it can be measured ──
+
+
+def test_fade_extreme_opens_the_gate_only_at_a_real_extreme():
+    """The bot could express exactly one playbook; the alternative was structurally unreachable.
+
+    A fade has the 1h against it BY DEFINITION, so the alignment gates blocked it, and the regime
+    label read "trending" on 68 of 69 entries so the mean-reversion hints never fired. Meanwhile
+    continuation measured -0.017% gross over 3,408 live samples — flat, and flat cannot pay costs.
+    """
+    cfg = _cfg()
+    assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=25.0, cfg=cfg) is True
+    assert allow_fade_extreme(side="sell", setup_family="fade_extreme", rsi=78.0, cfg=cfg) is True
+    # not an extreme -> no allowance
+    assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=45.0, cfg=cfg) is False
+
+
+def test_fade_extreme_requires_the_extreme_to_oppose_the_entry():
+    # Buying only into OVERSOLD and selling only into OVERBOUGHT; the reverse is just chasing.
+    cfg = _cfg()
+    assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=85.0, cfg=cfg) is False
+    assert allow_fade_extreme(side="sell", setup_family="fade_extreme", rsi=15.0, cfg=cfg) is False
+
+
+def test_fade_extreme_needs_an_honest_declaration():
+    # The allowance is tied to the declared family, so it cannot be used to smuggle a continuation
+    # trade past the alignment gates.
+    cfg = _cfg()
+    assert allow_fade_extreme(side="buy", setup_family="continuation", rsi=20.0, cfg=cfg) is False
+    assert allow_fade_extreme(side="buy", setup_family=None, rsi=20.0, cfg=cfg) is False
+
+
+def test_fade_extreme_disableable_and_safe_on_bad_input():
+    assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=20.0,
+                              cfg=_cfg(fade_extreme_enabled=False)) is False
+    cfg = _cfg()
+    assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=None, cfg=cfg) is False
+    assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi="x", cfg=cfg) is False
+    assert allow_fade_extreme(side="hold", setup_family="fade_extreme", rsi=20.0, cfg=cfg) is False
