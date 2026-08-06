@@ -315,7 +315,16 @@ class MemoryStore:
     data["plans"] = [p for p in data.get("plans", []) if (p.get("ts") or now) >= cutoff]
     data["triggers"] = [t for t in data.get("triggers", []) if (t.get("ts") or now) >= cutoff]
     data["coins"] = [c for c in data.get("coins", []) if (c.get("ts") or now) >= cutoff]
-    data["trades"] = [t for t in data.get("trades", []) if (t.get("ts") or now) >= cutoff]
+    # Orders with a real (planned price, achieved fill price) pair are the sample
+    # `edge.measured_slippage_pct` calibrates execution cost on, so they are retained by COUNT
+    # (MAX_TRADES) rather than by wall-clock age — see the closed-trade note below for why time-pruning
+    # learning data is harmful. The condition mirrors `recent_fills` exactly, so only rows that are
+    # actually usable as slippage samples are kept; everything else stays ephemeral.
+    data["trades"] = [
+      t for t in data.get("trades", [])
+      if (t.get("ts") or now) >= cutoff
+      or (isinstance(t, dict) and t.get("filled") and t.get("fillPrice") is not None)
+    ]
     data.setdefault("limits", {})
     if isinstance(data["limits"], dict):
       for scope, lim in list(data["limits"].items()):
@@ -325,7 +334,19 @@ class MemoryStore:
         if (lim.get("updated") or now) < cutoff:
           data["limits"].pop(scope, None)
     data["sentiments"] = [s for s in data.get("sentiments", []) if (s.get("ts") or now) >= cutoff]
-    data["decisions"] = [d for d in data.get("decisions", []) if (d.get("ts") or now) >= cutoff]
+    # REALIZED CLOSES (pnl != None) are exempt from the time cutoff — they are retained purely by count
+    # (MAX_CLOSED_TRADES, applied below). They are the training data for every adaptive guard:
+    # edge_stats, entry_quality_stats, expectancy sizing, the symbol bench, measured slippage and the
+    # adaptive stop floor all read them. Pruning them by wall-clock age created a doom loop that was
+    # measured live (2026-08-06): as the trade rate fell, the 7-day window emptied until only 8 closes
+    # remained, all recent losses. The controller then reported an 11% win rate and a 6-loss streak,
+    # halved position size, and the agent stood aside in 356 of 358 runs — which produced no new closes,
+    # so the window could only get staler and bleaker. Evidence must age out by being SUPERSEDED, never
+    # by the clock, or a quiet spell is self-reinforcing. Declines/entries (pnl None) stay time-pruned.
+    data["decisions"] = [
+      d for d in data.get("decisions", [])
+      if (d.get("ts") or now) >= cutoff or (isinstance(d, dict) and d.get("pnl") is not None)
+    ]
     data["fees"] = [f for f in data.get("fees", []) if (f.get("ts") or now) >= cutoff]
     data["supervisor_notes_temporary"] = [n for n in data.get("supervisor_notes_temporary", []) if (n.get("ts") or now) >= cutoff]
     data["pending_agent_events"] = [

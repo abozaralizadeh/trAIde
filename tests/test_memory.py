@@ -673,3 +673,53 @@ def test_market_reduce_only_close_does_not_affect_limit_fill_stats(tmp_path):
     assert after["limitOrdersSubmitted"] == before["limitOrdersSubmitted"]
     assert after["limitOrdersFilled"] == before["limitOrdersFilled"]
     assert after["limitFillRate"] == before["limitFillRate"]
+
+
+def test_realized_closes_survive_the_retention_cutoff(tmp_path):
+    """Learning data must age out by being SUPERSEDED, never by the clock.
+
+    Measured live 2026-08-06: as the trade rate fell, the 7-day window emptied until only 8 realized
+    closes remained, all recent losses. The edge controller then reported an 11% win rate and a 6-loss
+    streak, halved position size, and the agent stood aside in 356 of 358 runs — producing no new
+    closes, so the window could only get staler and bleaker. A quiet spell must not be self-reinforcing.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"), retention_days=1)
+    store.log_decision("BTC-USDT", "futures_sell_triggered", 0.9, "tp", pnl=1.25)
+    store.log_decision("ETH-USDT", "decline", 0.4, "no setup")
+
+    import json
+    path = tmp_path / "memory.json"
+    data = json.loads(path.read_text())
+    old = int(time.time()) - 30 * 86400          # a month old: far past the 1-day cutoff
+    for d in data["decisions"]:
+        d["ts"] = old
+    path.write_text(json.dumps(data))
+    store._cache = None
+
+    kept = store.realized_closes(limit=100)
+    assert len(kept) == 1 and kept[0]["pnl"] == 1.25   # the closed trade survives
+    # ...while the ephemeral decline (pnl=None) is still pruned by age.
+    store._cache = None
+    all_decisions = store._read().get("decisions", [])
+    assert all(d.get("pnl") is not None for d in all_decisions)
+
+
+def test_filled_orders_survive_retention_so_slippage_stays_calibrated(tmp_path):
+    # measured_slippage_pct needs (planned price, achieved fill price) pairs; time-pruning them would
+    # silently drop the estimator back to its stale prior during a quiet spell.
+    store = MemoryStore(str(tmp_path / "memory.json"), retention_days=1)
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002, filled=True)
+    store.record_trade("ETH-USDT", "buy", 100.0, paper=False, price=3000.0, size=0.03, filled=False)
+
+    import json
+    path = tmp_path / "memory.json"
+    data = json.loads(path.read_text())
+    for t in data["trades"]:
+        t["ts"] = int(time.time()) - 30 * 86400
+        if t["symbol"] == "BTC-USDT":
+            t["fillPrice"] = 50005.0          # only a real fill is a usable slippage sample
+    path.write_text(json.dumps(data))
+    store._cache = None
+
+    fills = store.recent_fills(limit=100)
+    assert len(fills) == 1 and fills[0]["fillPrice"] == 50005.0
