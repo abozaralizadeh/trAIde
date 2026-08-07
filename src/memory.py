@@ -315,15 +315,26 @@ class MemoryStore:
     data["plans"] = [p for p in data.get("plans", []) if (p.get("ts") or now) >= cutoff]
     data["triggers"] = [t for t in data.get("triggers", []) if (t.get("ts") or now) >= cutoff]
     data["coins"] = [c for c in data.get("coins", []) if (c.get("ts") or now) >= cutoff]
-    # Orders with a real (planned price, achieved fill price) pair are the sample
-    # `edge.measured_slippage_pct` calibrates execution cost on, so they are retained by COUNT
-    # (MAX_TRADES) rather than by wall-clock age — see the closed-trade note below for why time-pruning
-    # learning data is harmful. The condition mirrors `recent_fills` exactly, so only rows that are
-    # actually usable as slippage samples are kept; everything else stays ephemeral.
+    # Two kinds of order row are LEARNING DATA and are retained by COUNT (MAX_TRADES) rather than by
+    # wall-clock age — see the closed-trade note below for why time-pruning evidence is harmful:
+    #   * a real (planned price, achieved fill price) pair — the sample `edge.measured_slippage_pct`
+    #     calibrates execution cost on (condition mirrors `recent_fills` exactly);
+    #   * a `marketPriceAtSignal` stamp — the sample `edge.signal_edge_stats` measures directional edge
+    #     on. Note this deliberately includes UNFILLED plans, and that is the whole point: 6 of the
+    #     first 9 probes were unfilled, and those are the *unbiased* part of the sample. Filled orders
+    #     are adverse-selected (a resting limit fills preferentially when the move goes against it), so
+    #     pruning the unfilled ones would quietly bias signal edge toward exactly the contaminated
+    #     subset the measurement exists to avoid.
+    # Everything else stays ephemeral.
     data["trades"] = [
       t for t in data.get("trades", [])
       if (t.get("ts") or now) >= cutoff
-      or (isinstance(t, dict) and t.get("filled") and t.get("fillPrice") is not None)
+      or (
+        isinstance(t, dict) and (
+          (t.get("filled") and t.get("fillPrice") is not None)
+          or (isinstance(t.get("entryContext"), dict) and t["entryContext"].get("marketPriceAtSignal"))
+        )
+      )
     ]
     data.setdefault("limits", {})
     if isinstance(data["limits"], dict):

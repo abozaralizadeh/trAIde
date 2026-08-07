@@ -58,7 +58,7 @@ from .regime import (
   reward_risk_ratio,
   risk_capped_contracts,
 )
-from .edge import family_size_factor
+from .edge import SETUP_FAMILIES, family_size_factor
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
   logger,
@@ -3399,6 +3399,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # Nothing here decides that trend-following or fading is "right" — each family keeps its own score
     # and an unproven one is left at full risk so it can earn the evidence that judges it.
     _family_fl = str(setup_family or "").strip().lower() or None
+    if _family_fl and _family_fl not in SETUP_FAMILIES:
+      logger.warning("SETUP FAMILY: futures limit %s unknown family %r — scoring it as 'other'", spot_symbol, _family_fl)
+      _family_fl = "other"
+    if not _family_fl:
+      # Measured 2026-08-07: the model declared a family on only 4 of 9 entries. An undeclared trade is
+      # still scored (inferred below), but the FADE allowance is keyed on the declaration — so silently
+      # accepting the omission quietly re-blocks the one playbook we opened up. Log it so it is visible.
+      logger.warning(
+        "SETUP FAMILY MISSING: futures limit %s %s — no setup_family declared; scoring under an inferred "
+        "label. A deliberate fade MUST declare 'fade_extreme' or the alignment gates reject it.",
+        side_lower, spot_symbol,
+      )
     _soft_fl.append(family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other"))
     _quality_fl = combined_size_factor(_soft_fl, floor=cfg.trading.size_quality_floor)
     _atr_scale_fl = _vol_scale_fl * _quality_fl

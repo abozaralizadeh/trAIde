@@ -723,3 +723,30 @@ def test_filled_orders_survive_retention_so_slippage_stays_calibrated(tmp_path):
 
     fills = store.recent_fills(limit=100)
     assert len(fills) == 1 and fills[0]["fillPrice"] == 50005.0
+
+
+def test_signal_probes_survive_retention_even_when_unfilled(tmp_path):
+    """Unfilled plans carry the UNBIASED half of the signal sample and must not age out.
+
+    A resting limit fills preferentially when the move goes against it, so filled orders are
+    adverse-selected. Six of the first nine live probes were on unfilled plans; pruning those by the
+    clock would quietly bias signal edge toward exactly the contaminated subset the measurement exists
+    to avoid. Rows without a price stamp stay ephemeral.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"), retention_days=1)
+    store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002, filled=False,
+                       entry_context={"positionSide": "long", "marketPriceAtSignal": 50010.0})
+    store.record_trade("ETH-USDT", "buy", 100.0, paper=False, price=3000.0, size=0.03, filled=False)
+
+    import json
+    path = tmp_path / "memory.json"
+    data = json.loads(path.read_text())
+    for t in data["trades"]:
+        t["ts"] = int(time.time()) - 30 * 86400
+    path.write_text(json.dumps(data))
+    store._cache = None
+
+    probes = store.signal_probes(limit=50)
+    assert len(probes) == 1 and probes[0]["symbol"] == "BTC-USDT"
+    # the unstamped row carries no learning value, so it is still pruned
+    assert len(store._read().get("trades", [])) == 1
