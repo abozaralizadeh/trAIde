@@ -25,7 +25,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from .edge import family_size_factor, measured_slippage_pct, signal_edge_stats
+from .edge import family_size_factor, infer_setup_family, measured_slippage_pct, signal_edge_stats
 from .memory import MemoryStore
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -208,8 +208,10 @@ class DashboardPublisher:
     raw_limits = self._read_limits(memory)
     today = int(time.time() // 86400)
 
+    # Which playbook each row came from — built once and shared by the position panels.
+    family_index = self._family_index(memory)
     # Open positions come from the live exchange snapshot (truth), not from MemoryStore.
-    pos_list = self._build_positions(snapshot, memory)
+    pos_list = self._build_positions(snapshot, memory, family_index)
     dd_total = round(_f((raw_limits.get("total") or {}).get("drawdownPct")) or 0.0, 3)
 
     return {
@@ -222,7 +224,7 @@ class DashboardPublisher:
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
-      "pendingOrders": self._sanitize_pending_orders(snapshot),
+      "pendingOrders": self._sanitize_pending_orders(snapshot, family_index),
       "closedPositions": self._closed_position_lifecycles(memory),
       "coins": self._sanitize_coins(coins),
       "feed": [self._sanitize_decision(d) for d in decisions],
@@ -244,6 +246,53 @@ class DashboardPublisher:
     }
 
   # ----- sanitizers (whitelist only) --------------------------------------
+
+  def _family_index(self, memory: MemoryStore) -> Dict[str, Any]:
+    """Map recorded entries to their setup family, so a POSITION can show which playbook it came from.
+
+    The strategyEdge panel scores families in aggregate, but that only answers "which playbook is
+    paying" — not "which trades were those". Tagging the individual rows closes the loop: you can see
+    a losing family and immediately identify the trades behind the number, and spot a fade the moment
+    one is taken rather than waiting for it to appear in a bucket.
+
+    Two keys, because the panels have different identifiers available: `clientOid` (exact, used by
+    resting orders) and the most recent entry per `symbol|side` (open/closed positions, which no
+    longer carry the order id). Never raises — the dashboard must not be able to take the bot down.
+    """
+    by_oid: Dict[str, str] = {}
+    by_symbol_side: Dict[str, str] = {}
+    try:
+      for row in memory.recent_fills(limit=200) + memory.signal_probes(limit=200):
+        ctx = row.get("entryContext") if isinstance(row, dict) else None
+        if not isinstance(ctx, dict):
+          continue
+        fam = ctx.get("setupFamily") or infer_setup_family(ctx)
+        if not fam:
+          continue
+        oid = str(row.get("clientOid") or "").strip()
+        if oid:
+          by_oid[oid] = fam
+        sym = _normalize_symbol(str(row.get("symbol") or ""))
+        side = str(ctx.get("positionSide") or "").lower()
+        if sym and side:
+          by_symbol_side[f"{sym}|{side}"] = fam       # later rows win: most recent entry per symbol/side
+    except Exception as exc:  # pragma: no cover - defensive
+      logger.debug("family index unavailable: %s", exc)
+    return {"byOid": by_oid, "bySymbolSide": by_symbol_side}
+
+  @staticmethod
+  def _family_for(index: Dict[str, Any], symbol: Any, side: Any = None, client_oid: Any = None) -> Optional[str]:
+    """Look up a row's setup family — exact by clientOid where available, else by symbol+side."""
+    oid = str(client_oid or "").strip()
+    if oid:
+      hit = (index or {}).get("byOid", {}).get(oid)
+      if hit:
+        return hit
+    sym = _normalize_symbol(str(symbol or ""))
+    s = str(side or "").lower()
+    if sym and s:
+      return (index or {}).get("bySymbolSide", {}).get(f"{sym}|{s}")
+    return None
 
   def _build_strategy_edge(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
     """Does the direction call predict, and which playbook is currently paying?
@@ -349,7 +398,7 @@ class DashboardPublisher:
       base = "BTC"
     return f"{base}-{quote}" if base else (fsym or "")
 
-  def _build_positions(self, snapshot, memory: MemoryStore) -> list:
+  def _build_positions(self, snapshot, memory: MemoryStore, family_index: Optional[Dict[str, Any]] = None) -> list:
     """Open positions from the LIVE exchange snapshot (truth) — not MemoryStore, which only
     synthesizes positions from recorded trades and lingers after a TP/SL trigger closes one.
     Privacy-safe: symbol, side, venue, entry/mark price and return % only — never size,
@@ -379,6 +428,7 @@ class DashboardPublisher:
         "slPrice": _round(sl),
         "peakPnlPct": None,
         "troughPnlPct": None,
+        "setupFamily": self._family_for(family_index, disp, side),
         "lastTs": int(time.time()),
       }
       if self._allow_usd():
@@ -426,12 +476,13 @@ class DashboardPublisher:
         "slPrice": _round(sl),
         "peakPnlPct": None,
         "troughPnlPct": None,
+        "setupFamily": self._family_for(family_index, disp, side),
         "lastTs": int(time.time()),
       })
 
     return out
 
-  def _sanitize_pending_orders(self, snapshot) -> List[Dict[str, Any]]:
+  def _sanitize_pending_orders(self, snapshot, family_index: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Resting (unfilled) limit/entry orders waiting to trigger — public-safe: symbol, side, type,
     limit price, venue, entry-vs-reduce, and age only. Never size/quantity (privacy). Entries the bot
     placed are tagged (`traide-entry-`) so the dashboard can show what it's waiting to open."""
@@ -459,6 +510,7 @@ class DashboardPublisher:
           "price": _round(o.get("price")),
           "kind": "reduce" if reduce_only else "entry",
           "botEntry": str(o.get("clientOid") or "").startswith("traide-entry-"),
+          "setupFamily": self._family_for(family_index, disp, o.get("side"), o.get("clientOid")),
           "ts": _normalize_ts_sec(o.get("createdAt") or o.get("orderTime") or o.get("ts")),
         })
     out.sort(key=lambda r: r.get("ts") or 0, reverse=True)
@@ -670,6 +722,9 @@ class DashboardPublisher:
         "mfeR": mfe_r,
         "entryExtensionAtr": round(entry_ext, 2) if entry_ext is not None else None,
         "betterEntryAvailable": (mae_r is not None and mae_r >= 0.5),
+        # Which playbook this trade belonged to, so a losing family in strategyEdge can be traced to
+        # the individual trades behind the number.
+        "setupFamily": ctx.get("setupFamily") or (infer_setup_family(ctx) if ctx else None),
       })
     rows.sort(key=lambda r: r["closeTs"], reverse=True)
     return rows[:limit]

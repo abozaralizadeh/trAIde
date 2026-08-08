@@ -225,3 +225,64 @@ class TestStrategyEdgePanel:
     )
     out = pub._build_strategy_edge(broken, self._cfg())
     assert out["verdict"] == "insufficient data"
+
+
+class TestSetupFamilyOnPositions:
+  """Aggregate family scores answer 'which playbook pays'; the rows answer 'which trades were those'.
+
+  Without a family on each row you can see that continuation is losing but cannot identify the trades
+  behind the number, and a fade would be invisible until it aggregated into a bucket.
+  """
+
+  @staticmethod
+  def _memory(fills=(), probes=()):
+    return SimpleNamespace(
+      recent_fills=lambda limit=200: list(fills),
+      signal_probes=lambda limit=200: list(probes),
+    )
+
+  @staticmethod
+  def _row(sym, side, family, oid=None):
+    return {"symbol": sym, "clientOid": oid,
+            "entryContext": {"positionSide": side, "setupFamily": family,
+                             "marketPriceAtSignal": 100.0}}
+
+  def test_index_resolves_by_client_oid_and_by_symbol_side(self):
+    pub = _publisher()
+    mem = self._memory(fills=[self._row("XRP-USDT", "short", "fade_extreme", oid="traide-entry-abc")])
+    idx = pub._family_index(mem)
+    assert pub._family_for(idx, "XRP-USDT", "sell", "traide-entry-abc") == "fade_extreme"   # exact
+    assert pub._family_for(idx, "XRP-USDT", "short") == "fade_extreme"                      # fallback
+    assert pub._family_for(idx, "DOGE-USDT", "long") is None                                # unknown
+
+  def test_client_oid_wins_over_the_symbol_fallback(self):
+    # Two entries on the same symbol/side: the exact order id must not be shadowed by the newer one.
+    pub = _publisher()
+    mem = self._memory(fills=[
+      self._row("ADA-USDT", "long", "fade_extreme", oid="traide-entry-1"),
+      self._row("ADA-USDT", "long", "continuation", oid="traide-entry-2"),
+    ])
+    idx = pub._family_index(mem)
+    assert pub._family_for(idx, "ADA-USDT", "buy", "traide-entry-1") == "fade_extreme"
+    assert pub._family_for(idx, "ADA-USDT", "long") == "continuation"   # most recent wins by symbol
+
+  def test_index_falls_back_to_inference_when_undeclared(self):
+    pub = _publisher()
+    undeclared = {"symbol": "SOL-USDT", "clientOid": "traide-entry-x",
+                  "entryContext": {"positionSide": "long", "marketPriceAtSignal": 100.0,
+                                   "regime": {"intraday_bias_4h": "bearish", "intraday_bias_1h": "bearish"}}}
+    idx = pub._family_index(self._memory(fills=[undeclared]))
+    assert pub._family_for(idx, "SOL-USDT", "long", "traide-entry-x") == "fade_extreme"
+
+  def test_family_lookup_is_safe_on_missing_index_and_bad_input(self):
+    pub = _publisher()
+    assert pub._family_for(None, "XRP-USDT", "long") is None
+    assert pub._family_for({}, None, None, None) is None
+
+  def test_index_never_raises_when_memory_misbehaves(self):
+    pub = _publisher()
+    broken = SimpleNamespace(
+      recent_fills=lambda limit=200: (_ for _ in ()).throw(RuntimeError("boom")),
+      signal_probes=lambda limit=200: [],
+    )
+    assert pub._family_index(broken) == {"byOid": {}, "bySymbolSide": {}}
