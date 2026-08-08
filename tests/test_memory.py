@@ -750,3 +750,48 @@ def test_signal_probes_survive_retention_even_when_unfilled(tmp_path):
     assert len(probes) == 1 and probes[0]["symbol"] == "BTC-USDT"
     # the unstamped row carries no learning value, so it is still pruned
     assert len(store._read().get("trades", [])) == 1
+
+
+def test_post_close_review_rows_are_not_counted_as_trades(tmp_path):
+    """A review is commentary written AFTER a close and copies its pnl — booking it double-counts.
+
+    Second occurrence of this bug class (the first was "hold-close-only"). On 2026-08-08
+    `close_reviewed` / `close_reviewed_hold` slipped through `startswith("close_")`: the dashboard
+    showed every closed position twice (once real, once an empty shell), win rate read 36.7% instead
+    of 40.0%, and the loss streak read 3 instead of 2 — with CB_MAX_CONSECUTIVE_LOSSES=3 that phantom
+    row is the difference between tripping a 120-minute halt and not.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("ADA-USDT", "futures_sell_triggered", 0.0, "TP/SL triggered", pnl=-0.222,
+                       close_type="CLOSE_LONG", exit_price=0.19648)
+    store.log_decision("ADA-USDT", "close_reviewed", 0.0, "reviewed the close", pnl=-0.222)
+
+    closes = store.realized_closes(limit=50)
+    assert len(closes) == 1
+    assert closes[0]["action"] == "futures_sell_triggered"
+    assert all("review" not in str(c.get("action", "")).lower() for c in closes)
+
+
+def test_evidence_free_duplicate_pnl_is_dropped_even_under_a_new_action_name(tmp_path):
+    """Defence in depth: this bug class has recurred twice under different names.
+
+    A row carrying NO execution evidence that merely repeats a real close's exact pnl on the same
+    symbol nearby is a duplicate, whatever it is called.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("XRP-USDT", "futures_buy_triggered", 0.0, "TP", pnl=0.334,
+                       close_type="CLOSE_SHORT", exit_price=1.02965)
+    store.log_decision("XRP-USDT", "close_position", 0.0, "some future label", pnl=0.334)
+
+    closes = store.realized_closes(limit=50)
+    assert len(closes) == 1 and closes[0]["closeType"] == "CLOSE_SHORT"
+
+
+def test_a_genuine_second_close_on_the_same_symbol_is_still_kept(tmp_path):
+    """The dedup must not swallow a real re-entry that happens to be on the same symbol."""
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("ADA-USDT", "futures_sell_triggered", 0.0, "TP", pnl=-0.222,
+                       close_type="CLOSE_LONG", exit_price=0.19648)
+    store.log_decision("ADA-USDT", "futures_sell_triggered", 0.0, "TP", pnl=0.410,
+                       close_type="CLOSE_LONG", exit_price=0.21100)
+    assert len(store.realized_closes(limit=50)) == 2

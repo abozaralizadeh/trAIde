@@ -1013,8 +1013,11 @@ async def trading_loop(
             force_research = True
             logger.info("No trade for %d flat-book runs — forcing Research Agent handoff next run.", consecutive_no_trade_runs)
       except Exception as exc:
-        logger.error("Agent run failed: %s", exc)
-        notifier.notify_error(str(exc), context="Agent run")
+        # Log the TYPE and a traceback, not just str(exc): several exception classes stringify to the
+        # empty string, and on 2026-08-08 three of the run failures logged as bare "Agent run failed:"
+        # with nothing after it — undiagnosable from the log alone.
+        logger.error("Agent run failed: %s: %s", type(exc).__name__, exc or "<no message>", exc_info=True)
+        notifier.notify_error(f"{type(exc).__name__}: {exc}".strip(), context="Agent run")
         for symbol, move in agent_task_trigger_moves.items():
           pending_trigger_moves[symbol] = max(move, pending_trigger_moves.get(symbol, 0.0))
         pending_agent_triggers.update(agent_task_discrete_triggers)

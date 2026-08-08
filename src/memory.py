@@ -1429,6 +1429,16 @@ class MemoryStore:
   def _is_realized_close(action: str) -> bool:
     """Return True if the action represents a realized trade close, not a hold/manage snapshot."""
     a = action.lower()
+    # A REVIEW is commentary the agent writes *after* a close, and it copies the closed trade's pnl.
+    # Counting it books the same trade twice. This is the second time this class of bug has bitten —
+    # the note below records the "hold-close-only" case, and on 2026-08-08 `close_reviewed` /
+    # `close_reviewed_hold` slipped through `startswith("close_")` the same way. Consequences reach
+    # well past the dashboard's duplicated rows: win rate read 36.7% instead of 40.0%, and the loss
+    # streak read 3 instead of 2 — with CB_MAX_CONSECUTIVE_LOSSES=3 that phantom row is the difference
+    # between tripping a 120-minute trading halt and not. Reviews never execute, so exclude them by
+    # meaning rather than by name.
+    if "review" in a:
+      return False
     if "triggered" in a:
       return True
     # Exact execution actions only.  The old substring test counted labels such as
@@ -1522,6 +1532,16 @@ class MemoryStore:
     ]
     rows.sort(key=lambda d: d.get("ts") or 0)
     triggered = [d for d in rows if "triggered" in str(d.get("action") or "").lower()]
+
+    def _has_execution_evidence(d: Dict[str, Any]) -> bool:
+      return any(d.get(k) is not None for k in ("closeType", "exitPrice", "realizedR"))
+
+    def _num(value: Any) -> float | None:
+      try:
+        return float(value) if value is not None else None
+      except (TypeError, ValueError):
+        return None
+
     kept: list[Dict[str, Any]] = []
     for row in rows:
       action = str(row.get("action") or "").lower()
@@ -1532,6 +1552,23 @@ class MemoryStore:
           and 0 <= int(later.get("ts") or 0) - ts <= window_sec
           and MemoryStore._same_position_lifecycle(row, later, window_sec=window_sec)
           for later in triggered
+        ):
+          continue
+      # Defence in depth against commentary rows that copy a closed trade's pnl (the `close_reviewed`
+      # family, 2026-08-08). `_is_realized_close` now filters those by name, but this class of bug has
+      # recurred twice under different names, so also drop any row that carries NO execution evidence
+      # and merely repeats the exact pnl of a real close on the same symbol nearby — in either time
+      # direction, since a review is written *after* the close it comments on.
+      if not _has_execution_evidence(row):
+        ts = int(row.get("ts") or 0)
+        pnl = _num(row.get("pnl"))
+        if pnl is not None and any(
+          real.get("symbol") == row.get("symbol")
+          and _has_execution_evidence(real)
+          and abs(int(real.get("ts") or 0) - ts) <= window_sec
+          and _num(real.get("pnl")) is not None
+          and abs(_num(real.get("pnl")) - pnl) < 1e-9
+          for real in rows
         ):
           continue
       kept.append(row)
