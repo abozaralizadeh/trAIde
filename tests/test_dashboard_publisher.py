@@ -192,7 +192,7 @@ class TestStrategyEdgePanel:
     assert out["byFamily"]["continuation"]["verdict"] == "no edge"
     assert out["byFamily"]["fade_extreme"]["verdict"] == "edge"
     # ...and the multiplier that explains where capital is going.
-    assert out["familyRiskFactor"]["continuation"] == 0.5
+    assert out["familyRiskFactor"]["continuation"] == 0.25
     assert out["familyRiskFactor"]["fade_extreme"] == 1.0
 
   def test_publishes_no_money_figures_under_normalized_disclosure(self):

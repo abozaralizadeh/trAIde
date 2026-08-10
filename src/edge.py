@@ -316,7 +316,7 @@ def family_size_factor(
   signal_edge: Dict[str, Any],
   family: str,
   *,
-  no_edge_factor: float = 0.5,
+  min_factor: float = 0.25,
   min_samples: int = 20,
 ) -> float:
   """Risk multiplier for a setup family, from its OWN measured forward-return edge.
@@ -332,6 +332,18 @@ def family_size_factor(
   Never enlarges risk (mirrors ``expectancy_size_factor``): a family that clears the cost hurdle simply
   keeps full configured risk. An unproven family is left at 1.0 so it can gather the evidence that
   judges it — otherwise a new playbook could never earn its way in.
+
+  The penalty is PROPORTIONAL to how badly the family misses, expressed as its shortfall in units of
+  the cost hurdle it has to clear — so there is no tuned constant, and a family that is marginally
+  short is treated very differently from one that is deeply negative. Live on 2026-08-10 the
+  continuation family measured -0.29% net against a 0.166% hurdle: a shortfall of 1.75x, i.e. it loses
+  nearly two round-trips of cost on every signal, so it collapses to the floor.
+
+  ``min_factor`` is deliberately NOT zero. Position size is stop-defined, so driving it to nil pushes
+  notional under the exchange's contract minimum, the order is rejected, no probe is recorded, and the
+  family can never produce the evidence that would let it recover — the same doom loop that the memory
+  retention fix had to undo. A quartered position still trades, still generates probes, and still
+  recovers on its own if the measurement improves.
   """
   fam = str(family or "other").strip().lower()
   by_family = (signal_edge or {}).get("by_family") or {}
@@ -340,9 +352,15 @@ def family_size_factor(
     return 1.0
   if int(row.get("n") or 0) < max(1, int(min_samples)):
     return 1.0
-  if row.get("verdict") == "no edge":
-    return max(0.0, min(1.0, float(no_edge_factor)))
-  return 1.0
+  if row.get("verdict") != "no edge":
+    return 1.0
+  floor = max(0.0, min(1.0, float(min_factor)))
+  net = _f(row.get("net_of_cost_pct"))
+  hurdle = _f((signal_edge or {}).get("cost_pct"))
+  if net is None or hurdle is None or hurdle <= 0:
+    return floor
+  shortfall = max(0.0, -net) / (hurdle * 100.0)   # cost_pct is a fraction; net_of_cost_pct is a percent
+  return max(floor, min(1.0, 1.0 - shortfall))
 
 
 def signal_edge_stats(

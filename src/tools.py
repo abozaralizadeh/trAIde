@@ -35,6 +35,7 @@ from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
   allow_fade_extreme,
+  fade_setup_available,
   allow_reversal_long,
   allow_reversal_short,
   allow_trend_aligned_short,
@@ -1956,6 +1957,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "rsi15m": intraday_rsi_15m,
       "extensionAtrLong": round(_ext_long, 2) if _ext_long is not None else None,
       "extensionAtrShort": round(_ext_short, 2) if _ext_short is not None else None,
+      # A live fade-extreme opportunity, when one exists. Unblocking the gates was not enough: of the
+      # first 39 measured signals, 38 were continuation — the model had nothing at the point of
+      # decision telling it a fade was on the table (see regime.fade_setup_available).
+      "fadeSetup": fade_setup_available(intraday_rsi_15m, cfg.regime),
       "note": (
         "extensionAtr* = how many 15m ATRs price sits beyond the 15m VWAP in that direction. A large "
         "positive value means price is LATE/stretched in that direction — the highest-EV entry is usually "
@@ -3411,11 +3416,19 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "label. A deliberate fade MUST declare 'fade_extreme' or the alignment gates reject it.",
         side_lower, spot_symbol,
       )
-    _soft_fl.append(family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other"))
     _quality_fl = combined_size_factor(_soft_fl, floor=cfg.trading.size_quality_floor)
-    _atr_scale_fl = _vol_scale_fl * _quality_fl
-    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f (soft=%s floor=%.2f) → %.0f%%",
-                spot_symbol, _vol_scale_fl, _quality_fl, [round(f, 2) for f in _soft_fl], cfg.trading.size_quality_floor, _atr_scale_fl * 100)
+    # The family factor is applied OUTSIDE the soft stack, and deliberately so. `size_quality_floor`
+    # exists to stop several independent "be a bit cautious" OPINIONS from compounding a real edge into
+    # fee-dust — but the family factor is not an opinion, it is the measured forward return of that
+    # playbook against the cost it must clear. Inside the stack the floor clamped it: measured on
+    # 2026-08-10 the continuation family was -0.29% net against a 0.166% hurdle, yet no matter how bad
+    # the evidence got, the combined soft factor could not go below 0.50. The one signal grounded in
+    # data was capped by a guard built for the ones that are not.
+    _family_scale_fl = family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other")
+    _atr_scale_fl = _vol_scale_fl * _quality_fl * _family_scale_fl
+    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f family=%.2f(%s) (soft=%s floor=%.2f) → %.0f%%",
+                spot_symbol, _vol_scale_fl, _quality_fl, _family_scale_fl, _family_fl or "other",
+                [round(f, 2) for f in _soft_fl], cfg.trading.size_quality_floor, _atr_scale_fl * 100)
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:

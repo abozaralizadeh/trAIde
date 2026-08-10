@@ -583,7 +583,8 @@ def test_risk_follows_the_family_that_pays():
     probes = ([_fam_probe("short", 100.0, 100.05, "continuation") for _ in range(25)]
               + [_fam_probe("long", 100.0, 101.0, "fade_extreme") for _ in range(25)])
     out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
-    assert family_size_factor(out, "continuation") == pytest.approx(0.5)
+    # Deeply negative (-0.15% net against a 0.10% hurdle = 1.5x shortfall) collapses to the floor.
+    assert family_size_factor(out, "continuation") == pytest.approx(0.25)
     assert family_size_factor(out, "fade_extreme") == pytest.approx(1.0)
 
 
@@ -610,3 +611,38 @@ def test_family_inferred_when_the_model_did_not_declare_one():
     assert infer_setup_family(against) == "fade_extreme"
     assert infer_setup_family({"setupFamily": "breakout"}) == "breakout"   # declaration always wins
     assert infer_setup_family({}) == "other"
+
+
+def test_family_penalty_is_proportional_to_the_measured_shortfall():
+    """No tuned constant: the cut scales with how far the family misses the cost it must clear.
+
+    A family that is marginally short of paying its costs should not be treated like one that loses
+    two round-trips per signal. Live on 2026-08-10 continuation measured -0.29% net against a 0.166%
+    hurdle — a 1.75x shortfall — and collapsed to the floor.
+    """
+    # -0.02% net against a 0.10% hurdle = 0.2x shortfall -> keep 80% of risk.
+    marginal = {"cost_pct": 0.001,
+                "by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.02}}}
+    assert family_size_factor(marginal, "continuation") == pytest.approx(0.8)
+    # -0.29% against the same hurdle = 2.9x shortfall -> floored.
+    severe = {"cost_pct": 0.001,
+              "by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.29}}}
+    assert family_size_factor(severe, "continuation") == pytest.approx(0.25)
+
+
+def test_family_penalty_never_starves_a_family_into_a_doom_loop():
+    """min_factor is deliberately non-zero.
+
+    Size is stop-defined, so driving it to nil pushes notional under the exchange contract minimum,
+    the order is rejected, no probe is recorded, and the family can never produce the evidence that
+    would let it recover — the same doom loop the memory-retention fix had to undo.
+    """
+    awful = {"cost_pct": 0.001,
+             "by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -99.0}}}
+    assert family_size_factor(awful, "continuation") == pytest.approx(0.25)
+    assert family_size_factor(awful, "continuation", min_factor=0.1) == pytest.approx(0.1)
+
+
+def test_family_penalty_falls_back_to_the_floor_without_a_usable_hurdle():
+    no_cost = {"by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.2}}}
+    assert family_size_factor(no_cost, "continuation") == pytest.approx(0.25)
