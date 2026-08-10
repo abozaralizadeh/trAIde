@@ -795,3 +795,59 @@ def test_a_genuine_second_close_on_the_same_symbol_is_still_kept(tmp_path):
     store.log_decision("ADA-USDT", "futures_sell_triggered", 0.0, "TP", pnl=0.410,
                        close_type="CLOSE_LONG", exit_price=0.21100)
     assert len(store.realized_closes(limit=50)) == 2
+
+
+def test_direction_calls_are_recorded_even_when_no_order_is_placed(tmp_path):
+    """The live deadlock of 2026-08-10, in one test.
+
+    Continuation measured "no edge" -> its risk was cut to the floor -> the resulting $7.49 notional
+    fell under the $10.24 contract minimum -> the order was rejected -> no probe was recorded -> with
+    no new probes the family could never earn back the evidence that would restore its size. Recording
+    at the point of the CALL breaks the circularity: risk can fall as low as the measurement warrants
+    without ever starving the measurement.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.record_signal_probe("XRP-USDT", "sell", 1.0235, "continuation")
+    probes = store.signal_probes(limit=50)
+    assert len(probes) == 1
+    ctx = probes[0]["entryContext"]
+    assert ctx["positionSide"] == "short"          # side normalised for scoring
+    assert ctx["marketPriceAtSignal"] == 1.0235
+    assert ctx["setupFamily"] == "continuation"
+
+
+def test_recorded_calls_settle_and_score_like_any_other_probe(tmp_path):
+    from src.edge import signal_edge_stats
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.record_signal_probe("XRP-USDT", "sell", 100.0, "continuation")
+    # a short that then fell 1% is a correct call
+    data_path = tmp_path / "memory.json"
+    import json
+    d = json.loads(data_path.read_text())
+    d["signal_probes"][0]["ts"] -= 5 * 3600      # age past BOTH horizons (60m and 240m)
+    data_path.write_text(json.dumps(d))
+    store._cache = None
+    assert store.settle_signal_probes({"XRP-USDT": 99.0}) == 2
+
+    stats = signal_edge_stats(store.signal_probes(limit=50), cost_pct=0.001, min_samples=1)
+    assert stats["by_family"]["continuation"]["mean_pct"] == pytest.approx(1.0)
+
+
+def test_probes_are_retained_by_count_not_by_clock(tmp_path):
+    import json, time as _t
+    store = MemoryStore(str(tmp_path / "memory.json"), retention_days=1)
+    store.record_signal_probe("ADA-USDT", "buy", 0.20, "fade_extreme")
+    p = tmp_path / "memory.json"
+    d = json.loads(p.read_text())
+    d["signal_probes"][0]["ts"] = int(_t.time()) - 60 * 86400
+    p.write_text(json.dumps(d))
+    store._cache = None
+    assert len(store.signal_probes(limit=50)) == 1
+
+
+def test_probe_recording_ignores_unusable_calls(tmp_path):
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.record_signal_probe("X-USDT", "hold", 100.0)      # not a direction
+    store.record_signal_probe("X-USDT", "buy", 0)           # no price
+    store.record_signal_probe("X-USDT", "buy", "abc")       # unparseable
+    assert store.signal_probes(limit=50) == []

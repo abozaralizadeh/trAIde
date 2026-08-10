@@ -29,6 +29,9 @@ MAX_FEES = 3
 MAX_TEMPORARY_NOTES = 20
 MAX_PERMANENT_NOTES = 10
 MAX_PENDING_AGENT_EVENTS = 200
+# Direction calls kept for edge measurement. Retained by COUNT, never by clock — see
+# `record_signal_probe` for why coupling evidence supply to anything else creates a doom loop.
+MAX_SIGNAL_PROBES = 400
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
 _ATR_QUARANTINE_RE = re.compile(
   r"daily ATR\s+([0-9]+(?:\.[0-9]+)?)%\s+exceeds\s+([0-9]+(?:\.[0-9]+)?)%",
@@ -136,7 +139,7 @@ class MemoryStore:
     self._read()
 
   def _read(self) -> Dict[str, Any]:
-    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}, "seen_close_ids": [], "seen_fill_ids": [], "open_interest_observations": {}, "pending_agent_events": [], "agent_scheduler": _sanitize_agent_scheduler({})}
+    _empty: Dict[str, Any] = {"plans": [], "triggers": [], "coins": [], "trades": [], "limits": {}, "sentiments": [], "decisions": [], "fees": [], "supervisor_notes_temporary": [], "supervisor_notes_permanent": [], "position_extremes": {}, "seen_close_ids": [], "seen_fill_ids": [], "open_interest_observations": {}, "pending_agent_events": [], "signal_probes": [], "agent_scheduler": _sanitize_agent_scheduler({})}
     if self._cache is not None:
       try:
         disk_mtime = self.path.stat().st_mtime
@@ -162,6 +165,7 @@ class MemoryStore:
         data.setdefault("fees", [])
         data.setdefault("supervisor_notes_temporary", [])
         data.setdefault("supervisor_notes_permanent", [])
+        data.setdefault("signal_probes", [])
         data.setdefault("position_extremes", {})
         data.setdefault("seen_close_ids", [])
         data.setdefault("seen_fill_ids", [])
@@ -364,6 +368,11 @@ class MemoryStore:
       event for event in data.get("pending_agent_events", [])
       if isinstance(event, dict) and (event.get("ts") or now) >= cutoff
     ][-MAX_PENDING_AGENT_EVENTS:]
+    # Signal probes are learning data (every direction call, placed or not): retained by COUNT only,
+    # never by clock — see record_signal_probe for why tying evidence to anything else deadlocks.
+    probes = data.get("signal_probes") or []
+    if len(probes) > MAX_SIGNAL_PROBES:
+      data["signal_probes"] = probes[-MAX_SIGNAL_PROBES:]
     # Permanent notes are exempt from the retention-days cutoff by design — they persist
     # until manually deleted. Only the count cap (MAX_PERMANENT_NOTES) applies below.
     data.setdefault("supervisor_notes_permanent", [])
@@ -1107,6 +1116,55 @@ class MemoryStore:
     rows = self._authoritative_realized_rows(rows)
     return rows[-max(1, int(limit)):]
 
+  def record_signal_probe(
+    self,
+    symbol: str,
+    side: str,
+    market_price: Any,
+    setup_family: Optional[str] = None,
+  ) -> None:
+    """Record a DIRECTION CALL for edge measurement, whether or not it becomes an order.
+
+    Signal quality is a property of the call, not of the execution — so a setup that the model
+    committed to but which was then refused for a sizing reason is still evidence about whether the
+    model predicts. Measuring only placed orders biases the sample twice over: it drops every setup
+    too small to clear the exchange's contract minimum (a systematic subset, not a random one), and it
+    couples the evidence supply to the very risk factor the evidence is supposed to govern.
+
+    That coupling produced a live doom loop on 2026-08-10: the continuation family measured "no edge",
+    its risk was cut to the floor, the resulting $7.49 notional fell under the $10.24 contract minimum,
+    the order was rejected, no probe was recorded — and with no new probes the family could never earn
+    back the evidence that would restore its size. Recording at the point of the call breaks that
+    circularity completely: risk can go as low as the measurement warrants without ever starving the
+    measurement itself. Never raises.
+    """
+    try:
+      px = float(market_price)
+    except (TypeError, ValueError):
+      return
+    if px <= 0:
+      return
+    s = str(side or "").lower()
+    position_side = "long" if s in ("buy", "long") else ("short" if s in ("sell", "short") else None)
+    if not position_side:
+      return
+    row = {
+      "symbol": _normalize_symbol(symbol),
+      "ts": int(time.time()),
+      "entryContext": {
+        "positionSide": position_side,
+        "marketPriceAtSignal": px,
+        "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
+        "signalProbe": {},
+      },
+    }
+    with self._lock:
+      data = self._read()
+      data.setdefault("signal_probes", []).append(row)
+      if len(data["signal_probes"]) > MAX_SIGNAL_PROBES:
+        data["signal_probes"] = data["signal_probes"][-MAX_SIGNAL_PROBES:]
+      self._write(data)
+
   def settle_signal_probes(self, prices: Dict[str, Any], horizons_min: tuple = (60, 240)) -> int:
     """Stamp the forward price on any entry signal whose measurement horizon has elapsed.
 
@@ -1130,7 +1188,7 @@ class MemoryStore:
     settled = 0
     with self._lock:
       data = self._read()
-      for row in data.get("trades") or []:
+      for row in list(data.get("trades") or []) + list(data.get("signal_probes") or []):
         if not isinstance(row, dict):
           continue
         ctx = row.get("entryContext")
@@ -1161,10 +1219,20 @@ class MemoryStore:
     with self._lock:
       data = self._read()
     out = []
-    for row in (data.get("trades") or []):
+    # The dedicated bucket is the current source (every direction call); trades-derived rows are the
+    # legacy shape recorded before probes were decoupled from order placement. Union so no history is
+    # lost, deduped on (symbol, ts) since a placed order appears in both.
+    seen = set()
+    for row in list(data.get("signal_probes") or []) + list(data.get("trades") or []):
       ctx = row.get("entryContext") if isinstance(row, dict) else None
-      if isinstance(ctx, dict) and ctx.get("marketPriceAtSignal"):
-        out.append(row)
+      if not (isinstance(ctx, dict) and ctx.get("marketPriceAtSignal")):
+        continue
+      key = (row.get("symbol"), int(row.get("ts") or 0))
+      if key in seen:
+        continue
+      seen.add(key)
+      out.append(row)
+    out.sort(key=lambda r: int(r.get("ts") or 0))
     return out[-max(1, int(limit)):]
 
   def recent_fills(self, limit: int = 100) -> list[Dict[str, Any]]:

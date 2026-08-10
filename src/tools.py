@@ -3463,6 +3463,16 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if current_price is None:
       return {"error": "Unable to fetch current live price for deviation check"}
 
+    # Record the DIRECTION CALL for edge measurement now, before any sizing/RR rejection can discard
+    # it. Signal quality is a property of the call, not the execution, so a setup refused for being
+    # too small to clear the contract minimum is still evidence about whether the model predicts —
+    # and measuring only placed orders coupled the evidence supply to the very risk factor the
+    # evidence governs, which deadlocked live on 2026-08-10 (see memory.record_signal_probe).
+    try:
+      memory.record_signal_probe(spot_symbol, side_lower, current_price, setup_family)
+    except Exception as _probe_exc:
+      logger.debug("signal probe not recorded for %s: %s", spot_symbol, _probe_exc)
+
     # Noise floor on the bracket, applied BEFORE tick rounding, the RR gate and sizing, so the whole
     # chain prices the stop the trade will actually rest on. The target scales with the stop, so the
     # floor never turns into an RR rejection — it expresses itself as smaller size.
