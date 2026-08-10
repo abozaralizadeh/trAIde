@@ -7,6 +7,7 @@ import pytest
 from src.config import RegimeConfig
 from src.regime import (
     allow_fade_extreme,
+    fade_setup_available,
     is_hostile_regime,
     effective_min_confidence,
     combined_size_factor,
@@ -862,3 +863,46 @@ def test_fade_extreme_disableable_and_safe_on_bad_input():
     assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=None, cfg=cfg) is False
     assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi="x", cfg=cfg) is False
     assert allow_fade_extreme(side="hold", setup_family="fade_extreme", rsi=20.0, cfg=cfg) is False
+
+
+def test_fade_setup_is_surfaced_at_an_extreme_so_the_playbook_is_findable():
+    """Unblocking the gates was necessary but not sufficient.
+
+    Of the first 39 measured signals, 38 were `continuation` and one was a fade — not because the
+    model refused, but because nothing at the point of decision told it a fade was on the table. Every
+    piece of analysis guidance is written for arriving at a good price on a TREND trade, and the
+    regime label reads "trending" on ~93% of symbols so the mean-reversion hints never fire.
+    """
+    cfg = _cfg()
+    over = fade_setup_available(78.0, cfg)
+    under = fade_setup_available(22.0, cfg)
+    assert over["side"] == "sell" and "overbought" in over["reason"]
+    assert under["side"] == "buy" and "oversold" in under["reason"]
+    # the note must tell the model how to actually take it, or the gates still reject
+    assert "setup_family='fade_extreme'" in under["note"]
+
+
+def test_fade_setup_is_silent_when_there_is_no_extreme():
+    cfg = _cfg()
+    assert fade_setup_available(50.0, cfg) is None
+    assert fade_setup_available(31.0, cfg) is None
+    assert fade_setup_available(69.0, cfg) is None
+
+
+def test_fade_setup_thresholds_match_the_gate_that_admits_it():
+    """The hint must not advertise a setup the gate would then refuse."""
+    cfg = _cfg()
+    for rsi in (10.0, 29.9, 30.0):
+        hint = fade_setup_available(rsi, cfg)
+        assert hint is not None
+        assert allow_fade_extreme(side=hint["side"], setup_family="fade_extreme", rsi=rsi, cfg=cfg) is True
+    for rsi in (70.0, 85.0):
+        hint = fade_setup_available(rsi, cfg)
+        assert allow_fade_extreme(side=hint["side"], setup_family="fade_extreme", rsi=rsi, cfg=cfg) is True
+
+
+def test_fade_setup_respects_the_disable_flag_and_bad_input():
+    assert fade_setup_available(20.0, _cfg(fade_extreme_enabled=False)) is None
+    cfg = _cfg()
+    assert fade_setup_available(None, cfg) is None
+    assert fade_setup_available("x", cfg) is None

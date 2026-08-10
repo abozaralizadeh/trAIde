@@ -420,6 +420,54 @@ def scale_target_to_widened_stop(side: str, entry, take_profit, widen_factor):
   return take_profit
 
 
+def fade_setup_available(rsi, cfg: RegimeConfig):
+  """Flag a live fade-extreme opportunity at analysis time, so the playbook is FINDABLE.
+
+  Unblocking the gates was necessary but not sufficient: over the first 39 measured signals, 38 were
+  `continuation` and only one was a fade. The model was not withholding fades — it had no prompt at
+  the moment of decision telling it one was on the table. Every piece of guidance the analysis emits
+  (entry_hint, the entryMap note, the ATR-extension framing) is written for arriving at a good price
+  on a *trend* trade, and the regime label reads "trending" on ~93% of symbols, so the mean-reversion
+  hints keyed on "ranging" essentially never fire.
+
+  This says the quiet part out loud: RSI is at an extreme, a fade is permitted here, and it must be
+  declared as such to pass the alignment gates. It asserts nothing about whether fading is a good
+  idea — `signalEdge.by_family` keeps that score, and risk follows the measurement. It exists so the
+  hypothesis can be *tested at all*, which it currently cannot be at one probe per 39.
+
+  Returns ``None`` when there is no extreme, else a dict describing the available direction.
+  """
+  if not getattr(cfg, "fade_extreme_enabled", False):
+    return None
+  try:
+    value = float(rsi)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(value):
+    return None
+  oversold = float(getattr(cfg, "fade_extreme_oversold_rsi", 30.0))
+  overbought = float(getattr(cfg, "fade_extreme_overbought_rsi", 70.0))
+  if value <= oversold:
+    side, why = "buy", f"15m RSI {value:.0f} <= {oversold:.0f} (oversold)"
+  elif value >= overbought:
+    side, why = "sell", f"15m RSI {value:.0f} >= {overbought:.0f} (overbought)"
+  else:
+    return None
+  return {
+    "side": side,
+    "rsi15m": round(value, 1),
+    "reason": why,
+    "note": (
+      f"FADE SETUP AVAILABLE — {why}. A {side.upper()} here fades the stretch back toward value. "
+      "This is a different PLAYBOOK from trend continuation, and the 1h/daily will oppose it by "
+      "definition — that is what makes it a fade, not a reason to skip it. To take it you MUST pass "
+      "setup_family='fade_extreme' to place_futures_limit_order; without that declaration the "
+      "alignment gates reject it. It is scored separately in signalEdge.by_family, so taking it is "
+      "how the bot learns whether this playbook pays."
+    ),
+  }
+
+
 def allow_fade_extreme(
   *,
   side: str,
