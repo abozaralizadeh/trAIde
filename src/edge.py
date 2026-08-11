@@ -389,7 +389,20 @@ def signal_edge_stats(
   out: Dict[str, Any] = {"n": 0, "verdict": "insufficient data", "cost_pct": cost_pct}
   by_h: Dict[str, List[float]] = {}
   by_fam: Dict[str, List[float]] = {}
-  for row in probes or []:
+  # Probes on the same symbol are recorded minutes apart, so their forward windows OVERLAP almost
+  # entirely — thirty probes on one symbol inside four hours are close to one observation, not thirty.
+  # Counting them independently inflates the sample and, with it, the verdict. On 2026-08-11 that
+  # produced a false positive: the 240m horizon read +0.224% (t=+3.66, n=131) and the verdict flipped
+  # to "edge", but decimating to one probe per symbol per window gave +0.068% (t=+0.51, n=31) — below
+  # the cost hurdle, i.e. nothing. Since this verdict governs how much capital each family gets, an
+  # inflated sample can talk the bot into sizing UP on noise, which is the most expensive mistake this
+  # module could make. Keep one observation per symbol per horizon window.
+  last_seen: Dict[tuple, int] = {}
+  ordered = sorted(
+    (r for r in (probes or []) if isinstance(r, dict)),
+    key=lambda r: int(r.get("ts") or 0),
+  )
+  for row in ordered:
     ctx = row.get("entryContext") if isinstance(row, dict) else None
     if not isinstance(ctx, dict):
       continue
@@ -399,10 +412,17 @@ def signal_edge_stats(
     if not base or base <= 0 or side not in {"long", "short"} or not isinstance(probe, dict):
       continue
     family = infer_setup_family(ctx)
+    symbol = str(row.get("symbol") or "?")
+    ts = int(row.get("ts") or 0)
     for horizon in horizons_min:
       px = _f(probe.get(f"m{int(horizon)}"))
       if px is None or px <= 0:
         continue
+      # Drop this observation if the previous one on the same symbol is still inside its window.
+      key = (symbol, int(horizon))
+      if ts - last_seen.get(key, -10**9) < int(horizon) * 60:
+        continue
+      last_seen[key] = ts
       ret = (px - base) / base
       signed = ret if side == "long" else -ret
       by_h.setdefault(f"{int(horizon)}m", []).append(signed)

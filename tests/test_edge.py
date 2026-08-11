@@ -508,11 +508,17 @@ def test_entry_quality_reachability_empty_without_mfe_data():
 # ── Signal edge: does the direction call predict, independent of exits? ─────────
 
 
+_PROBE_SEQ = [0]
+
+
 def _probe(side, base, fwd_1h, fwd_4h=None):
+    """One INDEPENDENT observation: probes are spaced past the widest horizon so decimation keeps
+    them all. Overlapping-sample collapsing is exercised separately by the _ts_probe tests below."""
     ctx = {"positionSide": side, "marketPriceAtSignal": base, "signalProbe": {"m60": fwd_1h}}
     if fwd_4h is not None:
         ctx["signalProbe"]["m240"] = fwd_4h
-    return {"symbol": "X-USDT", "entryContext": ctx}
+    _PROBE_SEQ[0] += 1
+    return {"symbol": "X-USDT", "ts": 1_000_000 + _PROBE_SEQ[0] * 240 * 60, "entryContext": ctx}
 
 
 def test_signal_edge_detects_a_real_edge():
@@ -567,7 +573,10 @@ def test_signal_edge_ignores_probes_without_a_market_price_stamp():
 
 
 def _fam_probe(side, base, fwd, family):
-    return {"entryContext": {"positionSide": side, "marketPriceAtSignal": base,
+    """Independent observation per call — see _probe."""
+    _PROBE_SEQ[0] += 1
+    return {"symbol": f"{family.upper()}-USDT", "ts": 1_000_000 + _PROBE_SEQ[0] * 240 * 60,
+            "entryContext": {"positionSide": side, "marketPriceAtSignal": base,
                              "setupFamily": family, "signalProbe": {"m60": fwd}}}
 
 
@@ -646,3 +655,47 @@ def test_family_penalty_never_starves_a_family_into_a_doom_loop():
 def test_family_penalty_falls_back_to_the_floor_without_a_usable_hurdle():
     no_cost = {"by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.2}}}
     assert family_size_factor(no_cost, "continuation") == pytest.approx(0.25)
+
+
+def _ts_probe(sym, ts, side, base, fwd, family="continuation"):
+    return {"symbol": sym, "ts": ts,
+            "entryContext": {"positionSide": side, "marketPriceAtSignal": base,
+                             "setupFamily": family, "signalProbe": {"m60": fwd}}}
+
+
+def test_overlapping_probes_on_one_symbol_count_once_per_window():
+    """Thirty probes on one symbol inside an hour are ~one observation, not thirty.
+
+    Probes are recorded minutes apart, so their forward windows overlap almost entirely. Counting them
+    independently inflates the sample and the verdict with it. On 2026-08-11 that produced a FALSE
+    POSITIVE on live data: 240m read +0.224% (t=+3.66, n=131) and the verdict flipped to "edge", but
+    one-per-symbol-per-window gave +0.068% (t=+0.51, n=31) — below the cost hurdle, i.e. nothing.
+    Since this verdict governs how much capital each family gets, an inflated sample can size the bot
+    UP on noise, which is the most expensive mistake this module could make.
+    """
+    # 30 probes 60s apart on ONE symbol, all inside a single 60m window.
+    probes = [_ts_probe("XRP-USDT", 1_000_000 + i * 60, "long", 100.0, 102.0) for i in range(30)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=1)
+    assert out["by_horizon"]["60m"]["n"] == 1, "overlapping probes must collapse to one observation"
+
+
+def test_probes_spaced_beyond_the_window_all_count():
+    probes = [_ts_probe("XRP-USDT", 1_000_000 + i * 3600, "long", 100.0, 102.0) for i in range(5)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=1)
+    assert out["by_horizon"]["60m"]["n"] == 5
+
+
+def test_different_symbols_in_the_same_window_are_independent():
+    # Two symbols moving at the same time really are two observations.
+    probes = [_ts_probe("XRP-USDT", 1_000_000, "long", 100.0, 102.0),
+              _ts_probe("ADA-USDT", 1_000_010, "long", 100.0, 102.0)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=1)
+    assert out["by_horizon"]["60m"]["n"] == 2
+
+
+def test_decimation_cannot_manufacture_an_edge_verdict_from_repetition():
+    """A single lucky move, sampled 50 times, must not clear the cost hurdle."""
+    probes = [_ts_probe("XRP-USDT", 1_000_000 + i * 30, "long", 100.0, 105.0) for i in range(50)]
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["60m"]["n"] == 1
+    assert out["verdict"] == "insufficient data"   # one observation is not evidence

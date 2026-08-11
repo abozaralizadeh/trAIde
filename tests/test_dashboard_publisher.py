@@ -179,9 +179,15 @@ class TestStrategyEdgePanel:
       estimated_slippage_pct=0.001, slippage_autotune_min_samples=8,
     ))
 
-  @staticmethod
-  def _probe(side, base, fwd, family):
-    return {"entryContext": {"positionSide": side, "marketPriceAtSignal": base,
+  _seq = [0]
+
+  @classmethod
+  def _probe(cls, side, base, fwd, family):
+    """One INDEPENDENT observation — spaced past the widest horizon and keyed per family, since
+    signal_edge_stats collapses probes that overlap on the same symbol (see test_edge.py)."""
+    cls._seq[0] += 1
+    return {"symbol": f"{family.upper()}-USDT", "ts": 1_000_000 + cls._seq[0] * 240 * 60,
+            "entryContext": {"positionSide": side, "marketPriceAtSignal": base,
                              "setupFamily": family, "signalProbe": {"m60": fwd}}}
 
   def test_reports_per_family_verdicts_and_risk_factors(self):
