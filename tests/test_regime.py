@@ -906,3 +906,26 @@ def test_fade_setup_respects_the_disable_flag_and_bad_input():
     cfg = _cfg()
     assert fade_setup_available(None, cfg) is None
     assert fade_setup_available("x", cfg) is None
+
+
+def test_soft_and_evidence_factors_combine_by_the_worst_not_the_product():
+    """The compounding rule applies to the family factor too, or the account sizes to nothing.
+
+    Measured live 2026-08-11: quality 0.50 x family 0.25 = 0.12 effective, which sized a $66 account
+    to an $8.37 notional against a $10.24 contract minimum. Every entry was rejected — 79 agent runs,
+    zero orders placed in 12.5 hours. Taking the worse of the two still lets the evidence-based factor
+    dominate when it is the more cautious, without stacking two independent cautions into fee-dust.
+    """
+    quality, family = 0.50, 0.25
+    assert quality * family == pytest.approx(0.125)      # what paralysed it
+    assert min(quality, family) == pytest.approx(0.25)   # what ships
+    # The evidence factor must still dominate whenever it is the stricter of the two.
+    assert min(0.50, 0.25) == 0.25
+    # ...and must not loosen risk when the soft stack is stricter.
+    assert min(0.30, 1.00) == 0.30
+
+
+def test_combined_size_factor_already_uses_the_same_worst_signal_rule():
+    """The family factor now follows the rule the soft stack has always used, rather than fighting it."""
+    # Five independent 0.6 cautions must not compound to 0.08.
+    assert combined_size_factor([0.6, 0.6, 0.6, 0.6, 0.6], floor=0.0) == pytest.approx(0.6)

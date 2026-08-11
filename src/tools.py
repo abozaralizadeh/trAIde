@@ -3425,10 +3425,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # the evidence got, the combined soft factor could not go below 0.50. The one signal grounded in
     # data was capped by a guard built for the ones that are not.
     _family_scale_fl = family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other")
-    _atr_scale_fl = _vol_scale_fl * _quality_fl * _family_scale_fl
-    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f family=%.2f(%s) (soft=%s floor=%.2f) → %.0f%%",
+    # Combined with the soft stack by taking the WORSE of the two, never their product — the same rule
+    # `combined_size_factor` already applies within the stack, and for the same reason. Multiplying
+    # them re-created exactly the compounding that rule exists to prevent: measured live on 2026-08-11,
+    # quality 0.50 x family 0.25 = 0.12 effective, which sized a $66 account to a $8.37 notional against
+    # a $10.24 contract minimum. Every entry was rejected — **79 agent runs, zero orders placed** in
+    # 12.5 hours. Taking the minimum still lets the evidence-based factor dominate whenever it is the
+    # more cautious of the two (0.25 here), without stacking two independent cautions into fee-dust.
+    _atr_scale_fl = _vol_scale_fl * min(_quality_fl, _family_scale_fl)
+    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f family=%.2f(%s) → worst=%.2f (soft=%s floor=%.2f) → %.0f%%",
                 spot_symbol, _vol_scale_fl, _quality_fl, _family_scale_fl, _family_fl or "other",
-                [round(f, 2) for f in _soft_fl], cfg.trading.size_quality_floor, _atr_scale_fl * 100)
+                min(_quality_fl, _family_scale_fl), [round(f, 2) for f in _soft_fl],
+                cfg.trading.size_quality_floor, _atr_scale_fl * 100)
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
