@@ -152,3 +152,13 @@ def test_entry_ttl_stays_short_because_late_fills_are_adverse():
     # Assert the SHIPPED loader default, not the local fixture (which sets its own value).
     from src.config import load_config
     assert load_config().trading.entry_limit_expiry_minutes <= 20
+
+
+def test_no_edge_family_stand_aside_is_on_by_default():
+    """A playbook the bot has measured as no-edge should not be staked by default.
+
+    This is the shipped behaviour (loader default), not just the dataclass default — live goes through
+    the loader. It can be switched off with EDGE_STAND_ASIDE_NO_EDGE_FAMILY if it ever over-fires.
+    """
+    from src.config import load_config
+    assert load_config().edge.stand_aside_no_edge_family is True

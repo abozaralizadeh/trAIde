@@ -197,6 +197,12 @@ class EdgeConfig:
   streak_size_factor: float = 0.5  # entry-size multiplier while on a losing streak
   direction_min_trades: int = 5    # evidence required before long/short-specific adaptation
   negative_expectancy_size_factor: float = 0.5  # explore smaller on a losing direction; auto-restores
+  stand_aside_no_edge_family: bool = True  # skip entries whose PLAYBOOK measures "no edge" over a real
+                                           # sample (mean forward return fails to clear cost) instead of
+                                           # staking floor-size fee-dust on it. Kelly-zero for a
+                                           # non-positive-edge bet; probes still record at call time so
+                                           # the family auto-restores when its edge returns. See
+                                           # edge.family_stand_aside. Master escape hatch if it over-fires.
 
 
 @dataclass
@@ -273,12 +279,21 @@ class ProfitProtectionConfig:
   # the planned bracket isolates the exit rule: 63% win rate but avg win +0.35R vs avg loss -1.05R, a
   # 0.33 payoff ratio, net -4.5R. No win rate survives that payoff. Trail-arm sweep on the same paths:
   #   arm 0.40R -0.17R | 0.50R +0.39R | 0.75R -0.24R | 1.00R +2.72R | 1.25R +2.25R | 1.50R +1.97R
-  # The principle the numbers are pointing at: a trailing stop must not arm until the trade has earned
-  # back its OWN risk. Before +1R a "profit" is inside the noise the stop was drawn around, so locking
-  # it is not protecting a gain — it is converting a live thesis into a coin-flip. Arm at 1R, then trail
-  # a full 1R behind the peak and lock only a third of the run, so a winner keeps room to become a
-  # runner. Still pure-R and self-normalizing: no ATR feed, no per-symbol tuning, no maintenance.
-  trail_arm_r: float = 1.0           # arm only once the trade has made back its own risk
+  # The principle the numbers are pointing at: a trailing stop must not arm until the favourable run has
+  # cleared the NOISE BAND the stop was drawn around — that band was ~1.4x ATR when the sweep above ran.
+  # Aug 11 2026 correction — that sweep endorsed "1R", but 1R is a distance in *stop units*, and the stop
+  # floor has since roughly DOUBLED (STOP_ATR_FLOOR_MULT 2.5, adaptive to 3-4x ATR; live median stop is
+  # 3.0x the intraday ATR vs 1.4x in July). So the SAME 1.0R now sits at ~3x ATR — a move the tape almost
+  # never makes: over the last 58 live closes the median favourable excursion was 0.30R and only 12%
+  # reached +1R, so the trail NEVER armed and winners round-tripped from solid green to a full stop-out
+  # (GRAM +0.73R->-0.96R, ADA +0.62R->-1.01R, XRP +0.67R->-0.93R; 21 trades peaked +0.95R avg and kept
+  # +0.24R). The parameter stayed frozen in R-units while R's meaning doubled underneath it. 0.5R restores
+  # the arming distance the July replay actually validated (~1.4-1.5x ATR at today's wider stop) — this
+  # preserves that finding under the new geometry, it does not overturn it. Replaying the 58 closes,
+  # arming at 0.5R lifts expectancy from -0.24R toward -0.13R and is flat across 0.4-0.6R (not a knife-
+  # edge). TODO(self-tuning): the truly maintenance-free form anchors the arm to ATR, not R
+  # (arm_r = ~1.4 / stop_atr_mult), so it can't re-stale the next time the adaptive stop floor moves.
+  trail_arm_r: float = 0.5           # arm once the run clears the noise band (~1.4x ATR at the live stop)
   trail_lock_frac: float = 0.33      # lock at least this fraction of the peak favourable run once armed
   trail_distance_r: float = 1.0      # ...or trail this many R below the peak, whichever locks MORE
 
@@ -492,7 +507,7 @@ def load_config() -> AppConfig:
     profit_protection=ProfitProtectionConfig(
       enabled=_as_bool(os.getenv("PROFIT_LOCK_ENABLED"), True),
       dry_run=_as_bool(os.getenv("PROFIT_LOCK_DRY_RUN"), False),
-      breakeven_trigger_r=float(os.getenv("PROFIT_LOCK_BREAKEVEN_TRIGGER_R", "1.0")),
+      breakeven_trigger_r=float(os.getenv("PROFIT_LOCK_BREAKEVEN_TRIGGER_R", "0.5")),
       breakeven_fee_pct=float(os.getenv("PROFIT_LOCK_BREAKEVEN_FEE_PCT", "0.0015")),
       giveback_pct=float(os.getenv("PROFIT_LOCK_GIVEBACK_PCT", "0.35")),
       min_favorable_excursion_pct=float(os.getenv("PROFIT_LOCK_MIN_FE_PCT", "0.005")),
@@ -509,7 +524,7 @@ def load_config() -> AppConfig:
       trend_giveback_pct=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_PCT", "0.55")),
       trend_giveback_arm_r=float(os.getenv("PROFIT_LOCK_TREND_GIVEBACK_ARM_R", "2.5")),
       trail_enabled=_as_bool(os.getenv("PROFIT_LOCK_TRAIL_ENABLED"), True),
-      trail_arm_r=float(os.getenv("PROFIT_LOCK_TRAIL_ARM_R", "1.0")),
+      trail_arm_r=float(os.getenv("PROFIT_LOCK_TRAIL_ARM_R", "0.5")),
       trail_lock_frac=float(os.getenv("PROFIT_LOCK_TRAIL_LOCK_FRAC", "0.33")),
       trail_distance_r=float(os.getenv("PROFIT_LOCK_TRAIL_DISTANCE_R", "1.0")),
     ),
@@ -529,6 +544,7 @@ def load_config() -> AppConfig:
       streak_size_factor=float(os.getenv("EDGE_STREAK_SIZE_FACTOR", "0.5")),
       direction_min_trades=int(os.getenv("EDGE_DIRECTION_MIN_TRADES", "5")),
       negative_expectancy_size_factor=float(os.getenv("EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR", "0.5")),
+      stand_aside_no_edge_family=_as_bool(os.getenv("EDGE_STAND_ASIDE_NO_EDGE_FAMILY"), True),
     ),
     regime=RegimeConfig(
       throttle_enabled=_as_bool(os.getenv("REGIME_THROTTLE_ENABLED"), True),

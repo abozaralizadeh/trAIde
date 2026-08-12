@@ -21,7 +21,12 @@ def _cfg(**overrides) -> ProfitProtectionConfig:
     base = dict(
         enabled=True,
         dry_run=False,
+        # Mechanics tests below pin the arm thresholds at 1R so they exercise the ratchet math at a
+        # fixed, explicit boundary (peaks are written as multiples of this). The LIVE default is 0.5R
+        # (see ProfitProtectionConfig / test_trail_default_arm_is_half_r) — the stop floor doubled since
+        # 1R was calibrated, so 1R now sits ~3x ATR and never arms; 0.5R restores the validated distance.
         breakeven_trigger_r=1.0,
+        trail_arm_r=1.0,
         breakeven_fee_pct=0.0015,
         giveback_pct=0.35,
         min_favorable_excursion_pct=0.005,
@@ -31,6 +36,23 @@ def _cfg(**overrides) -> ProfitProtectionConfig:
     )
     base.update(overrides)
     return ProfitProtectionConfig(**base)
+
+
+def test_trail_default_arm_is_half_r():
+    """The LIVE profit-lock arms at 0.5R, not 1R (Aug 11 2026 geometry correction).
+
+    The July 1m-path replay endorsed a 1R arm, but 1R is a distance in *stop units*, and the stop
+    floor has since roughly doubled (median live stop 3.0x ATR vs 1.4x in July). So 1R now sits at
+    ~3x ATR — a move the tape almost never makes (median favourable excursion 0.30R; only 12% of the
+    last 58 closes reached +1R), leaving the trail permanently dormant while winners round-tripped to
+    full stops. 0.5R restores the ~1.4x-ATR arming distance the replay actually validated. This test
+    fails loudly if the default is ever reverted to 1R without re-checking the live stop geometry.
+    """
+    from src.config import load_config
+
+    cfg = load_config().profit_protection
+    assert cfg.trail_arm_r == 0.5
+    assert cfg.breakeven_trigger_r == 0.5
 
 
 # ── decide_protection: early invalidation (P1c) ─────────────────────────────────

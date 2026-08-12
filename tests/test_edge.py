@@ -10,6 +10,7 @@ from src.edge import (
     measured_slippage_pct,
     signal_edge_stats,
     family_size_factor,
+    family_stand_aside,
     infer_setup_family,
     entry_quality_stats,
     expectancy_size_factor,
@@ -655,6 +656,46 @@ def test_family_penalty_never_starves_a_family_into_a_doom_loop():
 def test_family_penalty_falls_back_to_the_floor_without_a_usable_hurdle():
     no_cost = {"by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.2}}}
     assert family_size_factor(no_cost, "continuation") == pytest.approx(0.25)
+
+
+# ── Stand aside: a proven-no-edge playbook gets zero stake, i.e. is skipped ──────
+
+
+def test_stand_aside_on_a_proven_no_edge_family():
+    # A real sample whose direction calls don't clear cost has non-positive expectancy: Kelly-zero,
+    # so decline the trade rather than stake floor-size fee-dust on it.
+    out = {"cost_pct": 0.001,
+           "by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.29}}}
+    assert family_stand_aside(out, "continuation") is True
+
+
+def test_stand_aside_leaves_an_unproven_family_alone():
+    # "insufficient data" is unmeasured, not bad — trading it is how it earns the evidence that judges it.
+    out = {"cost_pct": 0.001,
+           "by_family": {"breakout": {"n": 5, "verdict": "insufficient data", "net_of_cost_pct": -0.5}}}
+    assert family_stand_aside(out, "breakout") is False
+    # Below the sample floor even with a "no edge" label -> not yet actionable.
+    thin = {"by_family": {"continuation": {"n": 3, "verdict": "no edge", "net_of_cost_pct": -0.2}}}
+    assert family_stand_aside(thin, "continuation", min_samples=20) is False
+
+
+def test_stand_aside_leaves_a_paying_family_alone():
+    out = {"cost_pct": 0.001,
+           "by_family": {"fade_extreme": {"n": 30, "verdict": "edge", "net_of_cost_pct": 0.4}}}
+    assert family_stand_aside(out, "fade_extreme") is False
+    # An unmeasured family (no row at all) is never skipped.
+    assert family_stand_aside(out, "never_seen") is False
+    assert family_stand_aside({}, "continuation") is False
+
+
+def test_stand_aside_and_the_probe_pipeline_agree_on_the_verdict():
+    # End-to-end: the same probe stream that reads "no edge" via signal_edge_stats also trips stand-aside,
+    # so the skip fires on exactly the families the scoreboard condemns — no separate threshold to drift.
+    probes = ([_fam_probe("short", 100.0, 100.05, "continuation") for _ in range(25)]
+              + [_fam_probe("long", 100.0, 101.0, "fade_extreme") for _ in range(25)])
+    out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert family_stand_aside(out, "continuation") is True
+    assert family_stand_aside(out, "fade_extreme") is False
 
 
 def _ts_probe(sym, ts, side, base, fwd, family="continuation"):

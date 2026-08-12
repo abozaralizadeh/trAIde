@@ -59,7 +59,7 @@ from .regime import (
   reward_risk_ratio,
   risk_capped_contracts,
 )
-from .edge import SETUP_FAMILIES, family_size_factor
+from .edge import SETUP_FAMILIES, family_size_factor, family_stand_aside
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
   logger,
@@ -3480,6 +3480,37 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       memory.record_signal_probe(spot_symbol, side_lower, current_price, setup_family)
     except Exception as _probe_exc:
       logger.debug("signal probe not recorded for %s: %s", spot_symbol, _probe_exc)
+
+    # STAND ASIDE on a measured-no-edge playbook. The probe above is already recorded, so declining the
+    # trade does NOT starve the family's evidence — it keeps scoring from the call and re-opens on its
+    # own the moment its forward return clears cost. A signal whose mean move does not beat its round
+    # trip has non-positive expectancy; the growth-optimal (Kelly) stake on that is zero, i.e. skip.
+    # This is bet-sizing (survival), not a directional veto (opportunity): it acts only on the bot's own
+    # measurement of its own direction calls, and auto-restores. See edge.family_stand_aside.
+    if cfg.edge.stand_aside_no_edge_family and family_stand_aside(
+      _edge_state().get("signal_edge") or {}, _family_fl or "other"
+    ):
+      _fam_row = ((_edge_state().get("signal_edge") or {}).get("by_family") or {}).get(_family_fl or "other") or {}
+      _fam_n = _fam_row.get("n")
+      _fam_net = float(_fam_row.get("net_of_cost_pct") or 0.0)
+      logger.warning(
+        "STAND ASIDE: futures limit %s %s — family %r measures NO EDGE (n=%s, net_of_cost=%+.3f%%); skipping entry",
+        spot_symbol, side_lower, _family_fl or "other", _fam_n, _fam_net,
+      )
+      return {
+        "rejected": True,
+        "reason": (
+          f"Stand aside: '{_family_fl or 'other'}' playbook measures NO EDGE over {_fam_n} signals "
+          f"(net_of_cost {_fam_net:+.3f}% — its direction calls don't clear their round-trip cost, "
+          f"so this is a coin-flip minus fees)."
+        ),
+        "hint": (
+          "This is bet-sizing on measured edge, not a directional veto — it re-opens automatically once "
+          "this playbook's forward return beats cost. Switch to a playbook that is currently paying "
+          "(check signalEdge.by_family), take a genuine fade_extreme at an RSI extreme, or stand down "
+          "until the regime turns."
+        ),
+      }
 
     # Noise floor on the bracket, applied BEFORE tick rounding, the RR gate and sizing, so the whole
     # chain prices the stop the trade will actually rest on. The target scales with the stop, so the

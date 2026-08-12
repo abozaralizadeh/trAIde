@@ -363,6 +363,43 @@ def family_size_factor(
   return max(floor, min(1.0, 1.0 - shortfall))
 
 
+def family_stand_aside(
+  signal_edge: Dict[str, Any],
+  family: str,
+  *,
+  min_samples: int = 20,
+) -> bool:
+  """Should the bot DECLINE to execute this setup because its playbook has no measured edge?
+
+  ``family_size_factor`` shrinks a losing playbook but floors at a quarter-size, because driving a
+  stop-defined position to nil once pushed notional under the contract minimum, the order was rejected,
+  and — back when probes were recorded only on placed orders — the family then starved of the very
+  evidence that would let it recover. That floor was a workaround for a doom loop that no longer exists:
+  direction calls are now recorded as probes at call time, before any sizing or RR rejection
+  (``memory.record_signal_probe``), so a *skipped* trade still feeds the measurement and the family can
+  climb back to "edge" on its own.
+
+  With the evidence supply decoupled from execution, the floor is free to fall to its
+  mathematically-correct value. A family whose mean forward return does not clear the round-trip cost
+  has, by definition, non-positive expectancy on the signal itself — and the growth-optimal (Kelly)
+  stake on a non-positive-edge bet is zero. "Zero" for a stop-defined position means: do not place it.
+  This is bet-sizing (survival), not a view on which coin or direction is right (opportunity): it fires
+  only on the bot's OWN measurement of its OWN direction calls, and reverses automatically the moment
+  that measurement turns positive.
+
+  True only on a REAL sample (``n >= min_samples``) with a settled "no edge" verdict; an unproven or
+  merely marginal family is left to trade so it can gather the evidence that judges it.
+  """
+  fam = str(family or "other").strip().lower()
+  by_family = (signal_edge or {}).get("by_family") or {}
+  row = by_family.get(fam)
+  if not isinstance(row, dict):
+    return False
+  if int(row.get("n") or 0) < max(1, int(min_samples)):
+    return False
+  return row.get("verdict") == "no edge"
+
+
 def signal_edge_stats(
   probes: List[Dict[str, Any]],
   *,
