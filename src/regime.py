@@ -513,6 +513,47 @@ def allow_fade_extreme(
   return False
 
 
+def allow_declared_setup(
+  *,
+  setup_family: str | None,
+  cfg: RegimeConfig,
+) -> bool:
+  """Permit a deliberately-declared alternative playbook past the trend-alignment gates.
+
+  The alignment gates (daily + 1h) only ever admit a *trend-aligned* entry freely, and a trend-aligned
+  entry is tagged ``continuation`` by ``edge.infer_setup_family``. So continuation was the only playbook
+  that could reach the book at all: it accumulated ~every probe, measured "no edge", and the bot kept
+  taking it because it had nothing else it was allowed to express. ``allow_fade_extreme`` opened ONE
+  escape hatch, keyed on a genuine RSI extreme. But ``breakout`` and ``range_edge`` had no hatch and are
+  never auto-inferred, so a counter-trend breakout or range fade was rejected before it could ever log a
+  probe — no placement, no probe, ``samples: 0`` forever. The taxonomy listed five families while the
+  gates made three of them structurally unreachable.
+
+  This generalises the fade-extreme carve-out: a family the operator has listed in
+  ``declarable_setup_families`` is admitted past the gates *on the model's declaration alone*. That is
+  deliberate and philosophy-consistent — WHICH playbook to run is an OPPORTUNITY call (the model's job),
+  and a hardcoded trend gate deciding it is exactly the kind of veto this codebase avoids. Survival is
+  still fully code-governed, just DOWNSTREAM of the gate rather than at it: the probe is recorded at the
+  call, ``family_explore_factor`` sizes an unproven playbook down to exploration-size, ``family_size_factor``
+  shrinks it if it measures a shortfall, and ``family_stand_aside`` skips it outright once it settles to
+  "no edge" over a real sample. So a declared breakout that turns out not to pay still logs its evidence
+  and is then sized to a quarter, and eventually to zero — by MEASUREMENT, not by a pre-trade trend veto.
+  This widens what may be PROPOSED, never what may be RISKED.
+
+  No market-condition test is attached on purpose. A regime filter (e.g. "only range_edge in a ranging
+  tape") would re-block the family, because the live ``market_regime`` label reads "trending" ~93% of the
+  time — that mislabel is precisely why range_edge never fired. The declaration is the trigger; the
+  scoreboard is the judge.
+  """
+  if not getattr(cfg, "declared_setups_enabled", False):
+    return False
+  fam = str(setup_family or "").strip().lower()
+  if not fam:
+    return False
+  declarable = tuple(str(f).strip().lower() for f in (getattr(cfg, "declarable_setup_families", ()) or ()))
+  return fam in declarable
+
+
 def coherent_risk_fraction(
   configured_fraction,
   max_daily_drawdown_pct,

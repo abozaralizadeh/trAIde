@@ -203,6 +203,14 @@ class EdgeConfig:
                                            # non-positive-edge bet; probes still record at call time so
                                            # the family auto-restores when its edge returns. See
                                            # edge.family_stand_aside. Master escape hatch if it over-fires.
+  explore_unproven_family_factor: float = 0.4  # risk multiplier for a setup family that has NOT yet
+                                           # earned a scored verdict (< 20 probes). Probes record from
+                                           # the market price at signal time, so a family's evidence is
+                                           # independent of our size — we can measure a new playbook while
+                                           # risking little on it. Keeps exploring newly-reachable
+                                           # playbooks (breakout/range_edge) cheap on a small account;
+                                           # lifts to full measured sizing the instant it clears 20
+                                           # probes. See edge.family_explore_factor.
 
 
 @dataclass
@@ -322,6 +330,17 @@ class RegimeConfig:
   fade_extreme_enabled: bool = True
   fade_extreme_oversold_rsi: float = 30.0
   fade_extreme_overbought_rsi: float = 70.0
+  # Declared alternative playbooks (Aug 2026). The alignment gates only admit trend-aligned entries
+  # freely, and a trend-aligned entry is tagged 'continuation' — so continuation was the ONLY family
+  # that could reach the book, gathered ~every probe, measured no-edge, and the model kept taking it for
+  # want of anything else it was allowed to express. breakout/range_edge had no gate carve-out and are
+  # never auto-inferred, so a counter-trend one was rejected before it could log a single probe → 0
+  # samples → "untested" forever. This admits a declared playbook on the model's call alone (WHICH
+  # playbook is an opportunity decision, the model's job); survival stays code-governed downstream —
+  # explore-sizing while unproven, family sizing on measured shortfall, stand-aside once it settles to
+  # no-edge. Widens what may be proposed, never what may be risked. See regime.allow_declared_setup.
+  declared_setups_enabled: bool = True
+  declarable_setup_families: tuple = ("breakout", "range_edge")
   # A blanket BTC/alt veto misses genuine relative-strength leaders.  Permit only an alt whose own
   # daily, 4h, 1h and 15m trends are all bullish at high confidence, then size it down.  This is a
   # signal-based exception, not a symbol allow-list, so it adapts as leadership rotates.
@@ -545,6 +564,7 @@ def load_config() -> AppConfig:
       direction_min_trades=int(os.getenv("EDGE_DIRECTION_MIN_TRADES", "5")),
       negative_expectancy_size_factor=float(os.getenv("EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR", "0.5")),
       stand_aside_no_edge_family=_as_bool(os.getenv("EDGE_STAND_ASIDE_NO_EDGE_FAMILY"), True),
+      explore_unproven_family_factor=float(os.getenv("EDGE_EXPLORE_UNPROVEN_FAMILY_FACTOR", "0.4")),
     ),
     regime=RegimeConfig(
       throttle_enabled=_as_bool(os.getenv("REGIME_THROTTLE_ENABLED"), True),
@@ -556,6 +576,10 @@ def load_config() -> AppConfig:
       fade_extreme_enabled=_as_bool(os.getenv("FADE_EXTREME_ENABLED"), True),
       fade_extreme_oversold_rsi=float(os.getenv("FADE_EXTREME_OVERSOLD_RSI", "30")),
       fade_extreme_overbought_rsi=float(os.getenv("FADE_EXTREME_OVERBOUGHT_RSI", "70")),
+      declared_setups_enabled=_as_bool(os.getenv("DECLARED_SETUPS_ENABLED"), True),
+      declarable_setup_families=tuple(
+        s.strip().lower() for s in os.getenv("DECLARABLE_SETUP_FAMILIES", "breakout,range_edge").split(",") if s.strip()
+      ),
       alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
       alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
       relative_strength_longs_enabled=_as_bool(os.getenv("RELATIVE_STRENGTH_LONGS_ENABLED"), True),

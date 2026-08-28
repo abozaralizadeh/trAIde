@@ -6,6 +6,7 @@ import pytest
 
 from src.config import RegimeConfig
 from src.regime import (
+    allow_declared_setup,
     allow_fade_extreme,
     fade_setup_available,
     is_hostile_regime,
@@ -863,6 +864,34 @@ def test_fade_extreme_disableable_and_safe_on_bad_input():
     assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi=None, cfg=cfg) is False
     assert allow_fade_extreme(side="buy", setup_family="fade_extreme", rsi="x", cfg=cfg) is False
     assert allow_fade_extreme(side="hold", setup_family="fade_extreme", rsi=20.0, cfg=cfg) is False
+
+
+def test_declared_setup_admits_breakout_and_range_edge_on_the_declaration():
+    # breakout/range_edge have no RSI trigger — the model's declaration is what admits them past the
+    # alignment gates. Risk is governed downstream (explore-size, family scoring, stand-aside).
+    cfg = _cfg()
+    assert allow_declared_setup(setup_family="breakout", cfg=cfg) is True
+    assert allow_declared_setup(setup_family="range_edge", cfg=cfg) is True
+    assert allow_declared_setup(setup_family="RANGE_EDGE", cfg=cfg) is True  # case-insensitive
+
+
+def test_declared_setup_does_not_admit_continuation_or_a_missing_family():
+    # It must NOT become a blanket bypass of the gates for an undeclared or trend-continuation trade —
+    # only the deliberately-declared alternative playbooks pass this way.
+    cfg = _cfg()
+    assert allow_declared_setup(setup_family="continuation", cfg=cfg) is False
+    assert allow_declared_setup(setup_family="fade_extreme", cfg=cfg) is False  # handled by its own carve-out
+    assert allow_declared_setup(setup_family=None, cfg=cfg) is False
+    assert allow_declared_setup(setup_family="", cfg=cfg) is False
+    assert allow_declared_setup(setup_family="not_a_family", cfg=cfg) is False
+
+
+def test_declared_setup_respects_the_disable_flag_and_the_family_list():
+    assert allow_declared_setup(setup_family="breakout",
+                                cfg=_cfg(declared_setups_enabled=False)) is False
+    # The admissible list is operator-configurable.
+    assert allow_declared_setup(setup_family="range_edge",
+                                cfg=_cfg(declarable_setup_families=("breakout",))) is False
 
 
 def test_fade_setup_is_surfaced_at_an_extreme_so_the_playbook_is_findable():

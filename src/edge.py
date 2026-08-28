@@ -400,6 +400,43 @@ def family_stand_aside(
   return row.get("verdict") == "no edge"
 
 
+def family_explore_factor(
+  signal_edge: Dict[str, Any],
+  family: str,
+  *,
+  explore_factor: float = 0.4,
+  min_samples: int = 20,
+) -> float:
+  """Risk multiplier for a setup family that has not yet earned a scored verdict.
+
+  ``family_size_factor`` leaves an unproven family at full risk on the reasoning that a new playbook
+  "could never earn its way in" if it were shrunk. That reasoning predates call-time probing and no
+  longer holds: ``memory.record_signal_probe`` writes the probe from the MARKET price at signal time,
+  before any sizing, so the forward-return evidence that scores a family is entirely independent of the
+  notional we put behind it. A family gathers its ``min_samples`` probes at the same rate whether we
+  size it at 1.0, 0.4, or skip it — the evidence is size-independent. That severs the old link between
+  "explore" and "risk full size": we can measure a new playbook while risking little on it.
+
+  This matters because opening the alignment gates to deliberately-declared playbooks (breakout,
+  range_edge — see ``regime.allow_declared_setup``) lets families reach the book that have NO score yet
+  and, on a ~$70 account, full-risk exploration of an unproven hypothesis is exactly the overtrading
+  that fees punish. So while a family is still earning its verdict, it trades at ``explore_factor`` of
+  configured risk. The instant it crosses ``min_samples`` this returns 1.0 and hands sizing back to
+  ``family_size_factor`` (which then applies the measured edge) and ``family_stand_aside`` (which skips
+  a settled no-edge playbook). Cheap to learn, full weight once proven, zero once disproven.
+
+  Combine by taking the WORSE of this and ``family_size_factor`` — never their product — for the same
+  reason the soft stack does: two independent cautions must not compound into fee-dust.
+  """
+  fam = str(family or "other").strip().lower()
+  by_family = (signal_edge or {}).get("by_family") or {}
+  row = by_family.get(fam)
+  n = int(row.get("n") or 0) if isinstance(row, dict) else 0
+  if n >= max(1, int(min_samples)):
+    return 1.0
+  return max(0.0, min(1.0, float(explore_factor)))
+
+
 def signal_edge_stats(
   probes: List[Dict[str, Any]],
   *,

@@ -10,6 +10,8 @@ from typing import Any, Callable, Dict, List
 
 from agents import Agent, Model, Runner
 
+from .llm_runtime import STATELESS_RUN_CONFIG
+
 logger = logging.getLogger(__name__)
 
 
@@ -180,7 +182,8 @@ class ConversationMemory:
         prompt += f"Existing summary to incorporate:\n{_sanitize_for_filter(existing_summary)}\n\n"
       prompt += f"New messages to summarize:\n{formatted}"
 
-      result = asyncio.run(Runner.run(compactor, prompt, max_turns=1))
+      result = asyncio.run(Runner.run(compactor, prompt, max_turns=1,
+                                      run_config=STATELESS_RUN_CONFIG))
       return str(result.final_output)
 
     try:

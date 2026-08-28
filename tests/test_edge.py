@@ -11,6 +11,7 @@ from src.edge import (
     signal_edge_stats,
     family_size_factor,
     family_stand_aside,
+    family_explore_factor,
     infer_setup_family,
     entry_quality_stats,
     expectancy_size_factor,
@@ -696,6 +697,40 @@ def test_stand_aside_and_the_probe_pipeline_agree_on_the_verdict():
     out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
     assert family_stand_aside(out, "continuation") is True
     assert family_stand_aside(out, "fade_extreme") is False
+
+
+def test_explore_factor_shrinks_an_unproven_family():
+    # A family with fewer than min_samples probes has no verdict yet — it trades at explore-size, not
+    # full risk, because its evidence records from the market price at call time regardless of our size.
+    out = {"by_family": {"breakout": {"n": 5, "verdict": "insufficient data", "net_of_cost_pct": -0.1}}}
+    assert family_explore_factor(out, "breakout", explore_factor=0.4) == pytest.approx(0.4)
+    # A family never seen at all is also unproven → explore-size.
+    assert family_explore_factor({}, "range_edge", explore_factor=0.4) == pytest.approx(0.4)
+    assert family_explore_factor({"by_family": {}}, "range_edge", explore_factor=0.25) == pytest.approx(0.25)
+
+
+def test_explore_factor_lifts_to_full_once_a_family_is_scored():
+    # The instant a family crosses min_samples it is scored, so explore stops throttling it and hands
+    # sizing back to family_size_factor / family_stand_aside (whichever the verdict warrants).
+    scored = {"by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.29}}}
+    assert family_explore_factor(scored, "continuation") == 1.0
+    paying = {"by_family": {"fade_extreme": {"n": 44, "verdict": "edge", "net_of_cost_pct": 0.4}}}
+    assert family_explore_factor(paying, "fade_extreme") == 1.0
+
+
+def test_explore_and_measured_factors_compose_by_the_worst():
+    # The two family factors combine by the WORSE of the two (as tools.py does), never their product —
+    # so an unproven family is explore-sized (0.4) while family_size_factor still reads its no-op 1.0,
+    # and a proven no-edge family collapses via family_size_factor while explore reads its no-op 1.0.
+    unproven = {"by_family": {"breakout": {"n": 5, "verdict": "insufficient data"}}}
+    combined = min(family_size_factor(unproven, "breakout"),
+                   family_explore_factor(unproven, "breakout", explore_factor=0.4))
+    assert combined == pytest.approx(0.4)
+    proven = {"cost_pct": 0.001,
+              "by_family": {"continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.29}}}
+    combined2 = min(family_size_factor(proven, "continuation"),
+                    family_explore_factor(proven, "continuation", explore_factor=0.4))
+    assert combined2 < 0.4  # the measured shortfall, not the explore floor, is what binds here
 
 
 def _ts_probe(sym, ts, side, base, fwd, family="continuation"):

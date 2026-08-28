@@ -34,6 +34,7 @@ from .analytics import (
 from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
+  allow_declared_setup,
   allow_fade_extreme,
   fade_setup_available,
   allow_reversal_long,
@@ -59,7 +60,7 @@ from .regime import (
   reward_risk_ratio,
   risk_capped_contracts,
 )
-from .edge import SETUP_FAMILIES, family_size_factor, family_stand_aside
+from .edge import SETUP_FAMILIES, family_explore_factor, family_size_factor, family_stand_aside
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
   logger,
@@ -3316,8 +3317,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           ):
             logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the daily gate — 15m RSI %.1f is at an extreme against the entry (family scoring decides its risk)",
                         side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
+          elif allow_declared_setup(setup_family=setup_family, cfg=cfg.regime):
+            logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the daily gate — declared playbook %r (explore-sized until it earns a verdict; family scoring decides its risk)",
+                        side_lower, spot_symbol, str(setup_family or "").strip().lower())
           else:
-            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), declare setup_family='fade_extreme' at a genuine RSI extreme, or switch symbol."}
+            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), declare setup_family='fade_extreme' at a genuine RSI extreme, declare a deliberate 'breakout'/'range_edge' playbook, or switch symbol."}
       intraday_bias_1h_fl = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes_fl = (
         (intraday_bias_1h_fl == "bearish" and side_lower == "buy") or
@@ -3338,9 +3342,15 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           # alignment here is what made the playbook unreachable.
           logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the 1h gate — 15m RSI %.1f at an extreme",
                       side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
+        elif allow_declared_setup(setup_family=setup_family, cfg=cfg.regime):
+          # A breakout/range_edge often has the 1h against it too (a range fade at the top, a breakout
+          # of a level the 1h hasn't caught up to). Admit the declared playbook; risk is governed
+          # downstream (explore-sizing, family scoring, stand-aside).
+          logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the 1h gate — declared playbook %r (explore-sized until scored)",
+                      side_lower, spot_symbol, str(setup_family or "").strip().lower())
         else:
           logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)
-          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. Wait for 1h alignment, or declare setup_family='fade_extreme' if this is a deliberate fade of an RSI extreme."}
+          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. Wait for 1h alignment, declare setup_family='fade_extreme' at a genuine RSI extreme, or declare a deliberate 'breakout'/'range_edge' playbook."}
       tf_conflict_fl = gate.get("timeframe_conflict", False)
       intraday_bias_15m_fl = gate.get("intraday_bias_15m", "neutral")
       if tf_conflict_fl and intraday_bias_15m_fl != "neutral":
@@ -3424,7 +3434,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # 2026-08-10 the continuation family was -0.29% net against a 0.166% hurdle, yet no matter how bad
     # the evidence got, the combined soft factor could not go below 0.50. The one signal grounded in
     # data was capped by a guard built for the ones that are not.
-    _family_scale_fl = family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other")
+    # A family still earning its verdict (< 20 probes) trades at explore-size, NOT full risk: probes
+    # record from the market price at call time, so the family's evidence accrues at the same rate no
+    # matter how little we stake — cheap to learn a newly-reachable playbook (breakout/range_edge) on a
+    # small account, then full measured sizing the instant it is scored. Combined with the measured
+    # factor by the WORSE of the two (never the product), the same rule the soft stack uses.
+    _family_scale_fl = min(
+      family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other"),
+      family_explore_factor(
+        _edge_state().get("signal_edge") or {}, _family_fl or "other",
+        explore_factor=cfg.edge.explore_unproven_family_factor,
+      ),
+    )
     # Combined with the soft stack by taking the WORSE of the two, never their product — the same rule
     # `combined_size_factor` already applies within the stack, and for the same reason. Multiplying
     # them re-created exactly the compounding that rule exists to prevent: measured live on 2026-08-11,

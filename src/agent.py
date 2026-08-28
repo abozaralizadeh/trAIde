@@ -30,6 +30,7 @@ from agents import (
   gen_trace_id,
   gen_span_id)
 from agents.items import HandoffOutputItem, ToolCallItem, ToolCallOutputItem
+from .llm_runtime import STATELESS_RUN_CONFIG
 from agents.tool import WebSearchTool, function_tool
 from agents.tracing.processors import BatchTraceProcessor, ConsoleSpanExporter
 from agents.tracing.setup import get_trace_provider
@@ -565,7 +566,8 @@ async def _run_agent_with_tracing(
     tr.start(mark_as_current=True)
     try:
       return await asyncio.wait_for(
-        Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns),
+        Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns,
+                   run_config=STATELESS_RUN_CONFIG),
         timeout=20 * 60,
       )
     finally:
@@ -1362,10 +1364,16 @@ def run_trading_agent(
     "(edgeReport.signalEdge.by_family) and risk flows toward whichever is actually paying its costs. "
     "Omitting it means the trade is scored under a guessed label, which corrupts the scoreboard that "
     "decides where your risk goes.\n"
-    "- It also UNLOCKS setups: a deliberate fade has the 1h against it by definition, so the alignment "
-    "gates block it unless you declare setup_family='fade_extreme' at a genuine 15m RSI extreme "
-    "(<=30 to buy, >=70 to sell). If you are reasoning about an oversold bounce or an overbought fade "
-    "and want to trade it, you MUST declare it — otherwise the gate rejects a setup you correctly spotted.\n\n"
+    "- It also UNLOCKS setups: a deliberate fade or counter-trend playbook has a higher timeframe against "
+    "it by definition, so the alignment gates block it UNLESS you declare the playbook. Declare "
+    "setup_family='fade_extreme' at a genuine 15m RSI extreme (<=30 to buy, >=70 to sell); declare "
+    "'breakout' for a deliberate break of a range/level, or 'range_edge' to buy support / sell resistance "
+    "inside a range — either one is admitted past the daily/1h gates on your call alone. This is NOT a "
+    "free pass to relabel a trend-continuation trade: the trade is scored under whatever family you "
+    "declare, so a mislabeled entry just poisons that family's scoreboard and gets it stood aside. A newly "
+    "declared playbook trades at reduced 'explore' size until it has ~20 scored signals, then sizes up to "
+    "full risk only if it is actually paying. If you correctly spot a breakout or range fade against the "
+    "higher-timeframe trend, you MUST declare it — otherwise the gate rejects a setup you correctly saw.\n\n"
 
     "**How to pick entry_price (REQUIRED for limit order tools):**\n"
     "Choose a level where MULTIPLE reference points converge (confluence of 2+ levels is far more reliable than any single one):\n"

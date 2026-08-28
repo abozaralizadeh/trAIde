@@ -162,3 +162,19 @@ def test_no_edge_family_stand_aside_is_on_by_default():
     """
     from src.config import load_config
     assert load_config().edge.stand_aside_no_edge_family is True
+
+
+def test_declared_setups_reach_the_book_by_default():
+    """breakout/range_edge must be admissible past the alignment gates out of the box.
+
+    The whole point of the change is that the model can express a non-continuation playbook; if the
+    loader shipped this off (or with an empty family list) the families would stay structurally
+    unreachable — the exact bug it fixes. Shipped loader values, not just the dataclass defaults.
+    """
+    from src.config import load_config
+    cfg = load_config()
+    assert cfg.regime.declared_setups_enabled is True
+    assert "breakout" in cfg.regime.declarable_setup_families
+    assert "range_edge" in cfg.regime.declarable_setup_families
+    # Unproven playbooks explore cheap rather than at full risk.
+    assert 0.0 < cfg.edge.explore_unproven_family_factor <= 1.0

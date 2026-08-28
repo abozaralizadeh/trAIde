@@ -11,6 +11,7 @@ from agents.tool import WebSearchTool, function_tool
 from openai import AsyncAzureOpenAI
 
 from .config import AppConfig
+from .llm_runtime import STATELESS_RUN_CONFIG
 from .conversation_memory import ConversationMemory
 from .kucoin import KucoinClient, KucoinFuturesClient
 from .memory import MemoryStore
@@ -450,7 +451,8 @@ def run_supervisor_agent(
     model=model,
   )
 
-  result = asyncio.run(Runner.run(supervisor_agent, message_text, max_turns=30))
+  result = asyncio.run(Runner.run(supervisor_agent, message_text, max_turns=30,
+                                  run_config=STATELESS_RUN_CONFIG))
   response = str(result.final_output)
 
   conv_memory.add_exchange(message_text, response)
