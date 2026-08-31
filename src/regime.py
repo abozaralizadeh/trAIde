@@ -420,6 +420,58 @@ def scale_target_to_widened_stop(side: str, entry, take_profit, widen_factor):
   return take_profit
 
 
+def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.0):
+  """Flag a FUNDING-CARRY opportunity: take the side that is PAID to hold.
+
+  Every other playbook here is a prediction — it needs the direction call to be right. Funding carry is
+  the one edge in perpetuals that is *mechanical*: the exchange transfers value between longs and shorts
+  every 8h regardless of which way price goes. Positive funding means longs pay shorts, so the SHORT
+  side is paid; negative funding means the LONG side is paid. It is also the best-documented crypto
+  edge in the literature — delta-neutral funding carry is reported at Sharpe ~2-6, against the ambiguous
+  "momentum, reversal, or both" picture for intraday technical signals, which is the regime this bot has
+  been fishing in while measuring no edge across 178 probes.
+
+  A directional (non-hedged) version is not the pure arbitrage: price risk remains. But it stacks two
+  independent effects that point the same way — you are paid to hold, AND an extreme funding rate marks
+  crowded positioning on the other side, which is the setup most prone to unwinding.
+
+  The threshold is derived, never hardcoded: it fires when one funding payment covers at least
+  ``1/payments_to_cover`` of the measured round-trip cost, i.e. the carry alone pays for the trade within
+  ``payments_to_cover`` settlements. That keeps it tied to the bot's own measured friction — as execution
+  costs fall the bar falls with them, with nothing to re-tune.
+
+  Returns ``None`` when funding is not extreme enough to matter, else the side that receives it.
+  """
+  try:
+    rate = float(funding_rate)
+    cost = float(cost_pct)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(rate) or not math.isfinite(cost) or cost <= 0:
+    return None
+  threshold = cost / max(1e-9, float(payments_to_cover))
+  if abs(rate) < threshold:
+    return None
+  side = "sell" if rate > 0 else "buy"
+  payer = "longs pay shorts" if rate > 0 else "shorts pay longs"
+  return {
+    "side": side,
+    "fundingRate": rate,
+    "thresholdRate": threshold,
+    "coversCostInPayments": round(cost / abs(rate), 2),
+    "reason": f"funding {rate * 100:+.4f}%/8h ({payer})",
+    "note": (
+      f"FUNDING CARRY AVAILABLE — funding is {rate * 100:+.4f}% per 8h, so {payer}: a {side.upper()} is "
+      f"PAID to hold, and the carry alone covers the round-trip cost in about "
+      f"{cost / abs(rate):.1f} funding payment(s). This is the one playbook that does not require the "
+      "direction call to be right — the transfer happens whichever way price moves — and an extreme rate "
+      "also marks crowded positioning on the opposite side. Declare setup_family='funding_carry' to take "
+      "it; hold across at least one 8h settlement or the carry never accrues. It is scored separately in "
+      "signalEdge.by_family like every other playbook."
+    ),
+  }
+
+
 def fade_setup_available(rsi, cfg: RegimeConfig):
   """Flag a live fade-extreme opportunity at analysis time, so the playbook is FINDABLE.
 

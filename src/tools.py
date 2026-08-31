@@ -35,6 +35,7 @@ from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
   allow_declared_setup,
+  funding_carry_setup,
   allow_fade_extreme,
   fade_setup_available,
   allow_reversal_long,
@@ -1988,6 +1989,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           current_funding_rate = fr.get("value")
           futures_data["fundingRate"] = current_funding_rate
           futures_data["predictedRate"] = fr.get("predictedValue")
+          # A live FUNDING-CARRY opportunity, when the rate is extreme enough to matter against the
+          # bot's own measured round-trip cost. Every other playbook needs the direction call to be
+          # right; this one is paid mechanically every 8h whichever way price moves, and is the
+          # best-documented edge in perpetuals. Threshold is derived from measured cost, not tuned.
+          _rt_cost = 2.0 * (
+            (_to_float(fees.get("futures_taker")) or 0.0006) + _slippage_rate()
+          )
+          futures_data["fundingSetup"] = funding_carry_setup(current_funding_rate, _rt_cost)
         except Exception:
           pass
         current_oi = None
@@ -3165,6 +3174,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
 
     ALWAYS pass `setup_family` — which PLAYBOOK this trade belongs to. One of:
+      "funding_carry" — taking the side that is PAID by the 8h funding transfer (analyze_market_context
+                        reports futures.fundingSetup when the rate is extreme enough to matter). This
+                        is the ONLY playbook that does not need the direction call to be right: the
+                        transfer happens whichever way price moves, and an extreme rate also marks
+                        crowded positioning on the other side. Hold across at least one settlement.
       "continuation"  — trading with an established trend (timeframes agree, you expect it to persist)
       "fade_extreme"  — fading a stretched move back toward value (oversold bounce, overbought fade)
       "breakout"      — entering on a break of a range/level, expecting expansion

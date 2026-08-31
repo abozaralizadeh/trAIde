@@ -8,6 +8,7 @@ from src.config import RegimeConfig
 from src.regime import (
     allow_declared_setup,
     allow_fade_extreme,
+    funding_carry_setup,
     fade_setup_available,
     is_hostile_regime,
     effective_min_confidence,
@@ -958,3 +959,48 @@ def test_combined_size_factor_already_uses_the_same_worst_signal_rule():
     """The family factor now follows the rule the soft stack has always used, rather than fighting it."""
     # Five independent 0.6 cautions must not compound to 0.08.
     assert combined_size_factor([0.6, 0.6, 0.6, 0.6, 0.6], floor=0.0) == pytest.approx(0.6)
+
+
+# ── Funding carry: the one edge that does not need the direction call to be right ──
+
+
+def test_funding_carry_picks_the_side_that_is_paid():
+    """Positive funding = longs pay shorts, so the SHORT is paid; negative funding reverses it.
+
+    Getting this backwards would systematically PAY the carry instead of receiving it — the exact
+    inverse of the intended edge — so the direction is asserted explicitly in both cases.
+    """
+    cost = 0.0014                       # ~0.14% round trip, the bot's measured figure
+    paid_short = funding_carry_setup(0.0010, cost)     # +0.10% per 8h
+    paid_long = funding_carry_setup(-0.0010, cost)
+    assert paid_short["side"] == "sell" and "longs pay shorts" in paid_short["reason"]
+    assert paid_long["side"] == "buy" and "shorts pay longs" in paid_long["reason"]
+
+
+def test_funding_carry_threshold_is_derived_from_measured_cost_not_hardcoded():
+    """It fires only when the carry actually pays for the trade within a couple of settlements."""
+    cost = 0.0014
+    assert funding_carry_setup(0.0002, cost) is None          # 0.02%/8h: carry never covers the trip
+    assert funding_carry_setup(0.0007, cost) is not None      # exactly cost/2 -> 2 payments cover it
+    # As measured costs fall, the bar falls with them — nothing to re-tune.
+    assert funding_carry_setup(0.0002, 0.0002) is not None
+
+
+def test_funding_carry_reports_how_many_settlements_cover_the_cost():
+    out = funding_carry_setup(0.0014, 0.0014)
+    assert out["coversCostInPayments"] == pytest.approx(1.0)
+    out2 = funding_carry_setup(0.0007, 0.0014)
+    assert out2["coversCostInPayments"] == pytest.approx(2.0)
+
+
+def test_funding_carry_tells_the_model_how_to_take_it():
+    out = funding_carry_setup(0.0020, 0.0014)
+    assert "setup_family='funding_carry'" in out["note"]
+    assert "8h settlement" in out["note"]
+
+
+def test_funding_carry_safe_on_missing_or_degenerate_input():
+    assert funding_carry_setup(None, 0.0014) is None
+    assert funding_carry_setup("x", 0.0014) is None
+    assert funding_carry_setup(0.002, 0) is None       # unknown cost -> no threshold to test against
+    assert funding_carry_setup(0.0, 0.0014) is None    # flat funding is not an opportunity

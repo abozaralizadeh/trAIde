@@ -340,7 +340,7 @@ class RegimeConfig:
   # explore-sizing while unproven, family sizing on measured shortfall, stand-aside once it settles to
   # no-edge. Widens what may be proposed, never what may be risked. See regime.allow_declared_setup.
   declared_setups_enabled: bool = True
-  declarable_setup_families: tuple = ("breakout", "range_edge")
+  declarable_setup_families: tuple = ("breakout", "range_edge", "funding_carry")
   # A blanket BTC/alt veto misses genuine relative-strength leaders.  Permit only an alt whose own
   # daily, 4h, 1h and 15m trends are all bullish at high confidence, then size it down.  This is a
   # signal-based exception, not a symbol allow-list, so it adapts as leadership rotates.
@@ -578,7 +578,7 @@ def load_config() -> AppConfig:
       fade_extreme_overbought_rsi=float(os.getenv("FADE_EXTREME_OVERBOUGHT_RSI", "70")),
       declared_setups_enabled=_as_bool(os.getenv("DECLARED_SETUPS_ENABLED"), True),
       declarable_setup_families=tuple(
-        s.strip().lower() for s in os.getenv("DECLARABLE_SETUP_FAMILIES", "breakout,range_edge").split(",") if s.strip()
+        s.strip().lower() for s in os.getenv("DECLARABLE_SETUP_FAMILIES", "breakout,range_edge,funding_carry").split(",") if s.strip()
       ),
       alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
       alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
