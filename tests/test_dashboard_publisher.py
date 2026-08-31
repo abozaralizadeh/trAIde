@@ -1,3 +1,4 @@
+import pytest
 from types import SimpleNamespace
 
 from src.dashboard_publisher import DashboardPublisher
@@ -292,3 +293,76 @@ class TestSetupFamilyOnPositions:
       signal_probes=lambda limit=200: [],
     )
     assert pub._family_index(broken) == {"byOid": {}, "bySymbolSide": {}}
+
+
+class TestEquityIndexSanity:
+  """The published index is a DAILY CHAIN over a durable, never-rewritten Azure series.
+
+  indexClose_today = prevDayClose * (1 + intradayReturn). That makes one bad point permanent: every
+  later day multiplies it forward. On 2026-08-31, after a two-week outage, the live dashboard showed
+  an indexed return of +72,546,760% — index 72,546,860 against a base of 100, a 725,468x blow-up.
+  """
+
+  @staticmethod
+  def _pub(prev_close):
+    pub = _publisher()
+    pub.cfg = SimpleNamespace(disclosure="normalized", index_base=100.0)
+
+    class _Table:
+      def query_entities(self, **kw):
+        return [{"RowKey": "00020695", "indexClose": prev_close}]
+
+    pub._table_client = _Table()
+    return pub
+
+  @staticmethod
+  def _mem():
+    return SimpleNamespace(latest_items=lambda *a, **k: {"items": []})
+
+  def test_chain_guard_reanchors_a_corrupt_previous_close(self):
+    # The exact value seen on the live dashboard.
+    assert self._pub(72546860.79)._prev_day_close(20696) == 100.0
+
+  def test_chain_guard_leaves_a_healthy_series_alone(self):
+    assert self._pub(118.4)._prev_day_close(20696) == 118.4
+    # boundaries of the sane band are still accepted
+    assert self._pub(0.1)._prev_day_close(20696) == 0.1
+    assert self._pub(100000.0)._prev_day_close(20696) == 100000.0
+
+  def test_step_guard_holds_the_index_flat_on_a_partial_balance_snapshot(self):
+    """A near-zero daily baseline (spot only, futures 504'd) fabricates a five-figure return."""
+    bad = {"total": {"baselineUsdt": 0.001, "currentUsdt": 67.44, "drawdownPct": 0.0}}
+    out = self._pub(118.4)._compute_today_equity(self._mem(), bad, 20696)
+    assert out["indexClose"] == pytest.approx(118.4)      # carried, not compounded
+
+  def test_step_guard_lets_a_real_day_through(self):
+    good = {"total": {"baselineUsdt": 67.27, "currentUsdt": 67.44, "drawdownPct": 0.0}}
+    out = self._pub(118.4)._compute_today_equity(self._mem(), good, 20696)
+    assert out["indexClose"] == pytest.approx(118.4 * (1 + (67.44 - 67.27) / 67.27))
+
+  def test_step_guard_still_allows_a_large_but_believable_move(self):
+    # -30% in a day is a catastrophe, not a data error — it must be published honestly.
+    rough = {"total": {"baselineUsdt": 100.0, "currentUsdt": 70.0, "drawdownPct": 30.0}}
+    out = self._pub(118.4)._compute_today_equity(self._mem(), rough, 20696)
+    assert out["indexClose"] == pytest.approx(118.4 * 0.7)
+
+
+  def test_corrupt_history_is_hidden_from_the_published_curve(self):
+    """Today's value healing is not enough — the durable table still holds the bad rows.
+
+    Azure history is never rewritten here, so without filtering the read the chart keeps rendering
+    the 725,468x spike even once the chain guard has re-anchored the present.
+    """
+    pub = self._pub(118.4)
+
+    class _Table:
+      def query_entities(self, **kw):
+        return [
+          {"RowKey": "00020690", "indexClose": 101.2, "drawdownPct": 0.1},
+          {"RowKey": "00020695", "indexClose": 72546860.79, "drawdownPct": 0.0},   # corrupt
+          {"RowKey": "00020696", "indexClose": 118.4, "drawdownPct": 0.2},
+        ]
+
+    pub._table_client = _Table()
+    days = [p["day"] for p in pub._read_equity_series()]
+    assert days == [20690, 20696], "the corrupt point must not reach the chart"

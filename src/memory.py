@@ -847,10 +847,28 @@ class MemoryStore:
       limits_all = data.get("limits") if isinstance(data.get("limits"), dict) else {}
       limits = limits_all.get(scope) or {}
       if limits.get("day") != day_key:
+        # Rolling into a new day anchors the baseline to whatever equity reading arrives first, and a
+        # PARTIAL snapshot (spot only, futures API timed out — this account's log is full of KuCoin
+        # 504s) would anchor the day to near-zero. Every later reading then reports a five-figure
+        # "return", which the dashboard compounds into its durable index and can never undo: the live
+        # series reached 725,468x its base exactly this way. A real overnight move cannot be a
+        # tenfold change in either direction, so treat one as a bad read and keep the prior baseline.
+        prev_baseline = float(limits.get("baselineUsdt") or 0.0)
+        opening = float(current_usdt or 0.0)
+        implausible = (
+          prev_baseline > 0 and opening > 0
+          and (opening < prev_baseline / 10.0 or opening > prev_baseline * 10.0)
+        )
+        if implausible:
+          logger.warning(
+            "DAILY BASELINE: opening equity %.4g is >10x away from yesterday's %.4g — treating as a "
+            "partial/failed balance snapshot and keeping the previous baseline for day %s.",
+            opening, prev_baseline, day_key,
+          )
         limits = {
           "day": day_key,
-          "baselineUsdt": float(current_usdt or 0.0),
-          "currentUsdt": float(current_usdt or 0.0),
+          "baselineUsdt": prev_baseline if implausible else opening,
+          "currentUsdt": opening,
           "drawdownPct": 0.0,
           "updated": now,
         }
@@ -1622,22 +1640,35 @@ class MemoryStore:
           for later in triggered
         ):
           continue
-      # Defence in depth against commentary rows that copy a closed trade's pnl (the `close_reviewed`
-      # family, 2026-08-08). `_is_realized_close` now filters those by name, but this class of bug has
-      # recurred twice under different names, so also drop any row that carries NO execution evidence
-      # and merely repeats the exact pnl of a real close on the same symbol nearby — in either time
-      # direction, since a review is written *after* the close it comments on.
-      if not _has_execution_evidence(row):
+      # Defence in depth for every NON-triggered row that carries no execution evidence. This bug class
+      # has now bitten three times under three different action names — "hold-close-only",
+      # `close_reviewed` (2026-08-08) and `close_short` (2026-08-30) — because the rule above keys on
+      # the name `futures_*`. Keying on the SHAPE instead (no closeType/exitPrice/realizedR, shadowing
+      # a triggered close on the same symbol nearby) catches the next name too, in either time
+      # direction, since the duplicate may be written before or after the authoritative report.
+      if "triggered" not in action and not _has_execution_evidence(row):
         ts = int(row.get("ts") or 0)
         pnl = _num(row.get("pnl"))
-        if pnl is not None and any(
-          real.get("symbol") == row.get("symbol")
-          and _has_execution_evidence(real)
-          and abs(int(real.get("ts") or 0) - ts) <= window_sec
-          and _num(real.get("pnl")) is not None
-          and abs(_num(real.get("pnl")) - pnl) < 1e-9
-          for real in rows
-        ):
+
+        def _shadows(real: Dict[str, Any]) -> bool:
+          """True when `real` is the exchange's authoritative report of the same close as `row`."""
+          if real.get("symbol") != row.get("symbol") or not _has_execution_evidence(real):
+            return False
+          if abs(int(real.get("ts") or 0) - ts) > window_sec:
+            return False
+          rp = _num(real.get("pnl"))
+          if rp is None or pnl is None:
+            return False
+          if abs(rp - pnl) < 1e-9:
+            return True                      # a verbatim copy (the `close_reviewed` family)
+          # ...or the bot's own pre-close ESTIMATE, which differs slightly from the exchange's final
+          # figure. Matching only on an exact value missed exactly that case: DASH-USDT on 2026-08-30
+          # logged `close_short` at -0.0465 and KuCoin reported -0.0412 twenty-five seconds later, and
+          # both were booked. Same symbol, same direction of PnL, same minute, within half of each
+          # other is one close reported twice, not two trades.
+          return rp != 0 and (rp > 0) == (pnl > 0) and abs(rp - pnl) / abs(rp) < 0.5
+
+        if pnl is not None and any(_shadows(real) for real in rows):
           continue
       kept.append(row)
     return MemoryStore._dedupe_realized(kept, window_sec=window_sec)

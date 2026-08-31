@@ -851,3 +851,47 @@ def test_probe_recording_ignores_unusable_calls(tmp_path):
     store.record_signal_probe("X-USDT", "buy", 0)           # no price
     store.record_signal_probe("X-USDT", "buy", "abc")       # unparseable
     assert store.signal_probes(limit=50) == []
+
+
+def test_local_close_estimate_is_superseded_by_the_exchange_report(tmp_path):
+    """Third occurrence of this bug class, third action name.
+
+    The bot logs its own close estimate immediately, then KuCoin reports the authoritative figure
+    seconds later with a slightly DIFFERENT pnl. On 2026-08-30 DASH-USDT logged `close_short` at
+    -0.0465 and `futures_buy_triggered` at -0.0412 twenty-five seconds later, and both were booked.
+    The earlier guards missed it: the first keys on the action name `futures_*`, and the exact-pnl
+    fallback requires identical values, which an estimate never is.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("DASH-USDT", "close_short", 0.0, "closed at market", pnl=-0.0465)
+    store.log_decision("DASH-USDT", "futures_buy_triggered", 0.0, "TP/SL triggered", pnl=-0.0412,
+                       close_type="CLOSE_SHORT", exit_price=42.99)
+
+    closes = store.realized_closes(limit=50)
+    assert len(closes) == 1
+    assert closes[0]["action"] == "futures_buy_triggered"
+    assert closes[0]["pnl"] == pytest.approx(-0.0412)   # the exchange's figure wins
+
+
+def test_estimate_suppression_needs_the_same_direction_and_magnitude(tmp_path):
+    """It must not swallow a genuinely different trade that merely happens to be nearby."""
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    # opposite sign -> a different trade, keep both
+    store.log_decision("DASH-USDT", "close_short", 0.0, "est", pnl=+0.20)
+    store.log_decision("DASH-USDT", "futures_buy_triggered", 0.0, "trig", pnl=-0.04,
+                       close_type="CLOSE_SHORT", exit_price=42.99)
+    assert len(store.realized_closes(limit=50)) == 2
+
+    other = MemoryStore(str(tmp_path / "memory2.json"))
+    # same sign but an order of magnitude apart -> not the same close
+    other.log_decision("SUI-USDT", "close_long", 0.0, "est", pnl=-1.50)
+    other.log_decision("SUI-USDT", "futures_sell_triggered", 0.0, "trig", pnl=-0.04,
+                       close_type="CLOSE_LONG", exit_price=1.23)
+    assert len(other.realized_closes(limit=50)) == 2
+
+
+def test_a_triggered_close_is_never_treated_as_someone_elses_estimate(tmp_path):
+    """Old rows predate closeType/realizedR, so they look 'evidence-free' — they must still count."""
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("XRP-USDT", "futures_buy_triggered", 0.0, "old-style row", pnl=+0.0757)
+    assert len(store.realized_closes(limit=50)) == 1

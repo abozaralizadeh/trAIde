@@ -40,6 +40,23 @@ _TRIGGER_FRESHNESS_SEC = 12 * 3600
 # after a couple of trades (decisions themselves are retained ~90d, so this is the real limiter).
 _CLOSED_DETAIL_LIMIT = 12
 
+# ── Equity-index sanity bounds ────────────────────────────────────────────────────
+# The published index is a DAILY CHAIN: indexClose_today = prevDayClose * (1 + intradayReturn), and
+# the Azure series is durable and never rewritten. That makes a single bad point permanent — every
+# later day multiplies it forward. On 2026-08-31, after a two-week outage, the dashboard was showing
+# an indexed return of +72,546,760% (index 72,546,860 against a base of 100 — a 725,468x blow-up).
+#
+# The way a bad point gets in: `update_limits` anchors each new day's baseline to whatever equity
+# reading arrives first, and this account's log is full of KuCoin 504s / "futures event history is
+# incomplete". A partial snapshot (spot only, futures timed out) sets a near-zero baseline, and the
+# next honest reading then computes an intraday return of tens of thousands of percent.
+#
+# So: bound the daily STEP (no real trading day moves an account >50%), and bound the CHAIN (an index
+# a thousandfold away from its base is corruption, not performance). The step guard stops new
+# corruption entering; the chain guard heals a series that is already poisoned.
+_MAX_DAILY_INDEX_STEP = 0.5      # |intraday return| beyond this is a data artifact, not a return
+_INDEX_SANITY_FACTOR = 1000.0    # prevClose outside base/1000 .. base*1000 is unusable
+
 try:
   from azure.data.tables import TableServiceClient, UpdateMode
   from azure.storage.blob import BlobServiceClient, ContentSettings
@@ -749,7 +766,22 @@ class DashboardPublisher:
           continue
         if best_day is None or d > best_day:
           best_day, best_close = d, c
-      return best_close if best_close is not None else float(self.cfg.index_base)
+      base = float(self.cfg.index_base)
+      if best_close is None:
+        return base
+      # Chain guard: heal a series that is already poisoned. Because each day multiplies the previous
+      # close, one bad point is permanent — the live series reached 725,468x its base this way. An
+      # index a thousandfold from base is corruption, not performance, so re-anchor rather than keep
+      # compounding it forever.
+      lo, hi = base / _INDEX_SANITY_FACTOR, base * _INDEX_SANITY_FACTOR
+      if not (lo <= best_close <= hi):
+        logger.warning(
+          "EQUITY INDEX: previous close %.4g (day %s) is outside the sane band %.4g..%.4g — "
+          "re-anchoring to the index base %.4g. The durable series is corrupt from that day onward.",
+          best_close, best_day, lo, hi, base,
+        )
+        return base
+      return best_close
     except Exception:
       return float(self.cfg.index_base)
 
@@ -769,6 +801,18 @@ class DashboardPublisher:
     intraday_return = 0.0
     if baseline and baseline > 0 and current and current > 0:
       intraday_return = (current - baseline) / baseline
+
+    # Step guard: stop new corruption entering the durable chain. No real trading day moves an account
+    # by more than tens of percent; a five-figure "return" means the day's baseline was anchored to a
+    # partial balance snapshot (this account's log is full of KuCoin 504s and incomplete futures
+    # history). Carry the previous close rather than writing a point that can never be undone.
+    if abs(intraday_return) > _MAX_DAILY_INDEX_STEP:
+      logger.warning(
+        "EQUITY INDEX: implausible intraday return %.2f%% (baseline %.4g -> current %.4g) — treating "
+        "as a bad equity snapshot and holding the index flat for day %s.",
+        intraday_return * 100, baseline, current, today,
+      )
+      intraday_return = 0.0
 
     index_close = prev_close * (1.0 + intraday_return)
     out: Dict[str, Any] = {"day": today, "indexClose": round(index_close, 6), "drawdownPct": round(dd, 3)}
@@ -793,16 +837,31 @@ class DashboardPublisher:
         results_per_page=1000,
       )
       series: List[Dict[str, Any]] = []
+      base = float(self.cfg.index_base)
+      _lo, _hi = base / _INDEX_SANITY_FACTOR, base * _INDEX_SANITY_FACTOR
+      dropped = 0
       for r in rows:
         try:
           day = int(r["RowKey"])
         except Exception:
           continue
-        point = {"day": day, "indexClose": _f(r.get("indexClose")), "drawdownPct": _f(r.get("drawdownPct"))}
+        close = _f(r.get("indexClose"))
+        # Drop points the chain guard would reject. The corrupt rows written before that guard existed
+        # are still in the durable table (Azure history is never rewritten here), so without this the
+        # curve keeps rendering the 725,468x spike even though today's value is healthy again.
+        if close is not None and not (_lo <= close <= _hi):
+          dropped += 1
+          continue
+        point = {"day": day, "indexClose": close, "drawdownPct": _f(r.get("drawdownPct"))}
         if "dayRealizedPnl" in r:
           point["dayRealizedPnl"] = _f(r.get("dayRealizedPnl"))
         series.append(point)
       series.sort(key=lambda p: p["day"])
+      if dropped:
+        logger.warning(
+          "EQUITY INDEX: hid %d corrupt point(s) outside %.4g..%.4g from the published curve — "
+          "the underlying rows remain in the durable table.", dropped, _lo, _hi,
+        )
       return series
     except Exception:
       return []
