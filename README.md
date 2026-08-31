@@ -6,7 +6,7 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 
 ## Contents
 
-- [Architecture](#architecture) — five views: components, runtime loop, risk gates, position lifecycle, data flow
+- [Architecture](#architecture) — six views: components, runtime loop, risk gates, position lifecycle, playbooks & measurement, data flow
 - [Features](#features) — technical analysis, risk management, execution, memory, coin universe
 - [Setup](#setup)
 - [Configuration](#configuration) — all environment variables
@@ -20,7 +20,7 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 
 ## Architecture
 
-trAIde runs as a single Python process: a continuous **poll loop** drives a **Trading Agent** and a **Research Agent** (both backed by Azure OpenAI), a code-driven **ProtectionManager**, and a sanitized public **dashboard** — while an interactive **Supervisor Agent** lets you steer the system from Telegram. The diagrams below show the same system from five angles.
+trAIde runs as a single Python process: a continuous **poll loop** drives a **Trading Agent** and a **Research Agent** (both backed by Azure OpenAI), a code-driven **ProtectionManager**, and a sanitized public **dashboard** — while an interactive **Supervisor Agent** lets you steer the system from Telegram. The diagrams below show the same system from six angles.
 
 ### System components
 
@@ -150,6 +150,110 @@ stateDiagram-v2
     Cooldown --> Flat: cooldown expires
     Closed --> [*]
 ```
+
+### Playbooks, measurement & risk allocation
+
+The bot does not run one strategy. Every entry declares which **playbook** (`setup_family`) it belongs to, and each playbook keeps its own scoreboard. Nothing in the code decides that trend-following or fading is correct — that is the market's call and it changes. The code measures, and capital follows whatever currently pays.
+
+| Playbook | Thesis | Needs the direction call to be right? |
+|---|---|---|
+| `continuation` | Trade with an established trend; timeframes agree and you expect persistence | Yes |
+| `fade_extreme` | Fade a stretched move back toward value (RSI at a 30/70 extreme) | Yes |
+| `breakout` | Enter on a break of a range or level, expecting expansion | Yes |
+| `range_edge` | Buy support / sell resistance inside a defined range | Yes |
+| `funding_carry` | Take the side the 8h funding transfer **pays** | **No** — the transfer happens whichever way price moves |
+
+`funding_carry` is the odd one out on purpose. Every other playbook is a *prediction*; funding is a *mechanical* transfer, and it is the best-documented edge in the perpetuals literature.
+
+#### How a playbook earns (or loses) its capital
+
+A family is never vetoed for being unfashionable — it is sized by its own measured forward return against the round-trip cost it has to clear.
+
+```mermaid
+flowchart TD
+    declare(["Model declares setup_family"]) --> probe["Probe recorded AT THE CALL<br/>(market price at signal time)"]
+    probe --> gate{"Scored yet?<br/>(&ge; 20 non-overlapping probes)"}
+    gate -->|"no — unproven"| explore["Explore size &times;0.4<br/>trade small, gather evidence"]
+    gate -->|yes| verdict{"Mean forward return<br/>vs round-trip cost"}
+    verdict -->|"clears cost"| full["Full measured size<br/>(never sized UP beyond budget)"]
+    verdict -->|"short of cost"| shrink["Shrink in PROPORTION<br/>to the shortfall (floor &times;0.25)"]
+    verdict -->|"settled: no edge"| aside["STAND ASIDE<br/>skip the entry entirely"]
+    explore --> probe
+    shrink --> probe
+    aside -.->|"probe still recorded,<br/>so it can recover"| probe
+    full --> probe
+```
+
+The dotted line is the important one. A skipped trade **still records its probe**, because the probe is written when the call is made rather than when an order is placed. Without that, a stood-aside family would starve of the very evidence that could reinstate it — a deadlock this bot hit twice for real.
+
+#### The measurement loop
+
+Win rate and PnL conflate three different things: whether the direction was right, whether the fill was any good, and whether the exit was managed well. `signalEdge` isolates the first.
+
+```mermaid
+flowchart LR
+    dcall(["Direction call"]) --> stamp["Stamp market price<br/>at signal time"]
+    stamp --> wait["Poll loop settles<br/>forward price at 60m / 240m"]
+    wait --> dedupe["Collapse OVERLAPPING probes<br/>(one per symbol per window)"]
+    dedupe --> score["Mean forward return<br/>signed by traded direction"]
+    score --> hurdle{"&gt; measured round-trip cost?"}
+    hurdle -->|yes| edge["verdict: edge"]
+    hurdle -->|no| noedge["verdict: no edge"]
+    hurdle -->|"n too small"| insuf["verdict: insufficient data"]
+    edge --> alloc["Risk allocation<br/>per family"]
+    noedge --> alloc
+    insuf --> alloc
+    alloc --> dcall
+```
+
+Two details that are easy to get wrong and were both live bugs:
+
+- **Measure from the market price at signal time, not the limit price.** Measuring from the resting limit scores the discount as if it were prediction — on real data that showed a spurious *+1.24% at a 92% hit rate* where the honest figure was *−0.007%*.
+- **Collapse overlapping probes.** Thirty probes on one symbol inside four hours are ~one observation. Counting them independently once flipped the live verdict to `edge` at t=+3.66 when the decimated truth was t=+0.51 — below cost, i.e. nothing.
+
+#### From risk budget to contracts
+
+Size is *derived* from risk, never guessed and then capped. Because size is stop-defined, a wider stop buys proportionally fewer contracts at the **same dollar risk**.
+
+```mermaid
+flowchart TD
+    eq["Account equity"] --> frac["Coherent risk fraction<br/>min(RISK_PER_TRADE_PCT,<br/>daily drawdown &divide; tolerated losses)"]
+    frac --> soft["&times; WORST of:<br/>soft quality stack<br/>vs measured family factor"]
+    soft --> vol["&times; volatility scale"]
+    vol --> budget["Dollar risk for this trade"]
+    stop["Stop distance<br/>(floored at 2.5&times; ATR15m)"] --> notional
+    budget --> notional["Notional = risk &divide; stop fraction"]
+    notional --> lots["Round DOWN to contract lots"]
+    lots --> caps{"Hard caps:<br/>risk budget / portfolio heat /<br/>concentration / max notional"}
+    caps -->|"any binds"| shrunk["Shrink to the binding cap"]
+    caps -->|clear| place["Place bracketed order"]
+    shrunk --> place
+```
+
+The soft stack and the family factor combine by taking the **worse** of the two, never their product. Multiplying them once collapsed a $66 account to an $8.37 notional against a $10.24 contract minimum — 79 agent runs, zero orders placed.
+
+#### Regimes: why the label is not the decider
+
+The regime classifier is *information*, not a gate. It has to be, because it is unreliable: on live data `market_regime` read `trending` on **68 of 69** entries, including through a two-week range. Keying playbooks off that label made three of the five families structurally unreachable — a counter-trend breakout was rejected before it could log a single probe.
+
+```mermaid
+flowchart LR
+    subgraph label["Regime label (informational)"]
+        trend["trending"]
+        range["ranging"]
+        squeeze["squeeze"]
+    end
+    subgraph reality["What actually decides"]
+        decl["Model DECLARES a playbook"]
+        score["Scoreboard sizes it"]
+    end
+    label -.->|"informs, never vetoes"| decl
+    decl --> score
+    score -->|"pays"| more["More capital"]
+    score -->|"does not pay"| less["Less, then none"]
+```
+
+The declaration is the trigger; the scoreboard is the judge. This is the codebase's core rule in one line: **code enforces survival, the model owns opportunity** — so widening what may be *proposed* is safe, because what may be *risked* stays fully code-governed downstream.
 
 ### Memory & dashboard data flow
 
