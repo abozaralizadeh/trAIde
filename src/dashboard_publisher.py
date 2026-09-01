@@ -128,6 +128,7 @@ class DashboardPublisher:
     self.cfg = cfg.dashboard
     self._last_publish_ts: float = 0.0
     self._table_client = None
+    self._last_hidden_points = -1
     self._container_client = None
     self._init_failed = False
 
@@ -701,6 +702,7 @@ class DashboardPublisher:
     # within hours and the "recently closed" panel went empty. This keeps real history around.
     items = memory.realized_closes(limit=max(limit * 4, 60))
     rows: List[Dict[str, Any]] = []
+    unrenderable = 0
     for d in items:
       if d.get("pnl") is None:
         continue
@@ -724,6 +726,16 @@ class DashboardPublisher:
       mfe_r = round(max(0.0, peak) / planned_risk, 2) if (planned_risk and planned_risk > 0 and peak is not None) else None
       realized_r = _f(d.get("realizedR"))
       entry_ext = _f(ctx.get("entryExtensionAtr"))
+      # A closed position needs a SIDE and at least one price to draw as a trade. Rows carrying only a
+      # pnl are fragments — a pre-close estimate, a review note, or a partial record — and publishing
+      # them renders an empty duplicate card next to the real trade (seen live on 2026-09-01: NEAR
+      # appeared twice, once complete and once with no side, no prices and no family). The MemoryStore
+      # dedup catches the upstream variants it knows by shape, but this bug class has now appeared under
+      # four different action names, so the presentation layer refuses un-renderable rows outright
+      # rather than waiting to learn the fifth.
+      if not side or (_round(d.get("entryPrice")) is None and _round(d.get("exitPrice")) is None):
+        unrenderable += 1
+        continue
       rows.append({
         "symbol": d.get("symbol"),
         "side": side,
@@ -744,6 +756,11 @@ class DashboardPublisher:
         "setupFamily": ctx.get("setupFamily") or (infer_setup_family(ctx) if ctx else None),
       })
     rows.sort(key=lambda r: r["closeTs"], reverse=True)
+    if unrenderable:
+      logger.warning(
+        "CLOSED POSITIONS: dropped %d row(s) with no side or price — these render as empty duplicate "
+        "cards beside the real trade. Check MemoryStore for a close recorded twice.", unrenderable,
+      )
     return rows[:limit]
 
   def _prev_day_close(self, today: int) -> float:
@@ -857,7 +874,10 @@ class DashboardPublisher:
           point["dayRealizedPnl"] = _f(r.get("dayRealizedPnl"))
         series.append(point)
       series.sort(key=lambda p: p["day"])
-      if dropped:
+      if dropped and dropped != self._last_hidden_points:
+        # Once per change, not once per publish: these rows are permanent (Azure history is never
+        # rewritten here), so an unchanged count is steady state, not news.
+        self._last_hidden_points = dropped
         logger.warning(
           "EQUITY INDEX: hid %d corrupt point(s) outside %.4g..%.4g from the published curve — "
           "the underlying rows remain in the durable table.", dropped, _lo, _hi,

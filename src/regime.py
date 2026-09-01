@@ -472,6 +472,64 @@ def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.
   }
 
 
+def next_funding_settlement(now_ts, *, interval_hours: float = 8.0) -> float | None:
+  """Epoch seconds of the next funding settlement strictly after ``now_ts``.
+
+  Perpetual funding settles on a fixed UTC grid (KuCoin: every 8h at 00:00/08:00/16:00), so the
+  deadline is *derived from the clock*, not tuned. ``interval_hours`` stays a parameter only because
+  a contract may quote a different cadence; nothing here needs hand-maintenance.
+  """
+  try:
+    now = float(now_ts)
+    step = float(interval_hours) * 3600.0
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(now) or not math.isfinite(step) or step <= 0:
+    return None
+  return (math.floor(now / step) + 1.0) * step
+
+
+def carry_hold_deadline(entry_context, now_ts, *, interval_hours: float = 8.0) -> float | None:
+  """When a funding-carry position may start being managed for profit, or None if it is not one.
+
+  A carry trade earns from the 8h transfer, so it only pays if it is still open when the transfer
+  happens. Every other exit mechanic here is tuned for trades that live minutes — the measured median
+  hold is 13 minutes against a 480-minute settlement cycle — so without this the carry playbook can
+  never actually collect, and degrades into a directional punt whose edge we have measured at zero.
+
+  This is deliberately NOT an opportunity decision: the model still chooses whether to take the trade
+  and where the bracket goes. It only says that *the code's own* early profit-taking must not fire
+  before the trade's thesis has had its one scheduled chance to pay. The exchange-side stop is
+  untouched throughout, so the loss cap is exactly the one the model set.
+
+  Returns the settlement epoch, clamped to the entry's own cycle so a position cannot be held open
+  indefinitely by re-deriving a fresh deadline every poll.
+  """
+  if not isinstance(entry_context, dict):
+    return None
+  family = str(entry_context.get("setupFamily") or "").strip().lower()
+  if family != "funding_carry":
+    return None
+  opened = entry_context.get("fillTs") or entry_context.get("ts")
+  try:
+    opened_f = float(opened)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(opened_f) or opened_f <= 0:
+    return None
+  # Anchor on the ENTRY, not on "now": the deadline is the first settlement after the fill, so a
+  # position that has already carried through it becomes normally managed instead of rolling forward.
+  deadline = next_funding_settlement(opened_f, interval_hours=interval_hours)
+  if deadline is None:
+    return None
+  try:
+    if float(now_ts) >= deadline:
+      return None
+  except (TypeError, ValueError):
+    return None
+  return deadline
+
+
 def fade_setup_available(rsi, cfg: RegimeConfig):
   """Flag a live fade-extreme opportunity at analysis time, so the playbook is FINDABLE.
 

@@ -82,6 +82,9 @@ def decide_protection(
   cfg: ProfitProtectionConfig,
   opened_min_ago: Optional[float] = None,
   risk_override: Optional[float] = None,
+  hold_until_ts: Optional[float] = None,
+  now_ts: Optional[float] = None,
+  noise_band_r: Optional[float] = None,
 ) -> Dict[str, Any]:
   """Decide what protective action (if any) a position needs. Pure function.
 
@@ -93,6 +96,15 @@ def decide_protection(
     peak_fe: peak favourable excursion in price terms (>=0 once the trade has been green).
     cfg: thresholds.
     opened_min_ago: minutes since the position opened, for the early-invalidation cut (None skips it).
+    hold_until_ts: epoch seconds before which this trade's thesis has not yet had its scheduled
+      chance to pay (funding carry: the next 8h settlement). While it is in the future, the code's own
+      *early profit-taking* is suppressed — the position simply keeps the bracket the model gave it.
+      The exchange-side stop is never touched by this, so the loss cap is unchanged.
+    now_ts: current epoch seconds, for ``hold_until_ts`` (defaults to wall clock).
+    noise_band_r: this instrument's noise band expressed in R — i.e. ``1 / stopAtrMult``, the ATR
+      distance the entry's own stop was floored to. When given, the trail rides this far behind the
+      peak instead of the configured ``trail_distance_r``, so the give-back is set by the symbol's
+      actual volatility rather than a fixed fraction. None keeps the configured behaviour.
     risk_override: the ORIGINAL risk distance (entry − initial stop, in price). Once the stop ratchets
       to breakeven the live ``sl_price`` no longer yields a positive risk, which would silently disable
       every R-based rule (trail/give-back/breakeven) exactly when the trade is winning; the caller
@@ -102,6 +114,29 @@ def decide_protection(
   """
   if avg_entry <= 0 or mark <= 0:
     return {"action": "none", "reason": "missing price data"}
+
+  # Thesis-horizon hold. Every rule below is tuned for trades that resolve in minutes, which is right
+  # for the technical playbooks but silently guts any trade whose edge accrues on a schedule: a funding
+  # carry that is breakeven-ratcheted and shaken out 20 minutes in has paid the round-trip cost and
+  # collected exactly none of the transfer it was opened for. Holding here costs nothing extra — the
+  # stop the model set is still live on the exchange — so the downside stays capped at the planned 1R
+  # while the trade keeps the one thing it needs, which is time.
+  if hold_until_ts is not None:
+    _now = time.time() if now_ts is None else now_ts
+    try:
+      _remaining = float(hold_until_ts) - float(_now)
+    except (TypeError, ValueError):
+      _remaining = 0.0
+    if _remaining > 0:
+      return {
+        "action": "none",
+        "reason": (
+          f"carry hold — {_remaining / 60.0:.0f}min to the funding settlement this trade was opened "
+          "for; keeping the model's original bracket (stop unchanged) instead of taking profit early"
+        ),
+        "holdUntilTs": float(hold_until_ts),
+        "holdRemainingMin": round(_remaining / 60.0, 1),
+      }
 
   fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)
   risk_dist = None
@@ -163,14 +198,40 @@ def decide_protection(
   # "every winner capped at ~1.1R gross → ~0.4R net after fees" problem. The give-back close below is
   # kept only for when trailing is disabled (backward-compatible).
   trail_arm_r = float(getattr(cfg, "trail_arm_r", cfg.breakeven_trigger_r))
-  if getattr(cfg, "trail_enabled", False) and risk_dist is not None and peak_fe >= trail_arm_r * risk_dist:
+  _band_r = None
+  if noise_band_r is not None:
+    try:
+      _b = float(noise_band_r)
+      if math.isfinite(_b) and _b > 0:
+        _band_r = _b
+    except (TypeError, ValueError):
+      _band_r = None
+  # A run shorter than one noise band cannot be locked at all: any stop placed inside it is just
+  # handing the symbol's own chop a free exit. So the band raises the arm threshold as well as
+  # setting the trail distance — below it, the trade keeps its original stop and is left to develop.
+  _arm_r = trail_arm_r if _band_r is None else max(trail_arm_r, _band_r)
+  if getattr(cfg, "trail_enabled", False) and risk_dist is not None and peak_fe >= _arm_r * risk_dist:
     trail_r = max(0.0, float(getattr(cfg, "trail_distance_r", 0.75)))
+    # Ride one NOISE BAND behind the peak, not a fixed slice of risk. A 1.0R trail is wider than the
+    # whole move most of these trades ever make, so the lock_frac branch always won and the trade
+    # banked a flat 33% of its peak: across 81 closes the book reached +31R of favourable excursion
+    # and realised -4.5R, a 35R give-back that dwarfs the entire net loss. One noise band is the same
+    # standard the ENTRY stop is floored to, so this tightens the trail without putting it anywhere
+    # the symbol's own chop can reach. Only ever narrows the configured distance, never widens it.
+    if _band_r is not None:
+      trail_r = _band_r
     lock_frac = max(0.0, min(1.0, float(getattr(cfg, "trail_lock_frac", 0.5))))
     be = avg_entry * (1.0 + cfg.breakeven_fee_pct) if side_long else avg_entry * (1.0 - cfg.breakeven_fee_pct)
     # Lock the GREATER of (a) a fraction of the peak run and (b) a fixed R-trail below the peak. (a)
     # captures the mid-size runs (peak 0.6–1.5R) that used to give everything back before reaching the
     # old 1R arm; (b) captures genuine big runners tightly. Floored at fee-breakeven.
-    lock_fe = max(lock_frac * peak_fe, peak_fe - trail_r * risk_dist)
+    if _band_r is not None:
+      # With a measured band the give-back is fully determined: ride exactly one band behind the peak.
+      # The lock_frac branch is a heuristic for when we cannot measure the symbol's noise, and here we
+      # can — using it would only ever place the stop somewhere the chop can reach.
+      lock_fe = peak_fe - trail_r * risk_dist
+    else:
+      lock_fe = max(lock_frac * peak_fe, peak_fe - trail_r * risk_dist)
     # Only re-place the stop on a meaningful advance (>= 0.25R), so a slowly-creeping peak doesn't
     # cancel+replace the stop every poll — an internal churn guard, not a strategy parameter.
     min_step = 0.25 * risk_dist
@@ -290,6 +351,7 @@ class ProtectionManager:
     min_rr: float = 1.5,
     max_loss_equity_fraction: float = 0.0,
     breakeven_cost_pct: float = 0.0,
+    trade_context_lookup: Optional[Any] = None,
   ) -> None:
     self.cfg = replace(
       cfg,
@@ -318,6 +380,11 @@ class ProtectionManager:
     self._emergency_placed_legs: Dict[str, set[str]] = {}
     self._emergency_grace_sec: float = 90.0   # let an atomic/attached bracket appear before we add one
     self._open_since: Dict[str, float] = {}   # futures symbol -> ts first seen open (for early-cut age)
+    # Optional callable(futures_symbol, position) -> {"holdUntilTs": float|None, "noiseBandR": float|None}
+    # describing the trade behind an open position: when its edge is scheduled to accrue (funding
+    # settlement) and how wide its own noise band is. Injected rather than read here so this module
+    # keeps no memory/exchange dependency and stays unit-testable.
+    self._trade_context_lookup = trade_context_lookup
 
   # -- public -------------------------------------------------------------------
 
@@ -442,6 +509,16 @@ class ProtectionManager:
           self._naked_since.pop(fsym, None)
           self._emergency_placed_legs.pop(fsym, None)
 
+        hold_until = noise_band = None
+        if self._trade_context_lookup is not None:
+          try:
+            _tc = self._trade_context_lookup(fsym, pos) or {}
+            hold_until = _tc.get("holdUntilTs")
+            noise_band = _tc.get("noiseBandR")
+          except Exception:  # a lookup failure must never disable the guards
+            logger.debug("trade-context lookup failed for %s", fsym, exc_info=True)
+            hold_until = noise_band = None
+
         decision = decide_protection(
           side_long=side_long,
           avg_entry=avg_entry,
@@ -451,6 +528,8 @@ class ProtectionManager:
           cfg=self.cfg,
           opened_min_ago=opened_min_ago,
           risk_override=self._init_risk.get(fsym),
+          hold_until_ts=hold_until,
+          noise_band_r=noise_band,
         )
         action = decision.get("action")
         if action == "none":

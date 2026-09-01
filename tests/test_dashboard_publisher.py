@@ -366,3 +366,51 @@ class TestEquityIndexSanity:
     pub._table_client = _Table()
     days = [p["day"] for p in pub._read_equity_series()]
     assert days == [20690, 20696], "the corrupt point must not reach the chart"
+
+
+class TestClosedPositionsRenderability:
+  """A closed position needs a side and a price to draw as a trade.
+
+  Seen live on 2026-09-01: NEAR appeared TWICE in "Recently closed" — once complete
+  (RANGE EDGE / SHORT / entry 1.99400 -> exit 1.99100 / +0.02R) and once as an empty card with no
+  side, no prices and no family. The MemoryStore dedup catches upstream duplicates by shape, but this
+  bug class has now surfaced under four different action names, so the presentation layer refuses
+  un-renderable rows outright rather than waiting to learn the fifth.
+  """
+
+  @staticmethod
+  def _mem(rows):
+    return SimpleNamespace(realized_closes=lambda limit=100, symbol=None: list(rows))
+
+  REAL = {
+    "symbol": "NEAR-USDT", "ts": 1000, "pnl": 0.0006, "closeType": "CLOSE_SHORT",
+    "entryPrice": 1.994, "exitPrice": 1.991, "realizedR": 0.02,
+    "reason": "TP/SL triggered (CLOSE_SHORT, ROE 0.06%)",
+    "entryContext": {"setupFamily": "range_edge", "plannedMaxLossUsd": 0.03},
+  }
+
+  @pytest.mark.parametrize("shell", [
+    {"symbol": "NEAR-USDT", "ts": 1001, "pnl": 0.0006, "exitPrice": 1.991},              # price only
+    {"symbol": "NEAR-USDT", "ts": 1002, "pnl": 0.0006, "realizedR": 0.02},               # R only
+    {"symbol": "NEAR-USDT", "ts": 1003, "pnl": 0.0006, "closeType": "CLOSE_SHORT"},      # side only
+    {"symbol": "NEAR-USDT", "ts": 1004, "pnl": 0.0006, "action": "futures_buy_triggered"},
+  ])
+  def test_a_fragment_never_becomes_a_second_card(self, shell):
+    rows = _publisher()._closed_position_lifecycles(self._mem([self.REAL, shell]))
+    assert len(rows) == 1
+    assert rows[0]["entryPrice"] == pytest.approx(1.994)
+
+  def test_the_genuine_trade_still_publishes_in_full(self):
+    rows = _publisher()._closed_position_lifecycles(self._mem([self.REAL]))
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["side"] == "short" and r["setupFamily"] == "range_edge"
+    assert r["entryPrice"] == pytest.approx(1.994) and r["exitPrice"] == pytest.approx(1.991)
+    assert r["realizedR"] == pytest.approx(0.02) and r["roePct"] == pytest.approx(0.06)
+
+  def test_an_older_row_missing_only_realized_r_is_still_shown(self):
+    """Rows predating realizedR/setupFamily must not be swept up — they render fine."""
+    old = {"symbol": "NEAR-USDT", "ts": 900, "pnl": -0.032, "closeType": "CLOSE_LONG",
+           "entryPrice": 2.10, "exitPrice": 2.060167}
+    rows = _publisher()._closed_position_lifecycles(self._mem([old]))
+    assert len(rows) == 1 and rows[0]["side"] == "long"

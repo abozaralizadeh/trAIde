@@ -652,3 +652,143 @@ def test_manager_closes_when_live_unrealized_loss_exceeds_equity_budget():
     assert actions[0]["action"] == "close"
     assert actions[0]["dryRun"] is True
     assert "hard unrealized-loss cap" in actions[0]["reason"]
+
+
+# --- funding-carry thesis hold -------------------------------------------------------------------
+
+def test_next_funding_settlement_is_on_the_8h_utc_grid():
+  from src.regime import next_funding_settlement
+  # 2026-09-01 21:47 UTC -> next settlement is 2026-09-02 00:00 UTC
+  import datetime as _dt
+  now = _dt.datetime(2026, 9, 1, 21, 47, tzinfo=_dt.UTC).timestamp()
+  nxt = next_funding_settlement(now)
+  assert _dt.datetime.fromtimestamp(nxt, _dt.UTC) == _dt.datetime(2026, 9, 2, 0, 0, tzinfo=_dt.UTC)
+  # exactly on a boundary rolls to the NEXT one, never returns "now"
+  assert next_funding_settlement(nxt) > nxt
+
+
+def test_carry_hold_deadline_only_applies_to_declared_carry_trades():
+  from src.regime import carry_hold_deadline
+  import datetime as _dt
+  fill = _dt.datetime(2026, 9, 1, 21, 47, tzinfo=_dt.UTC).timestamp()
+  now = fill + 600
+  assert carry_hold_deadline({"setupFamily": "funding_carry", "fillTs": fill}, now) is not None
+  for other in ("continuation", "fade_extreme", "range_edge", "breakout", None):
+    assert carry_hold_deadline({"setupFamily": other, "fillTs": fill}, now) is None
+  assert carry_hold_deadline(None, now) is None
+
+
+def test_carry_hold_deadline_expires_after_the_settlement_it_was_opened_for():
+  """The deadline anchors on the FILL, so a carried trade becomes normally managed afterwards
+  instead of rolling its hold forward to the next cycle forever."""
+  from src.regime import carry_hold_deadline
+  import datetime as _dt
+  fill = _dt.datetime(2026, 9, 1, 21, 47, tzinfo=_dt.UTC).timestamp()
+  settle = _dt.datetime(2026, 9, 2, 0, 0, tzinfo=_dt.UTC).timestamp()
+  ctx = {"setupFamily": "funding_carry", "fillTs": fill}
+  assert carry_hold_deadline(ctx, settle - 60) == settle
+  assert carry_hold_deadline(ctx, settle + 1) is None
+
+
+def test_hold_window_suppresses_early_profit_taking_but_not_the_stop():
+  """The 0G-USDT case: a carry trade peaked at ~1R and was ratcheted+shaken out 142min in, collecting
+  the transfer only by luck. Inside the hold window the code must leave the model's bracket alone."""
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5)  # the LIVE arm; see test_trail_default_arm_is_half_r
+  entry, risk = 100.0, 10.0
+  peak = 0.97 * risk
+  base = dict(side_long=True, avg_entry=entry, sl_price=entry - risk, peak_fe=peak,
+              cfg=cfg, opened_min_ago=120.0, risk_override=risk)
+  # Without a hold, protection ratchets the stop up (which is what gave back the 0G peak).
+  assert decide_protection(mark=entry + peak, **base)["action"] == "move_breakeven"
+  # With the settlement still ahead, it stands pat.
+  held = decide_protection(mark=entry + peak, hold_until_ts=1_000.0, now_ts=0.0, **base)
+  assert held["action"] == "none"
+  assert "carry hold" in held["reason"]
+  assert held["holdRemainingMin"] == pytest.approx(1000.0 / 60.0, abs=0.05)
+  # Past the settlement the normal rules resume.
+  assert decide_protection(mark=entry + peak, hold_until_ts=1_000.0, now_ts=1_001.0, **base)["action"] == "move_breakeven"
+
+
+def test_hold_window_does_not_widen_or_remove_the_exchange_stop():
+  """Suppressing early exits is only safe because the loss cap is untouched: the decision must never
+  ask to move a stop while holding, so the model's original 1R remains live on the exchange."""
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5)
+  entry, risk = 100.0, 10.0
+  for mark in (entry - 0.9 * risk, entry, entry + 2.5 * risk):
+    d = decide_protection(side_long=True, avg_entry=entry, mark=mark, sl_price=entry - risk,
+                          peak_fe=max(0.0, mark - entry), cfg=cfg, opened_min_ago=200.0,
+                          risk_override=risk, hold_until_ts=1_000.0, now_ts=0.0)
+    assert d["action"] == "none"
+    assert "stop_price" not in d and "new_sl" not in d
+
+
+# --- noise-band trail ----------------------------------------------------------------------------
+
+def test_trail_rides_one_noise_band_behind_the_peak():
+  """The 35R give-back: across 81 closes the book reached +31R of favourable excursion and realised
+  -4.5R. With trail_distance_r=1.0 the `peak - trail_r*risk` branch is negative until peak > 1.5R —
+  which happened 0 times in 81 trades — so every winner banked a flat 33% of its peak instead."""
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True,
+             trail_distance_r=1.0, trail_lock_frac=0.33)
+  entry, risk = 100.0, 10.0
+  peak = 0.97 * risk                      # the 0G-USDT peak
+  base = dict(side_long=True, avg_entry=entry, mark=entry + peak, sl_price=entry - risk,
+              peak_fe=peak, cfg=cfg, opened_min_ago=60.0, risk_override=risk)
+
+  flat = decide_protection(**base)
+  locked_flat = (flat["stopPrice"] - entry) / risk
+  assert flat["action"] == "move_breakeven"
+  assert locked_flat == pytest.approx(0.33 * 0.97, abs=0.01)   # the flat-33% branch wins
+
+  # stopAtrMult 2.5 -> the entry stop sits 2.5 ATR out, so one noise band is 0.4R.
+  banded = decide_protection(noise_band_r=1.0 / 2.5, **base)
+  locked_band = (banded["stopPrice"] - entry) / risk
+  assert banded["action"] == "move_breakeven"
+  assert locked_band == pytest.approx(0.97 - 0.4, abs=0.01)    # peak minus one noise band
+  assert locked_band > locked_flat                              # strictly more of the run kept
+
+
+def test_noise_band_never_reaches_inside_the_chop():
+  """The band is a SAFETY FLOOR on give-back, not merely a narrowing of the configured trail.
+
+  A measured band fully determines the give-back — the trail rides exactly one band behind the peak,
+  wider than the config on noisy symbols and tighter on quiet ones. The invariant either way: the
+  stop never sits closer to the peak than one noise band. That is exactly the stop-inside-noise geometry this bot was already burned by."""
+  entry, risk = 100.0, 10.0
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True,
+             trail_distance_r=0.3, trail_lock_frac=0.0)
+  base = dict(side_long=True, avg_entry=entry, sl_price=entry - risk, cfg=cfg,
+              opened_min_ago=60.0, risk_override=risk)
+  # Config wants a 0.3R trail but the symbol's noise band is 0.8R — the band must win.
+  wide = decide_protection(mark=entry + 1.5 * risk, peak_fe=1.5 * risk, noise_band_r=0.8, **base)
+  assert (wide["stopPrice"] - entry) / risk == pytest.approx(1.5 - 0.8, abs=0.01)
+  # A quieter symbol gets a tighter trail than the config, for the same reason.
+  tight = decide_protection(mark=entry + 1.5 * risk, peak_fe=1.5 * risk, noise_band_r=0.1, **base)
+  assert (tight["stopPrice"] - entry) / risk == pytest.approx(1.5 - 0.1, abs=0.01)
+  # Wherever the TRAIL is the rule that fires, its lock stays at least one band below the peak.
+  # (A run shorter than one band cannot arm the trail at all; the separate fee-breakeven ratchet may
+  # still move the stop to entry there, which is a level the price actually traded, not a retracement.)
+  for atr_mult in (1.5, 2.5, 4.0):
+    band = 1.0 / atr_mult
+    for peak_r in (0.6, 1.0, 2.0):
+      d = decide_protection(mark=entry + peak_r * risk, peak_fe=peak_r * risk,
+                            noise_band_r=band, **dict(base, cfg=_cfg(
+                              breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True,
+                              trail_distance_r=1.0, trail_lock_frac=0.33)))
+      if d.get("action") != "move_breakeven" or "trailing" not in d.get("reason", ""):
+        continue
+      locked_r = (d["stopPrice"] - entry) / risk
+      assert locked_r <= peak_r - band + 1e-9, (atr_mult, peak_r, locked_r)
+      assert peak_r >= band, (atr_mult, peak_r)
+
+
+def test_trail_without_a_noise_band_is_unchanged():
+  """Positions whose entry predates stopAtrMult being recorded must behave exactly as before."""
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True,
+             trail_distance_r=1.0, trail_lock_frac=0.33)
+  entry, risk = 100.0, 10.0
+  base = dict(side_long=True, avg_entry=entry, mark=entry + 8.0, sl_price=entry - risk,
+              peak_fe=8.0, cfg=cfg, opened_min_ago=60.0, risk_override=risk)
+  for bad in (None, 0.0, -1.0, float("nan"), "x"):
+    assert decide_protection(noise_band_r=bad, **base)["stopPrice"] == pytest.approx(
+      decide_protection(**base)["stopPrice"])

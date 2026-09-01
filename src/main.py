@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from logging.handlers import RotatingFileHandler
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Optional
 
 from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
@@ -19,6 +19,7 @@ from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
 from .memory import MemoryStore
 from .protection import ProtectionManager
+from .regime import carry_hold_deadline
 from .safety import TradingSafetyState
 from .telegram import TelegramNotifier
 from .utils import normalize_symbol
@@ -764,8 +765,40 @@ async def trading_loop(
   elif cfg.dashboard.enabled:
     logger.warning("Dashboard publishing requested but DISABLED: %s", dashboard.disabled_reason())
 
+  def _trade_context(fsym: str, pos: Any) -> Dict[str, Any]:
+    """Facts about the trade behind an open position that its exit mechanics need.
+
+    ``holdUntilTs`` — a declared funding-carry trade is held to the settlement it was opened for;
+    None for every other playbook, leaving their management completely unchanged.
+    ``noiseBandR`` — the entry's own ATR stop multiple, inverted into R, so the trail can ride one
+    noise band behind the peak instead of a fixed slice of risk.
+
+    Looked up here rather than inside ProtectionManager so that module keeps no memory dependency.
+    """
+    out: Dict[str, Any] = {}
+    try:
+      side = str(pos.get("positionSide") or ("long" if float(pos.get("currentQty") or 0) > 0 else "short"))
+      opened = next(
+        (pos.get(k) for k in ("openingTimestamp", "openingTime", "openTime", "createdAt")
+         if pos.get(k) not in (None, "")),
+        None,
+      )
+      ctx = memory.entry_context_for_position(fsym, opened, side)
+      out["holdUntilTs"] = carry_hold_deadline(ctx, time.time())
+      if isinstance(ctx, dict):
+        try:
+          atr_mult = float(ctx.get("stopAtrMult") or 0.0)
+        except (TypeError, ValueError):
+          atr_mult = 0.0
+        if atr_mult > 0:
+          out["noiseBandR"] = 1.0 / atr_mult
+    except Exception:
+      logger.debug("trade-context lookup failed for %s", fsym, exc_info=True)
+    return out
+
   protection = ProtectionManager(
     cfg.profit_protection, kucoin_futures, notifier=notifier,
+    trade_context_lookup=_trade_context,
     emergency_sl_pct=cfg.trading.emergency_sl_pct, min_rr=cfg.trading.min_futures_rr,
     max_loss_equity_fraction=cfg.trading.risk_per_trade_pct,
     breakeven_cost_pct=2.0 * (
