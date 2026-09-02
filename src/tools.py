@@ -35,6 +35,7 @@ from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
   allow_declared_setup,
+  verify_declared_setup,
   funding_carry_setup,
   macro_event_entry_block,
   macro_event_window,
@@ -204,6 +205,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   def _normalize_futures_side(side: str) -> str | None:
     return normalize_futures_side(side)
+
+  def _declared_setup_error(setup_family: Any, side: str, gate: Dict[str, Any]) -> str | None:
+    """Reason a declared playbook's mechanism is absent, or None. See regime.verify_declared_setup."""
+    try:
+      return verify_declared_setup(
+        setup_family, side=side,
+        funding_setup=(gate or {}).get("funding_setup"),
+        macro_window=macro_event_window(
+          memory.macro_events(), time.time(),
+          before_min=cfg.regime.macro_event_before_min,
+          after_min=cfg.regime.macro_event_after_min,
+        ),
+      )
+    except Exception:  # a verification failure must never block an otherwise valid entry
+      logger.debug("declared-setup verification skipped", exc_info=True)
+      return None
 
   def _entry_context_error(symbol: str, confidence: float | None) -> str | None:
     authority_error = _authority_error()
@@ -2013,6 +2030,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             (_to_float(fees.get("futures_taker")) or 0.0006) + _slippage_rate()
           )
           futures_data["fundingSetup"] = funding_carry_setup(current_funding_rate, _rt_cost)
+          # Keep it on the gate too: a declared 'funding_carry' entry is verified against this, so the
+          # label cannot admit a trade whose mechanism is absent (see regime.verify_declared_setup).
+          if symbol in _daily_gate_state:
+            _daily_gate_state[symbol]["funding_setup"] = futures_data["fundingSetup"]
+            _daily_gate_state[symbol]["funding_rate"] = current_funding_rate
         except Exception:
           pass
         current_oi = None
@@ -3348,6 +3370,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the daily gate — 15m RSI %.1f is at an extreme against the entry (family scoring decides its risk)",
                         side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
           elif allow_declared_setup(setup_family=setup_family, cfg=cfg.regime):
+            _decl_bad = _declared_setup_error(setup_family, side_lower, gate)
+            if _decl_bad:
+              logger.warning("DECLARED SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _decl_bad)
+              return {"rejected": True, "reason": f"Declared setup does not match reality: {_decl_bad}",
+                      "hint": "A mechanical playbook must actually have its mechanism present. Re-declare the setup_family this trade really is and it will face that family's normal gates."}
             logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the daily gate — declared playbook %r (explore-sized until it earns a verdict; family scoring decides its risk)",
                         side_lower, spot_symbol, str(setup_family or "").strip().lower())
           else:
@@ -3375,7 +3402,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         elif allow_declared_setup(setup_family=setup_family, cfg=cfg.regime):
           # A breakout/range_edge often has the 1h against it too (a range fade at the top, a breakout
           # of a level the 1h hasn't caught up to). Admit the declared playbook; risk is governed
-          # downstream (explore-sizing, family scoring, stand-aside).
+          # downstream (explore-sizing, family scoring, stand-aside). A playbook with an OBJECTIVE
+          # trigger must still show it — this is the gate the XMR "funding carry" short walked through
+          # on a label while its funding sat below the threshold.
+          _decl_bad = _declared_setup_error(setup_family, side_lower, gate)
+          if _decl_bad:
+            logger.warning("DECLARED SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _decl_bad)
+            return {"rejected": True, "reason": f"Declared setup does not match reality: {_decl_bad}",
+                    "hint": "A mechanical playbook must actually have its mechanism present. Re-declare the setup_family this trade really is and it will face that family's normal gates."}
           logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the 1h gate — declared playbook %r (explore-sized until scored)",
                       side_lower, spot_symbol, str(setup_family or "").strip().lower())
         else:

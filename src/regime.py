@@ -642,6 +642,60 @@ def macro_event_entry_block(window, *, enabled: bool = True) -> str | None:
   )
 
 
+def verify_declared_setup(setup_family, *, side=None, funding_setup=None, macro_window=None) -> str | None:
+  """Reason a DECLARED playbook does not match reality, or None when the declaration checks out.
+
+  The declaration carve-out (:func:`allow_declared_setup`) exists because ``breakout`` and
+  ``range_edge`` are judgement calls with no computable trigger — they could never reach the book
+  otherwise, so the model's word is the only evidence available and rightly decides.
+
+  ``funding_carry`` and ``macro_event`` are different in kind: both have an OBJECTIVE trigger the code
+  can evaluate itself — is funding actually extreme enough to pay, is a release actually inside the
+  window. Accepting those on the label alone turns the carve-out into a universal gate-bypass token,
+  and it happened live on 2026-09-02: XMR funding was 0.0523%/8h against a 0.0700% threshold, so
+  ``funding_carry_setup`` returned None and "FUNDING CARRY AVAILABLE" had never once been logged — yet
+  a short was declared ``funding_carry``, admitted past the 1h gate on the label, and closed at -0.6R.
+  The carry it stood to earn was 0.0523% against a 1.89% stop, a 1:36 ratio: it was a directional
+  short wearing a carry label, and the ``funding_carry`` scoreboard was being scored on it.
+
+  This does NOT decide whether the trade is a good idea — that stays the model's call. It only says a
+  mechanical playbook must actually have its mechanism present. The same trade may still be taken
+  under the family it really is, where it faces that family's ordinary gates and is scored honestly.
+  Families with no computable trigger are always accepted here.
+  """
+  fam = str(setup_family or "").strip().lower()
+
+  if fam == "funding_carry":
+    if not isinstance(funding_setup, dict):
+      return (
+        "declared 'funding_carry' but funding is not extreme enough to pay for the trade — the "
+        "measured rate does not clear the threshold derived from round-trip cost, so there is no "
+        "carry to collect. Declare the playbook this really is, or take a symbol whose funding does "
+        "qualify (analyze_market_context reports futures.fundingSetup when one does)"
+      )
+    paid_side = str(funding_setup.get("side") or "").strip().lower()
+    declared_side = str(side or "").strip().lower()
+    if paid_side and declared_side and paid_side != declared_side:
+      return (
+        f"declared 'funding_carry' on a {declared_side.upper()} but funding is "
+        f"{float(funding_setup.get('fundingRate') or 0.0) * 100:+.4f}%/8h, so it is the "
+        f"{paid_side.upper()} side that is PAID — this entry would pay the carry, not receive it"
+      )
+    return None
+
+  if fam == "macro_event":
+    phase = (macro_window or {}).get("phase") if isinstance(macro_window, dict) else None
+    if phase != "after":
+      return (
+        "declared 'macro_event' but no high-impact release has just landed — this playbook is the "
+        "resolution window AFTER a scheduled print, and macroEvents shows none in that window"
+      )
+    return None
+
+  # breakout / range_edge / anything else: no computable trigger exists, so the declaration stands.
+  return None
+
+
 def fade_setup_available(rsi, cfg: RegimeConfig):
   """Flag a live fade-extreme opportunity at analysis time, so the playbook is FINDABLE.
 
