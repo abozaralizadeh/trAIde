@@ -36,6 +36,8 @@ from .protection import should_block_chase
 from .regime import (
   allow_declared_setup,
   funding_carry_setup,
+  macro_event_entry_block,
+  macro_event_window,
   allow_fade_extreme,
   fade_setup_available,
   allow_reversal_long,
@@ -216,6 +218,20 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       last_close_ts = int(closes[-1].get("ts") or 0) if closes else 0
       if last_close_ts and time.time() - last_close_ts < cfg.circuit_breaker.cooldown_minutes * 60:
         return "Live consecutive-loss circuit breaker cooldown is active"
+    # Scheduled high-impact release imminent: refuse to open NEW exposure. A risk control, not a
+    # direction call — open positions and their brackets are untouched, and the window is silent
+    # afterwards so the model is free to trade the resolution as setup_family='macro_event'.
+    macro_block = macro_event_entry_block(
+      macro_event_window(
+        memory.macro_events(),
+        time.time(),
+        before_min=cfg.regime.macro_event_before_min,
+        after_min=cfg.regime.macro_event_after_min,
+      ),
+      enabled=cfg.regime.macro_events_enabled,
+    )
+    if macro_block:
+      return macro_block
     if confidence is None:
       return "Entry confidence is required"
     gate = _gate_for(symbol)
@@ -5121,6 +5137,36 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
+  async def log_macro_calendar(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Store the schedule of upcoming HIGH-IMPACT macro releases (CPI, FOMC, NFP, PCE, Jackson Hole).
+
+    Use web_search to look up the official schedule (BLS / Federal Reserve release calendars, or any
+    economic calendar), then pass the events here. These dates are published a year in advance, so this
+    is a calendar, not a news feed — refresh it every day or two, not every run.
+
+    Each event is {"name": str, "ts": <unix seconds UTC>, "impact": "high"|"medium"|"low"}. Give ts as
+    the exact release time in UTC (US CPI and NFP are 08:30 ET; FOMC statements 14:00 ET — convert,
+    and mind US daylight saving). Anything already past, or missing a name or ts, is dropped.
+
+    This REPLACES the whole calendar, so always send the full forward list, not a single addition.
+
+    What it does: code opens no NEW position in the hour before a high-impact release (open positions
+    and their brackets are untouched), and you may declare setup_family='macro_event' to trade the
+    resolution in the hour after — scored in signalEdge.by_family like every other playbook. An empty
+    or stale calendar simply means no blackout, so a missed refresh never blocks trading.
+    """
+    stored = memory.record_macro_events(events)
+    return {
+      "stored": stored,
+      "calendar": memory.macro_events(within_hours=336),
+      "note": (
+        f"{stored} upcoming high-impact release(s) recorded. Entries are blocked for "
+        f"{cfg.regime.macro_event_before_min:.0f} min before each, and 'macro_event' setups are "
+        f"available for {cfg.regime.macro_event_after_min:.0f} min after."
+      ) if stored else "No valid future events supplied — calendar cleared, no blackout is in effect.",
+    }
+
+  @function_tool
   async def log_sentiment(symbol: str, score: float, rationale: str, source: str = "") -> Dict[str, Any]:
     """Store a sentiment score (0-1) with rationale and source for gating trades."""
     authority_error = _authority_error()
@@ -5311,6 +5357,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     add_coin=add_coin,
     remove_coin=remove_coin,
     log_sentiment=log_sentiment,
+    log_macro_calendar=log_macro_calendar,
     log_decision=log_decision,
     fetch_kucoin_news=fetch_kucoin_news,
     fetch_coindesk_news=fetch_coindesk_news,

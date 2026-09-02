@@ -562,6 +562,86 @@ def held_position_noise_pct(entry_context) -> float | None:
   return risk_pct / atr_mult
 
 
+def macro_event_window(
+  events,
+  now_ts,
+  *,
+  before_min: float = 60.0,
+  after_min: float = 60.0,
+  min_impact: str = "high",
+):
+  """The scheduled macro release we are currently near, or None.
+
+  Scheduled macro data is the one *news* input with the same mechanical property that makes funding
+  carry worth taking: you do not have to predict the event, only know that it is coming. CPI and FOMC
+  dates are published a year ahead, so this needs a calendar rather than a news feed — no latency race,
+  which is a race a 60-second poll loop with an LLM in it would lose by construction.
+
+  The window widths default to one hour either side because that is where the effect is measured to
+  live, not because an hour is a round number: through 2026 BTC's explanatory power against CPI
+  surprises concentrated at the **one-hour** horizon (Block Scholes), and single prints moved it 4-8%
+  intraday. Note the effect is DECAYING — BTC shrugged off the July 2026 print and Deribit's CPI-day
+  premium fell from +25% to under 5% — which is exactly why the post-event side is a scored playbook
+  (``macro_event``) that de-sizes itself rather than an assumption.
+
+  Returns a dict with ``phase`` in {"before", "after"}, the event, and minutes to/since it. Unknown or
+  malformed rows are skipped, and an empty calendar returns None, so a stale or failed fetch degrades
+  to ordinary behaviour instead of blocking trading.
+  """
+  try:
+    now = float(now_ts)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(now):
+    return None
+  wanted = str(min_impact or "high").strip().lower()
+  best = None
+  for row in events or []:
+    if not isinstance(row, dict):
+      continue
+    impact = str(row.get("impact") or "").strip().lower()
+    if wanted == "high" and impact != "high":
+      continue
+    try:
+      ets = float(row.get("ts"))
+    except (TypeError, ValueError):
+      continue
+    if not math.isfinite(ets):
+      continue
+    delta_min = (ets - now) / 60.0
+    if 0 <= delta_min <= max(0.0, float(before_min)):
+      cand = {"phase": "before", "event": row, "minutesTo": round(delta_min, 1)}
+    elif -max(0.0, float(after_min)) <= delta_min < 0:
+      cand = {"phase": "after", "event": row, "minutesSince": round(-delta_min, 1)}
+    else:
+      continue
+    # Nearest event wins when two are close together (CPI and a Fed speaker can share a morning).
+    if best is None or abs(delta_min) < best[0]:
+      best = (abs(delta_min), cand)
+  return best[1] if best else None
+
+
+def macro_event_entry_block(window, *, enabled: bool = True) -> str | None:
+  """Reason to decline NEW risk right now because a scheduled release is imminent, else None.
+
+  This is a risk control, not an opportunity call — the same family as the drawdown circuit breaker
+  and the portfolio-heat cap, and it makes no claim about direction. It only refuses to *open* fresh
+  exposure in the minutes before a print that is known to repeatedly move the market several times a
+  typical stop distance. Existing positions are left entirely alone: they keep their brackets and the
+  model is told the event is coming so it can decide for itself whether to stand aside or hold.
+
+  Deliberately silent AFTER the event: that side is the model's to trade via setup_family='macro_event'.
+  """
+  if not enabled or not isinstance(window, dict) or window.get("phase") != "before":
+    return None
+  ev = window.get("event") or {}
+  name = str(ev.get("name") or "scheduled macro release")
+  return (
+    f"Macro event blackout: {name} in {window.get('minutesTo')} min — no NEW risk opened into a "
+    "scheduled high-impact release (open positions keep their brackets and are unaffected)"
+  )
+
+
 def fade_setup_available(rsi, cfg: RegimeConfig):
   """Flag a live fade-extreme opportunity at analysis time, so the playbook is FINDABLE.
 

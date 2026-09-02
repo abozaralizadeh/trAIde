@@ -74,6 +74,8 @@ from .regime import (
   concentration_scale,
   conviction_size_factor,
   effective_min_confidence,
+  macro_event_entry_block,
+  macro_event_window,
   regime_size_factor,
   resolve_gate_deadlock,
   reward_risk_ratio,
@@ -1163,6 +1165,7 @@ def run_trading_agent(
   log_sentiment = _tools.log_sentiment
   log_decision = _tools.log_decision
   fetch_kucoin_news = _tools.fetch_kucoin_news
+  log_macro_calendar = _tools.log_macro_calendar
   fetch_coindesk_news = _tools.fetch_coindesk_news
   log_research = _tools.log_research
   add_source = _tools.add_source
@@ -1692,6 +1695,7 @@ def run_trading_agent(
       scan_futures_market,
       fetch_kucoin_news,
       fetch_coindesk_news,
+      log_macro_calendar,
       log_research,
       latest_items,
       list_coins,
@@ -1775,6 +1779,29 @@ def run_trading_agent(
   # rejections, and so it explains the posture in its narrative.
   try:
     _edge_now = _edge_state()
+    # Scheduled macro releases: the calendar the Research Agent maintains, plus whichever window (if
+    # any) is live right now. Degrades to "no events known" on an empty or stale calendar.
+    try:
+      _macro_events = memory.macro_events()
+      _macro_win = macro_event_window(
+        _macro_events, time.time(),
+        before_min=cfg.regime.macro_event_before_min,
+        after_min=cfg.regime.macro_event_after_min,
+      )
+      _macro_state = {
+        "calendarAgeHours": memory.macro_calendar_age_hours(),
+        "upcoming": [
+          {"name": e.get("name"), "inMinutes": round((int(e["ts"]) - time.time()) / 60.0)}
+          for e in _macro_events[:5] if int(e.get("ts") or 0) > time.time()
+        ],
+        "activeWindow": _macro_win,
+        "entriesBlockedNow": bool(
+          macro_event_entry_block(_macro_win, enabled=cfg.regime.macro_events_enabled)
+        ),
+      }
+    except Exception:
+      _macro_state = {"calendarAgeHours": None, "upcoming": [], "activeWindow": None,
+                      "entriesBlockedNow": False}
     _edge_stats_now = _edge_now.get("stats") or {}
     _per_sym = _edge_stats_now.get("per_symbol", {})
     # Realized reward:risk actually achieved vs the RR intended at entry. A gap is diagnostic of
@@ -1809,6 +1836,10 @@ def run_trading_agent(
       # Does the DIRECTION CALL predict, measured from the market price at signal time? Independent of
       # fills and exits. If verdict is "no edge", the problem is setup selection, not trade management.
       "signalEdge": _edge_now.get("signal_edge", {"verdict": "insufficient data"}),
+      # Scheduled high-impact macro releases. phase='before' means code is declining NEW entries
+      # right now (open positions unaffected); phase='after' is when a 'macro_event' setup applies.
+      # calendarAgeHours None/large = the calendar is stale, so no blackout is in force.
+      "macroEvents": _macro_state,
       # Your OWN record at overriding your own brackets. deltaR is positive when your closes helped.
       # Measured, not enforced — you still decide; this is the scoreboard for that decision.
       "exitDiscipline": _edge_now.get("exit_discipline", {"verdict": "insufficient data"}),
@@ -1862,6 +1893,19 @@ def run_trading_agent(
         "no edge; this one is paid by the exchange's own mechanics rather than by prediction. Declare "
         "setup_family='funding_carry' and hold across at least one 8h settlement, or the carry never "
         "accrues. It is scored in signalEdge.by_family like everything else, so it proves itself. "
+        "SCHEDULED MACRO EVENTS — macroEvents.upcoming lists high-impact releases (CPI, FOMC, NFP) "
+        "with minutes until each. This is the one news input that does not require you to be fast: "
+        "the dates are published a year ahead, so you are never racing a headline. Two uses. (1) Code "
+        "opens no NEW position in the hour before a high-impact print — macroEvents.entriesBlockedNow "
+        "tells you when that is in force; your OPEN positions are untouched and keep their brackets, "
+        "so if you are holding into a print, that is your call to make deliberately rather than by "
+        "accident. (2) Afterwards, direction often resolves quickly and volatility expands: you may "
+        "declare setup_family='macro_event' in that window, and it is scored in signalEdge.by_family "
+        "like every other playbook, explore-sized until it proves itself. Be aware the effect is "
+        "DECAYING — through 2026 the market's reaction to CPI has shrunk — so treat this as a "
+        "hypothesis the scoreboard will settle, not as a known edge. If macroEvents.calendarAgeHours "
+        "is null or large the calendar is stale and no blackout is in force; the Research Agent "
+        "refreshes it with log_macro_calendar. "
         "HOLDING IS A DECISION TOO — CHECK exitDiscipline BEFORE CLOSING A WINNER EARLY. When you "
         "open a position you attach a stop and a target: that bracket already states your thesis and "
         "the level that would disprove it. Closing before either is reached asks a different question "

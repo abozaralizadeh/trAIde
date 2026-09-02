@@ -287,7 +287,7 @@ def measured_slippage_pct(
   }
 
 
-SETUP_FAMILIES = ("continuation", "fade_extreme", "breakout", "range_edge", "funding_carry", "other")
+SETUP_FAMILIES = ("continuation", "fade_extreme", "breakout", "range_edge", "funding_carry", "macro_event", "other")
 
 
 def infer_setup_family(entry_context: Dict[str, Any]) -> str:

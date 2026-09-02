@@ -34,6 +34,7 @@ MAX_PENDING_AGENT_EVENTS = 200
 # `record_signal_probe` for why coupling evidence supply to anything else creates a doom loop.
 MAX_SIGNAL_PROBES = 400
 MAX_EXIT_PROBES = 200
+MAX_MACRO_EVENTS = 60
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
 _ATR_QUARANTINE_RE = re.compile(
   r"daily ATR\s+([0-9]+(?:\.[0-9]+)?)%\s+exceeds\s+([0-9]+(?:\.[0-9]+)?)%",
@@ -375,6 +376,12 @@ class MemoryStore:
     probes = data.get("signal_probes") or []
     if len(probes) > MAX_SIGNAL_PROBES:
       data["signal_probes"] = probes[-MAX_SIGNAL_PROBES:]
+    # The macro calendar is forward-looking: drop anything more than a day past, cap the rest. A stale
+    # or empty calendar must degrade to "no events known" (ordinary trading), never to a stuck blackout.
+    data["macro_events"] = [
+      e for e in (data.get("macro_events") or [])
+      if isinstance(e, dict) and (e.get("ts") or 0) >= now - 86400
+    ][-MAX_MACRO_EVENTS:]
     # Exit probes are learning data too (was the discretionary close better than the bracket?):
     # count-capped, never clock-pruned, for the same reason signal probes are not.
     _xp = data.get("exit_probes") or []
@@ -1189,6 +1196,72 @@ class MemoryStore:
       if len(data["signal_probes"]) > MAX_SIGNAL_PROBES:
         data["signal_probes"] = data["signal_probes"][-MAX_SIGNAL_PROBES:]
       self._write(data)
+
+  def record_macro_events(self, events: Any) -> int:
+    """Replace the scheduled-macro calendar with ``events``; returns how many were stored.
+
+    Scheduled releases (CPI, FOMC, NFP) are published a year ahead, so this is a calendar rather than
+    a news feed — the Research Agent fetches it with the web search it already has and code enforces
+    the timing. That split keeps the model on research and the clock-work in code, and it adds no API
+    key or runtime dependency that could fail mid-poll.
+
+    Rows are ``{"name", "ts", "impact"}``; anything malformed or already past is dropped, so a bad
+    fetch degrades to a shorter calendar rather than a corrupt one. Never raises.
+    """
+    now = int(time.time())
+    cleaned: list[Dict[str, Any]] = []
+    for row in events or []:
+      if not isinstance(row, dict):
+        continue
+      name = str(row.get("name") or "").strip()[:120]
+      if not name:
+        continue
+      try:
+        ets = int(float(row.get("ts")))
+      except (TypeError, ValueError):
+        continue
+      if ets <= now:
+        continue
+      impact = str(row.get("impact") or "high").strip().lower()
+      if impact not in ("high", "medium", "low"):
+        impact = "high"
+      cleaned.append({"name": name, "ts": ets, "impact": impact})
+    cleaned.sort(key=lambda e: e["ts"])
+    cleaned = cleaned[:MAX_MACRO_EVENTS]
+    with self._lock:
+      data = self._read()
+      data["macro_events"] = cleaned
+      data["macro_events_updated"] = now
+      self._write(data)
+    return len(cleaned)
+
+  def macro_events(self, within_hours: float = 72.0) -> list[Dict[str, Any]]:
+    """Upcoming scheduled releases inside ``within_hours`` (plus any just past, for the after-window)."""
+    now = int(time.time())
+    horizon = now + int(max(0.0, float(within_hours)) * 3600)
+    with self._lock:
+      data = self._read()
+    out = []
+    for row in data.get("macro_events") or []:
+      if not isinstance(row, dict):
+        continue
+      try:
+        ets = int(row.get("ts"))
+      except (TypeError, ValueError):
+        continue
+      if now - 86400 <= ets <= horizon:
+        out.append(row)
+    return sorted(out, key=lambda e: e["ts"])
+
+  def macro_calendar_age_hours(self) -> Optional[float]:
+    """Hours since the calendar was last refreshed, or None if never — so staleness is visible."""
+    with self._lock:
+      data = self._read()
+    ts = data.get("macro_events_updated")
+    try:
+      return round((time.time() - float(ts)) / 3600.0, 1)
+    except (TypeError, ValueError):
+      return None
 
   def record_exit_probe(
     self,

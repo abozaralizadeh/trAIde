@@ -340,7 +340,20 @@ class RegimeConfig:
   # explore-sizing while unproven, family sizing on measured shortfall, stand-aside once it settles to
   # no-edge. Widens what may be proposed, never what may be risked. See regime.allow_declared_setup.
   declared_setups_enabled: bool = True
-  declarable_setup_families: tuple = ("breakout", "range_edge", "funding_carry")
+  declarable_setup_families: tuple = ("breakout", "range_edge", "funding_carry", "macro_event")
+  # Scheduled macro releases (CPI / FOMC / NFP). Two halves, split along the usual line. SURVIVAL:
+  # no NEW risk is opened in the minutes before a known high-impact print — a risk control in the same
+  # family as the drawdown breaker, making no claim about direction, and leaving open positions and
+  # their brackets completely alone. OPPORTUNITY: the model may declare setup_family='macro_event' to
+  # trade the resolution afterwards, scored by signalEdge.by_family like every other playbook.
+  # The one-hour windows are where the effect is MEASURED to live, not a round number: through 2026
+  # BTC's explanatory power against CPI surprises concentrated at the one-hour horizon (Block Scholes)
+  # and single prints moved it 4-8% intraday. The effect is also decaying (BTC shrugged off the July
+  # 2026 print; Deribit CPI-day premium fell +25% -> <5%), which is precisely why the tradeable half is
+  # a scored, explore-sized family that de-sizes itself rather than an assumption baked into code.
+  macro_events_enabled: bool = True
+  macro_event_before_min: float = 60.0
+  macro_event_after_min: float = 60.0
   # A blanket BTC/alt veto misses genuine relative-strength leaders.  Permit only an alt whose own
   # daily, 4h, 1h and 15m trends are all bullish at high confidence, then size it down.  This is a
   # signal-based exception, not a symbol allow-list, so it adapts as leadership rotates.
@@ -577,8 +590,11 @@ def load_config() -> AppConfig:
       fade_extreme_oversold_rsi=float(os.getenv("FADE_EXTREME_OVERSOLD_RSI", "30")),
       fade_extreme_overbought_rsi=float(os.getenv("FADE_EXTREME_OVERBOUGHT_RSI", "70")),
       declared_setups_enabled=_as_bool(os.getenv("DECLARED_SETUPS_ENABLED"), True),
+      macro_events_enabled=_as_bool(os.getenv("MACRO_EVENTS_ENABLED"), True),
+      macro_event_before_min=float(os.getenv("MACRO_EVENT_BEFORE_MIN", "60")),
+      macro_event_after_min=float(os.getenv("MACRO_EVENT_AFTER_MIN", "60")),
       declarable_setup_families=tuple(
-        s.strip().lower() for s in os.getenv("DECLARABLE_SETUP_FAMILIES", "breakout,range_edge,funding_carry").split(",") if s.strip()
+        s.strip().lower() for s in os.getenv("DECLARABLE_SETUP_FAMILIES", "breakout,range_edge,funding_carry,macro_event").split(",") if s.strip()
       ),
       alt_long_block_enabled=_as_bool(os.getenv("ALT_LONG_BLOCK_WHEN_BTC_BEARISH"), True),
       alt_majors=tuple(s.strip().upper() for s in os.getenv("ALT_MAJORS", "BTC,ETH").split(",") if s.strip()),
