@@ -57,6 +57,7 @@ from .kucoin import (
 from .edge import (
   adaptive_stop_atr_mult,
   signal_edge_stats,
+  exit_discipline_stats,
   expectancy_size_factor,
   edge_stats,
   entry_quality_stats,
@@ -808,6 +809,15 @@ def run_trading_agent(
         try:
           _cost = 2.0 * (float(fees.get("futures_taker", 0.0006)) + float(state.get("slippage_pct") or 0.0))
           state["signal_edge"] = signal_edge_stats(memory.signal_probes(limit=200), cost_pct=_cost)
+          # EXIT DISCIPLINE: were the discretionary closes better than the brackets they overrode?
+          state["exit_discipline"] = exit_discipline_stats(memory.exit_probes(limit=200))
+          _xd = state["exit_discipline"]
+          if _xd.get("verdict") == "closes destroy value":
+            logger.warning(
+              "EXIT DISCIPLINE: %d discretionary closes returned %+.2fR where their brackets would have "
+              "returned %+.2fR (%+.3fR/trade) — closing early is costing more than it saves",
+              _xd.get("n"), _xd.get("takenR"), _xd.get("bracketR"), _xd.get("deltaRPerTrade") or 0.0,
+            )
           _se = state["signal_edge"]
           if _se.get("verdict") == "no edge":
             logger.warning(
@@ -1799,6 +1809,9 @@ def run_trading_agent(
       # Does the DIRECTION CALL predict, measured from the market price at signal time? Independent of
       # fills and exits. If verdict is "no edge", the problem is setup selection, not trade management.
       "signalEdge": _edge_now.get("signal_edge", {"verdict": "insufficient data"}),
+      # Your OWN record at overriding your own brackets. deltaR is positive when your closes helped.
+      # Measured, not enforced — you still decide; this is the scoreboard for that decision.
+      "exitDiscipline": _edge_now.get("exit_discipline", {"verdict": "insufficient data"}),
       "targetReachability": {
         "medianMfeR": (_edge_now.get("entry_quality") or {}).get("median_mfe_r"),
         "mfeReachedRate": (_edge_now.get("entry_quality") or {}).get("mfe_reached_rate", {}),
@@ -1849,6 +1862,19 @@ def run_trading_agent(
         "no edge; this one is paid by the exchange's own mechanics rather than by prediction. Declare "
         "setup_family='funding_carry' and hold across at least one 8h settlement, or the carry never "
         "accrues. It is scored in signalEdge.by_family like everything else, so it proves itself. "
+        "HOLDING IS A DECISION TOO — CHECK exitDiscipline BEFORE CLOSING A WINNER EARLY. When you "
+        "open a position you attach a stop and a target: that bracket already states your thesis and "
+        "the level that would disprove it. Closing before either is reached asks a different question "
+        "— has something CHANGED, or has price merely moved inside the trade's own noise band? On the "
+        "measured record those were mostly the latter: 16 of the recent closes were you closing your "
+        "own position (against 2 by the code's profit-lock) at a 13-minute median hold, on brackets "
+        "whose targets need hours to reach; replayed on real 1m data those brackets were worth +3.05R "
+        "against the +0.42R actually taken. exitDiscipline is your own running scoreboard for exactly "
+        "this decision, and it is symmetric — if your closes start beating your brackets it will say "
+        "so and you should keep making them. Nothing stops you closing: a real invalidation, a "
+        "structural break, or a materially better use of the margin are all good reasons. A 15m or 1h "
+        "bias flip on its own is usually not one, because those timeframes are finer than the stop "
+        "distance you chose. If the thesis still holds, the strongest action is often no action. "
         "ACT ON THE SCOREBOARD: signalEdge measures whether your DIRECTION CALLS predict, separately "
         "per playbook, against the cost each must clear. When a family reads 'no edge' over a real "
         "sample, that is not a suggestion to try harder at it — its forward return is measurably "

@@ -750,3 +750,82 @@ def loss_streak_size_factor(loss_streak: int, cfg: EdgeConfig) -> float:
   if int(loss_streak or 0) >= cfg.streak_threshold:
     return min(1.0, max(0.0, cfg.streak_size_factor))
   return 1.0
+
+
+def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
+  """Score the model's DISCRETIONARY closes against the brackets they overrode.
+
+  The bot has always measured whether its entries predict. It never measured whether its exits helped
+  — and on the 2026-09-02 data the exits were the dominant behaviour: 16 positions closed by the agent
+  against 2 by the profit-lock, median hold 13 minutes on brackets whose targets need hours. Replaying
+  those 16 on real 1m klines, letting the bracket run was worth +3.05R against the +0.42R taken: a
+  2.63R gap, larger than the entire net loss over the same period.
+
+  This is deliberately a MEASUREMENT, not a gate. Closing early is sometimes right — in that same
+  sample six of the sixteen beat their bracket, mostly by ducking a stop — so the model keeps the
+  decision and gets its own track record instead of a veto. It is symmetric by construction: if
+  discretionary closes start beating the brackets the verdict flips to ``closes add value`` and says
+  so. ``delta_r`` is positive when the closes HELPED.
+
+  Returns n, the two totals, their per-trade difference and a verdict; ``insufficient data`` until
+  ``min_samples`` probes have resolved, so a couple of lucky exits never reads as a policy.
+  """
+  taken: list[float] = []
+  bracket: list[float] = []
+  by_family: Dict[str, list] = {}
+  for row in probes or []:
+    if not isinstance(row, dict):
+      continue
+    outcome = row.get("outcome")
+    if not isinstance(outcome, dict) or not outcome.get("resolved"):
+      continue
+    try:
+      t = float(row.get("realizedR"))
+      b = float(outcome.get("bracketR"))
+    except (TypeError, ValueError):
+      continue
+    if not (math.isfinite(t) and math.isfinite(b)):
+      continue
+    taken.append(t)
+    bracket.append(b)
+    fam = str(row.get("setupFamily") or "other").strip().lower()
+    by_family.setdefault(fam, []).append((t, b))
+
+  n = len(taken)
+  out: Dict[str, Any] = {
+    "n": n,
+    "takenR": round(sum(taken), 3),
+    "bracketR": round(sum(bracket), 3),
+    "deltaR": round(sum(taken) - sum(bracket), 3),
+    "deltaRPerTrade": round((sum(taken) - sum(bracket)) / n, 4) if n else None,
+    "beatBracket": sum(1 for t, b in zip(taken, bracket) if t > b),
+  }
+  if n < max(1, int(min_samples)):
+    out["verdict"] = "insufficient data"
+    out["note"] = (
+      f"{n} discretionary close(s) scored so far; no verdict until {int(min_samples)}."
+    )
+    return out
+  per = out["deltaRPerTrade"] or 0.0
+  if per > 0.02:
+    out["verdict"] = "closes add value"
+  elif per < -0.02:
+    out["verdict"] = "closes destroy value"
+  else:
+    out["verdict"] = "neutral"
+  out["byFamily"] = {
+    f: {
+      "n": len(v),
+      "deltaR": round(sum(t for t, _ in v) - sum(b for _, b in v), 3),
+    }
+    for f, v in sorted(by_family.items(), key=lambda kv: -len(kv[1]))
+  }
+  out["note"] = (
+    f"Your last {n} discretionary closes returned {out['takenR']:+.2f}R in total; leaving each "
+    f"position's own bracket alone would have returned {out['bracketR']:+.2f}R "
+    f"({out['deltaR']:+.2f}R, {per:+.3f}R per trade; {out['beatBracket']}/{n} of your closes beat "
+    "their bracket). A bracket you set at entry already encodes the thesis and the invalidation "
+    "level, so closing before either is reached is only an improvement when something has genuinely "
+    "changed — not when price has merely moved inside the trade's own noise band."
+  )
+  return out

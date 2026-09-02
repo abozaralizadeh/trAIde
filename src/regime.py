@@ -530,6 +530,38 @@ def carry_hold_deadline(entry_context, now_ts, *, interval_hours: float = 8.0) -
   return deadline
 
 
+def held_position_noise_pct(entry_context) -> float | None:
+  """The noise band of an OPEN trade, as a percentage of its entry price.
+
+  One definition of "smaller than this is not information" now serves three places: the entry stop is
+  floored to it, the trail rides one of them behind the peak, and — here — a price move smaller than
+  one band on a symbol we already hold is not a reason to wake the model for a fresh decision.
+
+  This is orchestration, not a veto. The position keeps its bracket, ProtectionManager still evaluates
+  it every poll, and the agent still wakes on a move that clears the band, on any other symbol, and on
+  its scheduled runs. It only stops the model being asked to re-decide an hours-long thesis every time
+  price wiggles a quarter of the trade's own stop distance — which it was: the measured median hold is
+  13 minutes, 16 of the last closes were the agent closing its own position (vs 2 by the profit-lock),
+  and replaying those brackets on real 1m data they were worth +3.05R against the +0.42R actually taken.
+  """
+  if not isinstance(entry_context, dict):
+    return None
+  entry = entry_context.get("fillPrice") or entry_context.get("entryPrice")
+  stop = entry_context.get("stopLossPrice")
+  try:
+    entry_f = float(entry)
+    stop_f = float(stop)
+    atr_mult = float(entry_context.get("stopAtrMult") or 0.0)
+  except (TypeError, ValueError):
+    return None
+  if not (math.isfinite(entry_f) and math.isfinite(stop_f)) or entry_f <= 0 or atr_mult <= 0:
+    return None
+  risk_pct = abs(entry_f - stop_f) / entry_f * 100.0
+  if not math.isfinite(risk_pct) or risk_pct <= 0:
+    return None
+  return risk_pct / atr_mult
+
+
 def fade_setup_available(rsi, cfg: RegimeConfig):
   """Flag a live fade-extreme opportunity at analysis time, so the playbook is FINDABLE.
 

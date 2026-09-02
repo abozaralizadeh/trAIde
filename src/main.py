@@ -19,7 +19,7 @@ from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
 from .memory import MemoryStore
 from .protection import ProtectionManager
-from .regime import carry_hold_deadline
+from .regime import carry_hold_deadline, held_position_noise_pct
 from .safety import TradingSafetyState
 from .telegram import TelegramNotifier
 from .utils import normalize_symbol
@@ -1068,6 +1068,36 @@ async def trading_loop(
         agent_task_prices = {}
         agent_task_position_fingerprint = ()
 
+    # A symbol we already hold has its own definition of noise: the band its stop was floored to.
+    # Waking the model to re-decide inside that band is what produced a 13-minute median hold on
+    # theses that need hours (see regime.held_position_noise_pct). Computed once per poll.
+    held_noise_pct: Dict[str, float] = {}
+    for _p in getattr(snapshot, "futures_positions", None) or []:
+      if not isinstance(_p, dict):
+        continue
+      try:
+        _qty = float(_p.get("currentQty") or 0)
+      except (TypeError, ValueError):
+        continue
+      if not _qty:
+        continue
+      _sym = normalize_symbol(_p.get("symbol") or "")
+      if not _sym:
+        continue
+      try:
+        _ctx = memory.entry_context_for_position(
+          _p.get("symbol") or "",
+          next((_p.get(k) for k in ("openingTimestamp", "openingTime", "openTime", "createdAt")
+                if _p.get(k) not in (None, "")), None),
+          "long" if _qty > 0 else "short",
+        )
+        _band = held_position_noise_pct(_ctx)
+      except Exception:
+        logger.debug("held-noise lookup failed for %s", _sym, exc_info=True)
+        _band = None
+      if _band:
+        held_noise_pct[_sym] = _band
+
     triggers: list[str] = []
     for symbol, ticker in snapshot.tickers.items():
       price = float(ticker.price)
@@ -1091,6 +1121,10 @@ async def trading_loop(
           noise_multiplier=cfg.trading.price_noise_multiplier,
           max_multiplier=cfg.trading.price_trigger_max_multiplier,
         )
+        held_band = held_noise_pct.get(symbol)
+        if held_band:
+          # Never LOWER the threshold — only refuse to treat sub-noise drift on an open trade as news.
+          adaptive_threshold = max(adaptive_threshold, held_band)
         if state_move_pct >= adaptive_threshold:
           triggers.append(f"price_move:{symbol}:{state_move_pct:.2f}%")
           pending_trigger_moves[symbol] = max(
@@ -1126,6 +1160,9 @@ async def trading_loop(
     # memory.settle_signal_probes / edge.signal_edge_stats. Read-only w.r.t. trading behaviour.
     try:
       memory.settle_signal_probes(live_prices)
+      # Same idea one step later in the trade: resolve each recorded discretionary close against what
+      # the bracket it overrode would have returned.
+      memory.settle_exit_probes(live_prices)
     except Exception as exc:
       logger.debug("Signal-probe settle skipped: %s", exc)
     for stored_trigger, observed_price in _crossed_auto_triggers(memory.latest_triggers(), live_prices):
@@ -1324,6 +1361,31 @@ async def trading_loop(
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)
         logger.info("Recorded triggered close for %s: PnL=%.4f (%s)", sym, pnl, close_type)
+        # An exit that reached NEITHER the stop nor the target was somebody's discretionary call, not
+        # the bracket resolving. Score it later against what the bracket would have done — that is the
+        # book's largest measured leak and the model currently gets no feedback on it at all.
+        try:
+          _ctx = entry_context if isinstance(entry_context, dict) else {}
+          _e = _ctx.get("fillPrice") or _ctx.get("entryPrice") or entry_price
+          _sl, _tp = _ctx.get("stopLossPrice"), _ctx.get("takeProfitPrice")
+          if _e and _sl and _tp and exit_price:
+            _long = str(position_side).lower() == "long"
+            _reached = (
+              (float(exit_price) >= float(_tp) or float(exit_price) <= float(_sl)) if _long
+              else (float(exit_price) <= float(_tp) or float(exit_price) >= float(_sl))
+            )
+            if not _reached:
+              _risk = abs(float(_e) - float(_sl))
+              _taken = (
+                ((float(exit_price) - float(_e)) if _long else (float(_e) - float(exit_price))) / _risk
+                if _risk > 0 else None
+              )
+              memory.record_exit_probe(
+                sym, position_side, _e, _sl, _tp, exit_price,
+                realized_r=_taken, setup_family=_ctx.get("setupFamily"),
+              )
+        except Exception:
+          logger.debug("exit-probe recording failed for %s", sym, exc_info=True)
       except Exception as exc:
         logger.warning("Failed to record triggered close: %s", exc)
 

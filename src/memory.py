@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -32,6 +33,7 @@ MAX_PENDING_AGENT_EVENTS = 200
 # Direction calls kept for edge measurement. Retained by COUNT, never by clock — see
 # `record_signal_probe` for why coupling evidence supply to anything else creates a doom loop.
 MAX_SIGNAL_PROBES = 400
+MAX_EXIT_PROBES = 200
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
 _ATR_QUARANTINE_RE = re.compile(
   r"daily ATR\s+([0-9]+(?:\.[0-9]+)?)%\s+exceeds\s+([0-9]+(?:\.[0-9]+)?)%",
@@ -373,6 +375,11 @@ class MemoryStore:
     probes = data.get("signal_probes") or []
     if len(probes) > MAX_SIGNAL_PROBES:
       data["signal_probes"] = probes[-MAX_SIGNAL_PROBES:]
+    # Exit probes are learning data too (was the discretionary close better than the bracket?):
+    # count-capped, never clock-pruned, for the same reason signal probes are not.
+    _xp = data.get("exit_probes") or []
+    if len(_xp) > MAX_EXIT_PROBES:
+      data["exit_probes"] = _xp[-MAX_EXIT_PROBES:]
     # Permanent notes are exempt from the retention-days cutoff by design — they persist
     # until manually deleted. Only the count cap (MAX_PERMANENT_NOTES) applies below.
     data.setdefault("supervisor_notes_permanent", [])
@@ -1182,6 +1189,133 @@ class MemoryStore:
       if len(data["signal_probes"]) > MAX_SIGNAL_PROBES:
         data["signal_probes"] = data["signal_probes"][-MAX_SIGNAL_PROBES:]
       self._write(data)
+
+  def record_exit_probe(
+    self,
+    symbol: str,
+    position_side: str,
+    entry_price: Any,
+    stop_price: Any,
+    take_profit: Any,
+    exit_price: Any,
+    realized_r: Any = None,
+    setup_family: Optional[str] = None,
+  ) -> None:
+    """Record a DISCRETIONARY close so it can later be scored against the bracket it overrode.
+
+    The bot measures whether its entries predict (``signal_probes``) but never measured whether its
+    *exits* helped — and the exits turned out to be the dominant behaviour: over the 2026-09-02 window
+    16 positions were closed by the agent against 2 by the profit-lock, at a 13-minute median hold on
+    brackets whose targets need hours. Replaying those 16 on real 1m klines, letting the bracket run
+    was worth +3.05R against the +0.42R actually taken — the single largest measured leak in the book,
+    larger than the entire net loss.
+
+    The fix the project philosophy asks for is evidence, not a veto: the model still owns the decision
+    to close, it just gets to see its own record at doing so. Self-correcting in both directions — if
+    discretionary closes start beating the brackets, the same number says so and endorses them. Never
+    raises.
+    """
+    try:
+      e = float(entry_price)
+      sl = float(stop_price)
+      tp = float(take_profit)
+      xp = float(exit_price)
+    except (TypeError, ValueError):
+      return
+    # NaN fails every comparison, so `<= 0` alone would let it through and poison the aggregate.
+    if not all(math.isfinite(v) and v > 0 for v in (e, sl, tp, xp)):
+      return
+    if e == sl:
+      return  # no risk unit; nothing to express the comparison in
+    sym = _normalize_symbol(symbol)
+    if not sym:
+      return
+    side = str(position_side or "").lower()
+    side = "long" if side in ("buy", "long") else ("short" if side in ("sell", "short") else "")
+    if not side:
+      return
+    try:
+      rr = float(realized_r) if realized_r is not None else None
+    except (TypeError, ValueError):
+      rr = None
+    row = {
+      "symbol": sym,
+      "ts": int(time.time()),
+      "positionSide": side,
+      "entryPrice": e,
+      "stopPrice": sl,
+      "takeProfitPrice": tp,
+      "exitPrice": xp,
+      "realizedR": rr,
+      "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
+      "outcome": {},
+    }
+    with self._lock:
+      data = self._read()
+      data.setdefault("exit_probes", []).append(row)
+      if len(data["exit_probes"]) > MAX_EXIT_PROBES:
+        data["exit_probes"] = data["exit_probes"][-MAX_EXIT_PROBES:]
+      self._write(data)
+
+  def settle_exit_probes(self, prices: Dict[str, Any], expire_hours: float = 8.0) -> int:
+    """Resolve each recorded discretionary close against what its bracket would have done.
+
+    Uses the per-poll ticker snapshot, so resolution is at poll resolution (a level crossed and
+    retraced between two polls is missed) — which biases the comparison CONSERVATIVELY toward the
+    discretionary close, since a missed touch is a bracket outcome not credited. Unresolved probes are
+    marked to market at ``expire_hours`` so a trade that simply drifted still contributes. Never raises.
+    """
+    if not prices:
+      return 0
+    now = int(time.time())
+    settled = 0
+    with self._lock:
+      data = self._read()
+      for row in data.get("exit_probes") or []:
+        if not isinstance(row, dict):
+          continue
+        outcome = row.get("outcome")
+        if not isinstance(outcome, dict) or outcome.get("resolved"):
+          continue
+        px = prices.get(row.get("symbol"))
+        px = getattr(px, "price", px)
+        try:
+          px = float(px)
+        except (TypeError, ValueError):
+          continue
+        if px <= 0:
+          continue
+        try:
+          e = float(row["entryPrice"]); sl = float(row["stopPrice"]); tp = float(row["takeProfitPrice"])
+        except (TypeError, ValueError, KeyError):
+          continue
+        risk = abs(e - sl)
+        if risk <= 0:
+          continue
+        long_side = row.get("positionSide") == "long"
+        hit_tp = px >= tp if long_side else px <= tp
+        hit_sl = px <= sl if long_side else px >= sl
+        if hit_tp:
+          outcome.update({"resolved": "take_profit", "bracketR": abs(tp - e) / risk})
+        elif hit_sl:
+          outcome.update({"resolved": "stop", "bracketR": -1.0})
+        elif now >= int(row.get("ts") or now) + int(expire_hours * 3600):
+          mark = (px - e) / risk if long_side else (e - px) / risk
+          outcome.update({"resolved": "expired", "bracketR": mark})
+        else:
+          continue
+        outcome["resolvedTs"] = now
+        settled += 1
+      if settled:
+        self._write(data)
+    return settled
+
+  def exit_probes(self, limit: int = 200) -> list[Dict[str, Any]]:
+    """Recorded discretionary closes, newest last."""
+    with self._lock:
+      data = self._read()
+    rows = [r for r in (data.get("exit_probes") or []) if isinstance(r, dict)]
+    return rows[-max(1, int(limit)):]
 
   def settle_signal_probes(self, prices: Dict[str, Any], horizons_min: tuple = (60, 240)) -> int:
     """Stamp the forward price on any entry signal whose measurement horizon has elapsed.
