@@ -414,3 +414,95 @@ class TestClosedPositionsRenderability:
            "entryPrice": 2.10, "exitPrice": 2.060167}
     rows = _publisher()._closed_position_lifecycles(self._mem([old]))
     assert len(rows) == 1 and rows[0]["side"] == "long"
+
+
+class TestMacroEventsPanel:
+  """The calendar and blackout state published to the dashboard.
+
+  Everything here is public information — release names, times and which window the bot is in — so it
+  is safe in every disclosure mode. The state a reader most needs is the one that is easy to get wrong:
+  a stale calendar means NO blackout is in force, which must be visible rather than inferred.
+  """
+
+  @staticmethod
+  def _cfg():
+    return SimpleNamespace(
+      dashboard=SimpleNamespace(disclosure="normalized"),
+      regime=SimpleNamespace(macro_events_enabled=True,
+                             macro_event_before_min=60.0, macro_event_after_min=60.0),
+    )
+
+  @staticmethod
+  def _store(tmp_path):
+    from src.memory import MemoryStore
+    return MemoryStore(str(tmp_path / "m.json"))
+
+  def test_empty_calendar_publishes_no_blackout(self, tmp_path):
+    cfg = self._cfg()
+    out = DashboardPublisher(cfg)._build_macro_events(self._store(tmp_path), cfg)
+    assert out["upcoming"] == []
+    assert out["entriesBlockedNow"] is False
+    assert out["activeWindow"] is None
+    assert out["calendarAgeHours"] is None      # never fetched — readers must see that
+
+  def test_imminent_release_publishes_the_active_window(self, tmp_path):
+    import time
+    cfg, m = self._cfg(), self._store(tmp_path)
+    m.record_macro_events([
+      {"name": "US CPI (Aug)", "ts": time.time() + 22 * 60, "impact": "high"},
+      {"name": "FOMC statement", "ts": time.time() + 3 * 86400, "impact": "high"},
+    ])
+    out = DashboardPublisher(cfg)._build_macro_events(m, cfg)
+    assert out["entriesBlockedNow"] is True
+    assert out["activeWindow"]["phase"] == "before"
+    assert out["activeWindow"]["name"] == "US CPI (Aug)"
+    assert [e["name"] for e in out["upcoming"]] == ["US CPI (Aug)", "FOMC statement"]
+    assert out["upcoming"][0]["inMinutes"] == pytest.approx(22, abs=1)
+
+  def test_disabled_publishes_the_calendar_but_no_block(self, tmp_path):
+    import time
+    cfg, m = self._cfg(), self._store(tmp_path)
+    cfg.regime.macro_events_enabled = False
+    m.record_macro_events([{"name": "US CPI", "ts": time.time() + 10 * 60, "impact": "high"}])
+    out = DashboardPublisher(cfg)._build_macro_events(m, cfg)
+    assert out["enabled"] is False
+    assert out["entriesBlockedNow"] is False     # the guard is off...
+    assert len(out["upcoming"]) == 1             # ...but the calendar is still informative
+
+  def test_publishes_no_account_data(self, tmp_path):
+    import json, time
+    cfg, m = self._cfg(), self._store(tmp_path)
+    m.record_macro_events([{"name": "US CPI", "ts": time.time() + 600, "impact": "high"}])
+    blob = json.dumps(DashboardPublisher(cfg)._build_macro_events(m, cfg)).lower()
+    for banned in ("usdt", "equity", "balance", "notional", "accountid", "$"):
+      assert banned not in blob
+
+
+class TestExitDisciplinePanel:
+  def test_r_multiples_only_never_dollars(self, tmp_path):
+    """R is a ratio to the trade's own risk, so this is safe under `normalized` disclosure."""
+    import json, time
+    from src.memory import MemoryStore
+    cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized"))
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_exit_probe("AAVE-USDT", "short", 132.35, 135.25, 127.10, 131.94, realized_r=0.14,
+                        setup_family="fade_extreme")
+    data = m._read()
+    data["exit_probes"][0]["outcome"] = {"resolved": "take_profit", "bracketR": 1.76,
+                                         "resolvedTs": int(time.time())}
+    m._write(data)
+    out = DashboardPublisher(cfg)._build_exit_discipline(m)
+    assert out["n"] == 1
+    assert out["takenR"] == pytest.approx(0.14)
+    assert out["bracketR"] == pytest.approx(1.76)
+    assert out["deltaR"] == pytest.approx(-1.62)
+    blob = json.dumps(out).lower()
+    for banned in ("usd", "equity", "balance", "notional", "$"):
+      assert banned not in blob
+
+  def test_survives_a_store_with_no_probes(self, tmp_path):
+    from src.memory import MemoryStore
+    cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized"))
+    out = DashboardPublisher(cfg)._build_exit_discipline(MemoryStore(str(tmp_path / "m.json")))
+    assert out == {"verdict": "insufficient data", "n": 0, "takenR": 0, "bracketR": 0,
+                   "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0, "byFamily": {}}

@@ -25,7 +25,14 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from .edge import family_size_factor, infer_setup_family, measured_slippage_pct, signal_edge_stats
+from .edge import (
+  exit_discipline_stats,
+  family_size_factor,
+  infer_setup_family,
+  measured_slippage_pct,
+  signal_edge_stats,
+)
+from .regime import macro_event_entry_block, macro_event_window
 from .memory import MemoryStore
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -239,6 +246,8 @@ class DashboardPublisher:
       "disclosure": self.cfg.disclosure,
       "kpis": self._sanitize_perf(perf),
       "strategyEdge": self._build_strategy_edge(memory, cfg),
+      "macroEvents": self._build_macro_events(memory, cfg),
+      "exitDiscipline": self._build_exit_discipline(memory),
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
@@ -352,6 +361,78 @@ class DashboardPublisher:
       }
     except Exception as exc:  # pragma: no cover - defensive; publishing must never break the loop
       logger.debug("strategyEdge unavailable: %s", exc)
+    return out
+
+  def _build_macro_events(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
+    """The scheduled-release calendar and whichever window is live right now.
+
+    Entirely public information — release names and times, plus which window the bot is in. No
+    balance, equity, position size or account identifier is involved, so it is safe in every
+    disclosure mode. ``calendarAgeHours`` is published deliberately: a stale calendar means no
+    blackout is in force, and that is exactly the state a reader needs to be able to see rather than
+    infer from an empty list. Never raises — the dashboard must not be able to take the bot down.
+    """
+    out: Dict[str, Any] = {"enabled": False, "upcoming": [], "activeWindow": None,
+                           "entriesBlockedNow": False, "calendarAgeHours": None}
+    try:
+      before = float(getattr(cfg.regime, "macro_event_before_min", 60.0))
+      after = float(getattr(cfg.regime, "macro_event_after_min", 60.0))
+      enabled = bool(getattr(cfg.regime, "macro_events_enabled", True))
+      events = memory.macro_events()
+      now = time.time()
+      window = macro_event_window(events, now, before_min=before, after_min=after)
+      active = None
+      if isinstance(window, dict):
+        ev = window.get("event") or {}
+        active = {
+          "phase": window.get("phase"),
+          "name": ev.get("name"),
+          "impact": ev.get("impact"),
+          "minutesTo": window.get("minutesTo"),
+          "minutesSince": window.get("minutesSince"),
+        }
+      out = {
+        "enabled": enabled,
+        "windowBeforeMin": _round(before, 0),
+        "windowAfterMin": _round(after, 0),
+        "calendarAgeHours": memory.macro_calendar_age_hours(),
+        "activeWindow": active,
+        "entriesBlockedNow": bool(macro_event_entry_block(window, enabled=enabled)),
+        "upcoming": [
+          {
+            "name": str(e.get("name") or "")[:120],
+            "ts": int(e.get("ts") or 0),
+            "impact": str(e.get("impact") or "high"),
+            "inMinutes": int(round((int(e.get("ts") or 0) - now) / 60.0)),
+          }
+          for e in events if int(e.get("ts") or 0) > now
+        ][:8],
+      }
+    except Exception as exc:  # pragma: no cover - defensive; publishing must never break the loop
+      logger.debug("macroEvents unavailable: %s", exc)
+    return out
+
+  def _build_exit_discipline(self, memory: MemoryStore) -> Dict[str, Any]:
+    """Were the bot's discretionary closes better than the brackets they overrode?
+
+    R-multiples, counts and a verdict only — R is a ratio to the trade's own risk, never a dollar
+    amount — so this is safe under the default `normalized` disclosure policy. Never raises.
+    """
+    out: Dict[str, Any] = {"verdict": "insufficient data", "n": 0}
+    try:
+      stats = exit_discipline_stats(memory.exit_probes(limit=200))
+      out = {
+        "verdict": stats.get("verdict", "insufficient data"),
+        "n": int(stats.get("n") or 0),
+        "takenR": stats.get("takenR"),
+        "bracketR": stats.get("bracketR"),
+        "deltaR": stats.get("deltaR"),
+        "deltaRPerTrade": stats.get("deltaRPerTrade"),
+        "beatBracket": stats.get("beatBracket"),
+        "byFamily": stats.get("byFamily") or {},
+      }
+    except Exception as exc:  # pragma: no cover - defensive
+      logger.debug("exitDiscipline unavailable: %s", exc)
     return out
 
   def _allow_usd(self) -> bool:
