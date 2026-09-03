@@ -136,6 +136,7 @@ class DashboardPublisher:
     self._last_publish_ts: float = 0.0
     self._table_client = None
     self._last_hidden_points = -1
+    self._last_unrenderable_closes = -1
     self._container_client = None
     self._init_failed = False
 
@@ -837,7 +838,11 @@ class DashboardPublisher:
         "setupFamily": ctx.get("setupFamily") or (infer_setup_family(ctx) if ctx else None),
       })
     rows.sort(key=lambda r: r["closeTs"], reverse=True)
-    if unrenderable:
+    if unrenderable and unrenderable != self._last_unrenderable_closes:
+      # Once per change, not once per publish. These are legacy rows recorded before positionSide and
+      # entryPrice were captured; they are permanent (realized closes are never clock-pruned), so an
+      # unchanged count is steady state rather than news. A rising count IS news and still logs.
+      self._last_unrenderable_closes = unrenderable
       logger.warning(
         "CLOSED POSITIONS: dropped %d row(s) with no side or price — these render as empty duplicate "
         "cards beside the real trade. Check MemoryStore for a close recorded twice.", unrenderable,
