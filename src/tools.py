@@ -23,6 +23,7 @@ from typing import Any, Dict, List
 import requests
 
 from agents.tool import function_tool
+from pydantic import BaseModel, ConfigDict
 from .analytics import (
   INTERVAL_SECONDS,
   candles_to_dataframe,
@@ -139,6 +140,21 @@ def entry_cancel_guard_reason(
     f"Atomic entry validity lease has {remaining:.1f}min remaining and no completed 1h/daily "
     "direction flip invalidates it"
   )
+
+
+class MacroEventInput(BaseModel):
+  """One scheduled macro release, as the Research Agent supplies it.
+
+  Declared as an explicit model rather than ``Dict[str, Any]`` because the Agents SDK compiles tool
+  parameters into a STRICT JSON schema, and a free-form dict emits ``additionalProperties``, which
+  strict mode rejects — it raises at ``build_tools`` time and takes down every agent run, not just the
+  tool. All three fields are required: strict schemas do not allow optional properties.
+  """
+  model_config = ConfigDict(extra="forbid")
+
+  name: str
+  ts: int
+  impact: str
 
 
 def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
@@ -5171,14 +5187,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     return {"removed": entry, "coins": memory.get_coins(default=list(allowed_symbols))}
 
   @function_tool
-  async def log_macro_calendar(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+  async def log_macro_calendar(events: List[MacroEventInput]) -> Dict[str, Any]:
     """Store the schedule of upcoming HIGH-IMPACT macro releases (CPI, FOMC, NFP, PCE, Jackson Hole).
 
     Use web_search to look up the official schedule (BLS / Federal Reserve release calendars, or any
     economic calendar), then pass the events here. These dates are published a year in advance, so this
     is a calendar, not a news feed — refresh it every day or two, not every run.
 
-    Each event is {"name": str, "ts": <unix seconds UTC>, "impact": "high"|"medium"|"low"}. Give ts as
+    Each event needs all three of name, ts and impact ("high"|"medium"|"low"). Give ts as
     the exact release time in UTC (US CPI and NFP are 08:30 ET; FOMC statements 14:00 ET — convert,
     and mind US daylight saving). Anything already past, or missing a name or ts, is dropped.
 
@@ -5189,7 +5205,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     resolution in the hour after — scored in signalEdge.by_family like every other playbook. An empty
     or stale calendar simply means no blackout, so a missed refresh never blocks trading.
     """
-    stored = memory.record_macro_events(events)
+    stored = memory.record_macro_events([e.model_dump() for e in (events or [])])
     return {
       "stored": stored,
       "calendar": memory.macro_events(within_hours=336),
