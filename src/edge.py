@@ -459,11 +459,67 @@ def _stderr(vals: List[float]) -> float:
   return math.sqrt(var / n)
 
 
+def _probe_observations(
+  probes: List[Dict[str, Any]],
+  horizons_min: tuple,
+  *,
+  require: Any = None,
+):
+  """Yield ``(row, ctx, horizon_min, signed_return)`` for every usable probe observation.
+
+  Shared by every statistic computed off signal probes so the de-overlap rule below lives in exactly
+  one place — it is subtle, it is load-bearing, and a second copy of it would drift.
+
+  Probes on the same symbol are recorded minutes apart, so their forward windows OVERLAP almost
+  entirely — thirty probes on one symbol inside four hours are close to one observation, not thirty.
+  Counting them independently inflates the sample and, with it, the verdict. On 2026-08-11 that
+  produced a false positive: the 240m horizon read +0.224% (t=+3.66, n=131) and the verdict flipped
+  to "edge", but decimating to one probe per symbol per window gave +0.068% (t=+0.51, n=31) — below
+  the cost hurdle, i.e. nothing. Since that verdict governs how much capital each family gets, an
+  inflated sample can talk the bot into sizing UP on noise, which is the most expensive mistake this
+  module could make. Keep one observation per symbol per horizon window.
+
+  ``require`` optionally filters on the entry context (used to restrict to flow-stamped probes).
+  Note the filter runs BEFORE the de-overlap, so each statistic decimates its own eligible set rather
+  than inheriting gaps from rows it never counted.
+  """
+  last_seen: Dict[tuple, int] = {}
+  ordered = sorted(
+    (r for r in (probes or []) if isinstance(r, dict)),
+    key=lambda r: int(r.get("ts") or 0),
+  )
+  for row in ordered:
+    ctx = row.get("entryContext")
+    if not isinstance(ctx, dict):
+      continue
+    base = _f(ctx.get("marketPriceAtSignal"))
+    side = str(ctx.get("positionSide") or "").lower()
+    probe = ctx.get("signalProbe")
+    if not base or base <= 0 or side not in {"long", "short"} or not isinstance(probe, dict):
+      continue
+    if require is not None and not require(ctx):
+      continue
+    symbol = str(row.get("symbol") or "?")
+    ts = int(row.get("ts") or 0)
+    for horizon in horizons_min:
+      px = _f(probe.get(f"m{int(horizon)}"))
+      if px is None or px <= 0:
+        continue
+      key = (symbol, int(horizon))
+      if ts - last_seen.get(key, -10**9) < int(horizon) * 60:
+        continue
+      last_seen[key] = ts
+      ret = (px - base) / base
+      yield row, ctx, int(horizon), (ret if side == "long" else -ret)
+
+
 def signal_edge_stats(
   probes: List[Dict[str, Any]],
   *,
   cost_pct: float = 0.001,
-  horizons_min: tuple = (60, 240),
+  horizons_min: tuple = (5, 15, 60, 240),
+  verdict_horizons: tuple = (60, 240),
+  family_horizon_min: int = 60,
   min_samples: int = 20,
 ) -> Dict[str, Any]:
   """Does the agent's DIRECTION CALL predict? The one question that decides profitability.
@@ -481,50 +537,27 @@ def signal_edge_stats(
   A signal is only worth trading when its mean forward return clears the round-trip cost. Below that,
   no exit or sizing scheme can produce profit — it can only lose more slowly. ``verdict`` is therefore
   the honest summary: "edge" / "no edge" / "insufficient data".
+
+  ``horizons_min`` is what gets REPORTED; ``verdict_horizons`` and ``family_horizon_min`` are what
+  gets ACTED ON, and they are separate on purpose. The 5m and 15m points were added to find out
+  whether anything predicts at the short horizons where order-flow signals are supposed to live, and
+  a new measurement must not silently move live capital: were the verdict taken over all horizons,
+  the noisiest short one would win ``best_horizon`` by chance, and were family scoring left keyed to
+  ``horizons_min[0]`` it would have jumped from the 60m point to the 5m point — re-pricing every
+  playbook's risk multiplier as a side effect of adding a chart. Report widely, act narrowly.
   """
-  out: Dict[str, Any] = {"n": 0, "verdict": "insufficient data", "cost_pct": cost_pct}
+  # `by_horizon` is seeded so the return shape is the same whether or not anything settled — callers
+  # (dashboard, agent state) should not have to distinguish "no data" from "key absent".
+  out: Dict[str, Any] = {
+    "n": 0, "verdict": "insufficient data", "cost_pct": cost_pct, "by_horizon": {},
+  }
   by_h: Dict[str, List[float]] = {}
   by_fam: Dict[str, List[float]] = {}
-  # Probes on the same symbol are recorded minutes apart, so their forward windows OVERLAP almost
-  # entirely — thirty probes on one symbol inside four hours are close to one observation, not thirty.
-  # Counting them independently inflates the sample and, with it, the verdict. On 2026-08-11 that
-  # produced a false positive: the 240m horizon read +0.224% (t=+3.66, n=131) and the verdict flipped
-  # to "edge", but decimating to one probe per symbol per window gave +0.068% (t=+0.51, n=31) — below
-  # the cost hurdle, i.e. nothing. Since this verdict governs how much capital each family gets, an
-  # inflated sample can talk the bot into sizing UP on noise, which is the most expensive mistake this
-  # module could make. Keep one observation per symbol per horizon window.
-  last_seen: Dict[tuple, int] = {}
-  ordered = sorted(
-    (r for r in (probes or []) if isinstance(r, dict)),
-    key=lambda r: int(r.get("ts") or 0),
-  )
-  for row in ordered:
-    ctx = row.get("entryContext") if isinstance(row, dict) else None
-    if not isinstance(ctx, dict):
-      continue
-    base = _f(ctx.get("marketPriceAtSignal"))
-    side = str(ctx.get("positionSide") or "").lower()
-    probe = ctx.get("signalProbe")
-    if not base or base <= 0 or side not in {"long", "short"} or not isinstance(probe, dict):
-      continue
-    family = infer_setup_family(ctx)
-    symbol = str(row.get("symbol") or "?")
-    ts = int(row.get("ts") or 0)
-    for horizon in horizons_min:
-      px = _f(probe.get(f"m{int(horizon)}"))
-      if px is None or px <= 0:
-        continue
-      # Drop this observation if the previous one on the same symbol is still inside its window.
-      key = (symbol, int(horizon))
-      if ts - last_seen.get(key, -10**9) < int(horizon) * 60:
-        continue
-      last_seen[key] = ts
-      ret = (px - base) / base
-      signed = ret if side == "long" else -ret
-      by_h.setdefault(f"{int(horizon)}m", []).append(signed)
-      # Family scoring uses ONE horizon so a setup is not counted twice with different holding periods.
-      if int(horizon) == int(horizons_min[0]):
-        by_fam.setdefault(family, []).append(signed)
+  for _row, ctx, horizon, signed in _probe_observations(probes, horizons_min):
+    by_h.setdefault(f"{horizon}m", []).append(signed)
+    # Family scoring uses ONE horizon so a setup is not counted twice with different holding periods.
+    if horizon == int(family_horizon_min):
+      by_fam.setdefault(infer_setup_family(ctx), []).append(signed)
   if by_fam:
     fam_out = {}
     for fam, vals in by_fam.items():
@@ -545,6 +578,7 @@ def signal_edge_stats(
     out["by_family"] = fam_out
   if not by_h:
     return out
+  scoring = {f"{int(h)}m" for h in verdict_horizons}
   detail = {}
   best = None
   for key, vals in by_h.items():
@@ -554,19 +588,153 @@ def signal_edge_stats(
       "n": len(vals),
       "mean_pct": round(mean * 100, 4),
       "hit_rate": round(hit, 3),
+      "stderr_pct": round(_stderr(vals) * 100, 4),
       "net_of_cost_pct": round((mean - cost_pct) * 100, 4),
+      # Whether this horizon is one the bot acts on, or one it is only watching. Published so a
+      # reader of the dashboard is never left guessing which numbers move money.
+      "scored": key in scoring,
     }
-    if best is None or mean > best[1]:
+    if key in scoring and (best is None or mean > best[1]):
       best = (key, mean, len(vals))
-  out["n"] = max(d["n"] for d in detail.values())
+  out["n"] = max((d["n"] for k, d in detail.items() if k in scoring), default=0)
   out["by_horizon"] = detail
   out["best_horizon"] = best[0] if best else None
+  out["verdict_horizons"] = sorted(scoring, key=lambda k: int(k[:-1]))
   if out["n"] < max(1, int(min_samples)):
     out["verdict"] = "insufficient data"
   elif best and best[1] > cost_pct:
     out["verdict"] = "edge"
   else:
     out["verdict"] = "no edge"
+  return out
+
+
+def _flow_agreement(ctx: Dict[str, Any]) -> float | None:
+  """How far the taker tape leaned the way the trade was taken, in share points either side of 0.5.
+
+  Positive means the aggressors were pushing with the position (buyers into a long, sellers into a
+  short); negative means the trade was taken into the flow. Returns None when the probe carries no
+  usable reading, so unstamped probes are excluded rather than silently scored as neutral.
+  """
+  flow = ctx.get("takerFlow")
+  if not isinstance(flow, dict):
+    return None
+  share = _f(flow.get("buyShare"))
+  if share is None or not (0.0 <= share <= 1.0):
+    return None
+  bias = share - 0.5
+  side = str(ctx.get("positionSide") or "").lower()
+  if side == "long":
+    return bias
+  if side == "short":
+    return -bias
+  return None
+
+
+def taker_flow_edge_stats(
+  probes: List[Dict[str, Any]],
+  *,
+  cost_pct: float = 0.001,
+  horizons_min: tuple = (5, 15, 60, 240),
+  min_samples: int = 20,
+  neutral_band: float = 0.05,
+) -> Dict[str, Any]:
+  """Did the taker tape at signal time separate the direction calls that worked from those that did not?
+
+  MEASUREMENT ONLY — nothing in the trading path reads this. It exists to answer, from this account's
+  own data on this venue, a question the literature cannot answer for us. Order-flow imbalance is a
+  genuine and well-documented effect (Cont, Kukanov & Stoikov 2014), but it is measured at a
+  ten-second bucket and is largely *contemporaneous* — price moves because of the flow — with the
+  lagged, forecastable part concentrated inside a minute and decaying fast after. Published work on
+  the crypto retail version (CVD, taker buy/sell ratio) is descriptive: no out-of-sample results, no
+  hit rates, no ICs. And KuCoin is not where these prices are set, so its tape is one venue's slice
+  of a market led elsewhere. All of which means the honest prior is "probably nothing at our horizon",
+  and the only way to know is to record the reading at the call and score it forward.
+
+  The statistic is a SPREAD, not a return. Splitting probes into calls taken *with* the flow and
+  calls taken *against* it, the difference between the two groups' forward returns is the flow's
+  information content, and it is robust to the thing that would otherwise dominate: the bot's overall
+  directional bias. A raw "with-flow calls returned +0.1%" says nothing if every call returned +0.1%.
+
+  Two verdicts are reported because they are different questions, and conflating them is how a real
+  but unusable effect gets traded:
+
+  * ``informative`` — the spread clears its own standard error. Flow carries signal.
+  * ``tradable`` — the with-flow group ALSO clears the round-trip cost. Flow carries enough signal to
+    pay for the trade it would trigger. At a ~0.2% round trip against a few basis points of
+    short-horizon drift, this is the bar that is expected to fail.
+
+  Never raises; returns "insufficient data" until both groups have a real sample.
+  """
+  out: Dict[str, Any] = {
+    "n": 0, "verdict": "insufficient data", "cost_pct": cost_pct,
+    "neutral_band": neutral_band, "by_horizon": {}, "coverage": None,
+  }
+  band = max(0.0, float(neutral_band))
+  buckets: Dict[int, Dict[str, List[float]]] = {}
+  for _row, ctx, horizon, signed in _probe_observations(
+    probes, horizons_min, require=lambda c: _flow_agreement(c) is not None,
+  ):
+    agreement = _flow_agreement(ctx)
+    bucket = "with" if agreement > band else ("against" if agreement < -band else "neutral")
+    buckets.setdefault(horizon, {}).setdefault(bucket, []).append(signed)
+
+  # What fraction of retained probes carry a reading at all. A spread computed over 12% coverage is
+  # a statement about 12% of the book, and the reader needs to see that next to the verdict.
+  rows = [r for r in (probes or []) if isinstance(r, dict)]
+  stamped = sum(
+    1 for r in rows
+    if isinstance(r.get("entryContext"), dict) and _flow_agreement(r["entryContext"]) is not None
+  )
+  if rows:
+    out["coverage"] = round(stamped / len(rows), 3)
+
+  if not buckets:
+    return out
+
+  def _describe(vals: List[float]) -> Dict[str, Any]:
+    mean = sum(vals) / len(vals)
+    return {
+      "n": len(vals),
+      "mean_pct": round(mean * 100, 4),
+      "hit_rate": round(sum(1 for v in vals if v > 0) / len(vals), 3),
+      "stderr_pct": round(_stderr(vals) * 100, 4),
+    }
+
+  detail: Dict[str, Any] = {}
+  for horizon in sorted(buckets):
+    groups = buckets[horizon]
+    row: Dict[str, Any] = {name: _describe(vals) for name, vals in groups.items() if vals}
+    with_vals, against_vals = groups.get("with") or [], groups.get("against") or []
+    verdict = "insufficient data"
+    if len(with_vals) >= min_samples and len(against_vals) >= min_samples:
+      with_mean = sum(with_vals) / len(with_vals)
+      against_mean = sum(against_vals) / len(against_vals)
+      spread = with_mean - against_mean
+      # Standard error of a DIFFERENCE of two independent means: errors add in quadrature. Using
+      # either group's own SE would understate the noise and manufacture significance.
+      spread_se = math.sqrt(_stderr(with_vals) ** 2 + _stderr(against_vals) ** 2)
+      row["spread_pct"] = round(spread * 100, 4)
+      row["spread_stderr_pct"] = round(spread_se * 100, 4)
+      if spread <= spread_se:
+        verdict = "no information"
+      elif with_mean > cost_pct:
+        verdict = "tradable"
+      else:
+        verdict = "informative"
+    row["verdict"] = verdict
+    detail[f"{horizon}m"] = row
+
+  out["by_horizon"] = detail
+  out["n"] = max((sum(g["n"] for g in r.values() if isinstance(g, dict)) for r in detail.values()),
+                 default=0)
+  ranked = [r for r in detail.values() if r.get("verdict") in ("tradable", "informative")]
+  if any(r["verdict"] == "tradable" for r in ranked):
+    out["verdict"] = "tradable"
+  elif ranked:
+    out["verdict"] = "informative"
+  elif any(r.get("verdict") == "no information" for r in detail.values()):
+    out["verdict"] = "no information"
   return out
 
 

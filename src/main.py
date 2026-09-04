@@ -13,7 +13,11 @@ from typing import Any, Callable, Dict, Optional
 
 from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
-from .agent import TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client
+from .agent import (
+  TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client,
+  _to_futures_symbol,
+)
+from .analytics import taker_flow_summary
 from .config import load_config
 from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
@@ -186,6 +190,76 @@ def _next_price_noise_ewma(
     return observed
   previous = max(0.0, float(previous_ewma_pct))
   return (1.0 - _PRICE_NOISE_ALPHA) * previous + _PRICE_NOISE_ALPHA * observed
+
+
+_FLOW_EWMA_ALPHA = 0.3  # same responsiveness as the price-noise EWMA above
+
+
+def _next_flow_observation(
+  previous: Dict[str, Any] | None,
+  summary: Dict[str, Any],
+  now_ts: int,
+) -> Dict[str, Any]:
+  """Fold one taker-tape reading into a symbol's running flow state.
+
+  The EWMA tracks the share of the *newly arrived* trades, not the whole window. One 100-trade
+  window spans several minutes on a mid-cap perp while the loop polls every 60s, so consecutive
+  windows share most of their rows; smoothing the window share would mostly be smoothing the same
+  trades over and over, and would report a confidence the sample does not have. When the new slice
+  is empty (nothing traded, or no cursor to compare against) the window share seeds the series
+  instead, so a quiet symbol still has a usable level rather than a gap.
+  """
+  prior = previous if isinstance(previous, dict) else {}
+  window_share = summary.get("buyShare")
+  fresh_share = summary.get("newBuyShare")
+  observed = fresh_share if fresh_share is not None else window_share
+  try:
+    samples = max(0, int(prior.get("samples") or 0))
+  except (TypeError, ValueError):
+    samples = 0
+  try:
+    previous_ewma = float(prior.get("buyShareEwma"))
+  except (TypeError, ValueError):
+    previous_ewma = None
+
+  state = dict(summary)
+  state["updated"] = int(now_ts)
+  if observed is None:
+    # Nothing measurable this poll: carry the level forward rather than resetting it to neutral,
+    # which would read as "balanced flow" when it actually means "no data".
+    state["buyShareEwma"] = previous_ewma
+    state["samples"] = samples
+    return state
+  observed = float(observed)
+  state["buyShareEwma"] = round(
+    observed if previous_ewma is None or samples <= 0
+    else (1.0 - _FLOW_EWMA_ALPHA) * previous_ewma + _FLOW_EWMA_ALPHA * observed,
+    4,
+  )
+  state["samples"] = min(samples + 1, 1_000_000)
+  return state
+
+
+def _flow_symbols(snapshot, max_symbols: int) -> list[str]:
+  """Which symbols to sample the tape for, held positions first.
+
+  One public REST call per symbol per poll is cheap but not free, and the coin list can rotate wide
+  when flexible coins are on. Positions we are actually carrying are sampled first so the cap can
+  never starve an open trade of its record in favour of a watchlist name.
+  """
+  held: list[str] = []
+  for position in getattr(snapshot, "futures_positions", None) or []:
+    if not isinstance(position, dict):
+      continue
+    try:
+      qty = float(position.get("currentQty") or 0)
+    except (TypeError, ValueError):
+      continue
+    symbol = normalize_symbol(position.get("symbol") or "")
+    if qty and symbol and symbol not in held:
+      held.append(symbol)
+  ordered = held + [s for s in sorted(getattr(snapshot, "tickers", None) or {}) if s not in held]
+  return ordered[:max(0, int(max_symbols))]
 
 
 def _rebase_reviewed_price_triggers(
@@ -717,6 +791,7 @@ async def trading_loop(
   unproductive_runs = min(100, max(0, int(scheduler_state.get("unproductiveRuns") or 0)))
   reviewed_prices: Dict[str, float] = dict(scheduler_state.get("reviewedPrices") or {})
   price_observations: Dict[str, Dict[str, Any]] = dict(scheduler_state.get("priceObservations") or {})
+  flow_observations: Dict[str, Dict[str, Any]] = dict(scheduler_state.get("flowObservations") or {})
   last_prices: Dict[str, float] = {
     symbol: float(observation["lastPrice"])
     for symbol, observation in price_observations.items()
@@ -729,6 +804,7 @@ async def trading_loop(
       "unproductiveRuns": unproductive_runs,
       "reviewedPrices": reviewed_prices,
       "priceObservations": price_observations,
+      "flowObservations": flow_observations,
     })
 
   idle_polls = 0
@@ -1149,6 +1225,28 @@ async def trading_loop(
         "updated": int(time.time()),
       }
       last_prices[symbol] = price
+
+    # Continuous taker-flow record. The bot has always analysed CLOSED CANDLES at 15m and above, so
+    # it could see what price did but never who was pushing it — KuCoin klines carry no taker split,
+    # and this public tape is the only endpoint that does. Sampled every poll into persisted state so
+    # a reading exists at the moment of a direction call rather than being fetched inside the hot
+    # path. Purely observational: nothing in the trading path reads it yet, by design — see
+    # edge.taker_flow_edge_stats for the question it is being collected to answer.
+    if cfg.edge.taker_flow_enabled and kucoin_futures is not None:
+      for symbol in _flow_symbols(snapshot, cfg.edge.taker_flow_max_symbols):
+        futures_symbol = _to_futures_symbol(symbol)
+        if not futures_symbol:
+          continue
+        try:
+          previous = flow_observations.get(symbol) or {}
+          summary = taker_flow_summary(
+            kucoin_futures.get_trade_history(futures_symbol),
+            since_cursor=previous.get("lastCursor"),
+          )
+          flow_observations[symbol] = _next_flow_observation(previous, summary, int(time.time()))
+        except Exception:
+          # Market colour is never worth a poll. A failed tape read leaves the last state in place.
+          logger.debug("taker-flow sample failed for %s", symbol, exc_info=True)
 
     live_prices = {
       normalize_symbol(symbol): float(ticker.price)

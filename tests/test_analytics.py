@@ -8,6 +8,7 @@ from src.analytics import (
     exclude_open_candles,
     summarize_interval,
     summarize_multi_timeframe,
+    taker_flow_summary,
     validate_candle_data,
 )
 
@@ -399,3 +400,95 @@ def test_sine_wave_commentary_mentions_range():
     regime = result["market_regime"]["regime"]
     if regime == "ranging":
         assert "RANGE DETECTED" in result["commentary"]
+
+
+class TestTakerFlowSummary:
+    """The tape is the only place the aggressor is visible — klines carry no taker split.
+
+    Everything downstream (the per-poll EWMA, the stamp on a direction call, the with/against
+    spread) is a ratio computed here, so a bug in this reducer is invisible until it has quietly
+    mislabelled weeks of evidence.
+    """
+
+    @staticmethod
+    def _tape(rows):
+        """Rows as KuCoin returns them: newest first, size in CONTRACTS, ts in nanoseconds."""
+        return [
+            {"sequence": seq, "side": side, "size": size, "price": "1.0", "ts": ts * 1_000_000_000}
+            for seq, side, size, ts in rows
+        ]
+
+    def test_volume_and_count_shares_can_disagree(self):
+        """One whale buy against many small sells — the divergence is the point of reporting both."""
+        out = taker_flow_summary(self._tape([
+            (5, "buy", "900", 1_700_000_005),
+            (4, "sell", "25", 1_700_000_004),
+            (3, "sell", "25", 1_700_000_003),
+            (2, "sell", "25", 1_700_000_002),
+            (1, "sell", "25", 1_700_000_001),
+        ]))
+        assert out["buyShare"] == 0.9          # volume says buyers
+        assert out["buyTradeShare"] == 0.2     # count says sellers
+        assert out["trades"] == 5
+        assert out["spanSec"] == 4.0           # nanosecond ts normalized to seconds
+        assert out["lastCursor"] == 5
+
+    def test_only_trades_past_the_cursor_count_as_new_information(self):
+        """Consecutive 100-trade windows overlap heavily at a 60s poll; re-counting them would
+        manufacture a sample size the tape never delivered."""
+        tape = self._tape([
+            (4, "buy", "10", 1_700_000_004),
+            (3, "buy", "10", 1_700_000_003),
+            (2, "sell", "10", 1_700_000_002),
+            (1, "sell", "10", 1_700_000_001),
+        ])
+        out = taker_flow_summary(tape, since_cursor=2)
+        assert out["buyShare"] == 0.5          # whole window is balanced
+        assert out["newTrades"] == 2
+        assert out["newBuyShare"] == 1.0       # but everything NEW was a buy
+        assert out["gapped"] is False
+
+    def test_a_fully_rolled_window_is_flagged_as_gapped(self):
+        out = taker_flow_summary(
+            self._tape([(9, "buy", "1", 1_700_000_009), (8, "sell", "1", 1_700_000_008)]),
+            since_cursor=2,
+        )
+        assert out["newTrades"] == 2 and out["gapped"] is True
+
+    def test_no_cursor_means_no_new_slice_claimed(self):
+        out = taker_flow_summary(self._tape([(1, "buy", "1", 1_700_000_001)]))
+        assert out["newTrades"] == 0 and out["newBuyShare"] is None and out["gapped"] is False
+
+    def test_malformed_rows_are_skipped_not_fatal(self):
+        out = taker_flow_summary([
+            {"sequence": 3, "side": "buy", "size": "10", "ts": 1_700_000_003_000_000_000},
+            {"sequence": 2, "side": "", "size": "10", "ts": 1_700_000_002_000_000_000},
+            {"sequence": 1, "side": "sell", "size": "not-a-number", "ts": 1},
+            {"sequence": 0, "side": "sell", "size": "0", "ts": 1},
+            "garbage",
+            None,
+        ])
+        assert out["trades"] == 1 and out["buyShare"] == 1.0
+
+    def test_empty_tape_reads_as_no_data_not_as_balanced_flow(self):
+        """None, not 0.5 and not 0.0 — a silent zero would later be smoothed in as real evidence."""
+        for empty in ([], None):
+            out = taker_flow_summary(empty)
+            assert out["buyShare"] is None and out["buyTradeShare"] is None
+            assert out["trades"] == 0 and out["lastCursor"] is None and out["spanSec"] is None
+
+    def test_second_level_timestamps_are_left_alone(self):
+        """Not every venue field is nanoseconds; a plain epoch must not be divided into 1970."""
+        out = taker_flow_summary([
+            {"sequence": 2, "side": "buy", "size": "1", "ts": 1_700_000_060},
+            {"sequence": 1, "side": "buy", "size": "1", "ts": 1_700_000_000},
+        ])
+        assert out["spanSec"] == 60.0 and out["newestTs"] == 1_700_000_060
+
+    def test_falls_back_to_ts_when_the_tape_has_no_sequence(self):
+        out = taker_flow_summary([
+            {"side": "buy", "size": "1", "ts": 1_700_000_002},
+            {"side": "sell", "size": "1", "ts": 1_700_000_001},
+        ], since_cursor=1_700_000_001)
+        assert out["lastCursor"] == 1_700_000_002
+        assert out["newTrades"] == 1 and out["newBuyShare"] == 1.0

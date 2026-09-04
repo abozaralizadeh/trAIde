@@ -36,10 +36,51 @@ MAX_SIGNAL_PROBES = 400
 MAX_EXIT_PROBES = 200
 MAX_MACRO_EVENTS = 60
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
+# Forward-return measurement points, in minutes. 60/240 are the horizons the live entry gates score
+# against; 5/15 were added 2026-09-04 to test whether anything predicts at the short horizons where
+# order-flow signals are supposed to live — the bot had never looked below one hour. Adding them here
+# only measures: `edge.signal_edge_stats` keeps its verdict and its per-family sizing anchored to the
+# original horizons, so nothing the bot DOES changes until the evidence says it should.
+SIGNAL_PROBE_HORIZONS_MIN: tuple[int, ...] = (5, 15, 60, 240)
 _ATR_QUARANTINE_RE = re.compile(
   r"daily ATR\s+([0-9]+(?:\.[0-9]+)?)%\s+exceeds\s+([0-9]+(?:\.[0-9]+)?)%",
   re.IGNORECASE,
 )
+
+
+def _sanitize_taker_flow(value: Any) -> Optional[Dict[str, Any]]:
+  """Whitelist a taker-flow reading down to the fields worth persisting, or None.
+
+  Shares are ratios in [0,1] and are dropped (not clamped) when out of range, so a parsing bug
+  shows up as missing evidence rather than as a plausible-looking 0.0 that would quietly bias every
+  statistic computed from it. ``ageSec`` is kept because a reading taken three polls ago is weaker
+  evidence than one taken this poll, and the analysis needs to be able to tell.
+  """
+  raw = value if isinstance(value, dict) else None
+  if not raw:
+    return None
+  out: Dict[str, Any] = {}
+  for key in ("buyShare", "buyTradeShare", "newBuyShare"):
+    try:
+      share = float(raw.get(key))
+    except (TypeError, ValueError):
+      continue
+    if 0.0 <= share <= 1.0:
+      out[key] = round(share, 4)
+  for key in ("trades", "newTrades"):
+    try:
+      out[key] = max(0, int(raw.get(key) or 0))
+    except (TypeError, ValueError):
+      continue
+  for key in ("spanSec", "ageSec"):
+    try:
+      out[key] = round(max(0.0, float(raw.get(key))), 1)
+    except (TypeError, ValueError):
+      continue
+  out["gapped"] = bool(raw.get("gapped"))
+  # A reading with no buy share carries no information; storing the husk would only make probes look
+  # flow-stamped to the analysis when they are not.
+  return out if "buyShare" in out else None
 
 
 def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
@@ -99,12 +140,51 @@ def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
     }
     reviewed_prices = dict(list(reviewed_prices.items())[-MAX_AGENT_SCHEDULER_SYMBOLS:])
 
+  # Continuous taker-flow state, one row per symbol. Whitelisted here for the same reason every other
+  # key is: this function is the ONLY writer of the persisted scheduler shape, so a field absent from
+  # this dict is silently dropped on the next save and the state resets every restart.
+  flow: Dict[str, Dict[str, Any]] = {}
+  raw_flow = raw.get("flowObservations") or {}
+  if isinstance(raw_flow, dict):
+    for symbol, observation in raw_flow.items():
+      if not isinstance(observation, dict):
+        continue
+      try:
+        normalized = _normalize_symbol(str(symbol))
+      except (TypeError, ValueError):
+        continue
+      reading = _sanitize_taker_flow(observation)
+      if not normalized or not reading:
+        continue
+      for key, caster in (("buyShareEwma", float), ("samples", int), ("updated", int),
+                          ("lastCursor", int)):
+        try:
+          reading[key] = caster(observation.get(key))
+        except (TypeError, ValueError):
+          continue
+      flow[normalized] = reading
+  flow = dict(
+    sorted(flow.items(), key=lambda item: item[1].get("updated", 0))[-MAX_AGENT_SCHEDULER_SYMBOLS:]
+  )
+
   return {
     "lastRunTs": last_run_ts,
     "unproductiveRuns": unproductive_runs,
     "reviewedPrices": reviewed_prices,
     "priceObservations": observations,
+    "flowObservations": flow,
   }
+
+
+def _probe_settle_tolerance_sec(horizon_min: float) -> float:
+  """How late a forward-return stamp may be before it stops being that horizon's return.
+
+  Proportional to the horizon (20%) with a two-poll floor, so a 5-minute point is not allowed the
+  half-hour of slack that a 4-hour point can absorb without changing what it measures. The floor
+  gives the loop two chances to catch each horizon at a 60s poll; miss both and the observation is
+  dropped rather than recorded wrong.
+  """
+  return max(120.0, 0.2 * max(0.0, float(horizon_min)) * 60.0)
 
 
 def _adaptive_quarantine_seconds(reason: str) -> int:
@@ -1154,6 +1234,7 @@ class MemoryStore:
     side: str,
     market_price: Any,
     setup_family: Optional[str] = None,
+    taker_flow: Optional[Dict[str, Any]] = None,
   ) -> None:
     """Record a DIRECTION CALL for edge measurement, whether or not it becomes an order.
 
@@ -1169,6 +1250,12 @@ class MemoryStore:
     back the evidence that would restore its size. Recording at the point of the call breaks that
     circularity completely: risk can go as low as the measurement warrants without ever starving the
     measurement itself. Never raises.
+
+    ``taker_flow`` stamps the aggressor balance observed at the moment of the call (see
+    `analytics.taker_flow_summary`). It is recorded, not acted on: it exists so
+    `edge.taker_flow_edge_stats` can later answer whether flow agreeing with the direction separated
+    the calls that worked from the ones that did not, on this venue at these horizons. Nothing reads
+    it at entry time.
     """
     try:
       px = float(market_price)
@@ -1187,6 +1274,7 @@ class MemoryStore:
         "positionSide": position_side,
         "marketPriceAtSignal": px,
         "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
+        "takerFlow": _sanitize_taker_flow(taker_flow),
         "signalProbe": {},
       },
     }
@@ -1390,7 +1478,11 @@ class MemoryStore:
     rows = [r for r in (data.get("exit_probes") or []) if isinstance(r, dict)]
     return rows[-max(1, int(limit)):]
 
-  def settle_signal_probes(self, prices: Dict[str, Any], horizons_min: tuple = (60, 240)) -> int:
+  def settle_signal_probes(
+    self,
+    prices: Dict[str, Any],
+    horizons_min: tuple = SIGNAL_PROBE_HORIZONS_MIN,
+  ) -> int:
     """Stamp the forward price on any entry signal whose measurement horizon has elapsed.
 
     This closes the feedback loop the bot never had. It has always measured *outcomes* (win rate,
@@ -1406,6 +1498,15 @@ class MemoryStore:
 
     Cheap by construction: it reuses the per-poll ticker snapshot, writes only when a horizon elapses,
     and never raises. Returns the number of probes settled.
+
+    **A horizon that elapsed long ago is recorded as unmeasurable (``None``), never back-stamped.**
+    The check used to be "has the horizon passed?", which silently means "stamp today's price on
+    every probe old enough" — harmless while the loop runs every 60s and each horizon is crossed
+    within one poll of its true moment, but wrong after any downtime, and catastrophically wrong the
+    first time a NEW horizon is introduced: adding the 5m point would have stamped all 400 retained
+    probes with the current price and labelled a multi-day return as a five-minute one. ``None`` is
+    the honest record of a measurement that was missed, and `edge` already skips it; writing it once
+    also stops the horizon being retried forever.
     """
     if not prices:
       return 0
@@ -1423,7 +1524,12 @@ class MemoryStore:
         ts0 = row.get("ts") or 0
         for horizon in horizons_min:
           key = f"m{int(horizon)}"
-          if key in probe or now < ts0 + int(horizon) * 60:
+          due_at = ts0 + int(horizon) * 60
+          if key in probe or now < due_at:
+            continue
+          if now - due_at > _probe_settle_tolerance_sec(horizon):
+            probe[key] = None
+            settled += 1
             continue
           px = prices.get(row.get("symbol"))
           px = getattr(px, "price", px)

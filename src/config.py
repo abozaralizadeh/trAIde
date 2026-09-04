@@ -203,6 +203,15 @@ class EdgeConfig:
                                            # non-positive-edge bet; probes still record at call time so
                                            # the family auto-restores when its edge returns. See
                                            # edge.family_stand_aside. Master escape hatch if it over-fires.
+  taker_flow_enabled: bool = True  # sample KuCoin's public taker tape each poll and stamp the
+                                   # aggressor balance onto every direction call, so
+                                   # edge.taker_flow_edge_stats can measure whether order flow
+                                   # predicts ON THIS VENUE at OUR horizons. Pure observation — no
+                                   # gate, no sizing input, no wake trigger reads it. Off = stop
+                                   # collecting; the statistic then reports what it already has.
+  taker_flow_max_symbols: int = 12  # cap on tape samples per poll (one public REST call each). Held
+                                   # positions are sampled first, so the cap trims the watchlist
+                                   # tail rather than an open trade.
   explore_unproven_family_factor: float = 0.4  # risk multiplier for a setup family that has NOT yet
                                            # earned a scored verdict (< 20 probes). Probes record from
                                            # the market price at signal time, so a family's evidence is
@@ -578,6 +587,8 @@ def load_config() -> AppConfig:
       negative_expectancy_size_factor=float(os.getenv("EDGE_NEGATIVE_EXPECTANCY_SIZE_FACTOR", "0.5")),
       stand_aside_no_edge_family=_as_bool(os.getenv("EDGE_STAND_ASIDE_NO_EDGE_FAMILY"), True),
       explore_unproven_family_factor=float(os.getenv("EDGE_EXPLORE_UNPROVEN_FAMILY_FACTOR", "0.4")),
+      taker_flow_enabled=_as_bool(os.getenv("TAKER_FLOW_ENABLED"), True),
+      taker_flow_max_symbols=int(os.getenv("TAKER_FLOW_MAX_SYMBOLS", "12")),
     ),
     regime=RegimeConfig(
       throttle_enabled=_as_bool(os.getenv("REGIME_THROTTLE_ENABLED"), True),

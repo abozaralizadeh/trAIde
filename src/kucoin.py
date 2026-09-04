@@ -925,6 +925,17 @@ class KucoinFuturesClient:
     data = self._request("GET", path, query={"symbol": symbol})
     return data or {}
 
+  def get_trade_history(self, symbol: str) -> list[Dict[str, Any]]:
+    """Public taker tape: the last 100 executed trades, each carrying the aggressor's `side`.
+
+    This is the only KuCoin endpoint that exposes buy/sell aggression — futures klines return
+    `[ts, o, c, h, l, volume, turnover]` with no taker split, unlike some other venues. Public, so
+    no auth and no account exposure. `size` is in CONTRACTS (not base units) and `ts` is in
+    nanoseconds; see `analytics.taker_flow_summary`, which is the only thing that should parse it.
+    """
+    data = self._request("GET", "/api/v1/trade/history", query={"symbol": symbol})
+    return data if isinstance(data, list) else []
+
   def get_candles(self, symbol: str, granularity: int = 1, start_at: Optional[int] = None, end_at: Optional[int] = None) -> list[list]:
     """Get futures OHLCV candles. Granularity in minutes: 1,5,15,30,60,120,240,480,720,1440,10080."""
     query: Dict[str, Any] = {"symbol": symbol, "granularity": granularity}

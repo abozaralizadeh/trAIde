@@ -18,6 +18,7 @@ from src.edge import (
     loss_streak_size_factor,
     symbol_adaptive_rr,
     symbol_bench_until,
+    taker_flow_edge_stats,
 )
 from src.memory import MemoryStore
 
@@ -839,3 +840,126 @@ def test_stderr_is_reported_per_family():
   # Mean of a symmetric +/-1 spread is ~0, so the SE must dominate the net -> stand aside.
   from src.edge import family_stand_aside
   assert family_stand_aside(s, "continuation") is True
+
+
+# ── Taker flow: does the aggressor balance at signal time separate the good calls? ──
+#
+# Measurement only. The prior is that it does NOT at our horizons — order-flow imbalance is largely
+# contemporaneous and decays inside a minute, and KuCoin is not where these prices are set — so these
+# tests care most about the statistic REFUSING to claim an edge it cannot support.
+
+
+_FLOW_SEQ = [0]
+
+
+def _flow_probe(side, base, fwd, buy_share, *, horizon="m60"):
+    """One independent flow-stamped observation, spaced past the widest horizon (see _probe)."""
+    _FLOW_SEQ[0] += 1
+    ctx = {"positionSide": side, "marketPriceAtSignal": base, "signalProbe": {horizon: fwd}}
+    if buy_share is not None:
+        ctx["takerFlow"] = {"buyShare": buy_share, "trades": 100, "spanSec": 180.0}
+    return {"symbol": "F-USDT", "ts": 2_000_000 + _FLOW_SEQ[0] * 240 * 60, "entryContext": ctx}
+
+
+def test_flow_that_separates_winners_but_not_costs_is_informative_not_tradable():
+    """The expected outcome: a real spread that a 0.10% round trip still eats. Reporting this as
+    'tradable' is exactly the mistake that turns a microstructure paper into a losing strategy."""
+    probes = ([_flow_probe("long", 100.0, 100.05, 0.80) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 99.95, 0.20) for _ in range(25)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    row = out["by_horizon"]["60m"]
+    assert row["spread_pct"] == pytest.approx(0.1)      # with-flow beat against-flow by 10bps
+    assert row["verdict"] == "informative"              # ...which does not pay a 10bps round trip
+    assert out["verdict"] == "informative"
+
+
+def test_flow_is_called_tradable_only_when_the_with_group_clears_cost_on_its_own():
+    probes = ([_flow_probe("long", 100.0, 100.5, 0.80) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 99.5, 0.20) for _ in range(25)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["60m"]["verdict"] == "tradable"
+    assert out["verdict"] == "tradable"
+
+
+def test_a_house_wide_drift_is_not_mistaken_for_a_flow_edge():
+    """Every call made +0.5% regardless of the tape. A raw with-flow mean would look excellent; the
+    spread form cancels the book's own directional bias and correctly reports nothing."""
+    probes = ([_flow_probe("long", 100.0, 100.5, 0.80) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 100.5, 0.20) for _ in range(25)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["60m"]["with"]["mean_pct"] == pytest.approx(0.5)
+    assert out["by_horizon"]["60m"]["spread_pct"] == pytest.approx(0.0)
+    assert out["verdict"] == "no information"
+
+
+def test_a_spread_inside_its_own_standard_error_is_not_information():
+    probes = []
+    for i in range(25):
+        probes.append(_flow_probe("long", 100.0, 100.0 + (i % 5) - 2, 0.80))
+        probes.append(_flow_probe("long", 100.0, 100.0 + (i % 5) - 2.02, 0.20))
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    row = out["by_horizon"]["60m"]
+    assert row["spread_pct"] < row["spread_stderr_pct"]
+    assert row["verdict"] == "no information"
+
+
+def test_agreement_is_measured_against_the_traded_direction():
+    """Sellers hitting the bid are WITH a short. Scoring the tape without the position's side would
+    file every short taken into selling pressure as a trade against the flow."""
+    probes = ([_flow_probe("short", 100.0, 99.5, 0.20) for _ in range(25)]     # sell flow + short
+              + [_flow_probe("short", 100.0, 100.5, 0.80) for _ in range(25)])  # buy flow + short
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    row = out["by_horizon"]["60m"]
+    assert row["with"]["n"] == 25 and row["against"]["n"] == 25
+    assert row["with"]["mean_pct"] == pytest.approx(0.5)    # short + price fell = a win
+    assert row["verdict"] == "tradable"
+
+
+def test_a_balanced_tape_lands_in_neutral_rather_than_padding_a_side():
+    """0.52 is not a buy imbalance. Without a dead band, coin-flip readings would fill both groups
+    with noise and dilute whatever signal the decisive readings carry."""
+    probes = ([_flow_probe("long", 100.0, 101.0, 0.52) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 99.0, 0.48) for _ in range(25)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20, neutral_band=0.05)
+    row = out["by_horizon"]["60m"]
+    assert row["neutral"]["n"] == 50
+    assert "with" not in row and "against" not in row
+    assert row["verdict"] == "insufficient data"
+
+
+def test_coverage_reports_how_much_of_the_book_the_verdict_speaks_for():
+    """A strong spread over a tenth of the calls is a claim about a tenth of the calls."""
+    probes = ([_flow_probe("long", 100.0, 100.5, 0.80) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 99.5, 0.20) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 101.0, None) for _ in range(50)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["coverage"] == pytest.approx(0.5)
+    assert out["by_horizon"]["60m"]["with"]["n"] == 25      # unstamped rows never enter a bucket
+
+
+def test_unusable_readings_are_excluded_rather_than_scored_as_neutral():
+    for flow in ({"buyShare": None}, {"buyShare": 1.4}, {"buyShare": -0.1}, {}, "not-a-dict"):
+        probe = _flow_probe("long", 100.0, 101.0, None)
+        probe["entryContext"]["takerFlow"] = flow
+        out = taker_flow_edge_stats([probe] * 25, cost_pct=0.001, min_samples=1)
+        assert out["n"] == 0 and out["verdict"] == "insufficient data"
+        assert out["coverage"] == 0.0
+
+
+def test_both_groups_must_have_a_real_sample_before_a_verdict():
+    probes = ([_flow_probe("long", 100.0, 100.5, 0.80) for _ in range(25)]
+              + [_flow_probe("long", 100.0, 99.5, 0.20) for _ in range(3)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["60m"]["verdict"] == "insufficient data"
+    assert out["verdict"] == "insufficient data"
+    assert taker_flow_edge_stats([])["verdict"] == "insufficient data"
+    assert taker_flow_edge_stats([])["coverage"] is None
+
+
+def test_short_horizons_are_scored_alongside_the_established_ones():
+    """The 5m and 15m windows exist precisely because that is where flow information is documented
+    to live; a statistic that only looked at 60m could not see the effect it is testing for."""
+    probes = ([_flow_probe("long", 100.0, 100.5, 0.80, horizon="m5") for _ in range(25)]
+              + [_flow_probe("long", 100.0, 99.5, 0.20, horizon="m5") for _ in range(25)])
+    out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
+    assert out["by_horizon"]["5m"]["verdict"] == "tradable"

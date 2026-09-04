@@ -12,8 +12,10 @@ from src.main import (
   _fetch_futures,
   _fetch_recent_fills,
   _fill_event_id,
+  _flow_symbols,
   _futures_position_fingerprint,
   _idle_hunt_due,
+  _next_flow_observation,
   _next_price_noise_ewma,
   _productivity_adjusted_flat_cooldown,
   _rebase_reviewed_price_triggers,
@@ -230,3 +232,70 @@ class TestExpiredBotEntryOrders:
     order = {"id": "old", "clientOid": "traide-entry-old", "createdAt": now - 3600}
     assert _expired_bot_entry_orders([order], 0, now=now) == []
     assert _expired_bot_entry_orders([order], 30, now=now) == [order]
+
+
+class TestTakerFlowSampling:
+  """Folding the tape into per-symbol state, once per poll.
+
+  The subtle part is that consecutive 100-trade windows overlap heavily at a 60s poll, so the
+  running level has to be built from the NEW slice — smoothing the window share would be smoothing
+  the same trades repeatedly and would report a confidence the tape never provided.
+  """
+
+  @staticmethod
+  def _summary(**over):
+    base = {"trades": 100, "newTrades": 0, "spanSec": 180.0, "buyShare": None,
+            "buyTradeShare": None, "newBuyShare": None, "lastCursor": 100, "gapped": False}
+    base.update(over)
+    return base
+
+  def test_first_reading_seeds_the_level_from_the_window(self):
+    out = _next_flow_observation(None, self._summary(buyShare=0.7), 1_700_000_000)
+    assert out["buyShareEwma"] == 0.7 and out["samples"] == 1
+    assert out["updated"] == 1_700_000_000
+
+  def test_the_level_tracks_newly_arrived_trades_not_the_overlapping_window(self):
+    prior = {"buyShareEwma": 0.5, "samples": 4}
+    out = _next_flow_observation(prior, self._summary(buyShare=0.55, newBuyShare=1.0), 1)
+    # 0.7*0.5 + 0.3*1.0 — the new slice, not the 0.55 window that mostly repeats old trades.
+    assert out["buyShareEwma"] == pytest.approx(0.65)
+    assert out["samples"] == 5
+
+  def test_a_quiet_symbol_falls_back_to_the_window_share(self):
+    """Nothing new since the last poll is still a reading — the window is what the tape says now."""
+    prior = {"buyShareEwma": 0.5, "samples": 4}
+    out = _next_flow_observation(prior, self._summary(buyShare=0.9, newBuyShare=None), 1)
+    assert out["buyShareEwma"] == pytest.approx(0.62)   # 0.7*0.5 + 0.3*0.9
+
+  def test_an_unmeasurable_poll_carries_the_level_rather_than_resetting_to_neutral(self):
+    """A failed or empty read must not look like balanced flow — that is a claim, not a gap."""
+    prior = {"buyShareEwma": 0.8, "samples": 6}
+    out = _next_flow_observation(prior, self._summary(), 1)
+    assert out["buyShareEwma"] == 0.8 and out["samples"] == 6   # unchanged, not 0.5 and not counted
+
+  def test_corrupt_prior_state_does_not_poison_the_series(self):
+    out = _next_flow_observation({"buyShareEwma": "x", "samples": "y"}, self._summary(buyShare=0.4), 1)
+    assert out["buyShareEwma"] == 0.4 and out["samples"] == 1
+
+  def test_held_positions_are_sampled_before_the_watchlist(self):
+    """One REST call per symbol per poll is cheap but capped; the cap must trim the watchlist tail,
+    never the trade we are actually carrying."""
+    snapshot = SimpleNamespace(
+      futures_positions=[{"symbol": "XBTUSDTM", "currentQty": "-3"}],
+      tickers={"AAA-USDT": None, "BBB-USDT": None, "CCC-USDT": None},
+    )
+    assert _flow_symbols(snapshot, 2) == ["BTC-USDT", "AAA-USDT"]
+
+  def test_flat_positions_and_junk_rows_are_ignored(self):
+    snapshot = SimpleNamespace(
+      futures_positions=[{"symbol": "XBTUSDTM", "currentQty": "0"},
+                         {"symbol": "ETHUSDTM", "currentQty": "bad"},
+                         "not-a-dict"],
+      tickers={"AAA-USDT": None},
+    )
+    assert _flow_symbols(snapshot, 5) == ["AAA-USDT"]
+
+  def test_sampling_can_be_turned_off_by_the_cap(self):
+    snapshot = SimpleNamespace(futures_positions=[], tickers={"AAA-USDT": None})
+    assert _flow_symbols(snapshot, 0) == []
+    assert _flow_symbols(SimpleNamespace(futures_positions=None, tickers=None), 5) == []

@@ -506,3 +506,109 @@ class TestExitDisciplinePanel:
     out = DashboardPublisher(cfg)._build_exit_discipline(MemoryStore(str(tmp_path / "m.json")))
     assert out == {"verdict": "insufficient data", "n": 0, "takenR": 0, "bracketR": 0,
                    "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0, "byFamily": {}}
+
+
+class TestTakerFlowPanel:
+  """The dashboard's window onto the flow experiment while it runs.
+
+  Two halves that answer different questions: `live` is what the tape is doing right now (genuinely
+  new information on the panel — until now it only ever showed closed candles at 15m and above), and
+  `byHorizon` is whether that reading has ever predicted anything at our horizons.
+  """
+
+  @staticmethod
+  def _memory(probes=(), flow=None):
+    return SimpleNamespace(
+      signal_probes=lambda limit=200: list(probes),
+      recent_fills=lambda limit=100: [],
+      get_agent_scheduler=lambda: {"flowObservations": dict(flow or {})},
+    )
+
+  @staticmethod
+  def _cfg(enabled=True):
+    return SimpleNamespace(
+      trading=SimpleNamespace(estimated_slippage_pct=0.001, slippage_autotune_min_samples=8),
+      edge=SimpleNamespace(taker_flow_enabled=enabled),
+    )
+
+  _seq = [0]
+
+  @classmethod
+  def _probe(cls, side, fwd, buy_share):
+    """One independent flow-stamped observation, spaced past the widest horizon (see test_edge.py)."""
+    cls._seq[0] += 1
+    ctx = {"positionSide": side, "marketPriceAtSignal": 100.0, "signalProbe": {"m60": fwd}}
+    if buy_share is not None:
+      ctx["takerFlow"] = {"buyShare": buy_share}
+    return {"symbol": "F-USDT", "ts": 3_000_000 + cls._seq[0] * 240 * 60, "entryContext": ctx}
+
+  def test_publishes_the_with_against_spread_and_its_verdict(self):
+    pub = _publisher()
+    probes = ([self._probe("long", 100.5, 0.8) for _ in range(25)]
+              + [self._probe("long", 99.5, 0.2) for _ in range(25)])
+    out = pub._build_taker_flow(self._memory(probes), self._cfg())
+    assert out["enabled"] is True
+    assert out["byHorizon"]["60m"]["spread_pct"] == pytest.approx(1.0)
+    assert out["byHorizon"]["60m"]["verdict"] == "tradable"
+    assert out["coverage"] == 1.0
+
+  def test_live_readings_carry_an_age_so_a_stalled_sampler_is_visible(self):
+    """Without an age, a sampler that stopped an hour ago looks exactly like a calm market."""
+    import time as _t
+    pub = _publisher()
+    now = int(_t.time())
+    out = pub._build_taker_flow(self._memory(flow={
+      "BTC-USDT": {"buyShare": 0.61, "buyShareEwma": 0.58, "buyTradeShare": 0.55,
+                   "trades": 100, "spanSec": 182.4, "samples": 12, "updated": now - 90},
+      # No usable share: publishing the husk would show as balanced flow rather than as no data.
+      "ETH-USDT": {"trades": 100, "updated": now},
+    }), self._cfg())
+    assert out["live"]["BTC-USDT"]["buyShare"] == 0.61
+    assert out["live"]["BTC-USDT"]["buyShareEwma"] == 0.58
+    assert 85 <= out["live"]["BTC-USDT"]["ageSec"] <= 120
+    assert "ETH-USDT" not in out["live"]
+
+  def test_the_panel_says_when_collection_is_switched_off(self):
+    pub = _publisher()
+    out = pub._build_taker_flow(self._memory(), self._cfg(enabled=False))
+    assert out["enabled"] is False and out["verdict"] == "insufficient data"
+
+  def test_publishes_no_money_figures_under_normalized_disclosure(self):
+    """Shares, counts, ages and percentages only — nothing here can leak balance or position size."""
+    pub = _publisher("normalized")
+    probes = ([self._probe("long", 100.5, 0.8) for _ in range(25)]
+              + [self._probe("long", 99.5, 0.2) for _ in range(25)])
+    out = pub._build_taker_flow(
+      self._memory(probes, flow={"BTC-USDT": {"buyShare": 0.6, "updated": 1}}), self._cfg())
+    banned = {"equity", "balance", "notional", "usd", "size", "accountid", "qty", "leverage"}
+    def _keys(obj, acc):
+      if isinstance(obj, dict):
+        for k, v in obj.items():
+          # Symbol keys ("BTC-USDT") are names, not disclosures — everything else must be clean.
+          if "-" not in str(k):
+            acc.add(str(k).lower())
+          _keys(v, acc)
+      elif isinstance(obj, list):
+        for v in obj:
+          _keys(v, acc)
+      return acc
+    keys = _keys(out, set())
+    assert not any(b in k for k in keys for b in banned), keys
+
+  def test_a_broken_half_never_takes_down_the_other_or_the_publish_loop(self):
+    pub = _publisher()
+    broken_stats = SimpleNamespace(
+      signal_probes=lambda limit=200: (_ for _ in ()).throw(RuntimeError("boom")),
+      recent_fills=lambda limit=100: [],
+      get_agent_scheduler=lambda: {"flowObservations": {"BTC-USDT": {"buyShare": 0.6, "updated": 1}}},
+    )
+    out = pub._build_taker_flow(broken_stats, self._cfg())
+    assert out["verdict"] == "insufficient data"
+    assert out["live"]["BTC-USDT"]["buyShare"] == 0.6      # the live half still published
+
+    broken_live = SimpleNamespace(
+      signal_probes=lambda limit=200: [],
+      recent_fills=lambda limit=100: [],
+      get_agent_scheduler=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert pub._build_taker_flow(broken_live, self._cfg())["live"] == {}

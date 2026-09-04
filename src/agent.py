@@ -64,6 +64,7 @@ from .edge import (
   loss_streak_size_factor,
   measured_slippage_pct,
   symbol_bench_until,
+  taker_flow_edge_stats,
 )
 from .memory import MAX_SIGNAL_PROBES, MemoryStore
 from .protection import should_block_chase
@@ -814,8 +815,15 @@ def run_trading_agent(
           # kept threw away half the evidence for free and made the per-family verdict swing with the
           # window: on 2026-09-04 continuation read no-edge at every window size except 200, which is
           # the one the bot actually used.
-          state["signal_edge"] = signal_edge_stats(
-            memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=_cost)
+          _probes = memory.signal_probes(limit=MAX_SIGNAL_PROBES)
+          state["signal_edge"] = signal_edge_stats(_probes, cost_pct=_cost)
+          # TAKER FLOW: does the aggressor balance at the moment of the call carry information about
+          # where price goes next, on this venue and at our horizons? Surfaced only once the sample
+          # can answer — an n=5 reading in the prompt is an invitation to trade a coin flip, and the
+          # house rule here is to give the model better evidence, never a rule to obey.
+          _tf = taker_flow_edge_stats(_probes, cost_pct=_cost)
+          if _tf.get("verdict") != "insufficient data":
+            state["taker_flow_edge"] = _tf
           # EXIT DISCIPLINE: were the discretionary closes better than the brackets they overrode?
           state["exit_discipline"] = exit_discipline_stats(memory.exit_probes(limit=200))
           _xd = state["exit_discipline"]
@@ -1960,6 +1968,27 @@ def run_trading_agent(
         "the same evidence for a long as for a short, and to stand aside when neither side offers it."
       ),
     }
+    # TAKER FLOW — present only once enough calls carry a tape reading for the comparison to mean
+    # anything; an absent key means "still measuring", which is the honest answer to give. The
+    # legend travels INSIDE the block rather than in the always-present note above, so the prompt
+    # never describes a statistic that is not there — and so this stays a number to reason about
+    # rather than a rule in the instructions.
+    if _edge_now.get("taker_flow_edge"):
+      user_state_obj["edgeReport"]["takerFlow"] = dict(
+        _edge_now["taker_flow_edge"],
+        note=(
+          "Your OWN record at trading with vs against the taker tape (who was crossing the spread "
+          "when you made each call). Per horizon: 'with' is the forward return of calls taken with "
+          "the aggressor balance, 'against' is calls taken into it, and spread_pct is the gap — the "
+          "spread form matters because a house-wide drift would make both groups look good. "
+          "verdict 'no information' = the gap is inside its own noise; 'informative' = it clears "
+          "its standard error but not the round-trip cost, so it is real and not worth paying for; "
+          "'tradable' = the with-flow group clears cost on its own. coverage is the fraction of "
+          "your scored calls that carried a reading, so read the verdict against it. NOTHING in "
+          "the code acts on this — it is evidence about your own calls, not an instruction, and a "
+          "'tradable' reading is an invitation to look, not a signal to take."
+        ),
+      )
   except Exception as _edge_exc:
     logger.debug("Edge report unavailable: %s", _edge_exc)
 

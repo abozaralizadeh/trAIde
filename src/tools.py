@@ -392,6 +392,33 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.warning("Live ticker refresh failed for %s entry: %s", symbol, exc)
       return None
 
+  _flow_cache: Dict[str, Dict[str, Any]] = {}
+
+  def _taker_flow_reading(symbol: str) -> Dict[str, Any] | None:
+    """The most recent taker-tape reading for a symbol, as stamped onto a direction call.
+
+    Read from the scheduler state the poll loop just wrote (see main._next_flow_observation) rather
+    than fetching here: the tape is sampled once per poll for every watched symbol, and a fetch
+    inside the order path would both slow it and, worse, measure a *different* instant than the one
+    the model reasoned about. `ageSec` is carried so a stale reading can be discounted later instead
+    of silently passing as current. Cached per tool-build because every direction call in a poll
+    shares the same snapshot.
+    """
+    if "observations" not in _flow_cache:
+      try:
+        _flow_cache["observations"] = memory.get_agent_scheduler().get("flowObservations") or {}
+      except Exception as exc:
+        logger.debug("taker-flow state unavailable: %s", exc)
+        _flow_cache["observations"] = {}
+    observation = _flow_cache["observations"].get(normalize_symbol(symbol))
+    if not isinstance(observation, dict) or observation.get("buyShare") is None:
+      return None
+    reading = dict(observation)
+    updated = _to_float(reading.pop("updated", 0))
+    if updated > 0:
+      reading["ageSec"] = max(0, int(time.time() - updated))
+    return reading
+
   def _add_on_state(
     futures_symbol: str,
     side: str,
@@ -3598,7 +3625,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # and measuring only placed orders coupled the evidence supply to the very risk factor the
     # evidence governs, which deadlocked live on 2026-08-10 (see memory.record_signal_probe).
     try:
-      memory.record_signal_probe(spot_symbol, side_lower, current_price, setup_family)
+      memory.record_signal_probe(
+        spot_symbol, side_lower, current_price, setup_family,
+        taker_flow=_taker_flow_reading(spot_symbol),
+      )
     except Exception as _probe_exc:
       logger.debug("signal probe not recorded for %s: %s", spot_symbol, _probe_exc)
 
@@ -3868,6 +3898,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "marketPriceAtSignal": current_price,
       # Which playbook this trade belongs to, so signal edge can be scored per family.
       "setupFamily": _family_fl,
+      # Who was hitting the tape when the call was made. Stamped here as well as on the standalone
+      # probe because settle_signal_probes also walks placed trades, and edge.taker_flow_edge_stats
+      # can only ask "does flow agreement predict?" of calls that carry a reading.
+      "takerFlow": _taker_flow_reading(spot_symbol),
       # Stop geometry actually used, so post-trade review can tell a noise-floored stop from the
       # model's original and judge whether the floor is set where it needs to be.
       "stopAtrMult": (

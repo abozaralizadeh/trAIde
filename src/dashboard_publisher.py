@@ -31,6 +31,7 @@ from .edge import (
   infer_setup_family,
   measured_slippage_pct,
   signal_edge_stats,
+  taker_flow_edge_stats,
 )
 from .regime import macro_event_entry_block, macro_event_window
 from .memory import MAX_SIGNAL_PROBES, MemoryStore
@@ -247,6 +248,7 @@ class DashboardPublisher:
       "disclosure": self.cfg.disclosure,
       "kpis": self._sanitize_perf(perf),
       "strategyEdge": self._build_strategy_edge(memory, cfg),
+      "takerFlow": self._build_taker_flow(memory, cfg),
       "macroEvents": self._build_macro_events(memory, cfg),
       "exitDiscipline": self._build_exit_discipline(memory),
       "drawdownPct": dd_total,
@@ -322,6 +324,19 @@ class DashboardPublisher:
       return (index or {}).get("bySymbolSide", {}).get(f"{sym}|{s}")
     return None
 
+  def _cost_basis(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
+    """The round-trip cost every edge verdict has to clear, plus the measured slippage behind it.
+
+    Shared by the edge panels so two of them can never publish contradicting verdicts computed off
+    two different cost assumptions — and so the dashboard's bar is the same one the entry gates use.
+    """
+    prior = float(getattr(cfg.trading, "estimated_slippage_pct", 0.001) or 0.0)
+    slip = measured_slippage_pct(
+      memory.recent_fills(limit=100), prior,
+      min_samples=int(getattr(cfg.trading, "slippage_autotune_min_samples", 8)),
+    )
+    return {"slippage": slip, "cost": 2.0 * (0.0006 + float(slip.get("value") or 0.0))}
+
   def _build_strategy_edge(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
     """Does the direction call predict, and which playbook is currently paying?
 
@@ -336,13 +351,8 @@ class DashboardPublisher:
     """
     out: Dict[str, Any] = {"verdict": "insufficient data", "n": 0}
     try:
-      prior = float(getattr(cfg.trading, "estimated_slippage_pct", 0.001) or 0.0)
-      slip = measured_slippage_pct(
-        memory.recent_fills(limit=100), prior,
-        min_samples=int(getattr(cfg.trading, "slippage_autotune_min_samples", 8)),
-      )
-      # Same cost basis the entry gates use, so the dashboard verdict matches the bot's own.
-      cost = 2.0 * (0.0006 + float(slip.get("value") or 0.0))
+      basis = self._cost_basis(memory, cfg)
+      slip, cost = basis["slippage"], basis["cost"]
       # Same window the entry gates use, so the dashboard verdict cannot disagree with the bot's.
       stats = signal_edge_stats(memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=cost)
       out = {
@@ -363,6 +373,74 @@ class DashboardPublisher:
       }
     except Exception as exc:  # pragma: no cover - defensive; publishing must never break the loop
       logger.debug("strategyEdge unavailable: %s", exc)
+    return out
+
+  def _build_taker_flow(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
+    """Who is hitting the tape right now, and has that ever predicted anything?
+
+    Two halves, because they answer different questions. ``live`` is the current state of the market:
+    the share of taker volume lifting the offer per symbol, sampled from KuCoin's public trade tape
+    every poll and smoothed across polls (``buyShareEwma``). Until now the bot only ever saw closed
+    candles at 15m and above — what price did, never who was pushing it — so this is genuinely new
+    information on the panel, and it updates between agent runs.
+
+    ``byHorizon`` is the experiment. It is the forward return of direction calls made WITH the flow
+    minus those made AGAINST it, per horizon. The spread form matters: a raw "with-flow calls made
+    +0.1%" proves nothing if every call made +0.1%, so subtracting the against-flow group cancels the
+    book's own directional bias. ``coverage`` says what fraction of scored calls carried a reading —
+    read the verdict against it, since a strong spread over a tenth of the book is a claim about a
+    tenth of the book. Verdicts are staged deliberately: ``informative`` means the spread clears its
+    own standard error, ``tradable`` means it also clears the round trip. Only the second one would
+    be worth acting on, and at ~0.2% round trip it is expected to fail.
+
+    Nothing in the trading path reads any of this — it is published so the experiment can be watched
+    while it runs rather than being graded once in private. Shares, counts, ages and percentages
+    only; no balance, size or account identifier is involved, so it is safe in every disclosure mode.
+    Never raises: the dashboard must not be able to take the bot down.
+    """
+    out: Dict[str, Any] = {
+      "enabled": bool(getattr(cfg.edge, "taker_flow_enabled", False)),
+      "verdict": "insufficient data",
+      "n": 0,
+      "live": {},
+    }
+    try:
+      stats = taker_flow_edge_stats(
+        memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=self._cost_basis(memory, cfg)["cost"],
+      )
+      out.update({
+        "verdict": stats.get("verdict", "insufficient data"),
+        "n": int(stats.get("n") or 0),
+        "coverage": stats.get("coverage"),
+        "costPct": _round(float(stats.get("cost_pct") or 0.0) * 100, 4),
+        "neutralBand": stats.get("neutral_band"),
+        "byHorizon": stats.get("by_horizon") or {},
+      })
+    except Exception as exc:  # pragma: no cover - defensive
+      logger.debug("takerFlow stats unavailable: %s", exc)
+    try:
+      now = int(time.time())
+      observations = (memory.get_agent_scheduler() or {}).get("flowObservations") or {}
+      live: Dict[str, Any] = {}
+      for symbol in sorted(observations):
+        row = observations[symbol]
+        if not isinstance(row, dict) or row.get("buyShare") is None:
+          continue
+        updated = _f(row.get("updated")) or 0.0
+        live[symbol] = {
+          "buyShare": _round(_f(row.get("buyShare")), 4),
+          "buyShareEwma": _round(_f(row.get("buyShareEwma")), 4),
+          "buyTradeShare": _round(_f(row.get("buyTradeShare")), 4),
+          "trades": int(_f(row.get("trades")) or 0),
+          "spanSec": _round(_f(row.get("spanSec")), 1),
+          # A tape reading is only news while it is fresh; without an age a stalled sampler looks
+          # exactly like a calm market.
+          "ageSec": max(0, now - int(updated)) if updated > 0 else None,
+          "samples": int(_f(row.get("samples")) or 0),
+        }
+      out["live"] = live
+    except Exception as exc:  # pragma: no cover - defensive
+      logger.debug("takerFlow live readings unavailable: %s", exc)
     return out
 
   def _build_macro_events(self, memory: MemoryStore, cfg) -> Dict[str, Any]:

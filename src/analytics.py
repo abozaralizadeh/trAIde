@@ -313,6 +313,111 @@ def _round(val: Any, decimals: int = 4) -> float | None:
     return None
 
 
+def _trade_cursor(row: Dict[str, Any]) -> int | None:
+  """Monotone position of a tape row, so consecutive polls can be de-overlapped.
+
+  ``sequence`` is the exchange's own per-contract counter and is preferred; the nanosecond
+  ``ts`` is the fallback for venues/rows that omit it. Both are ints, so one comparison works.
+  """
+  for key in ("sequence", "ts"):
+    value = row.get(key)
+    if value in (None, ""):
+      continue
+    try:
+      return int(float(value))
+    except (TypeError, ValueError):
+      continue
+  return None
+
+
+def taker_flow_summary(trades: Any, *, since_cursor: int | None = None) -> Dict[str, Any]:
+  """Reduce a public taker tape to an aggressor-balance reading.
+
+  Every row on the tape carries the side of the *taker* — the participant who crossed the spread and
+  demanded immediate execution. Resting liquidity never appears. So the buy share answers one narrow
+  question: of the volume that insisted on trading right now, how much of it was buying?
+
+  Two shares are reported because they disagree in an informative way. ``buyShare`` is
+  volume-weighted and therefore dominated by the largest prints; ``buyTradeShare`` counts each trade
+  once and reflects the many small ones. When they diverge, size and count are pushing in different
+  directions — which is the whale/retail split that single-number CVD hides.
+
+  Sizes are in **contracts, not base units**, and the multiplier differs per contract — so absolute
+  volume is not comparable across symbols and is deliberately not reported. Both outputs are ratios,
+  which are multiplier-free and therefore safe to compare.
+
+  ``since_cursor`` de-overlaps consecutive polls. One 100-trade window spans minutes on a mid-cap
+  perp while the loop polls every 60s, so successive windows share most of their rows; treating each
+  poll as fresh information would badly overstate how much tape has been observed. ``newTrades`` and
+  ``newBuyShare`` cover only rows past the cursor. ``gapped`` marks the opposite failure — every row
+  is new, so the window rolled completely between polls and trades were missed.
+
+  Pure and total: malformed rows are skipped, an empty tape returns a zero reading rather than
+  raising, and shares are ``None`` (not 0.0) when there is no volume to take a ratio of.
+  """
+  rows: list[Dict[str, Any]] = []
+  for raw in trades or []:
+    if not isinstance(raw, dict):
+      continue
+    side = str(raw.get("side") or "").strip().lower()
+    if side not in ("buy", "sell"):
+      continue
+    try:
+      size = abs(float(raw.get("size")))
+    except (TypeError, ValueError):
+      continue
+    if size <= 0:
+      continue
+    rows.append({"side": side, "size": size, "cursor": _trade_cursor(raw), "ts": raw.get("ts")})
+
+  out: Dict[str, Any] = {
+    "trades": len(rows), "newTrades": 0, "spanSec": None,
+    "buyShare": None, "buyTradeShare": None, "newBuyShare": None,
+    "lastCursor": None, "newestTs": None, "gapped": False,
+  }
+  if not rows:
+    return out
+
+  # Timestamps are nanoseconds on KuCoin futures; normalize anything that large down to seconds so
+  # the span is readable and comparable with the poll interval.
+  seconds: list[float] = []
+  for row in rows:
+    try:
+      value = float(row["ts"])
+    except (TypeError, ValueError):
+      continue
+    while value > 1e11:
+      value /= 1000.0
+    seconds.append(value)
+  if seconds:
+    out["spanSec"] = round(max(seconds) - min(seconds), 1)
+    out["newestTs"] = int(max(seconds))
+
+  buy_volume = sum(r["size"] for r in rows if r["side"] == "buy")
+  total_volume = sum(r["size"] for r in rows)
+  if total_volume > 0:
+    out["buyShare"] = round(buy_volume / total_volume, 4)
+  out["buyTradeShare"] = round(sum(1 for r in rows if r["side"] == "buy") / len(rows), 4)
+
+  cursors = [r["cursor"] for r in rows if r["cursor"] is not None]
+  if cursors:
+    out["lastCursor"] = max(cursors)
+  if since_cursor is not None and cursors:
+    fresh = [r for r in rows if r["cursor"] is not None and r["cursor"] > int(since_cursor)]
+    out["newTrades"] = len(fresh)
+    fresh_volume = sum(r["size"] for r in fresh)
+    if fresh_volume > 0:
+      out["newBuyShare"] = round(
+        sum(r["size"] for r in fresh if r["side"] == "buy") / fresh_volume, 4
+      )
+    # Nothing carried over from the previous window: the tape advanced further than one window in
+    # one poll, so an unknown number of trades were never seen. The reading is still a valid sample
+    # of *now*, but it is not a continuous record, and a caller building a cumulative series needs
+    # to know that.
+    out["gapped"] = len(fresh) == len(rows)
+  return out
+
+
 def classify_regime(
   adx: float | None,
   bbw: float | None,

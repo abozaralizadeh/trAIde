@@ -192,8 +192,8 @@ Win rate and PnL conflate three different things: whether the direction was righ
 
 ```mermaid
 flowchart LR
-    dcall(["Direction call"]) --> stamp["Stamp market price<br/>at signal time"]
-    stamp --> wait["Poll loop settles<br/>forward price at 60m / 240m"]
+    dcall(["Direction call"]) --> stamp["Stamp market price<br/>+ taker-flow reading<br/>at signal time"]
+    stamp --> wait["Poll loop settles<br/>forward price at 5m / 15m / 60m / 240m<br/>(verdict + sizing still on 60m / 240m)"]
     wait --> dedupe["Collapse OVERLAPPING probes<br/>(one per symbol per window)"]
     dedupe --> score["Mean forward return<br/>signed by traded direction"]
     score --> hurdle{"&gt; measured round-trip cost?"}
@@ -255,6 +255,28 @@ flowchart LR
 
 The declaration is the trigger; the scoreboard is the judge. This is the codebase's core rule in one line: **code enforces survival, the model owns opportunity** — so widening what may be *proposed* is safe, because what may be *risked* stays fully code-governed downstream.
 
+#### Taker flow — measuring who is pushing price before trading it
+
+Every playbook above reads *closed candles at 15m and above*. That means the bot has always been able to see **what price did** and never **who was pushing it** — the buy/sell aggressor split is not in a kline, on KuCoin or anywhere else. The public trade tape (`/api/v1/trade/history`) is the one endpoint that carries it: each row is a **taker** — someone who crossed the spread and demanded immediate execution — with a side. Resting liquidity never appears. So the buy share answers one narrow question: *of the volume that insisted on trading right now, how much of it was buying?*
+
+This is being **measured, not traded**, and the honest prior is that it will not pay:
+
+- Order-flow imbalance is real and well documented (Cont, Kukanov & Stoikov 2014) — but it is measured in **ten-second buckets** and is largely *contemporaneous*: price moves **because of** the flow. The lagged, forecastable part is concentrated inside a minute and decays fast.
+- The retail crypto version (CVD, taker buy/sell ratio) has no rigorous public backtest behind it — no out-of-sample results, no hit rates, no ICs. It is descriptive, and it is venue-fragmented.
+- KuCoin is not where these prices are set. Its tape is one venue's slice of a market led elsewhere.
+- And the wall: a **~0.12–0.21% round trip** (taker fee both sides plus measured slippage) against a few basis points of short-horizon drift. An effect can be perfectly real and still not clear that.
+
+So instead of adding a flow gate, the repo does what it did for signal edge and exit discipline — **probe → settle forward → surface the statistic → let the model decide**:
+
+1. **Sample** the tape every poll for held positions first, then the watchlist (`TAKER_FLOW_MAX_SYMBOLS`, one public REST call each). A 100-trade window spans 2–7 minutes on a mid-cap perp against a 60s poll, so consecutive windows *overlap heavily* — the running level (`buyShareEwma`) is built from the **newly arrived** slice only, since smoothing the whole window would be smoothing the same trades repeatedly and claiming a confidence the tape never provided.
+2. **Stamp** the reading onto every direction call at the moment it is made — by settle time the tape is hours gone, so a reading not captured at the call is unrecoverable.
+3. **Score** it forward at `5m / 15m / 60m / 240m`. The two short horizons were added *because* that is where flow information is documented to live; a statistic that only looked at 60m could not see the effect it is testing for.
+4. **Report** the *spread*: with-flow forward return minus against-flow forward return. Two staged verdicts, because conflating them is how a real-but-unusable effect gets traded — `informative` (clears its own standard error) and `tradable` (also clears the round trip).
+
+Two properties keep this from quietly corrupting the existing scoreboard. **Report widely, act narrowly**: the new 5m/15m horizons are reported everywhere, but the live `signal_edge_stats` verdict and family sizing stay anchored to the horizons they were always computed on. And a forward stamp is written off as *missed* rather than back-filled once it is more than 20% of its horizon late — without that, adding a 5-minute horizon to a store of already-settled probes would have back-stamped **every retained probe with the current price and labelled multi-day returns as five-minute returns**.
+
+Nothing in the trading path reads any of it. The model sees `edgeReport.takerFlow` only once the sample can answer the question — an `n=5` reading in the prompt is an invitation to trade a coin flip — and even then it is a number to reason about, never a rule to obey.
+
 ### Memory & dashboard data flow
 
 The local `MemoryStore` is the agent's working memory (auto-pruned by `RETENTION_DAYS`). A whitelist sanitizer publishes a **normalized, dollar-free** projection to Azure, which a separate SandBox web app renders for public spectators.
@@ -269,6 +291,20 @@ The published payload includes a **`strategyEdge`** block — the honest headlin
     "fade_extreme":  {"n": 21, "mean_pct": +0.19, "hit_rate": 0.57, "verdict": "insufficient data"}
   },
   "familyRiskFactor": {"continuation": 0.5, "fade_extreme": 1.0}
+}
+```
+
+Alongside it sits a **`takerFlow`** block — the live tape, and a running experiment on it. Until now the bot only ever saw *closed candles at 15m and above*: it could see what price did, never who was pushing it, because KuCoin klines carry no taker split. `takerFlow.live` fixes the blind spot on the panel — per symbol, the share of **taker** volume lifting the offer (`buyShare`, volume-weighted; `buyTradeShare`, one vote per trade — they diverge when size and count disagree, which is the whale/retail split a single CVD number hides), smoothed across polls into `buyShareEwma`, with an `ageSec` so a stalled sampler cannot pass as a calm market. `takerFlow.byHorizon` is the experiment: the forward return of direction calls made **with** the flow minus those made **against** it, per horizon. The spread form matters — a raw "with-flow calls made +0.1%" proves nothing if *every* call made +0.1%, so subtracting the against-flow group cancels the book's own directional bias. Read the verdict next to `coverage` (the fraction of scored calls carrying a reading): `informative` means the spread clears its own standard error, `tradable` means it also clears the round trip. Only the second would be worth acting on, and at a ~0.2% round trip against a few basis points of short-horizon drift it is expected to fail — [see below](#taker-flow--measuring-who-is-pushing-price-before-trading-it) for why it is being measured anyway. Shares, counts, ages and percentages only, so it publishes in every disclosure mode.
+
+```jsonc
+"takerFlow": {
+  "enabled": true, "verdict": "no information", "n": 64, "coverage": 0.41, "costPct": 0.12,
+  "byHorizon": {
+    "5m":  {"with": {"n": 22, "mean_pct": +0.03}, "against": {"n": 19, "mean_pct": +0.01},
+            "spread_pct": +0.02, "spread_stderr_pct": 0.05, "verdict": "no information"}
+  },
+  "live": {"BTC-USDT": {"buyShare": 0.61, "buyShareEwma": 0.58, "trades": 100,
+                        "spanSec": 182.4, "ageSec": 47, "samples": 214}}
 }
 ```
 
@@ -343,6 +379,7 @@ flowchart LR
 - **Entry-planning wisdom (not a gate)**: Chasing is an entry-*timing* mistake (opportunity), not a survival threat — the bracket and risk caps already bound the loss — so it is left to the agent's judgement rather than a hardcoded veto (which would fight the agentic design and need tuning). The analysis surfaces an `entryMap`: how far price sits beyond the 15m VWAP in ATR units (`extensionAtrLong/Short`) plus the nearest pullback/retest anchors (VWAP, band-mid, prior breakout shelf, fib of the last impulse). The prompt's **OPTIMAL ENTRY PLANNING** step then makes the agent reason about the highest-EV arrival price — after a vertical spike it rests a limit at the anticipated pullback (avoiding the chase *and* capturing the next leg) instead of buying the local peak. This improves automatically as the model improves; no threshold to maintain.
 - **Strong-trend continuation (don't wait forever for a pullback)**: a pullback entry is only higher-EV if the pullback actually arrives. On a confirmed strong-trend leader that keeps running without retracing, "wait for the pullback" silently becomes "miss the whole move" — the bot churned unfilled ONDO limits while ONDO trended away. Unfilled entry-limit expiries are now recorded as agent-visible `entryExpiries` events (previously only logged), so the agent *sees* its own limits dying on a symbol and, per desk practice (scale-in), takes a **reduced-size bracketed marketable continuation** rather than re-placing the same never-filling limit — or stands down and rotates. Gated to an intact trend; a rolling-over trend gets no continuation.
 - **Post-trade entry-quality feedback (compounding wisdom)**: On every close, `edge.entry_quality_stats` derives — purely from data already recorded — how well the entry was timed: `avgMaeR` (how far price went *against* the fill before the trade worked, in R), `avgEntryExtensionAtr` (how stretched entries were vs the 15m VWAP), and `betterEntryRate`. This is fed back in `edgeReport.entryQuality` so the agent can see its own pattern ("your last entries kept dipping 0.6R before working — rest limits at the pullback") and self-correct. It's a mirror, not a rule: no restriction is imposed, and the signal sharpens the model's entry timing over time.
+- **Taker flow — closing the aggressor blind spot** (`analytics.taker_flow_summary`, `edge.taker_flow_edge_stats`, Sep 4 2026): every playbook the bot runs reads *closed candles at 15m and above*, so it could see **what price did** and never **who was pushing it** — no kline carries the buy/sell taker split. KuCoin's public trade tape does: each row is a taker who crossed the spread, with a side. It is now sampled every poll (held positions first, then the watchlist) and the aggressor balance is **stamped onto every direction call**, because by settle time the tape is hours gone. This is deliberately **measurement, not a new gate**, and the prior is that it will not pay: order-flow imbalance is real (Cont, Kukanov & Stoikov 2014) but is measured in ten-second buckets and is largely *contemporaneous* — price moves **because of** the flow, with the forecastable part decaying inside a minute; the retail crypto version (CVD, taker ratio) has no rigorous public backtest behind it; KuCoin is not where these prices are set; and a **~0.12–0.21% round trip** dwarfs a few basis points of short-horizon drift. So it goes through the same machinery every other claim here does — **probe → settle → surface → let the model decide** — reported as a *spread* (with-flow forward return minus against-flow), which cancels the book's own directional bias, at `5m/15m/60m/240m` (the two short horizons added precisely because that is where flow information is documented to live). Two staged verdicts keep a real-but-unusable effect from being traded: `informative` clears its own standard error, `tradable` also clears the round trip. Nothing in the trading path reads it; the model sees `edgeReport.takerFlow` only once the sample can answer, and the dashboard publishes both the live tape and the running experiment. Two guards keep it from corrupting the existing scoreboard: **report widely, act narrowly** (the new horizons are reported, but the live signal-edge verdict and family sizing stay anchored to the horizons they were always computed on), and a forward stamp more than 20% of its horizon late is written off as **missed rather than back-filled** — without which adding a 5-minute horizon would have back-stamped every retained probe with the current price and labelled multi-day returns as five-minute returns. Off-switch: `TAKER_FLOW_ENABLED=false`.
 - **Lifecycle risk + concentration caps**: Every add-on shares the original position's stop-defined risk and projected same-symbol exposure budgets. Caps are reapplied after contract-lot rounding; an exchange minimum that exceeds either budget is rejected. Add-ons require a live fee-adjusted breakeven stop and may never loosen it or average down.
 - **Correlation gate + relative-strength exception**: Blocks ordinary non-major alt longs while BTC's daily regime is bearish. A rotating leader may pass only when its 1D/4H/1H/15M trends are all bullish, strength is high, and confidence clears `RELATIVE_STRENGTH_MIN_CONFIDENCE`; it is then reduced by `RELATIVE_STRENGTH_SIZE_FACTOR`. No symbol is hardcoded.
 - **New-listing guard**: Blocks futures entries on contracts younger than `MIN_FUTURES_LISTING_AGE_DAYS` (via the contract's first-open date). Freshly-listed perps are thin and ultra-volatile — RE-USDT had a ~100% intraday range on day one.
@@ -540,6 +577,8 @@ Self-tuning risk (`src/edge.py`): posture derives from rolling realized closes, 
 | `EDGE_BENCH_COOLDOWN_MAX_MULT` | `4` | Cap on the bench-rest scaling (e.g. 12h × 4 = up to 48h) |
 | `EDGE_STREAK_THRESHOLD` | `2` | Consecutive realized losses that trigger the size throttle |
 | `EDGE_STREAK_SIZE_FACTOR` | `0.5` | Entry-size multiplier while on a losing streak |
+| `TAKER_FLOW_ENABLED` | `true` | Sample KuCoin's public taker tape every poll and stamp the aggressor balance onto every direction call, so `edge.taker_flow_edge_stats` can measure whether order flow predicts on **this** venue at **our** horizons. Pure observation — no gate, no sizing input, no wake trigger reads it |
+| `TAKER_FLOW_MAX_SYMBOLS` | `12` | Cap on tape samples per poll (one public REST call each). Held positions are sampled first, so the cap trims the watchlist tail rather than an open trade |
 | `ALT_LONG_BLOCK_WHEN_BTC_BEARISH` | `true` | Block longs on non-major alts while BTC's daily regime is bearish (alts are high-beta to BTC) |
 | `ALT_MAJORS` | `BTC,ETH` | Symbols exempt from the alt-long gate (they have their own per-symbol daily gate) |
 | `RELATIVE_STRENGTH_LONGS_ENABLED` | `true` | Allow a narrow all-timeframe bullish exception to the bearish-BTC alt veto |

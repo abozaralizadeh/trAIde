@@ -589,6 +589,64 @@ def test_agent_scheduler_persists_restart_cadence_and_price_noise(tmp_path):
     assert "INVALID" not in state["priceObservations"]
 
 
+def test_agent_scheduler_persists_taker_flow_across_a_restart(tmp_path):
+    """The sanitizer is the ONLY writer of the scheduler shape, so a field it does not whitelist is
+    silently dropped on the next save — the flow level would then reset on every restart and the
+    EWMA would never build a history."""
+    path = str(tmp_path / "memory.json")
+    MemoryStore(path, retention_days=7).save_agent_scheduler({
+        "flowObservations": {
+            "btcusdt": {
+                "buyShare": 0.6123, "buyTradeShare": 0.55, "newBuyShare": 0.7,
+                "trades": 100, "newTrades": 8, "spanSec": 182.4, "gapped": False,
+                "buyShareEwma": 0.58, "samples": 12, "updated": 1234, "lastCursor": 998,
+            },
+            # A reading with no usable share carries no information — the husk must not be kept.
+            "ethusdt": {"trades": 100, "spanSec": 60.0},
+            "junk": "not-a-dict",
+        },
+    })
+
+    state = MemoryStore(path, retention_days=7).get_agent_scheduler()
+    assert state["flowObservations"]["BTC-USDT"] == {
+        "buyShare": 0.6123, "buyTradeShare": 0.55, "newBuyShare": 0.7,
+        "trades": 100, "newTrades": 8, "spanSec": 182.4, "gapped": False,
+        "buyShareEwma": 0.58, "samples": 12, "updated": 1234, "lastCursor": 998,
+    }
+    assert list(state["flowObservations"]) == ["BTC-USDT"]
+
+
+def test_out_of_range_flow_shares_are_dropped_rather_than_clamped(tmp_path):
+    """A clamped 1.4 would persist as a perfectly plausible 1.0 and bias every statistic built on
+    it; a missing field is visible as missing evidence."""
+    path = str(tmp_path / "memory.json")
+    MemoryStore(path, retention_days=7).save_agent_scheduler({
+        "flowObservations": {"BTC-USDT": {"buyShare": 0.6, "buyTradeShare": 1.4, "newBuyShare": -0.2}},
+    })
+    row = MemoryStore(path, retention_days=7).get_agent_scheduler()["flowObservations"]["BTC-USDT"]
+    assert row["buyShare"] == 0.6
+    assert "buyTradeShare" not in row and "newBuyShare" not in row
+
+
+def test_a_direction_call_carries_the_tape_reading_that_was_current_when_it_was_made(tmp_path):
+    """Without the stamp there is nothing to score flow against later — the reading has to be
+    captured at the call, since by settle time the tape is hours gone."""
+    store = MemoryStore(str(tmp_path / "memory.json"), retention_days=7)
+    store.record_signal_probe(
+        "XRP-USDT", "buy", 100.0, "continuation",
+        taker_flow={"buyShare": 0.72, "trades": 100, "spanSec": 180.0, "gapped": False,
+                    "ageSec": 45, "secret": "dropped"},
+    )
+    ctx = store.signal_probes(limit=10)[0]["entryContext"]
+    assert ctx["takerFlow"] == {"buyShare": 0.72, "trades": 100, "newTrades": 0,
+                                "spanSec": 180.0, "ageSec": 45.0, "gapped": False}
+
+    # A call made with no reading available records the absence, rather than a neutral-looking stub.
+    store.record_signal_probe("ADA-USDT", "sell", 100.0, "continuation", taker_flow=None)
+    unstamped = next(p for p in store.signal_probes(limit=10) if p["symbol"] == "ADA-USDT")
+    assert unstamped["entryContext"]["takerFlow"] is None
+
+
 def test_automatic_quarantine_has_adaptive_expiring_retry_window(store, monkeypatch):
     now = 2_000_000_000
     monkeypatch.setattr("src.memory.time.time", lambda: now)
@@ -816,21 +874,58 @@ def test_direction_calls_are_recorded_even_when_no_order_is_placed(tmp_path):
     assert ctx["setupFamily"] == "continuation"
 
 
+def _age_probe(tmp_path, seconds: int, store) -> None:
+    """Push the stored probe back in time, as the live loop's clock would."""
+    import json
+    p = tmp_path / "memory.json"
+    d = json.loads(p.read_text())
+    d["signal_probes"][0]["ts"] -= seconds
+    p.write_text(json.dumps(d))
+    store._cache = None
+
+
 def test_recorded_calls_settle_and_score_like_any_other_probe(tmp_path):
     from src.edge import signal_edge_stats
     store = MemoryStore(str(tmp_path / "memory.json"))
     store.record_signal_probe("XRP-USDT", "sell", 100.0, "continuation")
     # a short that then fell 1% is a correct call
-    data_path = tmp_path / "memory.json"
-    import json
-    d = json.loads(data_path.read_text())
-    d["signal_probes"][0]["ts"] -= 5 * 3600      # age past BOTH horizons (60m and 240m)
-    data_path.write_text(json.dumps(d))
-    store._cache = None
-    assert store.settle_signal_probes({"XRP-USDT": 99.0}) == 2
+    _age_probe(tmp_path, 61 * 60, store)         # just past the 60m horizon
+    # 3 settles: the 60m price, plus 5m/15m written off as missed (their moment is long gone).
+    assert store.settle_signal_probes({"XRP-USDT": 99.0}) == 3
+
+    probe = store.signal_probes(limit=50)[0]["entryContext"]["signalProbe"]
+    assert probe["m60"] == 99.0
+    assert probe["m5"] is None and probe["m15"] is None
+    assert "m240" not in probe                   # not due yet, so not touched
 
     stats = signal_edge_stats(store.signal_probes(limit=50), cost_pct=0.001, min_samples=1)
     assert stats["by_family"]["continuation"]["mean_pct"] == pytest.approx(1.0)
+
+
+def test_a_long_elapsed_horizon_is_recorded_missed_not_back_stamped(tmp_path):
+    """The corruption that adding the 5m horizon would otherwise have caused.
+
+    The settle check used to be "has the horizon passed?", which reads as "stamp today's price on
+    every probe old enough". Harmless while the loop runs every 60s, wrong after downtime — and on
+    the day a NEW horizon is introduced it would have stamped all 400 retained probes at once,
+    labelling a multi-day return as a five-minute one. A missed measurement must record as missed.
+    """
+    from src.edge import signal_edge_stats
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.record_signal_probe("XRP-USDT", "buy", 100.0, "continuation")
+    _age_probe(tmp_path, 5 * 86400, store)       # five days of downtime
+
+    assert store.settle_signal_probes({"XRP-USDT": 400.0}) == 4
+    probe = store.signal_probes(limit=50)[0]["entryContext"]["signalProbe"]
+    assert probe == {"m5": None, "m15": None, "m60": None, "m240": None}
+
+    # A 300% "5-minute return" must not reach the statistics.
+    stats = signal_edge_stats(store.signal_probes(limit=50), cost_pct=0.001, min_samples=1)
+    assert stats["by_horizon"] == {}
+    assert stats["verdict"] == "insufficient data"
+
+    # And the write-off is final: re-settling must not resurrect the horizon at a newer price.
+    assert store.settle_signal_probes({"XRP-USDT": 500.0}) == 0
 
 
 def test_probes_are_retained_by_count_not_by_clock(tmp_path):
