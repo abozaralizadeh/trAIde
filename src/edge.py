@@ -397,7 +397,19 @@ def family_stand_aside(
     return False
   if int(row.get("n") or 0) < max(1, int(min_samples)):
     return False
-  return row.get("verdict") == "no edge"
+  if row.get("verdict") == "no edge":
+    return True
+  # Hysteresis. The verdict is a sign test on a noisy mean, so a family parked near the hurdle flips
+  # between polls on the same evidence — and a flip to "edge" restores FULL size to a playbook with a
+  # long adverse record. Releasing therefore demands the mean clear cost by at least one standard
+  # error of its own sample, while entering still only needs the sign. The band is the sample's own
+  # dispersion, so it tightens automatically as evidence accumulates: a family that genuinely starts
+  # paying still escapes, it just has to do so by more than the measurement's own uncertainty.
+  net = _f(row.get("net_of_cost_pct"))
+  se = _f(row.get("stderr_pct"))
+  if net is None or se is None or se <= 0:
+    return False
+  return net < se
 
 
 def family_explore_factor(
@@ -435,6 +447,16 @@ def family_explore_factor(
   if n >= max(1, int(min_samples)):
     return 1.0
   return max(0.0, min(1.0, float(explore_factor)))
+
+
+def _stderr(vals: List[float]) -> float:
+  """Standard error of the mean; 0.0 for a sample too small to have one."""
+  n = len(vals)
+  if n < 2:
+    return 0.0
+  mean = sum(vals) / n
+  var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+  return math.sqrt(var / n)
 
 
 def signal_edge_stats(
@@ -511,6 +533,11 @@ def signal_edge_stats(
         "n": len(vals),
         "mean_pct": round(mean * 100, 4),
         "hit_rate": round(sum(1 for v in vals if v > 0) / len(vals), 3),
+        # Standard error of THIS family's own mean. Without it a caller cannot tell a real shortfall
+        # from a rounding wobble, and the stand-aside chatters: on 2026-09-04 continuation sat at
+        # net -0.03% with an SE of ~0.30%, flipped verdict between polls, and a WIF long went in at
+        # FULL size (family x1.00) on the one poll it read non-negative — then lost a full 1R.
+        "stderr_pct": round(_stderr(vals) * 100, 4),
         "net_of_cost_pct": round((mean - cost_pct) * 100, 4),
         "verdict": ("insufficient data" if len(vals) < max(1, int(min_samples))
                     else ("edge" if mean > cost_pct else "no edge")),

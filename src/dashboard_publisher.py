@@ -33,7 +33,7 @@ from .edge import (
   signal_edge_stats,
 )
 from .regime import macro_event_entry_block, macro_event_window
-from .memory import MemoryStore
+from .memory import MAX_SIGNAL_PROBES, MemoryStore
 from .utils import normalize_symbol as _normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -343,7 +343,8 @@ class DashboardPublisher:
       )
       # Same cost basis the entry gates use, so the dashboard verdict matches the bot's own.
       cost = 2.0 * (0.0006 + float(slip.get("value") or 0.0))
-      stats = signal_edge_stats(memory.signal_probes(limit=200), cost_pct=cost)
+      # Same window the entry gates use, so the dashboard verdict cannot disagree with the bot's.
+      stats = signal_edge_stats(memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=cost)
       out = {
         "verdict": stats.get("verdict", "insufficient data"),
         "n": int(stats.get("n") or 0),

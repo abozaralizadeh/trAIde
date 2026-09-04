@@ -65,7 +65,7 @@ from .edge import (
   measured_slippage_pct,
   symbol_bench_until,
 )
-from .memory import MemoryStore
+from .memory import MAX_SIGNAL_PROBES, MemoryStore
 from .protection import should_block_chase
 from .regime import (
   allow_reversal_long,
@@ -810,7 +810,12 @@ def run_trading_agent(
         # only statistic that decides whether the strategy can be profitable at all.
         try:
           _cost = 2.0 * (float(fees.get("futures_taker", 0.0006)) + float(state.get("slippage_pct") or 0.0))
-          state["signal_edge"] = signal_edge_stats(memory.signal_probes(limit=200), cost_pct=_cost)
+          # Read the WHOLE retained probe set, not an arbitrary slice of it. Reading 200 of the 400
+          # kept threw away half the evidence for free and made the per-family verdict swing with the
+          # window: on 2026-09-04 continuation read no-edge at every window size except 200, which is
+          # the one the bot actually used.
+          state["signal_edge"] = signal_edge_stats(
+            memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=_cost)
           # EXIT DISCIPLINE: were the discretionary closes better than the brackets they overrode?
           state["exit_discipline"] = exit_discipline_stats(memory.exit_probes(limit=200))
           _xd = state["exit_discipline"]

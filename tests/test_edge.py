@@ -775,3 +775,67 @@ def test_decimation_cannot_manufacture_an_edge_verdict_from_repetition():
     out = signal_edge_stats(probes, cost_pct=0.001, min_samples=20)
     assert out["by_horizon"]["60m"]["n"] == 1
     assert out["verdict"] == "insufficient data"   # one observation is not evidence
+
+
+# --- stand-aside hysteresis -----------------------------------------------------------------------
+
+def _fam_edge(n, net_pct, se_pct, verdict="no edge", cost_pct=0.0014):
+  return {"cost_pct": cost_pct,
+          "by_family": {"continuation": {"n": n, "net_of_cost_pct": net_pct,
+                                         "stderr_pct": se_pct, "verdict": verdict}}}
+
+
+def test_stand_aside_does_not_release_on_a_within_noise_blip():
+  """2026-09-04: continuation sat at net -0.03% with an SE of ~0.30% over 130 samples. The verdict is
+  a sign test on a noisy mean, so it flipped between polls on the same evidence — and a flip to "edge"
+  restored FULL size (family x1.00) to the playbook with the longest adverse record. A WIF long went
+  in on that one poll and lost a full 1R. Releasing must clear cost by more than the sample's own
+  uncertainty; entering still only needs the sign."""
+  from src.edge import family_stand_aside
+  # The exact shape that let WIF through: verdict flipped positive, but net is far inside one SE.
+  assert family_stand_aside(_fam_edge(130, +0.02, 0.30, verdict="edge"), "continuation") is True
+  # A genuine, decisive improvement releases it.
+  assert family_stand_aside(_fam_edge(130, +0.45, 0.30, verdict="edge"), "continuation") is False
+  # A settled "no edge" still stands aside regardless of the band.
+  assert family_stand_aside(_fam_edge(130, -0.28, 0.30), "continuation") is True
+
+
+def test_the_band_tightens_as_evidence_accumulates():
+  """The gate must not become permanent: SE shrinks with n, so a family that really starts paying
+  escapes on its own. Same mean, more evidence -> released."""
+  from src.edge import family_stand_aside
+  assert family_stand_aside(_fam_edge(25, +0.20, 0.60, verdict="edge"), "continuation") is True
+  assert family_stand_aside(_fam_edge(400, +0.20, 0.08, verdict="edge"), "continuation") is False
+
+
+def test_unproven_and_missing_families_are_untouched():
+  from src.edge import family_stand_aside
+  # Below min_samples nothing stands aside — an unproven playbook must be free to gather evidence.
+  assert family_stand_aside(_fam_edge(5, -2.0, 0.1), "continuation") is False
+  assert family_stand_aside({"by_family": {}}, "continuation") is False
+  assert family_stand_aside({}, "continuation") is False
+  # A row with no dispersion recorded (older payload) must not start blocking on missing data.
+  assert family_stand_aside(
+    {"by_family": {"continuation": {"n": 100, "net_of_cost_pct": +0.02, "verdict": "edge"}}},
+    "continuation") is False
+
+
+def test_stderr_is_reported_per_family():
+  """Callers cannot tell a real shortfall from a wobble without the sample's own dispersion."""
+  from src.edge import signal_edge_stats
+  import time as _t
+  now = int(_t.time()) - 10 * 3600
+  probes = []
+  for i in range(30):
+    probes.append({
+      "symbol": f"S{i}-USDT", "ts": now + i * 7200,
+      "entryContext": {"positionSide": "long", "marketPriceAtSignal": 100.0,
+                       "setupFamily": "continuation", "signalProbe": {"m60": 100.0 + (i % 3) - 1}},
+    })
+  s = signal_edge_stats(probes, cost_pct=0.0014)
+  row = s["by_family"]["continuation"]
+  assert row["n"] == 30
+  assert row["stderr_pct"] > 0
+  # Mean of a symmetric +/-1 spread is ~0, so the SE must dominate the net -> stand aside.
+  from src.edge import family_stand_aside
+  assert family_stand_aside(s, "continuation") is True
