@@ -157,6 +157,26 @@ class MacroEventInput(BaseModel):
   impact: str
 
 
+def normalize_orderbook(ob: Any, depth: int, symbol: str) -> Dict[str, Any]:
+  """Shape a raw level2 response into the tool's return value. Never raises.
+
+  KuCoin answers ``code: 200000`` with a NULL ``data`` field for an unknown or delisted symbol, and
+  the client returns ``payload["data"]`` straight through — so a "successful" call can hand back
+  None. Reading ``.get()`` off that propagated out of ``fetch_orderbook`` as
+  ``'NoneType' object has no attribute 'get'`` instead of returning something the model could reason
+  about. Either side can also be absent or null on a genuinely thin book, which is data rather than a
+  failure, so those trim to an empty list without an error.
+  """
+  if not isinstance(ob, dict):
+    return {"symbol": symbol, "depth": depth,
+            "error": "No orderbook returned (unknown or delisted symbol?)",
+            "orderbook": {"bids": [], "asks": []}}
+  book = dict(ob)
+  book["bids"] = list(book.get("bids") or [])[:depth]
+  book["asks"] = list(book.get("asks") or [])[:depth]
+  return {"symbol": symbol, "depth": depth, "orderbook": book}
+
+
 def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   """Instantiate all agent tools bound to the given per-run context. Returns a namespace of tools."""
   cfg = ctx.cfg
@@ -1832,11 +1852,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     """Fetch level2 orderbook snapshot (depth 20 or 100)."""
     symbol = _normalize_symbol(symbol)
     depth_safe = 20 if depth <= 20 else 100
-    ob = kucoin.get_orderbook_levels(symbol, depth=depth_safe)
-    # trim in case API returns more than requested
-    ob["bids"] = ob.get("bids", [])[:depth_safe]
-    ob["asks"] = ob.get("asks", [])[:depth_safe]
-    return {"symbol": symbol, "depth": depth_safe, "orderbook": ob}
+    try:
+      ob = kucoin.get_orderbook_levels(symbol, depth=depth_safe)
+    except Exception as exc:
+      return {"error": str(exc), "symbol": symbol}
+    return normalize_orderbook(ob, depth_safe, symbol)
 
   @function_tool
   async def analyze_market_context(
@@ -4460,9 +4480,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     depth_safe = 20 if depth <= 20 else 100
     try:
       ob = kucoin_futures.get_orderbook(fsym, depth=depth_safe)
-      ob["bids"] = (ob.get("bids") or [])[:depth_safe]
-      ob["asks"] = (ob.get("asks") or [])[:depth_safe]
-      return {"symbol": fsym, "depth": depth_safe, "orderbook": ob}
+      return normalize_orderbook(ob, depth_safe, fsym)
     except Exception as exc:
       return {"error": str(exc), "symbol": fsym}
 
