@@ -18,6 +18,7 @@ from src.main import (
   _next_flow_observation,
   _next_price_noise_ewma,
   _productivity_adjusted_flat_cooldown,
+  _prune_flow_observations,
   _rebase_reviewed_price_triggers,
 )
 
@@ -299,3 +300,81 @@ class TestTakerFlowSampling:
     snapshot = SimpleNamespace(futures_positions=[], tickers={"AAA-USDT": None})
     assert _flow_symbols(snapshot, 0) == []
     assert _flow_symbols(SimpleNamespace(futures_positions=None, tickers=None), 5) == []
+
+  def test_the_watchlist_tail_is_ranked_by_the_move_waking_the_agent(self):
+    """Alphabetical order sounds neutral and is not.
+
+    With a 50-coin universe and a cap of 12, ranking by name recorded the tape for AAVE…FARTCOIN
+    for three days while every actual direction call went to TAO, INJ, WLD and XLM — so the
+    experiment covered none of the trades it exists to score. Rank by the excursion that is about
+    to wake the model instead, so a symbol is sampled from the moment it becomes interesting.
+    """
+    snapshot = SimpleNamespace(
+      futures_positions=[],
+      tickers={"AAA-USDT": None, "TAO-USDT": None, "WLD-USDT": None, "ZZZ-USDT": None},
+    )
+    moves = {"WLD-USDT": 1.4, "TAO-USDT": 3.1}
+    assert _flow_symbols(snapshot, 3, moves) == ["TAO-USDT", "WLD-USDT", "AAA-USDT"]
+
+  def test_a_held_position_outranks_even_the_biggest_move(self):
+    snapshot = SimpleNamespace(
+      futures_positions=[{"symbol": "XBTUSDTM", "currentQty": "-3"}],
+      tickers={"AAA-USDT": None, "TAO-USDT": None},
+    )
+    assert _flow_symbols(snapshot, 1, {"TAO-USDT": 9.9}) == ["BTC-USDT"]
+
+  def test_untriggered_symbols_keep_a_stable_order(self):
+    """Ties must not reshuffle between polls, or the cap would rotate symbols in and out at random
+    and no symbol would accumulate a continuous record."""
+    snapshot = SimpleNamespace(
+      futures_positions=[], tickers={"CCC-USDT": None, "AAA-USDT": None, "BBB-USDT": None},
+    )
+    assert _flow_symbols(snapshot, 3, {}) == ["AAA-USDT", "BBB-USDT", "CCC-USDT"]
+    assert _flow_symbols(snapshot, 3, {"QQQ-USDT": 5.0}) == ["AAA-USDT", "BBB-USDT", "CCC-USDT"]
+
+
+class TestFlowObservationPruning:
+  """A tape reading has a shelf life; the persisted state has to enforce it.
+
+  Symbols rotate through the sampling cap, and a symbol that rotated out simply stops being
+  refreshed — nothing marked it dead. Live state was found holding 23 symbols of which 11 were up to
+  63 HOURS stale, sitting in exactly the dict the entry path reads a "current" reading from.
+  """
+
+  @staticmethod
+  def _obs(updated):
+    return {"buyShare": 0.6, "updated": updated}
+
+  def test_readings_older_than_the_bound_are_forgotten(self):
+    now = 1_700_000_000
+    observations = {
+      "FRESH-USDT": self._obs(now - 60),         # last poll
+      "EDGE-USDT": self._obs(now - 600),         # exactly the bound: 10 polls x 60s
+      "STALE-USDT": self._obs(now - 63 * 3600),  # the 63-hour reading found in live state
+    }
+    assert _prune_flow_observations(observations, 60, now) == 1
+    assert sorted(observations) == ["EDGE-USDT", "FRESH-USDT"]
+
+  def test_the_bound_scales_with_the_poll_interval(self):
+    """Self-tuning: a slower loop must not start throwing away readings it has not had time to
+    refresh, and nobody should have to hand-edit a seconds constant when the interval changes."""
+    now = 1_700_000_000
+    at_10_min = {"A-USDT": self._obs(now - 3000)}
+    assert _prune_flow_observations(dict(at_10_min), 60, now) == 1     # 3000s > 10 x 60s
+    assert _prune_flow_observations(dict(at_10_min), 300, now) == 0    # 3000s = 10 x 300s
+
+  def test_unusable_rows_are_dropped_rather_than_kept_forever(self):
+    now = 1_700_000_000
+    observations = {"OK-USDT": self._obs(now), "JUNK-USDT": "not-a-dict",
+                    "NOTS-USDT": {"buyShare": 0.5}, "BAD-USDT": {"updated": "soon"}}
+    assert _prune_flow_observations(observations, 60, now) == 3
+    assert list(observations) == ["OK-USDT"]
+
+  def test_pruning_mutates_the_caller_dict_so_the_persisted_state_actually_shrinks(self):
+    """The poll loop shares this dict with the closure that writes scheduler state. Returning a new
+    dict would look identical in a unit test and silently persist the unpruned copy."""
+    now = 1_700_000_000
+    observations = {"STALE-USDT": self._obs(now - 99_999)}
+    persisted_view = observations               # what _persist_agent_scheduler closes over
+    _prune_flow_observations(observations, 60, now)
+    assert persisted_view == {}

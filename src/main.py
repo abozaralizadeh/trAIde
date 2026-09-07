@@ -17,7 +17,7 @@ from .agent import (
   TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client,
   _to_futures_symbol,
 )
-from .analytics import taker_flow_summary
+from .analytics import flow_reading_max_age_sec, taker_flow_summary
 from .config import load_config
 from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
@@ -195,6 +195,39 @@ def _next_price_noise_ewma(
 _FLOW_EWMA_ALPHA = 0.3  # same responsiveness as the price-noise EWMA above
 
 
+def _to_epoch(value: Any) -> float:
+  """Coerce a persisted timestamp to seconds; anything unreadable is treated as infinitely old."""
+  try:
+    return float(value or 0)
+  except (TypeError, ValueError):
+    return 0.0
+
+
+def _prune_flow_observations(
+  observations: Dict[str, Dict[str, Any]],
+  poll_interval_sec: float,
+  now_ts: float,
+) -> int:
+  """Drop tape readings that have aged out, in place. Returns how many were forgotten.
+
+  Without this the persisted state grows with every symbol the coin universe ever rotated through,
+  and — the real damage — keeps serving a reading that *looks* like a tape observation while
+  describing a market from days ago. See analytics.flow_reading_max_age_sec.
+
+  Mutates rather than rebinding on purpose: the caller's dict is shared with the closure that
+  persists scheduler state, and a rebinding there would silently persist the unpruned copy if this
+  block ever moved into a nested function.
+  """
+  cutoff = now_ts - flow_reading_max_age_sec(poll_interval_sec)
+  stale = [
+    symbol for symbol, observation in observations.items()
+    if not isinstance(observation, dict) or _to_epoch(observation.get("updated")) < cutoff
+  ]
+  for symbol in stale:
+    observations.pop(symbol, None)
+  return len(stale)
+
+
 def _next_flow_observation(
   previous: Dict[str, Any] | None,
   summary: Dict[str, Any],
@@ -240,12 +273,24 @@ def _next_flow_observation(
   return state
 
 
-def _flow_symbols(snapshot, max_symbols: int) -> list[str]:
-  """Which symbols to sample the tape for, held positions first.
+def _flow_symbols(
+  snapshot,
+  max_symbols: int,
+  pending_moves: Dict[str, float] | None = None,
+) -> list[str]:
+  """Which symbols to sample the tape for: held positions, then whatever the model is about to look at.
 
   One public REST call per symbol per poll is cheap but not free, and the coin list can rotate wide
   when flexible coins are on. Positions we are actually carrying are sampled first so the cap can
   never starve an open trade of its record in favour of a watchlist name.
+
+  Everything after that is ranked by the move that is *waking the agent* — `pending_moves` is the
+  same per-symbol excursion the price trigger uses, and it is retained until the model reviews it, so
+  a symbol stays sampled from the moment it becomes interesting until the call is actually made. The
+  first version ranked alphabetically, which sounds neutral and is not: with a 50-coin universe and a
+  cap of 12 the tape was permanently recorded for AAVE…FARTCOIN while the model spent 2026-09-05..07
+  calling TAO, INJ, WLD and XLM — none of them sampled. A reading that never covers the symbols being
+  traded cannot answer the question it is collected to answer.
   """
   held: list[str] = []
   for position in getattr(snapshot, "futures_positions", None) or []:
@@ -258,8 +303,11 @@ def _flow_symbols(snapshot, max_symbols: int) -> list[str]:
     symbol = normalize_symbol(position.get("symbol") or "")
     if qty and symbol and symbol not in held:
       held.append(symbol)
-  ordered = held + [s for s in sorted(getattr(snapshot, "tickers", None) or {}) if s not in held]
-  return ordered[:max(0, int(max_symbols))]
+  known = [s for s in sorted(getattr(snapshot, "tickers", None) or {}) if s not in held]
+  moves = pending_moves or {}
+  # Largest pending move first; alphabetical within the untriggered tail keeps the order stable.
+  known.sort(key=lambda s: -float(moves.get(s) or 0.0))
+  return (held + known)[:max(0, int(max_symbols))]
 
 
 def _rebase_reviewed_price_triggers(
@@ -1233,7 +1281,7 @@ async def trading_loop(
     # path. Purely observational: nothing in the trading path reads it yet, by design — see
     # edge.taker_flow_edge_stats for the question it is being collected to answer.
     if cfg.edge.taker_flow_enabled and kucoin_futures is not None:
-      for symbol in _flow_symbols(snapshot, cfg.edge.taker_flow_max_symbols):
+      for symbol in _flow_symbols(snapshot, cfg.edge.taker_flow_max_symbols, pending_trigger_moves):
         futures_symbol = _to_futures_symbol(symbol)
         if not futures_symbol:
           continue
@@ -1247,6 +1295,11 @@ async def trading_loop(
         except Exception:
           # Market colour is never worth a poll. A failed tape read leaves the last state in place.
           logger.debug("taker-flow sample failed for %s", symbol, exc_info=True)
+      _dropped = _prune_flow_observations(
+        flow_observations, cfg.trading.poll_interval_sec, time.time()
+      )
+      if _dropped:
+        logger.debug("taker-flow: forgot %d stale symbol reading(s)", _dropped)
 
     live_prices = {
       normalize_symbol(symbol): float(ticker.price)

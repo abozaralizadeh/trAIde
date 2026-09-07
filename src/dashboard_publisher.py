@@ -25,6 +25,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
+from .analytics import flow_reading_max_age_sec
 from .edge import (
   exit_discipline_stats,
   family_size_factor,
@@ -421,12 +422,19 @@ class DashboardPublisher:
     try:
       now = int(time.time())
       observations = (memory.get_agent_scheduler() or {}).get("flowObservations") or {}
+      # Same shelf life the collector and the entry path use. The panel is labelled "live", and a
+      # reading that outlived its usefulness is not a quiet tape — it is no tape at all. Applied
+      # here too rather than trusting the collector's prune, because publishing runs on its own
+      # schedule and must never be the one surface that still shows a reading from days ago.
+      max_age = flow_reading_max_age_sec(getattr(cfg.trading, "poll_interval_sec", 0))
       live: Dict[str, Any] = {}
       for symbol in sorted(observations):
         row = observations[symbol]
         if not isinstance(row, dict) or row.get("buyShare") is None:
           continue
         updated = _f(row.get("updated")) or 0.0
+        if updated <= 0 or now - updated > max_age:
+          continue
         live[symbol] = {
           "buyShare": _round(_f(row.get("buyShare")), 4),
           "buyShareEwma": _round(_f(row.get("buyShareEwma")), 4),

@@ -418,6 +418,30 @@ def taker_flow_summary(trades: Any, *, since_cursor: int | None = None) -> Dict[
   return out
 
 
+# How many polls a tape reading stays usable. A symbol inside the sampling cap is refreshed every
+# poll, so its reading is ~1 poll old; a symbol that rotated out of the cap ages without bound. Ten
+# polls is wide enough to survive a slow agent run or a few failed tape reads and narrow enough that
+# the two cases can never be confused — before this bound existed the persisted state held readings
+# 63 HOURS old, and nothing stopped one being stamped onto a direction call as though it were
+# current. Lives here, next to the function that produces a reading, because both the writer
+# (main's collector) and the reader (tools' entry path) have to agree on when one stops counting.
+FLOW_MAX_AGE_POLLS = 10
+
+
+def flow_reading_max_age_sec(poll_interval_sec: float) -> float:
+  """Wall-clock age past which a taker-flow reading is no longer a reading.
+
+  Derived from the poll interval rather than fixed in seconds so it stays correct if the loop is
+  re-tuned, and applied on *both* sides: the collector prunes aged-out symbols, and the read side
+  re-checks, because state loaded from disk at startup has not been through a prune yet.
+  """
+  try:
+    interval = float(poll_interval_sec or 0)
+  except (TypeError, ValueError):
+    interval = 0.0
+  return FLOW_MAX_AGE_POLLS * max(1.0, interval)
+
+
 def classify_regime(
   adx: float | None,
   bbw: float | None,

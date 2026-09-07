@@ -1,5 +1,7 @@
-import pytest
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from src.dashboard_publisher import DashboardPublisher
 
@@ -527,7 +529,8 @@ class TestTakerFlowPanel:
   @staticmethod
   def _cfg(enabled=True):
     return SimpleNamespace(
-      trading=SimpleNamespace(estimated_slippage_pct=0.001, slippage_autotune_min_samples=8),
+      trading=SimpleNamespace(estimated_slippage_pct=0.001, slippage_autotune_min_samples=8,
+                              poll_interval_sec=60),
       edge=SimpleNamespace(taker_flow_enabled=enabled),
     )
 
@@ -568,6 +571,23 @@ class TestTakerFlowPanel:
     assert 85 <= out["live"]["BTC-USDT"]["ageSec"] <= 120
     assert "ETH-USDT" not in out["live"]
 
+  def test_a_reading_past_its_shelf_life_is_dropped_rather_than_shown_as_live(self):
+    """A panel labelled "live" must not carry a reading from days ago.
+
+    Symbols rotate through the sampling cap and a rotated-out symbol simply stops being refreshed;
+    live state was found holding readings 63 HOURS old. An old reading is not a quiet tape, and at
+    a glance a stale buyShare of 0.8 is indistinguishable from a real one.
+    """
+    import time as _t
+    pub = _publisher()
+    now = int(_t.time())
+    out = pub._build_taker_flow(self._memory(flow={
+      "BTC-USDT": {"buyShare": 0.61, "updated": now - 120},          # inside 10 polls x 60s
+      "OLD-USDT": {"buyShare": 0.80, "updated": now - 63 * 3600},    # the reading found live
+      "NOTS-USDT": {"buyShare": 0.55},                               # no timestamp: unverifiable
+    }), self._cfg())
+    assert list(out["live"]) == ["BTC-USDT"]
+
   def test_the_panel_says_when_collection_is_switched_off(self):
     pub = _publisher()
     out = pub._build_taker_flow(self._memory(), self._cfg(enabled=False))
@@ -579,7 +599,8 @@ class TestTakerFlowPanel:
     probes = ([self._probe("long", 100.5, 0.8) for _ in range(25)]
               + [self._probe("long", 99.5, 0.2) for _ in range(25)])
     out = pub._build_taker_flow(
-      self._memory(probes, flow={"BTC-USDT": {"buyShare": 0.6, "updated": 1}}), self._cfg())
+      self._memory(probes, flow={"BTC-USDT": {"buyShare": 0.6, "updated": int(time.time())}}),
+      self._cfg())
     banned = {"equity", "balance", "notional", "usd", "size", "accountid", "qty", "leverage"}
     def _keys(obj, acc):
       if isinstance(obj, dict):
@@ -600,7 +621,8 @@ class TestTakerFlowPanel:
     broken_stats = SimpleNamespace(
       signal_probes=lambda limit=200: (_ for _ in ()).throw(RuntimeError("boom")),
       recent_fills=lambda limit=100: [],
-      get_agent_scheduler=lambda: {"flowObservations": {"BTC-USDT": {"buyShare": 0.6, "updated": 1}}},
+      get_agent_scheduler=lambda: {
+        "flowObservations": {"BTC-USDT": {"buyShare": 0.6, "updated": int(time.time())}}},
     )
     out = pub._build_taker_flow(broken_stats, self._cfg())
     assert out["verdict"] == "insufficient data"

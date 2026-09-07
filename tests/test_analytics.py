@@ -8,6 +8,7 @@ from src.analytics import (
     exclude_open_candles,
     summarize_interval,
     summarize_multi_timeframe,
+    flow_reading_max_age_sec,
     taker_flow_summary,
     validate_candle_data,
 )
@@ -492,3 +493,22 @@ class TestTakerFlowSummary:
         ], since_cursor=1_700_000_001)
         assert out["lastCursor"] == 1_700_000_002
         assert out["newTrades"] == 1 and out["newBuyShare"] == 1.0
+
+
+class TestFlowReadingMaxAge:
+    """How long a tape reading stays a reading.
+
+    Shared by the collector (which prunes) and the entry path (which re-checks, because state loaded
+    from disk after downtime never went through a prune). Both sides must agree, or a reading
+    dropped by one is still stamped onto a direction call by the other.
+    """
+
+    def test_the_bound_follows_the_poll_interval(self):
+        assert flow_reading_max_age_sec(60) == 600.0
+        assert flow_reading_max_age_sec(300) == 3000.0
+
+    def test_a_missing_or_absurd_interval_still_yields_a_usable_bound(self):
+        """This is called on the order path. It must never raise and never return 0, which would
+        reject every reading including the one written moments ago."""
+        for bad in (None, 0, -5, "", "nonsense"):
+            assert flow_reading_max_age_sec(bad) >= 10.0

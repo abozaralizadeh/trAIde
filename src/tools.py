@@ -28,6 +28,7 @@ from .analytics import (
   INTERVAL_SECONDS,
   candles_to_dataframe,
   compute_indicators,
+  flow_reading_max_age_sec,
   summarize_interval,
   summarize_multi_timeframe,
   validate_candle_data,
@@ -403,21 +404,35 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     the model reasoned about. `ageSec` is carried so a stale reading can be discounted later instead
     of silently passing as current. Cached per tool-build because every direction call in a poll
     shares the same snapshot.
+
+    An aged-out reading is dropped rather than returned with a large `ageSec`. The collector already
+    prunes, but state loaded from disk after downtime has not been through a prune, and a reading
+    stamped onto a direction call is indistinguishable afterwards from a fresh one — it would quietly
+    poison the very experiment it exists to feed. Absent beats wrong.
+
+    **Total by construction — this is telemetry sitting in the entry path.** A measurement must never
+    be able to refuse a trade or suppress a probe, so every failure degrades to "no reading". Learned
+    the hard way: a bare NameError here (2026-09-04 → 09-07) both raised out of the atomic futures
+    entry and, at the probe call site, was swallowed as a failed probe — freezing the edge scoreboard
+    at its last verdict so every family stayed permanently stood-aside. Guard the whole body, not
+    just the state read.
     """
-    if "observations" not in _flow_cache:
-      try:
+    try:
+      if "observations" not in _flow_cache:
         _flow_cache["observations"] = memory.get_agent_scheduler().get("flowObservations") or {}
-      except Exception as exc:
-        logger.debug("taker-flow state unavailable: %s", exc)
-        _flow_cache["observations"] = {}
-    observation = _flow_cache["observations"].get(normalize_symbol(symbol))
-    if not isinstance(observation, dict) or observation.get("buyShare") is None:
+      observation = _flow_cache["observations"].get(_normalize_symbol(symbol))
+      if not isinstance(observation, dict) or observation.get("buyShare") is None:
+        return None
+      reading = dict(observation)
+      updated = _to_float(reading.pop("updated", 0))
+      age_sec = max(0.0, time.time() - updated) if updated > 0 else None
+      if age_sec is None or age_sec > flow_reading_max_age_sec(cfg.trading.poll_interval_sec):
+        return None
+      reading["ageSec"] = int(age_sec)
+      return reading
+    except Exception as exc:
+      logger.debug("taker-flow reading unavailable for %s: %s", symbol, exc)
       return None
-    reading = dict(observation)
-    updated = _to_float(reading.pop("updated", 0))
-    if updated > 0:
-      reading["ageSec"] = max(0, int(time.time() - updated))
-    return reading
 
   def _add_on_state(
     futures_symbol: str,
@@ -3630,7 +3645,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         taker_flow=_taker_flow_reading(spot_symbol),
       )
     except Exception as _probe_exc:
-      logger.debug("signal probe not recorded for %s: %s", spot_symbol, _probe_exc)
+      # WARNING, not debug: the probe is the evidence supply for every edge verdict, and a verdict
+      # with no fresh evidence never changes — so silently dropping probes freezes the scoreboard and
+      # stands the book aside indefinitely. That failure ran unseen for three days (2026-09-04 →
+      # 09-07) because this line was debug-level. It must be visible in the log the operator reads.
+      logger.warning("SIGNAL PROBE LOST: %s %s not recorded (%s) — edge verdicts will go stale",
+                     spot_symbol, side_lower, _probe_exc)
 
     # STAND ASIDE on a measured-no-edge playbook. The probe above is already recorded, so declining the
     # trade does NOT starve the family's evidence — it keeps scoring from the call and re-opens on its
