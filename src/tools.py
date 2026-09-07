@@ -66,7 +66,13 @@ from .regime import (
   reward_risk_ratio,
   risk_capped_contracts,
 )
-from .edge import SETUP_FAMILIES, family_explore_factor, family_size_factor, family_stand_aside
+from .edge import (
+  SETUP_FAMILIES,
+  family_explore_factor,
+  family_size_factor,
+  family_stand_aside,
+  open_families,
+)
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
   logger,
@@ -3661,13 +3667,29 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if cfg.edge.stand_aside_no_edge_family and family_stand_aside(
       _edge_state().get("signal_edge") or {}, _family_fl or "other"
     ):
-      _fam_row = ((_edge_state().get("signal_edge") or {}).get("by_family") or {}).get(_family_fl or "other") or {}
+      _signal_edge = _edge_state().get("signal_edge") or {}
+      _fam_row = (_signal_edge.get("by_family") or {}).get(_family_fl or "other") or {}
       _fam_n = _fam_row.get("n")
       _fam_net = float(_fam_row.get("net_of_cost_pct") or 0.0)
       logger.warning(
         "STAND ASIDE: futures limit %s %s — family %r measures NO EDGE (n=%s, net_of_cost=%+.3f%%); skipping entry",
         spot_symbol, side_lower, _family_fl or "other", _fam_n, _fam_net,
       )
+      # Name where the edge actually is, from the live scoreboard. A refusal that does not say where
+      # to go just gets the same family re-proposed next poll — which is what live did on 2026-09-07,
+      # 21 continuation stand-asides in six hours while range_edge sat unblocked at a measured +0.72%.
+      _open = open_families(_signal_edge)
+      _fmt = lambda rows: ", ".join(
+        f"{r['family']} (n={r['n']}, {r['netOfCostPct']:+.3f}%)" if r["netOfCostPct"] is not None
+        else f"{r['family']} (n={r['n']})" for r in rows
+      )
+      _where = []
+      if _open["paying"]:
+        _where.append(f"Currently paying: {_fmt(_open['paying'])}.")
+      if _open["unproven"]:
+        _where.append(f"Open but unproven (still gathering evidence): {_fmt(_open['unproven'])}.")
+      if not _where:
+        _where.append("No playbook currently measures an edge — standing down is a valid answer.")
       return {
         "rejected": True,
         "reason": (
@@ -3675,11 +3697,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           f"(net_of_cost {_fam_net:+.3f}% — its direction calls don't clear their round-trip cost, "
           f"so this is a coin-flip minus fees)."
         ),
+        "openFamilies": _open,
         "hint": (
           "This is bet-sizing on measured edge, not a directional veto — it re-opens automatically once "
-          "this playbook's forward return beats cost. Switch to a playbook that is currently paying "
-          "(check signalEdge.by_family), take a genuine fade_extreme at an RSI extreme, or stand down "
-          "until the regime turns."
+          "this playbook's forward return beats cost. " + " ".join(_where) +
+          " Re-proposing the same playbook will be refused again; take one of the above only if the "
+          "setup is genuinely there, otherwise stand down until the regime turns."
         ),
       }
 

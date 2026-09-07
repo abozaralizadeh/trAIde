@@ -1295,11 +1295,14 @@ async def trading_loop(
         except Exception:
           # Market colour is never worth a poll. A failed tape read leaves the last state in place.
           logger.debug("taker-flow sample failed for %s", symbol, exc_info=True)
-      _dropped = _prune_flow_observations(
-        flow_observations, cfg.trading.poll_interval_sec, time.time()
-      )
-      if _dropped:
-        logger.debug("taker-flow: forgot %d stale symbol reading(s)", _dropped)
+    # Outside the enabled check on purpose: switching collection off must still let the last
+    # readings expire, or they sit in .agent_memory.json for good describing a market from whenever
+    # sampling stopped.
+    _dropped = _prune_flow_observations(
+      flow_observations, cfg.trading.poll_interval_sec, time.time()
+    )
+    if _dropped:
+      logger.debug("taker-flow: forgot %d stale symbol reading(s)", _dropped)
 
     live_prices = {
       normalize_symbol(symbol): float(ticker.price)

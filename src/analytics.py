@@ -426,6 +426,7 @@ def taker_flow_summary(trades: Any, *, since_cursor: int | None = None) -> Dict[
 # current. Lives here, next to the function that produces a reading, because both the writer
 # (main's collector) and the reader (tools' entry path) have to agree on when one stops counting.
 FLOW_MAX_AGE_POLLS = 10
+_ASSUMED_POLL_INTERVAL_SEC = 60.0  # config's POLL_INTERVAL_SEC default; only used if the real one is unreadable
 
 
 def flow_reading_max_age_sec(poll_interval_sec: float) -> float:
@@ -434,12 +435,16 @@ def flow_reading_max_age_sec(poll_interval_sec: float) -> float:
   Derived from the poll interval rather than fixed in seconds so it stays correct if the loop is
   re-tuned, and applied on *both* sides: the collector prunes aged-out symbols, and the read side
   re-checks, because state loaded from disk at startup has not been through a prune yet.
+
+  An unusable interval falls back to the configured default rather than collapsing the window
+  towards zero. Both failure directions are wrong, but they are not equally wrong: too wide keeps a
+  slightly old reading, too narrow silently discards every good one and empties the panel.
   """
   try:
     interval = float(poll_interval_sec or 0)
   except (TypeError, ValueError):
     interval = 0.0
-  return FLOW_MAX_AGE_POLLS * max(1.0, interval)
+  return FLOW_MAX_AGE_POLLS * (interval if interval > 0 else _ASSUMED_POLL_INTERVAL_SEC)
 
 
 def classify_regime(

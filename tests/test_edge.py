@@ -12,6 +12,7 @@ from src.edge import (
     family_size_factor,
     family_stand_aside,
     family_explore_factor,
+    open_families,
     infer_setup_family,
     entry_quality_stats,
     expectancy_size_factor,
@@ -688,6 +689,61 @@ def test_stand_aside_leaves_a_paying_family_alone():
     # An unmeasured family (no row at all) is never skipped.
     assert family_stand_aside(out, "never_seen") is False
     assert family_stand_aside({}, "continuation") is False
+
+
+class TestOpenFamilies:
+  """Where a refused setup can actually go, read off the live scoreboard.
+
+  The stand-aside used to hand back a hardcoded suggestion ("take a genuine fade_extreme"). On
+  2026-09-07 that pointed straight at a family sitting at n=38, net -1.12%, itself stood aside — so
+  the model was told to do the one thing guaranteed to be refused again, and re-proposed
+  continuation 21 times in six hours while range_edge sat unblocked at a measured +0.72%.
+  """
+
+  _SCOREBOARD = {"cost_pct": 0.001, "by_family": {
+    "continuation": {"n": 134, "verdict": "no edge", "net_of_cost_pct": -0.356, "stderr_pct": 0.1},
+    "fade_extreme": {"n": 38, "verdict": "no edge", "net_of_cost_pct": -1.122, "stderr_pct": 0.2},
+    "range_edge": {"n": 22, "verdict": "edge", "net_of_cost_pct": 0.724, "stderr_pct": 0.2},
+    "funding_carry": {"n": 10, "verdict": "insufficient data", "net_of_cost_pct": 0.817},
+    "breakout": {"n": 7, "verdict": "insufficient data", "net_of_cost_pct": -0.081},
+  }}
+
+  def test_a_blocked_family_is_never_offered_as_the_way_out(self):
+    out = open_families(self._SCOREBOARD)
+    named = {r["family"] for r in out["paying"] + out["unproven"]}
+    assert not any(family_stand_aside(self._SCOREBOARD, fam) for fam in named)
+    assert "continuation" not in named and "fade_extreme" not in named
+
+  def test_proven_and_unproven_are_reported_separately(self):
+    """Conflating them would sell an n=7 coin flip as an edge — the distinction is the whole point
+    of measuring, and the model needs to size differently against each."""
+    out = open_families(self._SCOREBOARD)
+    assert [r["family"] for r in out["paying"]] == ["range_edge"]
+    assert [r["family"] for r in out["unproven"]] == ["funding_carry", "breakout"]  # by sample size
+    assert out["paying"][0]["n"] == 22 and out["paying"][0]["netOfCostPct"] == 0.724
+
+  def test_paying_families_are_ranked_best_first(self):
+    board = {"by_family": {
+      "range_edge": {"n": 22, "verdict": "edge", "net_of_cost_pct": 0.3},
+      "breakout": {"n": 25, "verdict": "edge", "net_of_cost_pct": 1.1},
+    }}
+    assert [r["family"] for r in open_families(board)["paying"]] == ["breakout", "range_edge"]
+
+  def test_it_says_nothing_rather_than_inventing_somewhere_to_go(self):
+    """With every family blocked the honest answer is "stand down" — a suggestion pulled out of
+    nowhere is how a veto turns into a nudge toward a worse trade."""
+    all_bad = {"by_family": {
+      "continuation": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.5, "stderr_pct": 0.1},
+      "fade_extreme": {"n": 30, "verdict": "no edge", "net_of_cost_pct": -0.4, "stderr_pct": 0.1},
+    }}
+    assert open_families(all_bad) == {"paying": [], "unproven": []}
+    assert open_families({}) == {"paying": [], "unproven": []}
+    assert open_families(None) == {"paying": [], "unproven": []}
+
+  def test_a_family_with_no_evidence_at_all_is_not_advertised(self):
+    # An n=0 row is not "open to trade", it is unmeasured — offering it reads as a recommendation.
+    board = {"by_family": {"macro_event": {"n": 0, "verdict": "insufficient data"}}}
+    assert open_families(board)["unproven"] == []
 
 
 def test_stand_aside_and_the_probe_pipeline_agree_on_the_verdict():

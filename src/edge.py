@@ -412,6 +412,36 @@ def family_stand_aside(
   return net < se
 
 
+def open_families(signal_edge: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
+  """Which playbooks are actually available right now, split by how well proven they are.
+
+  Wisdom, not a gate. When a stand-aside refuses a setup the model needs somewhere to go, and the
+  answer has to come from the *current* scoreboard: a hardcoded suggestion goes stale silently and
+  then points at a family that is itself stood aside, which is exactly what happened live on
+  2026-09-07 (the hint said "take a genuine fade_extreme" while fade_extreme sat at n=38,
+  net -1.12%, blocked). Nothing here decides anything — it names what the bot's own measurement
+  currently says, so the model can redirect instead of re-proposing the family it was just refused.
+
+  ``paying`` = measured edge, best net first. ``unproven`` = not yet judged, so still open to trade
+  and still worth evidence. Families that are stood aside appear in neither.
+  """
+  by_family = (signal_edge or {}).get("by_family") or {}
+  paying: List[Dict[str, Any]] = []
+  unproven: List[Dict[str, Any]] = []
+  for fam in SETUP_FAMILIES:
+    row = by_family.get(fam)
+    if not isinstance(row, dict) or family_stand_aside(signal_edge, fam):
+      continue
+    entry = {"family": fam, "n": int(row.get("n") or 0), "netOfCostPct": _f(row.get("net_of_cost_pct"))}
+    if row.get("verdict") == "edge":
+      paying.append(entry)
+    elif entry["n"] > 0:
+      unproven.append(entry)
+  paying.sort(key=lambda e: -(e["netOfCostPct"] or 0.0))
+  unproven.sort(key=lambda e: -e["n"])
+  return {"paying": paying, "unproven": unproven}
+
+
 def family_explore_factor(
   signal_edge: Dict[str, Any],
   family: str,

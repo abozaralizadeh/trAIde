@@ -507,8 +507,9 @@ class TestFlowReadingMaxAge:
         assert flow_reading_max_age_sec(60) == 600.0
         assert flow_reading_max_age_sec(300) == 3000.0
 
-    def test_a_missing_or_absurd_interval_still_yields_a_usable_bound(self):
-        """This is called on the order path. It must never raise and never return 0, which would
-        reject every reading including the one written moments ago."""
-        for bad in (None, 0, -5, "", "nonsense"):
-            assert flow_reading_max_age_sec(bad) >= 10.0
+    def test_an_unreadable_interval_falls_back_wide_rather_than_narrow(self):
+        """Called on the order path, so it must never raise — but the direction of the fallback
+        matters more than that. Collapsing towards zero would reject every reading including the one
+        written moments ago; assuming the default interval only risks keeping a slightly old one."""
+        for bad in (None, 0, -5, "", "nonsense", object()):
+            assert flow_reading_max_age_sec(bad) == 600.0
