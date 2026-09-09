@@ -418,6 +418,49 @@ class TestClosedPositionsRenderability:
     assert len(rows) == 1 and rows[0]["side"] == "long"
 
 
+class TestClosedTradeBarChartAgreesWithTheCards:
+  """Two panels counting the same trades must reach the same number.
+
+  Reported live on 2026-09-01: "recently closed" showed one win and one loss while the outcome bar
+  chart showed one win and TWO losses. The chart filtered the raw decisions feed itself and so was
+  the only closed-trade surface that skipped the estimate/echo dedupe every other panel goes
+  through, and NEAR-USDT had been reported twice — the bracket, then the agent narrating the same
+  close seconds later at a different figure.
+  """
+
+  @staticmethod
+  def _mem(rows):
+    return SimpleNamespace(latest_items=lambda kind, limit=50: {"items": list(rows)})
+
+  def test_a_narrated_echo_does_not_draw_its_own_bar(self):
+    rows = [
+      {"symbol": "NEAR-USDT", "action": "close_long", "ts": 1005, "pnl": +0.00666,
+       "reason": "closed the runner"},
+      {"symbol": "NEAR-USDT", "action": "futures_sell_triggered", "ts": 1000, "pnl": +0.00335,
+       "closeType": "CLOSE_LONG", "exitPrice": 2.481, "reason": "TP/SL triggered (ROE 0.34%)"},
+    ]
+    out = _publisher()._closed_trades(self._mem(rows))
+    assert len(out) == 1
+    assert out[0]["action"] == "futures_sell_triggered"
+
+  def test_genuinely_separate_closes_all_keep_their_bars_newest_first(self):
+    rows = [
+      {"symbol": "XRP-USDT", "action": "futures_sell_triggered", "ts": 3000, "pnl": -0.41,
+       "closeType": "CLOSE_LONG", "exitPrice": 2.9},
+      {"symbol": "NEAR-USDT", "action": "futures_buy_triggered", "ts": 2000, "pnl": +0.12,
+       "closeType": "CLOSE_SHORT", "exitPrice": 2.4},
+    ]
+    out = _publisher()._closed_trades(self._mem(rows))
+    assert [d["symbol"] for d in out] == ["XRP-USDT", "NEAR-USDT"]
+
+  def test_rows_that_are_not_closes_are_still_excluded(self):
+    rows = [
+      {"symbol": "ADA-USDT", "action": "decline", "ts": 4000, "reason": "no edge"},
+      {"symbol": "ADA-USDT", "action": "futures_buy", "ts": 4100, "reason": "entry placed"},
+    ]
+    assert _publisher()._closed_trades(self._mem(rows)) == []
+
+
 class TestMacroEventsPanel:
   """The calendar and blackout state published to the dashboard.
 

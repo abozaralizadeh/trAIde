@@ -1173,6 +1173,22 @@ class MemoryStore:
     return None
 
   @staticmethod
+  def _has_position_identity(row: Dict[str, Any]) -> bool:
+    """Whether a row names the position it closed, by any of the identifiers we persist.
+
+    Used to tell a real close record from a narrative echo. A row that names no position cannot be
+    reconciled with the exchange's report of the same close, so it can only ever be matched by
+    guesswork on value and timing — which is how the NEAR-USDT double-count of 2026-09-01 slipped
+    through. Deliberately permissive: any one identifier is enough, so a row that carries real
+    provenance is never treated as an echo.
+    """
+    if str(row.get("positionId") or "").strip():
+      return True
+    if MemoryStore._position_open_time_ms(row) is not None:
+      return True
+    return bool(row.get("positionLifecycleVersion"))
+
+  @staticmethod
   def _same_position_lifecycle(
     local: Dict[str, Any],
     authoritative: Dict[str, Any],
@@ -1974,14 +1990,34 @@ class MemoryStore:
             return False
           if abs(rp - pnl) < 1e-9:
             return True                      # a verbatim copy (the `close_reviewed` family)
+          if rp == 0 or (rp > 0) != (pnl > 0):
+            return False                     # opposite signs are two different trades, never one echo
           # ...or the bot's own pre-close ESTIMATE, which differs slightly from the exchange's final
           # figure. Matching only on an exact value missed exactly that case: DASH-USDT on 2026-08-30
           # logged `close_short` at -0.0465 and KuCoin reported -0.0412 twenty-five seconds later, and
           # both were booked. Same symbol, same direction of PnL, same minute, within half of each
           # other is one close reported twice, not two trades.
-          return rp != 0 and (rp > 0) == (pnl > 0) and abs(rp - pnl) / abs(rp) < 0.5
+          if abs(rp - pnl) / abs(rp) < 0.5:
+            return True
+          # The half-of-each-other band assumes the estimate was roughly right. When the row also names
+          # no position at all it is not a trade record but the agent narrating a close it believed it
+          # was making, and its figure can be arbitrarily wrong because nothing in it was ever
+          # reconciled: NEAR-USDT on 2026-09-01 had the bracket fire at +0.00335 and the agent log its
+          # own reduce-only close at +0.00666 five seconds later — 99% apart, so the band let it
+          # through and the trade was booked twice. It surfaced as a phantom bar on the dashboard's
+          # outcome chart with no matching card in "recently closed" (that panel needs entry/exit
+          # prices, which an echo has never had), and it corrupts realized PnL and every rolling stat.
+          #
+          # So for an anonymous row the test widens from "roughly equal" to "the same order of
+          # magnitude", which is the real claim: two reports of ONE close can disagree over fees,
+          # partial reductions and an estimate taken a few seconds early, but not by 10x. Two genuinely
+          # different trades on one symbol do differ by that much — -1.50 next to -0.04 stays two.
+          if not MemoryStore._has_position_identity(row):
+            larger, smaller = max(abs(rp), abs(pnl)), min(abs(rp), abs(pnl))
+            return smaller > 0 and larger / smaller < 10.0
+          return False
 
-        if pnl is not None and any(_shadows(real) for real in rows):
+        if any(_shadows(real) for real in rows):
           continue
       kept.append(row)
     return MemoryStore._dedupe_realized(kept, window_sec=window_sec)

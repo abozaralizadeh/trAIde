@@ -852,11 +852,18 @@ class DashboardPublisher:
       return {}
 
   def _closed_trades(self, memory: MemoryStore, limit: int = 100) -> List[Dict[str, Any]]:
+    """Closed outcomes for the bar chart — counted the same way every other panel counts them.
+
+    This read the raw decisions feed and filtered it itself, so it was the one closed-trade surface
+    that never went through the estimate/echo dedupe. On 2026-09-01 that showed: NEAR-USDT was
+    reported twice (bracket at +0.00335, the agent's own narration of the same close at +0.00666),
+    and the dashboard drew three bars for two trades — one win, two losses — beside a "recently
+    closed" panel that correctly showed one win and one loss. Two panels disagreeing about how many
+    trades happened destroys trust in both, so both now ask the same question of the same filter.
+    """
     items = memory.latest_items("decisions", limit=50).get("items", [])
-    closed = [
-      d for d in items
-      if d.get("pnl") is not None and MemoryStore._is_realized_close(d.get("action") or "")
-    ]
+    closed = MemoryStore._authoritative_realized_rows(items)
+    closed.sort(key=lambda d: d.get("ts") or 0, reverse=True)   # newest first, as the feed is
     return closed[:limit]
 
   def _closed_position_lifecycles(self, memory: MemoryStore, limit: int = _CLOSED_DETAIL_LIMIT) -> List[Dict[str, Any]]:

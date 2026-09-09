@@ -110,6 +110,30 @@ def round_entry_contracts_down(contracts_raw: float, lot_size: int) -> int:
   return int(math.floor(raw / lot) * lot)
 
 
+def entry_contracts_at_least_one_lot(contracts_raw: float, lot_size: int) -> tuple[int, bool]:
+  """Round an entry down to whole lots, but never below the one lot the exchange will accept.
+
+  A size factor means "bet smaller", and on a ~$70 account the soft stack routinely asks for less than
+  the smallest position the venue sells. Rounding to zero there turns caution into abstention: measured
+  live over 2026-09-07→09, five of the eight entries that reached final sizing died on it — three PUMP
+  ($2.83/$2.60/$2.58 against a $4.60 lot) and two XRP ($11.26/$11.38 against $14.54) — and every one of
+  them, taken at one lot, would have risked only 26–52% of the hard per-trade budget. They were refused
+  as too big while being a quarter to a half of what is allowed.
+
+  So the soft stack stops at the exchange's floor and hands the survival question to the guards built
+  for it: ``risk_capped_contracts`` returns 0 when one lot genuinely exceeds the risk budget, and the
+  heat and concentration caps do the same for theirs. Those rejections are correct and still fire. The
+  one this replaces was not — it tested an opinion-scaled budget, not a risk one.
+
+  Returns the contract count and whether the floor had to be applied, so the caller can say so.
+  """
+  lot = max(1, int(lot_size or 1))
+  contracts = round_entry_contracts_down(contracts_raw, lot)
+  if contracts >= lot:
+    return contracts, False
+  return lot, True
+
+
 def entry_cancel_guard_reason(
   order: Dict[str, Any],
   gate: Dict[str, Any],
@@ -590,6 +614,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       snapshot.total_usdt, _effective_risk_fraction(),
       existing_risk_usd=existing_risk_usd,
     )
+
 
   def _concentration_capped_contracts(
     contracts: int,
@@ -2817,18 +2842,15 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
-    contracts = (
-      round_entry_contracts_down(contracts_raw, lot)
-      if is_entry else int(math.ceil(contracts_raw / lot) * lot)
-    )
     if is_entry:
-      if contracts < lot:
-        return {
-          "rejected": True,
-          "reason": "Contract minimum exceeds the adaptively sized entry budget",
-          "requestedNotionalUsd": notional_input,
-          "minNotionalUsd": lot * multiplier * price,
-        }
+      _min_notional_fm = lot * multiplier * price
+      contracts, _min_lot_floored = entry_contracts_at_least_one_lot(contracts_raw, lot)
+      if _min_lot_floored:
+        logger.info(
+          "MIN LOT FLOOR: futures market %s sized budget %.2f buys less than one lot (%.2f) — "
+          "testing one lot against the hard risk budget",
+          futures_symbol, notional_input, _min_notional_fm,
+        )
       contracts = _risk_capped_contracts(
         contracts, lot, multiplier, price, _risk_stop_fm, existing_risk_usd=existing_risk_usd,
       )
@@ -2837,6 +2859,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "rejected": True,
           "reason": "Contract minimum exceeds the configured per-trade risk budget",
           "riskBudgetUsd": snapshot.total_usdt * _effective_risk_fraction(),
+          "minNotionalUsd": _min_notional_fm,
         }
       contracts = _heat_capped_contracts(contracts, lot, multiplier, price, _risk_stop_fm)
       if contracts < lot:
@@ -2852,6 +2875,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if contracts < lot:
         return {"rejected": True, "reason": "Contract minimum exceeds remaining same-symbol concentration budget"}
     else:
+      # A close rounds UP, so a residual smaller than a lot still gets flattened rather than stranded.
+      contracts = int(math.ceil(contracts_raw / lot) * lot)
       live_contracts = abs(int(_to_float((live_close_position or {}).get("currentQty")) or 0.0))
       max_close_contracts = int(math.floor(live_contracts / lot) * lot)
       contracts = min(contracts, max_close_contracts)
@@ -3821,14 +3846,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     contracts_raw = base_size / multiplier
     lot = max(1, lot_size)
-    contracts = round_entry_contracts_down(contracts_raw, lot)
-    if contracts < lot:
-      return {
-        "rejected": True,
-        "reason": "Contract minimum exceeds the adaptively sized entry budget",
-        "requestedNotionalUsd": notional_input,
-        "minNotionalUsd": lot * multiplier * entry_price_val,
-      }
+    _min_notional_fl = lot * multiplier * entry_price_val
+    contracts, _min_lot_floored = entry_contracts_at_least_one_lot(contracts_raw, lot)
+    if _min_lot_floored:
+      logger.info(
+        "MIN LOT FLOOR: futures limit %s sized budget %.2f buys less than one lot (%.2f) — "
+        "testing one lot against the hard risk budget",
+        spot_symbol, notional_input, _min_notional_fl,
+      )
     contracts = _risk_capped_contracts(
       contracts, lot, multiplier, entry_price_val, float(stop_loss_price),
       existing_risk_usd=existing_risk_usd,
@@ -3838,6 +3863,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "rejected": True,
         "reason": "Contract minimum exceeds the configured per-trade risk budget",
         "riskBudgetUsd": snapshot.total_usdt * _effective_risk_fraction(),
+        "minNotionalUsd": _min_notional_fl,
       }
     contracts = _heat_capped_contracts(contracts, lot, multiplier, entry_price_val, float(stop_loss_price))
     if contracts < lot:

@@ -985,6 +985,37 @@ def test_estimate_suppression_needs_the_same_direction_and_magnitude(tmp_path):
     assert len(other.realized_closes(limit=50)) == 2
 
 
+def test_an_anonymous_narrative_close_cannot_book_a_second_trade(tmp_path):
+    """The dashboard's phantom bar: NEAR-USDT, 2026-09-01.
+
+    The bracket fired at +0.00335 and five seconds later the agent logged its own reduce-only
+    close at +0.00666 — the same close, described twice, 99% apart because the agent's figure was
+    never reconciled with anything. The 50% estimate band let it through, so one trade was booked
+    twice: it drew a third bar on the outcome chart with no matching card in "recently closed"
+    (cards need entry/exit prices, which a narrative echo has never had), and it corrupted realized
+    PnL and every rolling stat downstream.
+    """
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("NEAR-USDT", "futures_sell_triggered", 0.0, "TP hit", pnl=+0.00335,
+                       close_type="CLOSE_LONG", exit_price=2.481)
+    store.log_decision("NEAR-USDT", "close_long", 0.0, "closed the runner", pnl=+0.00666)
+
+    closes = store.realized_closes(limit=50)
+    assert len(closes) == 1
+    assert closes[0]["action"] == "futures_sell_triggered"
+    assert closes[0]["pnl"] == pytest.approx(0.00335)
+
+
+def test_the_widened_band_only_applies_to_rows_that_name_no_position(tmp_path):
+    """Provenance beats guesswork: a row that says which position it closed is a trade, not an echo."""
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.log_decision("NEAR-USDT", "futures_sell_triggered", 0.0, "TP hit", pnl=+0.00335,
+                       close_type="CLOSE_LONG", exit_price=2.481, position_id="pos-1")
+    store.log_decision("NEAR-USDT", "close_long", 0.0, "second scalp", pnl=+0.00666,
+                       position_id="pos-2")
+    assert len(store.realized_closes(limit=50)) == 2
+
+
 def test_a_triggered_close_is_never_treated_as_someone_elses_estimate(tmp_path):
     """Old rows predate closeType/realizedR, so they look 'evidence-free' — they must still count."""
     store = MemoryStore(str(tmp_path / "memory.json"))
