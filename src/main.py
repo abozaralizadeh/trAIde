@@ -1051,13 +1051,50 @@ async def trading_loop(
           continue
 
     total_usdt = spot_usdt + futures_usdt + financial_usdt
-    safety.refresh(total_usdt)
+
+    # Is this a COMPLETE view of the account? total_usdt is a sum across venues, and each term
+    # silently contributes 0.0 when its read fails — a KuCoin 504 on the futures overview drops the
+    # entire futures balance out of "total equity" without raising anything. That number then drives
+    # three things that must never see a partial account: the drawdown circuit breaker, the daily
+    # baseline, and the compounding equity index.
+    #
+    # Measured live: the durable index holds ~7.27e7 on days 20693-20695 and a fabricated +19.46%
+    # step across 2026-08-15 -> 08-31. There were NO deposits or withdrawals in that window — only
+    # internal spot<->futures transfers, which cancel in this sum by construction. A partial snapshot
+    # is the only thing that moves the total without money entering or leaving.
+    #
+    # Money in the account is not lost because an HTTP call was, so treat an unreadable venue as
+    # "unknown", not as "zero", and decline to record equity from it at all.
+    equity_complete = True
+    equity_gap: str | None = None
+    if cfg.kucoin_futures.enabled and not snapshot.futures_account:
+      equity_complete = False
+      equity_gap = "futures account overview unavailable"
+    elif cfg.kucoin_futures.enabled and futures_usdt <= 0 and spot_usdt <= 0 and financial_usdt <= 0:
+      equity_complete = False
+      equity_gap = "every venue reported zero — treating as an unread account, not an empty one"
+    snapshot.equity_complete = equity_complete
 
     # Track daily drawdown per venue; the circuit-breaker section below converts the total scope
     # into a hard close-only restriction when its configured limit is breached.
-    limits_total = memory.update_limits(total_usdt, scope="total")
-    limits_spot = memory.update_limits(spot_usdt, scope="spot")
-    limits_futures = memory.update_limits(futures_usdt, scope="futures")
+    if equity_complete:
+      safety.refresh(total_usdt)
+      limits_total = memory.update_limits(total_usdt, scope="total")
+      limits_spot = memory.update_limits(spot_usdt, scope="spot")
+      limits_futures = memory.update_limits(futures_usdt, scope="futures")
+    else:
+      # Carry the last known-good limits. Recording this poll would either trip the drawdown breaker
+      # on a phantom loss or, on the next successful read, book the recovery as a phantom gain — and
+      # the equity index compounds, so that second one is permanent.
+      logger.warning(
+        "EQUITY SNAPSHOT INCOMPLETE (%s) — spot=%.4f futures=%.4f financial=%.4f. Holding the last "
+        "known limits and skipping this poll's equity point; a missing venue is unknown, not zero.",
+        equity_gap, spot_usdt, futures_usdt, financial_usdt,
+      )
+      limits_total = memory.latest_limits("total") or {}
+      limits_spot = memory.latest_limits("spot") or {}
+      limits_futures = memory.latest_limits("futures") or {}
+      total_usdt = float(limits_total.get("currentUsdt") or total_usdt)
 
     snapshot.total_usdt = total_usdt
     snapshot.drawdown_pct = float(limits_total.get("drawdownPct") or 0.0)

@@ -932,6 +932,20 @@ class MemoryStore:
       day_key = int(time.time() // 86400)
       return len([t for t in data.get("trades", []) or [] if (t.get("day") or 0) == day_key])
 
+  def latest_limits(self, scope: str = "total") -> Dict[str, Any]:
+    """The last recorded limits for a scope, without writing anything.
+
+    Used when a balance snapshot comes back incomplete: a venue that failed to read is UNKNOWN, not
+    zero, so the poll must reuse the last known-good figures rather than record a partial account.
+    """
+    with self._lock:
+      data = self._read()
+    limits_all = data.get("limits")
+    if not isinstance(limits_all, dict):
+      return {}
+    row = limits_all.get(str(scope or "total"))
+    return copy.deepcopy(row) if isinstance(row, dict) else {}
+
   def update_limits(self, current_usdt: float, scope: str = "total") -> Dict[str, Any]:
     """Track daily drawdown percentage for informational context. No kill switch."""
     with self._lock:

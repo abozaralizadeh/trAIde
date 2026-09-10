@@ -1021,3 +1021,50 @@ def test_a_triggered_close_is_never_treated_as_someone_elses_estimate(tmp_path):
     store = MemoryStore(str(tmp_path / "memory.json"))
     store.log_decision("XRP-USDT", "futures_buy_triggered", 0.0, "old-style row", pnl=+0.0757)
     assert len(store.realized_closes(limit=50)) == 1
+
+
+class TestLatestLimitsReadOnly:
+  """A venue that failed to read is UNKNOWN, not zero.
+
+  `total_usdt` is a sum across spot + futures + financial, and each term silently contributes 0.0
+  when its fetch fails — a KuCoin 504 on the futures overview drops the whole futures balance out of
+  "total equity" without raising. That number drives the drawdown circuit breaker, the daily baseline
+  and the COMPOUNDING equity index, so a partial snapshot either trips the breaker on a phantom loss
+  or books the recovery as a phantom gain that can never be undone. Live evidence: a +19.46% index
+  step across an outage during which the user made no deposits or withdrawals at all — only internal
+  spot<->futures transfers, which cancel in that sum by construction.
+  """
+
+  def test_returns_the_last_recorded_row_without_writing(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.update_limits(100.0, scope="total")
+    before = m.latest_limits("total")
+    assert before["currentUsdt"] == pytest.approx(100.0)
+    # Reading must not mutate: a second read is identical, and no new baseline is established.
+    assert m.latest_limits("total") == before
+    assert m.latest_limits("total")["baselineUsdt"] == before["baselineUsdt"]
+
+  def test_unknown_scope_and_empty_store_return_empty(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    assert m.latest_limits("total") == {}
+    assert m.latest_limits("nonesuch") == {}
+    m.update_limits(50.0, scope="futures")
+    assert m.latest_limits("spot") == {}
+    assert m.latest_limits("futures")["currentUsdt"] == pytest.approx(50.0)
+
+  def test_the_caller_cannot_corrupt_stored_state(self, tmp_path):
+    """It hands back a copy — a caller mutating it must not rewrite the account's history."""
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.update_limits(100.0, scope="total")
+    got = m.latest_limits("total")
+    got["currentUsdt"] = 999999.0
+    assert m.latest_limits("total")["currentUsdt"] == pytest.approx(100.0)
+
+  def test_a_partial_snapshot_would_otherwise_look_like_a_total_loss(self, tmp_path):
+    """Documents the shape of the bug this exists to prevent: recording a poll whose futures read
+    failed reports a ~100% drawdown on an account that never lost anything."""
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.update_limits(67.14, scope="total")           # healthy poll: spot 0 + futures 67.14
+    partial = m.update_limits(0.0, scope="total")   # futures overview 504s -> the sum is just spot
+    assert partial["drawdownPct"] > 99.0, "a dropped venue reads as a near-total loss"
+    # Which is exactly why the poll loop reuses latest_limits instead of recording that.

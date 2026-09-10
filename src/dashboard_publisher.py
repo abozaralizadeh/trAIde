@@ -962,8 +962,15 @@ class DashboardPublisher:
         query_filter=f"PartitionKey eq '{PK_EQUITY}' and RowKey lt '{rk}'",
         results_per_page=1000,
       )
-      best_day: Optional[int] = None
-      best_close: Optional[float] = None
+      base = float(self.cfg.index_base)
+      lo, hi = base / _INDEX_SANITY_FACTOR, base * _INDEX_SANITY_FACTOR
+      # Collect every stored close, then pick the most recent SANE one. Taking the latest row
+      # unconditionally and re-anchoring to base when it turned out to be corrupt is what destroyed
+      # the live curve: days 20693-20695 held ~7.27e7, so the next publish reset the index to 100 and
+      # threw away the real -15.8% the account had actually accumulated by day 20680. Corruption
+      # should be SKIPPED, not made the reason to forget the history behind it — the last good close
+      # is right there, and resuming from it keeps the curve continuous and honest.
+      candidates: list[tuple[int, float]] = []
       for r in rows:
         try:
           d = int(r["RowKey"])
@@ -972,23 +979,25 @@ class DashboardPublisher:
           continue
         if c is None:
           continue
-        if best_day is None or d > best_day:
+        candidates.append((d, c))
+      candidates.sort(key=lambda p: p[0], reverse=True)
+      best_day: Optional[int] = None
+      best_close: Optional[float] = None
+      skipped = 0
+      for d, c in candidates:
+        if lo <= c <= hi:
           best_day, best_close = d, c
-      base = float(self.cfg.index_base)
+          break
+        skipped += 1
+      if skipped:
+        logger.warning(
+          "EQUITY INDEX: skipped %d corrupt close(s) newer than day %s (outside %.4g..%.4g) and "
+          "resumed from the last sane close %.6g — the durable rows remain, but the chain is no "
+          "longer re-anchored to base and the history behind them is preserved.",
+          skipped, best_day, lo, hi, best_close if best_close is not None else base,
+        )
       if best_close is None:
         return base, None
-      # Chain guard: heal a series that is already poisoned. Because each day multiplies the previous
-      # close, one bad point is permanent — the live series reached 725,468x its base this way. An
-      # index a thousandfold from base is corruption, not performance, so re-anchor rather than keep
-      # compounding it forever.
-      lo, hi = base / _INDEX_SANITY_FACTOR, base * _INDEX_SANITY_FACTOR
-      if not (lo <= best_close <= hi):
-        logger.warning(
-          "EQUITY INDEX: previous close %.4g (day %s) is outside the sane band %.4g..%.4g — "
-          "re-anchoring to the index base %.4g. The durable series is corrupt from that day onward.",
-          best_close, best_day, lo, hi, base,
-        )
-        return base, best_day
       return best_close, best_day
     except Exception:
       return float(self.cfg.index_base), None

@@ -728,3 +728,51 @@ class TestEquityChainGapGuard:
     """Unrelated backstop, still armed: a >50% one-day move is a bad snapshot even without a gap."""
     out = self._pub(100.0, 20704, 20705, 10.0, 100.0)
     assert out["indexClose"] == pytest.approx(100.0, abs=1e-6)
+
+
+class TestCorruptCloseSkipsToLastGood:
+  """Corruption must be SKIPPED, not made a reason to forget the history behind it.
+
+  Live sequence that destroyed the published curve:
+      day 20680 = 84.172806   (last good close, the account really was down ~15.8%)
+      day 20693-20695 ~ 7.27e7 (corrupt, written before the step guard existed)
+      day 20696 = 100.552734   <- the old heal re-anchored to base 100
+  Re-anchoring healed the arithmetic but discarded four months of real performance: the curve then
+  read roughly break-even since June on an account down ~16.5%. The last sane close is still sitting
+  in the table one row back, so resume from it.
+  """
+
+  @staticmethod
+  def _pub(rows):
+    cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized", index_base=100.0))
+    pub = DashboardPublisher(cfg)
+    pub._table_client = SimpleNamespace(
+      query_entities=lambda **k: [{"RowKey": f"{d:08d}", "indexClose": v} for d, v in rows])
+    return pub
+
+  def test_resumes_from_the_last_sane_close_instead_of_base(self):
+    rows = [(20680, 84.172806), (20693, 72714000.4928),
+            (20694, 72738827.545142), (20695, 72358594.525117)]
+    close, day = self._pub(rows)._prev_day_point(20696)
+    assert close == pytest.approx(84.172806), "must resume the real curve, not reset to base 100"
+    assert day == 20680
+
+  def test_a_clean_series_is_unaffected(self):
+    close, day = self._pub([(20704, 99.5), (20705, 99.7)])._prev_day_point(20706)
+    assert close == pytest.approx(99.7) and day == 20705
+
+  def test_falls_back_to_base_only_when_no_sane_close_exists(self):
+    """If every stored row is corrupt there is nothing to resume from — base is the honest anchor."""
+    close, day = self._pub([(20693, 7.2e7), (20694, 7.3e7)])._prev_day_point(20695)
+    assert close == pytest.approx(100.0) and day is None
+
+  def test_an_empty_table_anchors_at_base(self):
+    close, day = self._pub([])._prev_day_point(20611)
+    assert close == pytest.approx(100.0) and day is None
+
+  def test_the_gap_guard_still_sees_the_last_good_day_not_the_corrupt_one(self):
+    """The two guards compose: the day returned must be the SANE row's day, so the chain-gap check
+    measures the real gap (20680 -> 20696 = 16 days) rather than a 1-day hop off a corrupt row."""
+    rows = [(20680, 84.172806), (20695, 72358594.525117)]
+    _, day = self._pub(rows)._prev_day_point(20696)
+    assert day == 20680
