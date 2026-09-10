@@ -677,3 +677,54 @@ class TestTakerFlowPanel:
       get_agent_scheduler=lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert pub._build_taker_flow(broken_live, self._cfg())["live"] == {}
+
+
+class TestEquityChainGapGuard:
+  """A gap in the equity chain must not be booked as one day's return.
+
+  Live, 2026-08-15 -> 08-31: the bot was down 16 days. On restart it compared today's equity against
+  a baseline from whenever it stopped, so the whole gap — including a capital change the bot had no
+  part in — landed as a single daily return. The index stepped 84.17 -> 100.55, a fabricated +19.46%
+  that sailed through the 50% step guard, and because the index COMPOUNDS it inflated every later
+  point: the curve now reads ~flat since June on an account that is actually down ~16.5%.
+  """
+
+  @staticmethod
+  def _pub(prev_close, prev_day, today, baseline, current):
+    cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized", index_base=100.0))
+    pub = DashboardPublisher(cfg)
+    pub._prev_day_point = lambda _t: (prev_close, prev_day)
+    limits = {"total": {"baselineUsdt": baseline, "currentUsdt": current, "drawdownPct": 0.0}}
+    return pub._compute_today_equity(SimpleNamespace(latest_items=lambda *a, **k: {"items": []}),
+                                     limits, today)
+
+  def test_the_live_16_day_outage_no_longer_fabricates_a_return(self):
+    # baseline 56.59 -> current 67.60 is the +19.46% the outage produced.
+    out = self._pub(84.172806, 20680, 20696, 56.59, 67.60)
+    assert out["indexClose"] == pytest.approx(84.172806, abs=1e-6), \
+      "a 16-day gap must hold the index flat, not compound the gap as one day"
+
+  def test_a_normal_consecutive_day_still_compounds(self):
+    """The guard must not freeze the curve in ordinary operation."""
+    out = self._pub(100.0, 20704, 20705, 100.0, 101.0)
+    assert out["indexClose"] == pytest.approx(101.0, abs=1e-6)
+
+  def test_a_single_missed_day_is_tolerated_as_a_trading_day(self):
+    """One missing publish is a hiccup, not an outage — day-1 is still 'yesterday' enough to compound
+    (the 50% step guard remains the backstop for an implausible move)."""
+    out = self._pub(100.0, 20704, 20705, 100.0, 102.0)
+    assert out["indexClose"] == pytest.approx(102.0, abs=1e-6)
+
+  def test_a_gap_with_no_move_is_untouched(self):
+    out = self._pub(84.0, 20680, 20696, 67.0, 67.0)
+    assert out["indexClose"] == pytest.approx(84.0, abs=1e-6)
+
+  def test_the_first_ever_point_has_no_chain_to_break(self):
+    """prev_day None = nothing stored yet; the guard must not swallow the opening day."""
+    out = self._pub(100.0, None, 20611, 100.0, 101.3)
+    assert out["indexClose"] == pytest.approx(101.3, abs=1e-6)
+
+  def test_the_step_guard_still_catches_an_implausible_same_day_move(self):
+    """Unrelated backstop, still armed: a >50% one-day move is a bad snapshot even without a gap."""
+    out = self._pub(100.0, 20704, 20705, 10.0, 100.0)
+    assert out["indexClose"] == pytest.approx(100.0, abs=1e-6)

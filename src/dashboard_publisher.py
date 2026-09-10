@@ -65,6 +65,9 @@ _CLOSED_DETAIL_LIMIT = 12
 # corruption entering; the chain guard heals a series that is already poisoned.
 _MAX_DAILY_INDEX_STEP = 0.5      # |intraday return| beyond this is a data artifact, not a return
 _INDEX_SANITY_FACTOR = 1000.0    # prevClose outside base/1000 .. base*1000 is unusable
+# A chain longer than this many days between finalized closes is a GAP, not a trading day. The index
+# compounds, so a gap booked as one day's return is permanent; days the bot was down earned nothing.
+_MAX_CHAIN_GAP_DAYS = 1
 
 try:
   from azure.data.tables import TableServiceClient, UpdateMode
@@ -945,6 +948,14 @@ class DashboardPublisher:
 
   def _prev_day_close(self, today: int) -> float:
     """The indexClose of the most recent finalized day before `today` (durable, from Azure)."""
+    return self._prev_day_point(today)[0]
+
+  def _prev_day_point(self, today: int) -> tuple[float, Optional[int]]:
+    """As `_prev_day_close`, but also the DAY it came from, so the caller can see a chain gap.
+
+    The index compounds each day onto the previous close, which is only meaningful when that close is
+    actually yesterday's. Callers need the age to tell "yesterday" from "sixteen days ago".
+    """
     try:
       rk = f"{int(today):08d}"
       rows = self._table_client.query_entities(
@@ -965,7 +976,7 @@ class DashboardPublisher:
           best_day, best_close = d, c
       base = float(self.cfg.index_base)
       if best_close is None:
-        return base
+        return base, None
       # Chain guard: heal a series that is already poisoned. Because each day multiplies the previous
       # close, one bad point is permanent — the live series reached 725,468x its base this way. An
       # index a thousandfold from base is corruption, not performance, so re-anchor rather than keep
@@ -977,10 +988,10 @@ class DashboardPublisher:
           "re-anchoring to the index base %.4g. The durable series is corrupt from that day onward.",
           best_close, best_day, lo, hi, base,
         )
-        return base
-      return best_close
+        return base, best_day
+      return best_close, best_day
     except Exception:
-      return float(self.cfg.index_base)
+      return float(self.cfg.index_base), None
 
   def _compute_today_equity(self, memory: MemoryStore, raw_limits: Dict[str, Any], today: int) -> Dict[str, Any]:
     """Build today's index point from intraday return ONLY (no absolute $ ever published).
@@ -993,11 +1004,29 @@ class DashboardPublisher:
     baseline = _f(total.get("baselineUsdt"))
     current = _f(total.get("currentUsdt"))
     dd = _f(total.get("drawdownPct")) or 0.0
-    prev_close = self._prev_day_close(today)
+    prev_close, prev_day = self._prev_day_point(today)
 
     intraday_return = 0.0
     if baseline and baseline > 0 and current and current > 0:
       intraday_return = (current - baseline) / baseline
+
+    # Chain-gap guard. `indexClose_today = prevDayClose * (1 + intradayReturn)` is only meaningful
+    # when prevDayClose really is YESTERDAY's. After an outage the bot restarts against a baseline
+    # from whenever it stopped, so the whole gap — including any deposit or unattended position — is
+    # booked as a single day's return, and because the index compounds, that error is permanent.
+    # Measured live: the bot was down 2026-08-15 -> 08-31 and the index stepped 84.17 -> 100.55,
+    # a fabricated +19.5% that passed the 50% step guard and inflated every later point. Today's
+    # curve reads ~flat since June when the account is actually down ~16.5%.
+    # Days the system was not trading produced no trading performance, so hold the index flat across
+    # the gap rather than attributing the gap to a day.
+    if prev_day is not None and (int(today) - int(prev_day)) > _MAX_CHAIN_GAP_DAYS and intraday_return:
+      logger.warning(
+        "EQUITY INDEX: %d-day gap in the chain (last close day %s, today %s) — the daily baseline is "
+        "stale, so the %.2f%% move it implies is not one day's return. Holding the index flat across "
+        "the gap; performance resumes from the next daily close.",
+        int(today) - int(prev_day), prev_day, today, intraday_return * 100,
+      )
+      intraday_return = 0.0
 
     # Step guard: stop new corruption entering the durable chain. No real trading day moves an account
     # by more than tens of percent; a five-figure "return" means the day's baseline was anchored to a
