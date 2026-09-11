@@ -7,7 +7,9 @@ import pytest
 from src.config import RegimeConfig
 from src.regime import (
     allow_declared_setup,
+    allow_mechanical_setup,
     allow_fade_extreme,
+    verify_declared_setup,
     funding_carry_setup,
     fade_setup_available,
     is_hostile_regime,
@@ -893,6 +895,65 @@ def test_declared_setup_respects_the_disable_flag_and_the_family_list():
     # The admissible list is operator-configurable.
     assert allow_declared_setup(setup_family="range_edge",
                                 cfg=_cfg(declarable_setup_families=("breakout",))) is False
+
+
+class TestExhaustionYieldsOnlyToAVerifiableMechanism:
+    """Anti-FOMO refuses a bet that the trend runs further. Some trades are not that bet.
+
+    RAY-USDT, 2026-09-10/11: funding reached -0.19%/8h paid to longs while daily RSI hit 83 on a
+    ~96%/week rally. The carry long was proposed ~54 times over two days and refused every time as a
+    "continuation entry", with the fade short separately stood aside as a no-edge family — so the
+    book went to zero orders while the poll loop kept running ~190 times a day.
+    """
+
+    def test_a_non_directional_playbook_may_pass_the_exhaustion_gate(self):
+        cfg = _cfg()
+        assert allow_mechanical_setup(setup_family="funding_carry", cfg=cfg) is True
+        assert allow_mechanical_setup(setup_family="macro_event", cfg=cfg) is True
+        assert allow_mechanical_setup(setup_family="FUNDING_CARRY", cfg=cfg) is True
+
+    def test_a_directional_playbook_may_not_declare_its_way_out_of_anti_fomo(self):
+        """A breakout long at RSI 83 IS the continuation bet the gate exists to refuse."""
+        cfg = _cfg()
+        assert allow_mechanical_setup(setup_family="breakout", cfg=cfg) is False
+        assert allow_mechanical_setup(setup_family="range_edge", cfg=cfg) is False
+        assert allow_mechanical_setup(setup_family="continuation", cfg=cfg) is False
+        assert allow_mechanical_setup(setup_family="fade_extreme", cfg=cfg) is False
+        assert allow_mechanical_setup(setup_family=None, cfg=cfg) is False
+        assert allow_mechanical_setup(setup_family="", cfg=cfg) is False
+
+    def test_it_is_strictly_narrower_than_the_direction_gate_carve_out(self):
+        """Bypassing a DIRECTION gate is the model's call; bypassing an EXTENSION gate is not."""
+        cfg = _cfg()
+        for fam in ("breakout", "range_edge", "funding_carry", "macro_event"):
+            if allow_mechanical_setup(setup_family=fam, cfg=cfg):
+                assert allow_declared_setup(setup_family=fam, cfg=cfg)
+
+    def test_disabling_the_family_disables_the_carve_out_too(self):
+        assert allow_mechanical_setup(setup_family="funding_carry",
+                                      cfg=_cfg(declared_setups_enabled=False)) is False
+        assert allow_mechanical_setup(
+            setup_family="funding_carry",
+            cfg=_cfg(declarable_setup_families=("breakout", "range_edge")),
+        ) is False
+
+    def test_the_label_alone_is_never_enough_the_mechanism_is_checked(self):
+        """The permission and the proof are separate steps; the caller must run both."""
+        # Permitted to try...
+        assert allow_mechanical_setup(setup_family="funding_carry", cfg=_cfg()) is True
+        # ...but refused when funding is not actually there.
+        assert verify_declared_setup("funding_carry", side="buy", funding_setup=None) is not None
+        # RAY's live numbers: -0.1877%/8h against a 0.14% round-trip, so one payment covers well over
+        # half the cost and the LONG side is the one paid.
+        setup = funding_carry_setup(-0.001877, 0.0014)
+        assert setup is not None and setup["side"] == "buy"
+        assert verify_declared_setup("funding_carry", side="buy", funding_setup=setup) is None
+        # The same setup does not license the other side — that entry would PAY the carry.
+        assert verify_declared_setup("funding_carry", side="sell", funding_setup=setup) is not None
+
+    def test_funding_below_the_cost_derived_threshold_still_fails(self):
+        """Live on 2026-09-10: RAY at -0.063% was correctly called below the carry threshold."""
+        assert funding_carry_setup(-0.00063, 0.0014) is None
 
 
 def test_fade_setup_is_surfaced_at_an_extreme_so_the_playbook_is_findable():

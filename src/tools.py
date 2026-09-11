@@ -37,6 +37,7 @@ from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
 from .regime import (
   allow_declared_setup,
+  allow_mechanical_setup,
   verify_declared_setup,
   funding_carry_setup,
   macro_event_entry_block,
@@ -3326,6 +3327,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
                         is the ONLY playbook that does not need the direction call to be right: the
                         transfer happens whichever way price moves, and an extreme rate also marks
                         crowded positioning on the other side. Hold across at least one settlement.
+                        Because its payoff is not the trend continuing, it (and "macro_event") is also
+                        the only way past the daily-exhaustion gate — but only when fundingSetup is
+                        actually present and pays the side you are entering.
       "continuation"  — trading with an established trend (timeframes agree, you expect it to persist)
       "fade_extreme"  — fading a stretched move back toward value (oversold bounce, overbought fade)
       "breakout"      — entering on a break of a range/level, expecting expansion
@@ -3454,9 +3458,19 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("TREND-SHORT ALLOWED: futures limit %s %s — exhausted-bearish daily but 1h/15m confirm downtrend resumption (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+          elif allow_mechanical_setup(setup_family=setup_family, cfg=cfg.regime):
+            # Anti-FOMO refuses a bet that the trend runs further. A carry or a post-release trade is
+            # not that bet, so the mechanism — not the RSI — decides. Verification is mandatory here.
+            _mech_bad = _declared_setup_error(setup_family, side_lower, gate)
+            if _mech_bad:
+              logger.warning("MECHANICAL SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _mech_bad)
+              return {"rejected": True, "reason": f"Declared setup does not match reality: {_mech_bad}",
+                      "hint": "Only a playbook whose payoff is mechanical rather than directional may pass the daily-exhaustion gate, and it must actually have its mechanism present."}
+            logger.info("MECHANICAL SETUP ALLOWED: futures limit %s %s past the daily-exhaustion gate — declared %r earns its payoff from a verified mechanism, not from the %s trend continuing (explore-sized until it earns a verdict)",
+                        side_lower, spot_symbol, str(setup_family or "").strip().lower(), daily_bias_raw)
           else:
             logger.warning("ANTI-FOMO BLOCK: futures limit %s %s rejected — daily %s exhausted", side_lower, spot_symbol, daily_bias_raw)
-            return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback or trade counter-trend."}
+            return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback, trade counter-trend, or — if this trade's payoff does not depend on the trend continuing — declare the mechanical playbook it really is ('funding_carry' with funding that clears the threshold, 'macro_event' just after a scheduled release)."}
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:

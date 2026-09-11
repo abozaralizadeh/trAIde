@@ -830,6 +830,57 @@ def allow_declared_setup(
   return fam in declarable
 
 
+# Playbooks that do NOT earn their payoff from the daily trend continuing, and whose mechanism
+# verify_declared_setup can check on its own. Both properties are required — see
+# allow_mechanical_setup for why neither alone is enough.
+MECHANICAL_SETUP_FAMILIES = ("funding_carry", "macro_event")
+
+
+def allow_mechanical_setup(
+  *,
+  setup_family: str | None,
+  cfg: RegimeConfig,
+) -> bool:
+  """Permit a non-directional playbook past the daily-EXHAUSTION gate.
+
+  Anti-FOMO exists to refuse one specific bet: "this trend has run 80 RSI points and I want to bet it
+  runs further." That is a good refusal. But the gate identifies that bet by *side vs daily bias*
+  alone, so it cannot distinguish it from a trade whose payoff has nothing to do with the trend. It
+  charged the full anti-FOMO veto against a ``funding_carry`` — whose return is the funding payment,
+  collected at settlement, whether price goes up, down or nowhere.
+
+  Live cost, 2026-09-10/11: RAY-USDT rallied ~96% in a week on tokenized-stock volume, dragging daily
+  RSI to 83 while funding went to **-0.19%/8h paid to longs**. The agent proposed the carry long
+  ~54 times over two days. Every one was refused "Daily exhaustion: bullish trend overextended — no
+  continuation entry", and it correctly never retried or relabelled. The opposite side was no escape
+  either: the fade short is stood aside as a measured no-edge family. With the whole market bullish
+  AND overbought at once (BTC 14d RSI ~80, 56% of alts back above their 200DMA), that intersection
+  closed both halves of the daily gate and the book went to **zero orders** while the poll loop kept
+  running ~190 times a day.
+
+  The branch below this one, for an entry OPPOSING a healthy daily, has four escape hatches. The
+  exhaustion branch had exactly one, ``allow_trend_aligned_short``, which requires a bearish daily and
+  a sell. A buy into an exhausted bullish daily had no path at all, whatever it declared.
+
+  Why this is narrower than ``allow_declared_setup``, which admits any declared family on the model's
+  word: there, the thing being bypassed is a *direction* gate, and direction is the model's call. Here
+  the thing being bypassed is an *extension* gate, and "I promise this isn't FOMO" is exactly the claim
+  a label cannot be trusted to make — accepting it would make anti-FOMO one word away from disabled,
+  which is how the 2026-09-02 ``funding_carry`` bypass happened (see verify_declared_setup). So this
+  admits only families that are BOTH non-directional in their thesis AND objectively verifiable, and
+  the caller must still run verify_declared_setup: a ``funding_carry`` must show funding that actually
+  clears the cost-derived threshold and pays the side being entered. ``breakout`` and ``range_edge``
+  are deliberately excluded — a breakout long at RSI 83 *is* the continuation bet anti-FOMO is for.
+
+  Survival stays downstream and unchanged: the probe is recorded, ``family_explore_factor`` sizes an
+  unproven playbook to exploration-size, and ``family_stand_aside`` drops it to zero once it measures
+  no edge. This widens what may be PROPOSED, never what may be RISKED.
+  """
+  if not allow_declared_setup(setup_family=setup_family, cfg=cfg):
+    return False
+  return str(setup_family or "").strip().lower() in MECHANICAL_SETUP_FAMILIES
+
+
 def coherent_risk_fraction(
   configured_fraction,
   max_daily_drawdown_pct,
