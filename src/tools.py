@@ -3545,9 +3545,24 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           (intraday_bias_15m_fl == "bearish" and side_lower == "buy") or
           (intraday_bias_15m_fl == "bullish" and side_lower == "sell")
         )
-        if intraday_opposes_fl:
+        if intraday_opposes_fl and allow_mechanical_setup(setup_family=setup_family, cfg=cfg.regime):
+          # The 15m bias is a DIRECTIONAL test, and a mechanical playbook does not claim to pass it:
+          # the funding transfer happens whichever way price moves. Refusing a verified carry because
+          # a 15-minute candle disagrees applies a standard the setup never claimed. Measured
+          # 2026-09-14: CVC (-0.32%/8h) and CAP (-0.19%/8h) were the ONLY two qualifying carry setups
+          # on the watchlist, and this gate — the one branch here with no hatch, while the 1h gate
+          # above has four — refused them 11 times each, for 31 runs and ZERO orders. Verification is
+          # mandatory: the mechanism must be real and must pay the side being entered.
+          _mech_bad = _declared_setup_error(setup_family, side_lower, gate)
+          if _mech_bad:
+            logger.warning("MECHANICAL SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _mech_bad)
+            return {"rejected": True, "reason": f"Declared setup does not match reality: {_mech_bad}",
+                    "hint": "Only a playbook whose payoff is mechanical rather than directional may pass the timeframe-conflict gate, and it must actually have its mechanism present."}
+          logger.info("MECHANICAL SETUP ALLOWED: futures limit %s %s past the timeframe-conflict gate — declared %r is paid by a verified mechanism, not by the 15m bias agreeing (explore-sized until it earns a verdict)",
+                      side_lower, spot_symbol, str(setup_family or "").strip().lower())
+        elif intraday_opposes_fl:
           logger.warning("TF CONFLICT BLOCK: futures limit %s %s rejected — daily/intraday split, 15m %s opposes %s", side_lower, spot_symbol, intraday_bias_15m_fl, side_lower)
-          return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, or pick a different symbol."}
+          return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, pick a different symbol, or — if this trade's payoff does not depend on the 15m direction — declare the mechanical playbook it really is ('funding_carry' with funding that clears the threshold and pays your side, 'macro_event' just after a scheduled release)."}
 
     # Correlation gate: block alt LONGs while BTC's daily regime is bearish (the RE-USDT failure mode).
     if _alt_long_is_blocked(spot_symbol, side_lower, confidence):

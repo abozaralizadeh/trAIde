@@ -1065,3 +1065,89 @@ def test_funding_carry_safe_on_missing_or_degenerate_input():
     assert funding_carry_setup("x", 0.0014) is None
     assert funding_carry_setup(0.002, 0) is None       # unknown cost -> no threshold to test against
     assert funding_carry_setup(0.0, 0.0014) is None    # flat funding is not an opportunity
+
+
+class TestTimeframeConflictHatchForMechanicalSetups:
+  """The 15m bias is a DIRECTIONAL test; a mechanical playbook never claimed to pass it.
+
+  Measured 2026-09-14: 31 runs, ZERO orders. The only two qualifying carry setups on the entire
+  watchlist were CVC (-0.32%/8h) and CAP (-0.19%/8h) — both negative funding, so the LONG is paid —
+  and the timeframe-conflict gate refused `buy` on each of them 11 times. That branch was the one
+  gate here with no escape hatch at all, while the 1h gate directly above it has four. Same shape as
+  the daily-exhaustion bug: a gate with no hatch refusing a verified, non-directional setup.
+
+  The carve-out is narrow by construction: `allow_mechanical_setup` admits only the families whose
+  payoff is mechanical, and `verify_declared_setup` still has to confirm the mechanism is real and
+  pays the side being entered.
+  """
+
+  def test_only_mechanical_families_may_use_the_hatch(self):
+    from src.config import load_config
+    from src.regime import allow_mechanical_setup
+    cfg = load_config().regime
+    for fam in ("funding_carry", "macro_event"):
+      assert allow_mechanical_setup(setup_family=fam, cfg=cfg) is True
+    for fam in ("continuation", "fade_extreme", "breakout", "range_edge", "other", None, ""):
+      assert allow_mechanical_setup(setup_family=fam, cfg=cfg) is False
+
+  def test_the_live_cvc_setup_verifies_as_a_real_long_carry(self):
+    """CVC funding was -0.3249%/8h: negative funding pays the LONG, and it clears the threshold by
+    4.6x. That is precisely the trade the gate was refusing."""
+    from src.regime import funding_carry_setup, verify_declared_setup
+    cost = 2.0 * (0.0006 + 0.0001)
+    setup = funding_carry_setup(-0.003249, cost)
+    assert setup is not None and setup["side"] == "buy"
+    assert verify_declared_setup("funding_carry", side="buy", funding_setup=setup) is None
+    # ...and the short side must still be refused: it would PAY the carry, not receive it.
+    assert verify_declared_setup("funding_carry", side="sell", funding_setup=setup) is not None
+
+  def test_the_hatch_still_requires_a_real_mechanism(self):
+    """Declaring 'funding_carry' on a symbol whose funding does not qualify must not open the gate —
+    otherwise the label becomes a universal bypass token again."""
+    from src.regime import funding_carry_setup, verify_declared_setup
+    cost = 2.0 * (0.0006 + 0.0001)
+    assert funding_carry_setup(0.0100 / 100, cost) is None        # +0.0100%/8h: far below threshold
+    assert verify_declared_setup("funding_carry", side="buy", funding_setup=None) is not None
+
+
+class TestEveryDirectionalGateHasAMechanicalHatch:
+  """Structural guard: a gate that tests DIRECTION must let a verified mechanical setup past.
+
+  This is the fifth freeze of the same shape. The daily-exhaustion branch had no hatch and refused a
+  verified RAY carry ~54 times; it was fixed. The timeframe-conflict branch then had no hatch and
+  refused the only two qualifying carry setups (CVC, CAP) 11 times each, for 31 runs and zero orders.
+  Unit-testing `allow_mechanical_setup` alone does NOT catch this — the pure function is fine in both
+  versions; what breaks is the WIRING. So assert the wiring, in source, at each blocking branch.
+  """
+
+  @staticmethod
+  def _tools_source():
+    from pathlib import Path
+    return Path(__file__).resolve().parents[1].joinpath("src", "tools.py").read_text()
+
+  @pytest.mark.parametrize("marker", [
+    "TF CONFLICT BLOCK: futures limit",
+    "ANTI-FOMO BLOCK: futures limit",
+  ])
+  def test_each_futures_direction_gate_offers_the_mechanical_hatch(self, marker):
+    """Every directional futures gate must reference allow_mechanical_setup within the branch that
+    can reject, so a verified carry is never refused for disagreeing with a candle."""
+    src_text = self._tools_source()
+    idx = src_text.find(marker)
+    assert idx != -1, f"gate marker {marker!r} not found — did the log message change?"
+    window = src_text[max(0, idx - 2000):idx + 500]
+    assert "allow_mechanical_setup" in window, (
+      f"the gate logging {marker!r} can reject without offering the mechanical-setup hatch"
+    )
+
+  def test_the_hatch_is_always_paired_with_verification(self):
+    """The hatch must never open on the declaration alone — that is how the label became a universal
+    gate-bypass token before. Every allow_mechanical_setup call site verifies the mechanism."""
+    src_text = self._tools_source()
+    sites = [i for i in range(len(src_text)) if src_text.startswith("allow_mechanical_setup(", i)]
+    assert len(sites) >= 2, "expected the hatch at both the exhaustion and timeframe gates"
+    for i in sites:
+      window = src_text[i:i + 900]
+      assert "_declared_setup_error" in window, (
+        "an allow_mechanical_setup branch opens without calling _declared_setup_error"
+      )
