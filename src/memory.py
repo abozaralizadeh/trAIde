@@ -33,6 +33,14 @@ MAX_PENDING_AGENT_EVENTS = 200
 # Direction calls kept for edge measurement. Retained by COUNT, never by clock — see
 # `record_signal_probe` for why coupling evidence supply to anything else creates a doom loop.
 MAX_SIGNAL_PROBES = 400
+# Per-family retention floor. The global cap alone lets a LOUD family evict a QUIET one's history,
+# and the loud one is usually the benched one: a stood-aside family still records a probe on every
+# direction call (deliberately — that is how it earns its way back), so it keeps consuming the
+# evidence budget while never trading. Measured 2026-09-14: `continuation`, benched for weeks, held
+# 283 of 479 probes (59%), and truncating to the 400 cap dropped `fade_extreme` from n=27/"no edge"
+# to n=17/"insufficient data" — which RELEASED it to full size, and it promptly lost two trades.
+# Losing the evidence for a verdict must never be equivalent to never having had it.
+MAX_PROBES_PER_FAMILY = 150
 MAX_EXIT_PROBES = 200
 MAX_MACRO_EVENTS = 60
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
@@ -202,6 +210,40 @@ def _adaptive_quarantine_seconds(reason: str) -> int:
   # one week. The retry time adapts to the evidence and expires automatically without maintenance.
   hours = min(7 * 24.0, max(12.0, 12.0 * excess_ratio * excess_ratio))
   return int(hours * 3600)
+
+
+def _probe_family(row: Any) -> str:
+  ctx = row.get("entryContext") if isinstance(row, dict) else None
+  if not isinstance(ctx, dict):
+    return "other"
+  return str(ctx.get("setupFamily") or "other").strip().lower() or "other"
+
+
+def _trim_probes_per_family(probes: Any) -> list:
+  """Cap probe retention PER FAMILY, preserving chronological order.
+
+  A single global ring buffer makes families compete for one budget, and the family that generates
+  the most probes is not the one that most needs them — a stood-aside playbook still records a probe
+  on every direction call (that is how it can earn its way back), so it evicts the history of the
+  families still trading. When an adversely-judged family's sample falls under the stand-aside's
+  min_samples it stops reading "no edge" and starts reading "insufficient data", which RELEASES it to
+  full size: the system silently un-learns a verdict it had already paid to establish.
+
+  Keeping the newest ``MAX_PROBES_PER_FAMILY`` of each family bounds the file just as well (families
+  are a small fixed set) while guaranteeing every playbook keeps enough evidence to sustain its own
+  verdict. Never raises; non-dict rows are dropped.
+  """
+  rows = [r for r in (probes or []) if isinstance(r, dict)]
+  if not rows:
+    return []
+  keep_ids: set[int] = set()
+  buckets: Dict[str, list] = {}
+  for row in rows:
+    buckets.setdefault(_probe_family(row), []).append(row)
+  for bucket in buckets.values():
+    for row in bucket[-MAX_PROBES_PER_FAMILY:]:
+      keep_ids.add(id(row))
+  return [r for r in rows if id(r) in keep_ids]
 
 
 class MemoryStore:
@@ -453,9 +495,7 @@ class MemoryStore:
     ][-MAX_PENDING_AGENT_EVENTS:]
     # Signal probes are learning data (every direction call, placed or not): retained by COUNT only,
     # never by clock — see record_signal_probe for why tying evidence to anything else deadlocks.
-    probes = data.get("signal_probes") or []
-    if len(probes) > MAX_SIGNAL_PROBES:
-      data["signal_probes"] = probes[-MAX_SIGNAL_PROBES:]
+    data["signal_probes"] = _trim_probes_per_family(data.get("signal_probes") or [])
     # The macro calendar is forward-looking: drop anything more than a day past, cap the rest. A stale
     # or empty calendar must degrade to "no events known" (ordinary trading), never to a stuck blackout.
     data["macro_events"] = [
@@ -1311,8 +1351,7 @@ class MemoryStore:
     with self._lock:
       data = self._read()
       data.setdefault("signal_probes", []).append(row)
-      if len(data["signal_probes"]) > MAX_SIGNAL_PROBES:
-        data["signal_probes"] = data["signal_probes"][-MAX_SIGNAL_PROBES:]
+      data["signal_probes"] = _trim_probes_per_family(data["signal_probes"])
       self._write(data)
 
   def record_macro_events(self, events: Any) -> int:
@@ -1576,7 +1615,14 @@ class MemoryStore:
     return settled
 
   def signal_probes(self, limit: int = 200) -> list[Dict[str, Any]]:
-    """Entry signals carrying a market-price-at-signal stamp, for edge measurement."""
+    """Entry signals carrying a market-price-at-signal stamp, for edge measurement.
+
+    ``limit=0`` means EVERYTHING retained, which is what the entry gates and the dashboard want.
+    Asking for a fixed slice is how a verdict gets silently un-learned: retention is already bounded
+    per family, so a second truncation at read time can only throw away evidence the writer chose to
+    keep. This union also returns MORE rows than ``MAX_SIGNAL_PROBES`` (it folds in legacy
+    trades-derived rows), so passing that constant as the limit quietly dropped the oldest of them.
+    """
     with self._lock:
       data = self._read()
     out = []
@@ -1594,7 +1640,8 @@ class MemoryStore:
       seen.add(key)
       out.append(row)
     out.sort(key=lambda r: int(r.get("ts") or 0))
-    return out[-max(1, int(limit)):]
+    lim = int(limit or 0)
+    return out if lim <= 0 else out[-lim:]
 
   def recent_fills(self, limit: int = 100) -> list[Dict[str, Any]]:
     """Recent FILLED entry orders, oldest→newest — the sample the friction estimate calibrates on.

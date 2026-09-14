@@ -815,7 +815,7 @@ def run_trading_agent(
           # kept threw away half the evidence for free and made the per-family verdict swing with the
           # window: on 2026-09-04 continuation read no-edge at every window size except 200, which is
           # the one the bot actually used.
-          _probes = memory.signal_probes(limit=MAX_SIGNAL_PROBES)
+          _probes = memory.signal_probes(limit=0)
           state["signal_edge"] = signal_edge_stats(_probes, cost_pct=_cost)
           # TAKER FLOW: does the aggressor balance at the moment of the call carry information about
           # where price goes next, on this venue and at our horizons? Surfaced only once the sample

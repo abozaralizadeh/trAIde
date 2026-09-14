@@ -358,7 +358,7 @@ class DashboardPublisher:
       basis = self._cost_basis(memory, cfg)
       slip, cost = basis["slippage"], basis["cost"]
       # Same window the entry gates use, so the dashboard verdict cannot disagree with the bot's.
-      stats = signal_edge_stats(memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=cost)
+      stats = signal_edge_stats(memory.signal_probes(limit=0), cost_pct=cost)
       out = {
         "verdict": stats.get("verdict", "insufficient data"),
         "n": int(stats.get("n") or 0),
@@ -410,7 +410,7 @@ class DashboardPublisher:
     }
     try:
       stats = taker_flow_edge_stats(
-        memory.signal_probes(limit=MAX_SIGNAL_PROBES), cost_pct=self._cost_basis(memory, cfg)["cost"],
+        memory.signal_probes(limit=0), cost_pct=self._cost_basis(memory, cfg)["cost"],
       )
       out.update({
         "verdict": stats.get("verdict", "insufficient data"),

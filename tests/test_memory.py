@@ -1068,3 +1068,81 @@ class TestLatestLimitsReadOnly:
     partial = m.update_limits(0.0, scope="total")   # futures overview 504s -> the sum is just spot
     assert partial["drawdownPct"] > 99.0, "a dropped venue reads as a near-total loss"
     # Which is exactly why the poll loop reuses latest_limits instead of recording that.
+
+
+class TestPerFamilyProbeRetention:
+  """A loud family must not evict a quiet one's verdict.
+
+  Measured 2026-09-14. A stood-aside playbook still records a probe on every direction call — that is
+  deliberate, it is how the family can earn its way back. But it means the BENCHED family is usually
+  the loudest: `continuation`, benched for weeks, held 283 of 479 retained probes (59%). Under one
+  global ring buffer it evicted `fade_extreme`'s history, whose decimated sample fell from 27 to 17 —
+  under the stand-aside's `min_samples=20`. Its verdict flipped from "no edge" to "insufficient data",
+  which RELEASES a family to full size, and it immediately took two trades and lost both.
+
+  Losing the evidence for a verdict must never be equivalent to never having had it.
+  """
+
+  @staticmethod
+  def _probe(family, ts):
+    return {"symbol": "X-USDT", "ts": ts,
+            "entryContext": {"positionSide": "long", "marketPriceAtSignal": 100.0,
+                             "setupFamily": family, "signalProbe": {}}}
+
+  def test_a_loud_family_cannot_evict_a_quiet_one(self):
+    from src.memory import _trim_probes_per_family, MAX_PROBES_PER_FAMILY
+    loud = [self._probe("continuation", 1000 + i) for i in range(MAX_PROBES_PER_FAMILY * 3)]
+    quiet = [self._probe("fade_extreme", 1 + i) for i in range(25)]
+    kept = _trim_probes_per_family(quiet + loud)
+    families = [r["entryContext"]["setupFamily"] for r in kept]
+    assert families.count("fade_extreme") == 25, "the quiet family keeps ALL of its evidence"
+    assert families.count("continuation") == MAX_PROBES_PER_FAMILY
+
+  def test_each_family_keeps_its_newest_rows_in_order(self):
+    from src.memory import _trim_probes_per_family, MAX_PROBES_PER_FAMILY
+    rows = [self._probe("continuation", i) for i in range(MAX_PROBES_PER_FAMILY + 40)]
+    kept = _trim_probes_per_family(rows)
+    assert len(kept) == MAX_PROBES_PER_FAMILY
+    ts = [r["ts"] for r in kept]
+    assert ts == sorted(ts), "chronological order must survive trimming"
+    assert ts[-1] == MAX_PROBES_PER_FAMILY + 39, "the NEWEST rows are the ones kept"
+
+  def test_untagged_probes_are_bucketed_not_dropped(self):
+    from src.memory import _trim_probes_per_family
+    rows = [{"symbol": "X", "ts": i, "entryContext": {"positionSide": "long"}} for i in range(5)]
+    rows += [{"symbol": "X", "ts": 100 + i} for i in range(3)]        # no entryContext at all
+    kept = _trim_probes_per_family(rows)
+    assert len(kept) == 8
+
+  def test_junk_rows_are_dropped_without_raising(self):
+    from src.memory import _trim_probes_per_family
+    assert _trim_probes_per_family(None) == []
+    assert _trim_probes_per_family([]) == []
+    assert _trim_probes_per_family(["junk", None, 7]) == []
+
+  def test_retention_survives_the_prune_sweep(self, tmp_path):
+    """End to end: the store must not collapse back to one shared budget on the next write."""
+    from src.memory import MAX_PROBES_PER_FAMILY
+    m = MemoryStore(str(tmp_path / "m.json"))
+    for i in range(MAX_PROBES_PER_FAMILY + 60):
+      m.record_signal_probe("X-USDT", "buy", 100.0, setup_family="continuation")
+    for i in range(30):
+      m.record_signal_probe("Y-USDT", "sell", 100.0, setup_family="fade_extreme")
+    m._write(m._prune(m._read()))
+    rows = m._read()["signal_probes"]
+    fams = [r["entryContext"]["setupFamily"] for r in rows]
+    assert fams.count("fade_extreme") == 30, "quiet family intact after pruning"
+    assert fams.count("continuation") == MAX_PROBES_PER_FAMILY
+
+
+class TestSignalProbesReadAll:
+  def test_limit_zero_returns_everything_retained(self, tmp_path):
+    """The entry gates must not re-truncate what retention deliberately kept — that second cut is
+    how the `fade_extreme` verdict was silently un-learned."""
+    m = MemoryStore(str(tmp_path / "m.json"))
+    # Distinct symbols: signal_probes dedupes on (symbol, ts), and a loop records within one second.
+    for i in range(40):
+      m.record_signal_probe(f"S{i}-USDT", "buy", 100.0, setup_family="continuation")
+    assert len(m.signal_probes(limit=0)) == 40
+    assert len(m.signal_probes(limit=10)) == 10
+    assert len(m.signal_probes()) == 40        # default 200 > stored
