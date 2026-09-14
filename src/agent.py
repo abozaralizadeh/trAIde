@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List
 
+import httpx
 import requests
 from datetime import datetime, timezone
 import contextlib
@@ -169,20 +170,79 @@ class TradingSnapshot:
   restriction_reason: str = ""
 
 
+# Azure returns this 404 when the requested model has no matching deployment on the backend that
+# served the request. Behind a load balancer that is a PER-BACKEND condition, not a permanent one.
+_DEPLOYMENT_MISS = "could not find an existing deployment"
+_DEPLOYMENT_MISS_RETRIES = 3
+
+
+class _RetryDeploymentMissTransport(httpx.AsyncBaseTransport):
+  """Retry a 404 that means "this backend lacks the deployment", so one bad backend is not fatal.
+
+  The OpenAI SDK retries 408/409/429/5xx and connection errors; a 404 is a client error and is
+  treated as permanent, which is right for a single endpoint and wrong for a pool. The live endpoint
+  is an APIM load balancer (`.../abopenailb`) fanning out over several Azure OpenAI backends. On
+  2026-09-14 one backend lost the `gpt-5.6-luna` deployment and the tape shows the consequence
+  exactly: calls alternated 200 / 404 (10 vs 8), and because a single 404 aborts the whole agent run,
+  EVERY run from 15:10 onward died. The bot went fully dark for an hour on a fault that only affected
+  roughly half of one pool.
+
+  Retrying re-dispatches through the balancer and usually lands on a healthy backend. Bounded and
+  narrow: only this 404, only a few attempts, and it still surfaces the error if every attempt misses
+  (a deployment genuinely absent everywhere is a config error and must stay loud).
+  """
+
+  def __init__(self, inner: httpx.AsyncBaseTransport, attempts: int = _DEPLOYMENT_MISS_RETRIES):
+    self._inner = inner
+    self._attempts = max(1, int(attempts))
+
+  async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+    last: httpx.Response | None = None
+    for attempt in range(self._attempts):
+      response = await self._inner.handle_async_request(request)
+      if response.status_code != 404:
+        return response
+      body = await response.aread()
+      await response.aclose()
+      if _DEPLOYMENT_MISS not in body.decode("utf-8", "ignore").lower():
+        # A real 404 (bad path, unknown route) — hand it back untouched.
+        return httpx.Response(response.status_code, headers=response.headers, content=body,
+                              request=request, extensions=response.extensions)
+      last = httpx.Response(response.status_code, headers=response.headers, content=body,
+                            request=request, extensions=response.extensions)
+      if attempt + 1 < self._attempts:
+        logger.warning(
+          "AZURE DEPLOYMENT MISS: a backend behind %s has no deployment matching the requested "
+          "model (attempt %d/%d) — retrying through the load balancer. If this persists, one "
+          "backend in the pool is missing the deployment.",
+          request.url.host, attempt + 1, self._attempts,
+        )
+        await asyncio.sleep(0.4 * (attempt + 1))
+    logger.error(
+      "AZURE DEPLOYMENT MISS: every one of %d attempts hit a backend without the requested "
+      "deployment. This is a configuration problem, not a transient one — check that the deployment "
+      "name exists on EVERY backend in the pool.", self._attempts,
+    )
+    return last  # type: ignore[return-value]
+
+
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
   # Prefer APIM when subscription key is provided; else use direct Azure OpenAI.
+  http_client = httpx.AsyncClient(transport=_RetryDeploymentMissTransport(httpx.AsyncHTTPTransport()))
   if cfg.apim.subscription_key:
     return AsyncAzureOpenAI(
       api_key=cfg.apim.subscription_key,
       api_version=cfg.apim.api_version,
       azure_endpoint=cfg.apim.endpoint,
       azure_deployment=cfg.apim.deployment,
+      http_client=http_client,
     )
   return AsyncAzureOpenAI(
     api_key=cfg.azure.api_key,
     api_version=cfg.azure.api_version,
     azure_endpoint=cfg.azure.endpoint,
     azure_deployment=cfg.azure.deployment,
+    http_client=http_client,
   )
 
 def _to_float(val: Any, default: float = 0.0) -> float:
