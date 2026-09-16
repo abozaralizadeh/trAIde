@@ -1055,9 +1055,24 @@ def test_funding_carry_reports_how_many_settlements_cover_the_cost():
 
 
 def test_funding_carry_tells_the_model_how_to_take_it():
+    """The note must say how to declare it AND that the transfer only accrues if the position is
+    still open at a settlement — asserted by substance, not by one phrasing, so the wording can be
+    corrected as the measurement improves."""
     out = funding_carry_setup(0.0020, 0.0014)
     assert "setup_family='funding_carry'" in out["note"]
-    assert "8h settlement" in out["note"]
+    assert "settlement" in out["note"]
+    assert out["side"] == "sell"                        # positive funding pays the short
+    assert "PAID" in out["note"]
+
+
+def test_funding_carry_note_does_not_overclaim_the_transfer():
+    """Measured 2026-09-15: 3 of the first 4 funding_carry trades resolved at their bracket BEFORE
+    any settlement and collected ZERO funding — including the best winner (+1.81R at target in 90min).
+    What the family has actually measured is the POSITIONING half, not the carry. The note must not
+    tell the model it is being paid to hold when the record says otherwise."""
+    note = funding_carry_setup(0.0020, 0.0014)["note"].lower()
+    assert "zero funding" in note or "collected zero" in note, "the measured record must be stated"
+    assert "positioning" in note, "the half that is actually carrying the edge must be named"
 
 
 def test_funding_carry_safe_on_missing_or_degenerate_input():

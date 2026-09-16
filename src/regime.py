@@ -466,7 +466,11 @@ def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.
       f"{cost / abs(rate):.1f} funding payment(s). This is the one playbook that does not require the "
       "direction call to be right — the transfer happens whichever way price moves — and an extreme rate "
       "also marks crowded positioning on the opposite side. Declare setup_family='funding_carry' to take "
-      "it; hold across at least one 8h settlement or the carry never accrues. It is scored separately in "
+      "it. MEASURED 2026-09-15: 3 of the first 4 such trades resolved at their bracket BEFORE any "
+      "settlement and collected zero funding — including the best winner (+1.81R, closed at target in "
+      "90min) — so what the family has actually been measuring is the POSITIONING half, not the "
+      "transfer. Treat the extreme rate as evidence of a crowded book that is prone to unwinding; if "
+      "you also want the carry, the position has to still be open at the settlement. It is scored in "
       "signalEdge.by_family like every other playbook."
     ),
   }
