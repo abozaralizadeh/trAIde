@@ -1,10 +1,16 @@
-openai>=1.51.0
-openai-agents>=0.0.14
-python-dotenv>=1.0.1
-requests>=2.32.3
-gunicorn>=22.0.0
-pandas>=2.2.3
-langsmith[openai-agents]
-langsmith
-azure-data-tables>=12.5.0
-azure-storage-blob>=12.19.0
+# Floors are pinned, not exact versions: a fresh `pip install -r` on the server must not silently
+# land on a client older than the one these were verified against. Verified 2026-09-20 against the
+# versions in the comments, on Python 3.13 locally and >=3.12 on the server (every package below
+# still supports 3.12; numpy is the tightest at >=3.12).
+openai>=3.16.2                  # verified 3.16.2 (major bump from 2.x)
+openai-agents>=0.22.3           # verified 0.22.3 — strict tool schemas; see tests/test_tool_schemas.py
+python-dotenv>=1.2.3
+requests>=2.34.2
+gunicorn>=26.2.0
+pandas>=3.0.6                   # verified 3.0.6 (major bump from 2.x); requires-python >=3.11
+# LangSmith <0.4 posted traces to /runs/batch, which LangSmith deprecates on 2027-01-31. 0.13.0 posts
+# to /runs/multipart and only falls back to /runs/batch if multipart 404s. Verified by capturing the
+# actual HTTP calls: 1x POST /runs/multipart, 0x /runs/batch.
+langsmith[openai-agents]>=0.13.0
+azure-data-tables>=12.7.0
+azure-storage-blob>=12.30.2

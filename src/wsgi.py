@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import os
 import logging
 import threading
 from logging.handlers import RotatingFileHandler
@@ -47,9 +49,27 @@ def _start_supervisor_bot() -> None:
   start_telegram_bot(cfg)
 
 
-# Start immediately at module import so no HTTP hit is required.
+# Start immediately at module import so no HTTP hit is required — gunicorn imports this module and
+# never calls `application` until a request arrives, and the loop must run regardless.
+#
+# But "on import" means ANY import, and `tests/test_module_imports.py` imports every module in `src`
+# to catch partial commits. That silently started a LIVE trading loop and the Telegram bot against the
+# real account on every `pytest` run (verified 2026-09-20: importing this module under pytest spawns
+# `Thread-1 (_start_background_loop)` and `supervisor-bot`). A daemon thread in a 5-second test cannot
+# finish an agent run, but ProtectionManager can place and move real orders well inside that window.
+# Test runners never serve traffic, so skip the auto-start there; production is untouched.
+_under_test = "pytest" in sys.modules or bool(os.getenv("PYTEST_CURRENT_TEST"))
+_autostart = os.getenv("TRAIDE_WSGI_AUTOSTART", "").strip().lower()
+if _autostart in ("0", "false", "no"):
+  _under_test = True          # explicit off-switch, e.g. for a shell that only wants the module
+elif _autostart in ("1", "true", "yes"):
+  _under_test = False         # explicit on-switch, if something ever needs it under a test runner
+
+if _under_test:
+  logger.info("wsgi auto-start skipped (test runner detected); no trading loop or Telegram bot started.")
+
 with _lock:
-  if not _started:
+  if not _started and not _under_test:
     thread = threading.Thread(target=_start_background_loop, daemon=True)
     thread.start()
 
