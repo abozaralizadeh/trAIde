@@ -898,7 +898,21 @@ or
 sudo bash setup_service.sh
 ```
 
-Environment overrides: `SERVICE_NAME`, `SERVICE_USER`, `SERVICE_GROUP`, `WORKDIR`, `VENV_PATH`, `BIND_ADDR`.
+Environment overrides: `SERVICE_NAME`, `SERVICE_USER`, `SERVICE_GROUP`, `WORKDIR`, `VENV_PATH`, `BIND_ADDR`, `REQUIREMENTS_FILE`, `FORCE_PIP_INSTALL`, `DEPS_ONLY`.
+
+**The script syncs Python dependencies before it restarts anything.** It creates the virtualenv if missing and re-installs `requirements.txt` whenever that file has changed since the last successful install (tracked by a SHA-256 stamp at `$VENV_PATH/.requirements.sha256`), then restarts the service. Without this, a deploy that changed `requirements.txt` restarted into a venv still holding the old packages — which is how the server sat for months on a LangSmith client calling an endpoint due for retirement.
+
+Details that matter if you change it:
+
+- **pip runs as `SERVICE_USER`, never as root.** Running it under `sudo` as root leaves root-owned files inside the venv that the service user can no longer write, breaking every later install.
+- **No `--upgrade`.** `requirements.txt` pins *floors* (`>=`), so a plain install already lifts anything below the floor; `--upgrade` would pull the newest of everything and walk off the combination those floors were verified against.
+- **Nothing restarts unless the install verifies.** After installing, the script runs `pip check` and then imports every module the installed requirements provide (derived from package metadata, so the list cannot drift). If either fails it exits non-zero *before* the unit is rewritten, so the previously working service keeps running. The stamp is only written on success, so a failed deploy retries next time instead of believing it succeeded.
+- `DEPS_ONLY=1 bash setup_service.sh` syncs dependencies and exits without touching systemd — no root required. `FORCE_PIP_INSTALL=1` re-installs even when `requirements.txt` is unchanged.
+
+```bash
+# sync dependencies only (no root, no service changes)
+DEPS_ONLY=1 bash setup_service.sh
+```
 
 
 ___
