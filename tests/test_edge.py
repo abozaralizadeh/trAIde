@@ -1116,3 +1116,44 @@ def test_recency_is_by_close_time_not_by_list_order():
   old = [_hclose("x", 90, ts=1_000_000 + i) for i in range(40)]
   new = [_hclose("x", 171, ts=5_000_000 + i) for i in range(20)]
   assert family_scoring_horizons(new + old) == {"x": 240}
+
+
+# --- graduation ramps with evidence instead of jumping --------------------------------------------
+
+def _grow(n, net, se):
+  return {"by_family": {"x": {"n": n, "net_of_cost_pct": net, "stderr_pct": se}}}
+
+
+def test_graduation_is_continuous_not_a_cliff():
+  """The live failure: funding_carry reached n=24 at t=1.18 (net +3.78%, SE 3.20%) and its risk jumped
+  0.40x -> 1.00x in one step; the first full-size trade was a -1.04R short into a vertical spike at 2.2x
+  the size of the same trade an hour before. Just past graduation, size must sit at the explore floor."""
+  from src.edge import family_explore_factor
+  below = family_explore_factor(_grow(19, 3.78, 3.20), "x")
+  just_over = family_explore_factor(_grow(20, 1.01, 1.00), "x")
+  assert below == pytest.approx(0.4)
+  assert just_over == pytest.approx(0.4, abs=0.01), "no step at n=20 when the edge only just clears"
+  assert family_explore_factor(_grow(24, 3.78, 3.20), "x") == pytest.approx(0.509, abs=0.01)
+
+
+def test_size_grows_with_the_strength_of_the_evidence():
+  from src.edge import family_explore_factor
+  ts = [1.0, 1.25, 1.5, 1.75, 2.0]
+  sizes = [family_explore_factor(_grow(30, t, 1.0), "x") for t in ts]
+  assert sizes == sorted(sizes), "more proof must never mean less size"
+  assert sizes[0] == pytest.approx(0.4) and sizes[-1] == pytest.approx(1.0)
+  assert family_explore_factor(_grow(30, 9.0, 1.0), "x") == pytest.approx(1.0)   # capped at full
+
+
+def test_the_ramp_follows_the_market_because_it_reads_live_evidence():
+  """No regime constant: the same family shrinks as its measured edge weakens and grows as it
+  strengthens, purely from its own net and SE, which are recomputed every run from live probes."""
+  from src.edge import family_explore_factor
+  strong = family_explore_factor(_grow(40, 2.4, 1.0), "x")
+  weakening = family_explore_factor(_grow(40, 1.3, 1.0), "x")
+  assert strong > weakening
+
+
+def test_a_row_without_dispersion_keeps_the_previous_full_size_behaviour():
+  from src.edge import family_explore_factor
+  assert family_explore_factor({"by_family": {"x": {"n": 30, "net_of_cost_pct": 1.0}}}, "x") == 1.0

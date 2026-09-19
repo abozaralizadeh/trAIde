@@ -3498,7 +3498,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
               logger.warning("DECLARED SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _decl_bad)
               return {"rejected": True, "reason": f"Declared setup does not match reality: {_decl_bad}",
                       "hint": "A mechanical playbook must actually have its mechanism present. Re-declare the setup_family this trade really is and it will face that family's normal gates."}
-            logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the daily gate — declared playbook %r (explore-sized until it earns a verdict; family scoring decides its risk)",
+            logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the daily gate — declared playbook %r (family scoring decides its risk — see SIZE FACTORS)",
                         side_lower, spot_symbol, str(setup_family or "").strip().lower())
           else:
             return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), declare setup_family='fade_extreme' at a genuine RSI extreme, declare a deliberate 'breakout'/'range_edge' playbook, or switch symbol."}
@@ -3533,7 +3533,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             logger.warning("DECLARED SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _decl_bad)
             return {"rejected": True, "reason": f"Declared setup does not match reality: {_decl_bad}",
                     "hint": "A mechanical playbook must actually have its mechanism present. Re-declare the setup_family this trade really is and it will face that family's normal gates."}
-          logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the 1h gate — declared playbook %r (explore-sized until scored)",
+          logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the 1h gate — declared playbook %r (family scoring decides its risk — see SIZE FACTORS)",
                       side_lower, spot_symbol, str(setup_family or "").strip().lower())
         else:
           logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)

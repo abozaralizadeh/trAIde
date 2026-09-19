@@ -448,6 +448,7 @@ def family_explore_factor(
   *,
   explore_factor: float = 0.4,
   min_samples: int = 20,
+  full_size_tstat: float = 2.0,
 ) -> float:
   """Risk multiplier for a setup family that has not yet earned a scored verdict.
 
@@ -463,9 +464,19 @@ def family_explore_factor(
   range_edge — see ``regime.allow_declared_setup``) lets families reach the book that have NO score yet
   and, on a ~$70 account, full-risk exploration of an unproven hypothesis is exactly the overtrading
   that fees punish. So while a family is still earning its verdict, it trades at ``explore_factor`` of
-  configured risk. The instant it crosses ``min_samples`` this returns 1.0 and hands sizing back to
-  ``family_size_factor`` (which then applies the measured edge) and ``family_stand_aside`` (which skips
-  a settled no-edge playbook). Cheap to learn, full weight once proven, zero once disproven.
+  configured risk. Once it crosses ``min_samples`` the size RAMPS with the strength of the evidence
+  rather than jumping to full: from ``explore_factor`` when the edge only just clears the stand-aside's
+  release bar (t = net / SE = 1) up to 1.0 at ``full_size_tstat``. Cheap to learn, weight in proportion
+  to proof, zero once disproven.
+
+  Why a ramp and not a switch (2026-09-19): this used to return 1.0 the instant n reached 20, whatever
+  the evidence said. `funding_carry` graduated at n=24 on net +3.78% with a standard error of 3.20% —
+  t = 1.18, barely distinguishable from noise — and its risk jumped 0.40x -> 1.00x in one 2.5x step.
+  The first full-size trade after that was a G-USDT short into a +28.6%-in-25-minutes spike, stopped
+  for -1.04R at 2.2x the size of the same trade an hour earlier. The size should follow what the
+  measurement actually supports. ``full_size_tstat`` is a statement about statistical confidence (two
+  standard errors), not about the market, so it does not need re-tuning as conditions change — the
+  family's own net and SE, recomputed every run from live probes, do all the adapting.
 
   Combine by taking the WORSE of this and ``family_size_factor`` — never their product — for the same
   reason the soft stack does: two independent cautions must not compound into fee-dust.
@@ -474,9 +485,17 @@ def family_explore_factor(
   by_family = (signal_edge or {}).get("by_family") or {}
   row = by_family.get(fam)
   n = int(row.get("n") or 0) if isinstance(row, dict) else 0
-  if n >= max(1, int(min_samples)):
-    return 1.0
-  return max(0.0, min(1.0, float(explore_factor)))
+  floor = max(0.0, min(1.0, float(explore_factor)))
+  if n < max(1, int(min_samples)):
+    return floor
+  net = _f(row.get("net_of_cost_pct"))
+  se = _f(row.get("stderr_pct"))
+  if net is None or se is None or se <= 0:
+    return 1.0   # no dispersion recorded (older payload): keep the previous behaviour
+  t = net / se
+  span = max(1e-9, float(full_size_tstat) - 1.0)
+  proof = max(0.0, min(1.0, (t - 1.0) / span))
+  return floor + (1.0 - floor) * proof
 
 
 def _stderr(vals: List[float]) -> float:
@@ -1067,9 +1086,14 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
 
   The bot has always measured whether its entries predict. It never measured whether its exits helped
   — and on the 2026-09-02 data the exits were the dominant behaviour: 16 positions closed by the agent
-  against 2 by the profit-lock, median hold 13 minutes on brackets whose targets need hours. Replaying
-  those 16 on real 1m klines, letting the bracket run was worth +3.05R against the +0.42R taken: a
-  2.63R gap, larger than the entire net loss over the same period.
+  against 2 by the profit-lock, median hold 13 minutes on brackets whose targets need hours.
+
+  Correction (2026-09-19): an earlier version of this note claimed that replaying those closes
+  showed the brackets worth +3.05R against +0.42R taken. That replay read KuCoin FUTURES candles in
+  SPOT column order ([ts,o,c,h,l] instead of [ts,o,h,l,c]), so it checked stops against the close
+  rather than the low and missed most stop-outs. Re-run correctly over the same window (17 trades)
+  the brackets return -1.01R against -0.17R taken: the early closes HELPED, by +0.84R — a sample too
+  small to settle either way, which is exactly why this is measured live.
 
   This is deliberately a MEASUREMENT, not a gate. Closing early is sometimes right — in that same
   sample six of the sixteen beat their bracket, mostly by ducking a stop — so the model keeps the

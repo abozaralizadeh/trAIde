@@ -1436,9 +1436,9 @@ class MemoryStore:
     The bot measures whether its entries predict (``signal_probes``) but never measured whether its
     *exits* helped — and the exits turned out to be the dominant behaviour: over the 2026-09-02 window
     16 positions were closed by the agent against 2 by the profit-lock, at a 13-minute median hold on
-    brackets whose targets need hours. Replaying those 16 on real 1m klines, letting the bracket run
-    was worth +3.05R against the +0.42R actually taken — the single largest measured leak in the book,
-    larger than the entire net loss.
+    brackets whose targets need hours. (A replay once put the cost of those closes at ~2.6R; it read
+    futures candles in the wrong column order, and re-measured correctly the closes slightly HELPED,
+    +0.84R over 17 trades. That uncertainty is the reason this is recorded and scored live.)
 
     The fix the project philosophy asks for is evidence, not a veto: the model still owns the decision
     to close, it just gets to see its own record at doing so. Self-correcting in both directions — if

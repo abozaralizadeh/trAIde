@@ -545,8 +545,11 @@ def held_position_noise_pct(entry_context) -> float | None:
   it every poll, and the agent still wakes on a move that clears the band, on any other symbol, and on
   its scheduled runs. It only stops the model being asked to re-decide an hours-long thesis every time
   price wiggles a quarter of the trade's own stop distance — which it was: the measured median hold is
-  13 minutes, 16 of the last closes were the agent closing its own position (vs 2 by the profit-lock),
-  and replaying those brackets on real 1m data they were worth +3.05R against the +0.42R actually taken.
+  13 minutes against brackets whose targets need hours, and 16 of the last closes were the agent
+  closing its own position (vs 2 by the profit-lock). NOTE: an earlier claim that those closes cost
+  ~2.6R came from a replay that read futures candles in the wrong column order; re-measured correctly
+  they slightly HELPED (+0.84R over 17). This mechanism stands on the timescale argument alone — a
+  re-decision on a move smaller than the trade's own noise band is noise — not on a P&L claim.
   """
   if not isinstance(entry_context, dict):
     return None
