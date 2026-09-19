@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional
 from .analytics import flow_reading_max_age_sec
 from .edge import (
   exit_discipline_stats,
+  family_scoring_horizons,
+  safe_family_horizons,
   family_size_factor,
   infer_setup_family,
   measured_slippage_pct,
@@ -358,7 +360,11 @@ class DashboardPublisher:
       basis = self._cost_basis(memory, cfg)
       slip, cost = basis["slippage"], basis["cost"]
       # Same window the entry gates use, so the dashboard verdict cannot disagree with the bot's.
-      stats = signal_edge_stats(memory.signal_probes(limit=0), cost_pct=cost)
+      # Same per-family horizons the entry gate uses, so the published verdict matches the bot's.
+      stats = signal_edge_stats(
+        memory.signal_probes(limit=0), cost_pct=cost,
+        family_horizons=safe_family_horizons(memory),
+      )
       out = {
         "verdict": stats.get("verdict", "insufficient data"),
         "n": int(stats.get("n") or 0),

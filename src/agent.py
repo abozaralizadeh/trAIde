@@ -59,6 +59,8 @@ from .edge import (
   adaptive_stop_atr_mult,
   signal_edge_stats,
   exit_discipline_stats,
+  family_scoring_horizons,
+  safe_family_horizons,
   expectancy_size_factor,
   edge_stats,
   entry_quality_stats,
@@ -876,7 +878,11 @@ def run_trading_agent(
           # window: on 2026-09-04 continuation read no-edge at every window size except 200, which is
           # the one the bot actually used.
           _probes = memory.signal_probes(limit=0)
-          state["signal_edge"] = signal_edge_stats(_probes, cost_pct=_cost)
+          # Score each playbook at the horizon it is actually HELD, not one shared 60m point.
+          # Hold times come from a wide window of realized closes so a family's median is stable.
+          _fam_horizons = safe_family_horizons(memory)
+          state["family_horizons"] = _fam_horizons
+          state["signal_edge"] = signal_edge_stats(_probes, cost_pct=_cost, family_horizons=_fam_horizons)
           # TAKER FLOW: does the aggressor balance at the moment of the call carry information about
           # where price goes next, on this venue and at our horizons? Surfaced only once the sample
           # can answer — an n=5 reading in the prompt is an invitation to trade a coin flip, and the

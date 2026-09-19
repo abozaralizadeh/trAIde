@@ -1019,3 +1019,100 @@ def test_short_horizons_are_scored_alongside_the_established_ones():
               + [_flow_probe("long", 100.0, 99.5, 0.20, horizon="m5") for _ in range(25)])
     out = taker_flow_edge_stats(probes, cost_pct=0.001, min_samples=20)
     assert out["by_horizon"]["5m"]["verdict"] == "tradable"
+
+
+# --- per-family scoring horizons -----------------------------------------------------------------
+
+def _hclose(family, hold_min, ts=10_000_000):
+  return {"ts": ts, "entryContext": {"setupFamily": family, "fillTs": ts - hold_min * 60}}
+
+
+def test_each_family_is_scored_at_its_own_holding_period():
+  """Live 2026-09-18: continuation is held a median 162m, fade_extreme 12m, funding_carry 116m.
+  Snapped on a LOG scale (ratios matter for time): 162m -> 240m, 12m -> 15m, 116m -> 60m."""
+  from src.edge import family_scoring_horizons
+  closes = ([_hclose("continuation", 162)] * 8 + [_hclose("fade_extreme", 12)] * 8
+            + [_hclose("funding_carry", 116)] * 8)
+  h = family_scoring_horizons(closes)
+  assert h == {"continuation": 240, "fade_extreme": 15, "funding_carry": 60}
+
+
+def test_a_family_without_enough_trades_falls_back_to_the_default():
+  """breakout had 2 realized closes — no trustworthy median, so it must not get a horizon at all."""
+  from src.edge import family_scoring_horizons
+  h = family_scoring_horizons([_hclose("breakout", 180)] * 2 + [_hclose("continuation", 162)] * 8)
+  assert "breakout" not in h and h["continuation"] == 240
+
+
+def test_junk_closes_are_ignored_without_raising():
+  from src.edge import family_scoring_horizons
+  assert family_scoring_horizons(None) == {}
+  assert family_scoring_horizons(["x", {}, {"ts": "bad", "entryContext": {}}]) == {}
+  assert family_scoring_horizons([_hclose("continuation", -5)] * 8) == {}   # negative hold: invalid
+
+
+def _hprobe(family, ts, m15, m60, m240, side="long"):
+  return {"symbol": f"{family[:3].upper()}{ts}-USDT", "ts": ts,
+          "entryContext": {"positionSide": side, "marketPriceAtSignal": 100.0, "setupFamily": family,
+                           "signalProbe": {"m15": m15, "m60": m60, "m240": m240}}}
+
+
+def test_the_live_failure_a_trend_playbook_benched_on_the_wrong_horizon():
+  """The exact shape of 2026-09-18: at 60m a trending entry sits mid-pullback (≈ flat), at its real
+  240m holding period it is clearly profitable. Scored at 60m it stands aside; at 240m it trades."""
+  from src.edge import signal_edge_stats, family_stand_aside
+  probes = [_hprobe("continuation", 1_000_000 + i * 90_000, 100.0, 100.0 + ((-1) ** i) * 0.05,
+                   101.5) for i in range(30)]
+  at60 = signal_edge_stats(probes, cost_pct=0.0014)
+  at_own = signal_edge_stats(probes, cost_pct=0.0014, family_horizons={"continuation": 240})
+  assert family_stand_aside(at60, "continuation") is True
+  assert family_stand_aside(at_own, "continuation") is False
+
+
+def test_a_short_hold_family_is_not_released_by_a_long_horizon():
+  """Why the fix is per-family, not a blanket 240m: fade_extreme is held ~12m. At 240m its calls
+  look fine (the move eventually comes); at its own 15m horizon they lose. It must stay benched."""
+  from src.edge import signal_edge_stats, family_stand_aside
+  probes = [_hprobe("fade_extreme", 1_000_000 + i * 90_000, 99.6, 100.0, 101.0) for i in range(30)]
+  blanket = signal_edge_stats(probes, cost_pct=0.0014, family_horizon_min=240)
+  own = signal_edge_stats(probes, cost_pct=0.0014, family_horizons={"fade_extreme": 15})
+  assert family_stand_aside(blanket, "fade_extreme") is False, "a blanket 240m would wrongly release it"
+  assert family_stand_aside(own, "fade_extreme") is True
+
+
+def test_a_broken_store_degrades_to_the_default_horizon_not_a_blank_verdict():
+  """Hold-time derivation is a refinement: if it fails, the edge report must still be produced."""
+  from src.edge import safe_family_horizons
+  class _Broken:
+    def realized_closes(self, **k): raise RuntimeError("disk gone")
+  assert safe_family_horizons(_Broken()) == {}
+
+
+def test_horizons_are_snapped_on_a_log_scale_not_a_linear_one():
+  """For a holding period what matters is the RATIO. A 35-minute hold is 2.3x a 15m horizon but only
+  1.7x short of a 60m one, so 60m is the proportionally nearer match — a linear snap would pick 15m
+  and score the family at less than half its real holding period. (For the live values 162/12/116m
+  both scales happen to agree, which is exactly why this needs its own test.)"""
+  from src.edge import family_scoring_horizons
+  assert family_scoring_horizons([_hclose("x", 35)] * 8) == {"x": 60}
+  assert family_scoring_horizons([_hclose("x", 130)] * 8) == {"x": 240}   # linear would say 60
+
+
+def test_the_horizon_follows_the_market_not_the_average_of_every_regime():
+  """Holding time drifts with conditions: funding_carry went 90m in chop -> 171m in the Sep 2026 rally,
+  which moves it from the 60m horizon to 240m. The horizon must follow the RECENT regime, not be
+  outvoted by however many old closes came before the market changed."""
+  from src.edge import family_scoring_horizons
+  old = [_hclose("funding_carry", 90, ts=1_000_000 + i) for i in range(40)]       # long chop history
+  new = [_hclose("funding_carry", 171, ts=5_000_000 + i) for i in range(20)]      # regime changed
+  assert family_scoring_horizons(old) == {"funding_carry": 60}
+  assert family_scoring_horizons(old + new) == {"funding_carry": 240}, \
+    "40 stale chop closes must not outvote the 20 that describe the market now"
+
+
+def test_recency_is_by_close_time_not_by_list_order():
+  """The store is not guaranteed chronological; recency must come from the timestamps."""
+  from src.edge import family_scoring_horizons
+  old = [_hclose("x", 90, ts=1_000_000 + i) for i in range(40)]
+  new = [_hclose("x", 171, ts=5_000_000 + i) for i in range(20)]
+  assert family_scoring_horizons(new + old) == {"x": 240}

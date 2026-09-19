@@ -792,3 +792,4 @@ def test_trail_without_a_noise_band_is_unchanged():
   for bad in (None, 0.0, -1.0, float("nan"), "x"):
     assert decide_protection(noise_band_r=bad, **base)["stopPrice"] == pytest.approx(
       decide_protection(**base)["stopPrice"])
+

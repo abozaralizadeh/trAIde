@@ -543,6 +543,76 @@ def _probe_observations(
       yield row, ctx, int(horizon), (ret if side == "long" else -ret)
 
 
+def family_scoring_horizons(
+  closes,
+  *,
+  available: tuple = (5, 15, 60, 240),
+  min_trades: int = 6,
+  recent: int = 20,
+) -> Dict[str, int]:
+  """The settled probe horizon that best matches how long each family is actually held.
+
+  Derived from the family's own realized trades — the median minutes from fill to close — and snapped
+  to the nearest horizon that probes actually settle at, measured on a LOG scale because what matters
+  for a holding period is the ratio, not the difference (162m sits nearer 240m than 60m; 116m nearer
+  60m than 240m). A family with fewer than ``min_trades`` realized closes has no trustworthy median
+  and is omitted, so it falls back to the caller's default horizon. Self-tuning: if a playbook starts
+  being held longer or shorter, its verdict follows without anyone editing a constant. Never raises.
+
+  Only each family's most recent ``recent`` closes count, so the horizon follows the market rather than
+  averaging over every regime the bot has ever seen. Holding time is mostly a property of the playbook
+  (fade ~12m, range ~14m) but it DOES move with conditions: `funding_carry` went from a 90m median in
+  chop to 171m in the Sep 2026 rally, which moves it from the 60m horizon to 240m. An all-history
+  median would lag a regime change by however many old closes had to be outvoted. The window matches
+  the stand-aside's own ``min_samples`` (20), so the horizon a family is judged at comes from the same
+  recent sample size that judges it, rather than from a second, unrelated constant.
+  """
+  holds: Dict[str, List[float]] = {}
+  for row in closes or []:
+    if not isinstance(row, dict):
+      continue
+    ctx = row.get("entryContext") if isinstance(row.get("entryContext"), dict) else {}
+    try:
+      filled = float(ctx.get("fillTs"))
+      closed = float(row.get("ts"))
+    except (TypeError, ValueError):
+      continue
+    minutes = (closed - filled) / 60.0
+    if not (math.isfinite(minutes) and minutes > 0):
+      continue
+    fam = str(ctx.get("setupFamily") or "").strip().lower()
+    if not fam:
+      continue
+    holds.setdefault(fam, []).append((closed, minutes))
+  opts = sorted({int(h) for h in available if int(h) > 0})
+  out: Dict[str, int] = {}
+  if not opts:
+    return out
+  for fam, dated in holds.items():
+    dated.sort(key=lambda p: p[0])                       # oldest -> newest
+    vals = [m for _, m in dated[-max(1, int(recent)):]]    # this family's most recent closes only
+    if len(vals) < max(1, int(min_trades)):
+      continue
+    vals.sort()
+    n = len(vals)
+    median = vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+    out[fam] = min(opts, key=lambda h: abs(math.log(h) - math.log(max(median, 1e-9))))
+  return out
+
+
+def safe_family_horizons(memory: Any, **kwargs: Any) -> Dict[str, int]:
+  """`family_scoring_horizons` over a store's realized closes, or {} if they cannot be read.
+
+  Hold-time derivation is a refinement of the verdict, not a precondition for having one: if it
+  fails, every family falls back to the default horizon rather than the whole edge report going blank
+  (which silently disables the stand-aside and every family size factor with it).
+  """
+  try:
+    return family_scoring_horizons(memory.realized_closes(limit=1000), **kwargs)
+  except Exception:
+    return {}
+
+
 def signal_edge_stats(
   probes: List[Dict[str, Any]],
   *,
@@ -551,6 +621,7 @@ def signal_edge_stats(
   verdict_horizons: tuple = (60, 240),
   family_horizon_min: int = 60,
   min_samples: int = 20,
+  family_horizons: Dict[str, int] | None = None,
 ) -> Dict[str, Any]:
   """Does the agent's DIRECTION CALL predict? The one question that decides profitability.
 
@@ -575,6 +646,17 @@ def signal_edge_stats(
   the noisiest short one would win ``best_horizon`` by chance, and were family scoring left keyed to
   ``horizons_min[0]`` it would have jumped from the 60m point to the 5m point — re-pricing every
   playbook's risk multiplier as a side effect of adding a chart. Report widely, act narrowly.
+
+  ``family_horizons`` narrows that one step further, per playbook: each family is scored at the
+  horizon that matches how long it is actually HELD (see :func:`family_scoring_horizons`), falling
+  back to ``family_horizon_min`` for any family not in the map. One shared 60m horizon measured every
+  playbook against a holding period most of them never use. Live, 2026-09-18: `continuation` is held
+  a median 162 minutes, and in a strong rally its entries sit mid-pullback at the 60m mark, so its
+  verdict hovered at net -0.006% over ~110 probes and the stand-aside benched it for the entire second
+  day of the move — 143 blocked calls that measured +0.17% at 60m and **+1.27% net at 240m with a 76%
+  hit rate**, by the same probe method. The fix is per-family on purpose: `fade_extreme` is held a
+  median 12 minutes, and a blanket 240m horizon would have RELEASED it (+0.77% at 240m) on evidence
+  from a holding period it never uses; at its own 15m horizon it correctly stays benched (-0.30%).
   """
   # `by_horizon` is seeded so the return shape is the same whether or not anything settled — callers
   # (dashboard, agent state) should not have to distinguish "no data" from "key absent".
@@ -583,11 +665,14 @@ def signal_edge_stats(
   }
   by_h: Dict[str, List[float]] = {}
   by_fam: Dict[str, List[float]] = {}
+  fam_h = {str(k).strip().lower(): int(v) for k, v in (family_horizons or {}).items() if v}
   for _row, ctx, horizon, signed in _probe_observations(probes, horizons_min):
     by_h.setdefault(f"{horizon}m", []).append(signed)
-    # Family scoring uses ONE horizon so a setup is not counted twice with different holding periods.
-    if horizon == int(family_horizon_min):
-      by_fam.setdefault(infer_setup_family(ctx), []).append(signed)
+    # Family scoring uses ONE horizon PER FAMILY so a setup is never counted twice with different
+    # holding periods — that horizon being the family's own, not a single one shared by all.
+    fam = infer_setup_family(ctx)
+    if horizon == int(fam_h.get(fam, family_horizon_min)):
+      by_fam.setdefault(fam, []).append(signed)
   if by_fam:
     fam_out = {}
     for fam, vals in by_fam.items():
