@@ -18,8 +18,8 @@ def _store(tmp_path) -> MemoryStore:
   return MemoryStore(str(tmp_path / "mem.json"))
 
 
-def _probe(taken, bracket, family="fade_extreme"):
-  return {"realizedR": taken, "setupFamily": family,
+def _probe(taken, bracket, family="fade_extreme", closed_by="agent"):
+  return {"realizedR": taken, "setupFamily": family, "closedBy": closed_by,
           "outcome": {"resolved": "take_profit", "bracketR": bracket}}
 
 
@@ -118,3 +118,46 @@ def test_held_position_noise_floor_uses_the_trades_own_geometry():
               {"fillPrice": 0, "stopLossPrice": 1, "stopAtrMult": 2.5},
               {"fillPrice": 100, "stopLossPrice": 100, "stopAtrMult": 2.5}):
     assert held_position_noise_pct(bad) is None
+
+
+# --- attribution: the model is judged only on the closes it actually made ---------------------------
+
+def test_trailing_stop_exits_are_not_blamed_on_the_model():
+  """The live bug (2026-09-19): of 30 scored 'discretionary closes', 16 were the code's trailing stop
+  (-8.99R) and ONE was the model (+1.54R). The scoreboard said "closes destroy value, -12.41R" and the
+  prompt told the model to let that number decide how readily it closes. Only agent closes may count."""
+  rows = [_probe(0.2, 1.8, "continuation", closed_by="protection")] * 16 + [_probe(1.8, 0.26, closed_by="agent")]
+  out = exit_discipline_stats(rows)
+  assert out["n"] == 1, "only the model's own close is scored"
+  assert out["deltaR"] == pytest.approx(1.54, abs=0.01)
+  assert out["otherExits"]["protection"]["n"] == 16
+  assert out["otherExits"]["protection"]["deltaR"] == pytest.approx(16 * (0.2 - 1.8), abs=0.01)
+
+
+def test_legacy_rows_without_attribution_are_not_counted_as_the_models():
+  """Rows recorded before attribution existed are mostly trailing-stop exits; they must not inflate
+  or deflate the model's own record."""
+  rows = [{"realizedR": 0.1, "setupFamily": "x", "outcome": {"resolved": "stop", "bracketR": 1.5}}] * 13
+  out = exit_discipline_stats(rows)
+  assert out["n"] == 0 and out["verdict"] == "insufficient data"
+  assert out["otherExits"]["unattributed"]["n"] == 13
+
+
+def test_agent_close_marker_round_trips(tmp_path):
+  m = MemoryStore(str(tmp_path / "m.json"))
+  assert m.recent_agent_close("SOL-USDT") is False
+  m.note_agent_close("SOL-USDT")
+  assert m.recent_agent_close("SOL-USDT") is True
+  assert m.recent_agent_close("SOL-USDT", within_sec=0) in (True, False)   # boundary is not an error
+  assert m.recent_agent_close("ETH-USDT") is False                         # per symbol
+  m.record_exit_probe("SOL-USDT", "long", 100, 90, 130, 105, realized_r=0.5, closed_by="agent")
+  assert m.exit_probes()[-1]["closedBy"] == "agent"
+
+
+def test_the_marker_is_set_only_where_the_model_closes():
+  """Structural guard: ProtectionManager places its closes directly and must never set the marker,
+  and the tools layer must set it on BOTH futures market-order placement sites."""
+  from pathlib import Path
+  root = Path(__file__).resolve().parents[1] / "src"
+  assert "note_agent_close" not in (root / "protection.py").read_text()
+  assert (root / "tools.py").read_text().count("memory.note_agent_close(spot_symbol)") == 2

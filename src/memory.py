@@ -502,6 +502,7 @@ class MemoryStore:
       e for e in (data.get("macro_events") or [])
       if isinstance(e, dict) and (e.get("ts") or 0) >= now - 86400
     ][-MAX_MACRO_EVENTS:]
+    data["agent_closes"] = [m for m in (data.get("agent_closes") or []) if isinstance(m, dict)][-200:]
     # Exit probes are learning data too (was the discretionary close better than the bracket?):
     # count-capped, never clock-pruned, for the same reason signal probes are not.
     _xp = data.get("exit_probes") or []
@@ -1420,6 +1421,40 @@ class MemoryStore:
     except (TypeError, ValueError):
       return None
 
+  def note_agent_close(self, symbol: str) -> None:
+    """Remember that the MODEL just closed a position on ``symbol`` (its reduce-only order was accepted).
+
+    Exit probes are recorded later, when the poll loop notices the position is gone, and by then the
+    exchange reports every close the same way ("TP/SL triggered"). Without this marker a close by the
+    model and a close by the code's own trailing stop are indistinguishable — which is how the exit
+    scoreboard came to blame the model for 16 trailing-stop exits in a window where it had made ONE
+    close, and that one had helped. Never raises; the marker list is bounded.
+    """
+    sym = _normalize_symbol(symbol)
+    if not sym:
+      return
+    with self._lock:
+      data = self._read()
+      marks = [m for m in (data.get("agent_closes") or []) if isinstance(m, dict)]
+      marks.append({"symbol": sym, "ts": int(time.time())})
+      data["agent_closes"] = marks[-200:]
+      self._write(data)
+
+  def recent_agent_close(self, symbol: str, within_sec: int = 900) -> bool:
+    """True when the model closed ``symbol`` within the last ``within_sec`` seconds."""
+    sym = _normalize_symbol(symbol)
+    now = time.time()
+    with self._lock:
+      data = self._read()
+    for m in reversed(data.get("agent_closes") or []):
+      if not isinstance(m, dict) or m.get("symbol") != sym:
+        continue
+      try:
+        return (now - float(m.get("ts") or 0)) <= max(0, int(within_sec))
+      except (TypeError, ValueError):
+        return False
+    return False
+
   def record_exit_probe(
     self,
     symbol: str,
@@ -1430,8 +1465,13 @@ class MemoryStore:
     exit_price: Any,
     realized_r: Any = None,
     setup_family: Optional[str] = None,
+    closed_by: Optional[str] = None,
   ) -> None:
-    """Record a DISCRETIONARY close so it can later be scored against the bracket it overrode.
+    """Record an EARLY close so it can later be scored against the bracket it overrode.
+
+    ``closed_by`` is "agent" when the model closed it and "protection" when the code's trailing stop
+    or profit-lock did. Both land between the original stop and target, so both are worth scoring —
+    but against different questions, and only the first is the model's decision.
 
     The bot measures whether its entries predict (``signal_probes``) but never measured whether its
     *exits* helped — and the exits turned out to be the dominant behaviour: over the 2026-09-02 window
@@ -1478,6 +1518,7 @@ class MemoryStore:
       "exitPrice": xp,
       "realizedR": rr,
       "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
+      "closedBy": (str(closed_by).strip().lower() or None) if closed_by else None,
       "outcome": {},
     }
     with self._lock:

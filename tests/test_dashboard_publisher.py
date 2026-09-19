@@ -531,7 +531,7 @@ class TestExitDisciplinePanel:
     cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized"))
     m = MemoryStore(str(tmp_path / "m.json"))
     m.record_exit_probe("AAVE-USDT", "short", 132.35, 135.25, 127.10, 131.94, realized_r=0.14,
-                        setup_family="fade_extreme")
+                        setup_family="fade_extreme", closed_by="agent")
     data = m._read()
     data["exit_probes"][0]["outcome"] = {"resolved": "take_profit", "bracketR": 1.76,
                                          "resolvedTs": int(time.time())}
@@ -550,7 +550,8 @@ class TestExitDisciplinePanel:
     cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized"))
     out = DashboardPublisher(cfg)._build_exit_discipline(MemoryStore(str(tmp_path / "m.json")))
     assert out == {"verdict": "insufficient data", "n": 0, "takenR": 0, "bracketR": 0,
-                   "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0, "byFamily": {}}
+                   "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0, "byFamily": {},
+                   "otherExits": {}}
 
 
 class TestTakerFlowPanel:

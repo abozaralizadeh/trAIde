@@ -1084,6 +1084,14 @@ def loss_streak_size_factor(loss_streak: int, cfg: EdgeConfig) -> float:
 def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
   """Score the model's DISCRETIONARY closes against the brackets they overrode.
 
+  Only rows with ``closedBy == "agent"`` count toward the verdict. Until 2026-09-19 every exit that
+  landed between the original stop and target was scored here, and a trailing-stop exit lands exactly
+  there — so of 30 "discretionary closes" the scoreboard reported (verdict "closes destroy value",
+  -12.41R), 16 were the code's trailing stop (-8.99R) and ONE was the model (+1.54R, it helped). The
+  model was being told its judgement was destroying value on the strength of a mechanism it does not
+  control. Those exits are still scored — under ``otherExits`` — because "the trail left the target
+  on the table" is worth knowing; it is simply a different question.
+
   The bot has always measured whether its entries predict. It never measured whether its exits helped
   — and on the 2026-09-02 data the exits were the dominant behaviour: 16 positions closed by the agent
   against 2 by the profit-lock, median hold 13 minutes on brackets whose targets need hours.
@@ -1107,6 +1115,7 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
   taken: list[float] = []
   bracket: list[float] = []
   by_family: Dict[str, list] = {}
+  others: Dict[str, list] = {}
   for row in probes or []:
     if not isinstance(row, dict):
       continue
@@ -1119,6 +1128,13 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
     except (TypeError, ValueError):
       continue
     if not (math.isfinite(t) and math.isfinite(b)):
+      continue
+    who = str(row.get("closedBy") or "").strip().lower()
+    if who != "agent":
+      # The code's trailing stop / profit-lock (or a legacy row recorded before attribution existed).
+      # Real information about the TRAIL, but not a decision the model made — see the note below.
+      bucket = others.setdefault(who or "unattributed", [])
+      bucket.append((t, b))
       continue
     taken.append(t)
     bracket.append(b)
@@ -1133,11 +1149,20 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
     "deltaR": round(sum(taken) - sum(bracket), 3),
     "deltaRPerTrade": round((sum(taken) - sum(bracket)) / n, 4) if n else None,
     "beatBracket": sum(1 for t, b in zip(taken, bracket) if t > b),
+    # Early exits the MODEL did not make. "protection" = the code's trailing stop / profit-lock, scored
+    # against the same bracket: negative deltaR there means the trail left the bracket's target on the
+    # table, which is a statement about the trail, not about the model's judgement.
+    "otherExits": {
+      k: {"n": len(v), "deltaR": round(sum(t for t, _ in v) - sum(b for _, b in v), 3)}
+      for k, v in sorted(others.items())
+    },
   }
   if n < max(1, int(min_samples)):
     out["verdict"] = "insufficient data"
     out["note"] = (
-      f"{n} discretionary close(s) scored so far; no verdict until {int(min_samples)}."
+      f"{n} of your own early close(s) scored so far; no verdict until {int(min_samples)}. "
+      "(Exits made by the code's trailing stop are reported separately under otherExits and are "
+      "not counted here — they were not your decision.)"
     )
     return out
   per = out["deltaRPerTrade"] or 0.0

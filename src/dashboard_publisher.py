@@ -527,6 +527,9 @@ class DashboardPublisher:
         "deltaRPerTrade": stats.get("deltaRPerTrade"),
         "beatBracket": stats.get("beatBracket"),
         "byFamily": stats.get("byFamily") or {},
+        # Exits made by the code (trailing stop / profit-lock), scored against the same bracket but
+        # NOT counted in the model's verdict above — they were not the model's decision.
+        "otherExits": stats.get("otherExits") or {},
       }
     except Exception as exc:  # pragma: no cover - defensive
       logger.debug("exitDiscipline unavailable: %s", exc)

@@ -3205,6 +3205,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         if authority_error:
           return {"rejected": True, "reason": authority_error}
         res = kucoin_futures.place_order(order_req).__dict__
+      if reduce_only:
+        # This is the MODEL closing a position. ProtectionManager places its own closes directly and
+        # never passes through here, so this is the only reliable place to tell the two apart.
+        memory.note_agent_close(spot_symbol)
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
@@ -3260,6 +3264,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         if authority_error:
           return {"rejected": True, "reason": authority_error}
         res = kucoin_futures.place_order(order_req).__dict__
+      if reduce_only:
+        # This is the MODEL closing a position. ProtectionManager places its own closes directly and
+        # never passes through here, so this is the only reliable place to tell the two apart.
+        memory.note_agent_close(spot_symbol)
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
