@@ -70,3 +70,4 @@ Config validity: `python -c "from src.config import load_config; load_config()"`
 - **Dashboard disclosure policy:** never publish balances, equity, position sizes, or account IDs. `DASHBOARD_DISCLOSURE=normalized` = % returns + indexed curve only, no `$`. Respect it in `dashboard_publisher.py`.
 - **Commit only when asked.** On a feature branch (`master` is the main branch). Tests must pass before proposing a commit.
 - Tests use local fakes only — no network. Keep it that way.
+- **`story.md` is the running build journal** (timeline, numbers, themes, screenshot checklist) and the raw material for posts like `medium_post.md`. Add a dated line when something story-worthy happens — a bug with a good number, a reversal, a milestone.
