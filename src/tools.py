@@ -189,6 +189,31 @@ class MacroEventInput(BaseModel):
   impact: str
 
 
+def lifecycle_for_close(action: str, position: Any) -> Dict[str, Any]:
+  """Lifecycle fields to stamp on a model-logged close, or {} when the live book cannot vouch for it.
+
+  The action names the side that was CLOSED; the position is whatever is open NOW. On a flip (close
+  the long and open a short in the same run) those differ, and stamping the long's close with the new
+  short's openTime/side made the row unmatchable to its own fill — no prices, an empty dashboard card
+  and no exit probe (H-USDT, 2026-09-22 06:04). Only attach the lifecycle when the live side is the
+  one the action closed; otherwise return {} and let the poll-loop reconciliation, which keys closes
+  by the exchange's own lifecycle, own it. Actions that do not name a side keep the old behaviour.
+  """
+  if not isinstance(position, dict):
+    return {}
+  qty = _to_float(position.get("currentQty")) or 0.0
+  live_side = "long" if qty > 0 else "short" if qty < 0 else None
+  act = str(action or "").lower()
+  closed_side = "long" if act.endswith("close_long") else ("short" if act.endswith("close_short") else None)
+  if closed_side is not None and live_side != closed_side:
+    return {}
+  return {
+    "position_id": position.get("id") or position.get("positionId"),
+    "position_open_time": position.get("openTime") or position.get("openingTimestamp"),
+    "position_side": live_side,
+  }
+
+
 def normalize_orderbook(ob: Any, depth: int, symbol: str) -> Dict[str, Any]:
   """Shape a raw level2 response into the tool's return value. Never raises.
 
@@ -5416,12 +5441,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         None,
       )
       if position:
-        qty = _to_float(position.get("currentQty")) or 0.0
-        lifecycle = {
-          "position_id": position.get("id") or position.get("positionId"),
-          "position_open_time": position.get("openTime") or position.get("openingTimestamp"),
-          "position_side": "long" if qty > 0 else "short" if qty < 0 else None,
-        }
+        lifecycle = lifecycle_for_close(action, position)   # {} on a side flip; see the helper
     entry = memory.log_decision(
       normalized, action, conf, reason, pnl=pnl, paper=paper, **lifecycle,
     )

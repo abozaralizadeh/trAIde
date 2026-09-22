@@ -530,6 +530,9 @@ class DashboardPublisher:
         # Exits made by the code (trailing stop / profit-lock), scored against the same bracket but
         # NOT counted in the model's verdict above — they were not the model's decision.
         "otherExits": stats.get("otherExits") or {},
+        # The trail's record split by the entry's own regime — negative in a trend, expected positive
+        # in chop. A regime-adaptive trail is only justified once both rows exist.
+        "trailByRegime": stats.get("trailByRegime") or {},
       }
     except Exception as exc:  # pragma: no cover - defensive
       logger.debug("exitDiscipline unavailable: %s", exc)

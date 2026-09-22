@@ -1575,6 +1575,7 @@ async def trading_loop(
                 sym, position_side, _e, _sl, _tp, exit_price,
                 realized_r=_taken, setup_family=_ctx.get("setupFamily"),
                 closed_by="agent" if memory.recent_agent_close(sym) else "protection",
+                regime=_ctx.get("regime") if isinstance(_ctx.get("regime"), dict) else None,
               )
         except Exception:
           logger.debug("exit-probe recording failed for %s", sym, exc_info=True)

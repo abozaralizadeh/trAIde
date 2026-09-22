@@ -161,3 +161,62 @@ def test_the_marker_is_set_only_where_the_model_closes():
   root = Path(__file__).resolve().parents[1] / "src"
   assert "note_agent_close" not in (root / "protection.py").read_text()
   assert (root / "tools.py").read_text().count("memory.note_agent_close(spot_symbol)") == 2
+
+
+# --- a flip must not stamp the closed side with the new side's lifecycle -------------------------
+
+def test_flip_close_does_not_borrow_the_new_positions_lifecycle():
+  """H-USDT, 2026-09-22 06:04: the model closed a LONG and opened a SHORT in the same run. When it
+  logged the long's close, the live book already held the short, so the close row was stamped with the
+  short's openTime and side — unmatchable to its own fill: no prices, an empty dashboard card, and no
+  exit probe. The row is then invisible to the very scoreboard meant to judge the model's closes."""
+  from src.tools import lifecycle_for_close
+  short_now = {"currentQty": -5, "id": "p2", "openTime": 1790055100087}
+  assert lifecycle_for_close("close_long", short_now) == {}
+  assert lifecycle_for_close("futures_close_long", short_now) == {}
+  long_now = {"currentQty": 5, "id": "p1", "openTime": 1790050000000}
+  assert lifecycle_for_close("close_long", long_now) == {
+    "position_id": "p1", "position_open_time": 1790050000000, "position_side": "long"}
+  assert lifecycle_for_close("close_short", long_now) == {}
+  assert lifecycle_for_close("close_short", short_now)["position_side"] == "short"
+
+
+def test_side_less_close_actions_keep_the_old_behaviour():
+  """'futures_close' / 'close_position' name no side, so the live book is the only evidence there is."""
+  from src.tools import lifecycle_for_close
+  pos = {"currentQty": -3, "positionId": "p9", "openingTimestamp": 42}
+  assert lifecycle_for_close("futures_close", pos) == {
+    "position_id": "p9", "position_open_time": 42, "position_side": "short"}
+  assert lifecycle_for_close("close_long", None) == {}
+  assert lifecycle_for_close("close_long", {"currentQty": 0}) == {}   # flat book: nothing to vouch
+
+
+# --- regime tag on exit probes, and the trail split by regime -----------------------------------
+
+def test_exit_probe_stores_the_entrys_regime_tag(tmp_path):
+  m = MemoryStore(str(tmp_path / "m.json"))
+  m.record_exit_probe("X-USDT", "long", 100, 90, 130, 105, realized_r=0.5, closed_by="protection",
+                      regime={"market_regime": "trending", "strength": "strong", "daily_atr_pct": 6.8})
+  m.record_exit_probe("Y-USDT", "long", 100, 90, 130, 105, realized_r=0.5, closed_by="protection",
+                      regime="junk")
+  rows = m.exit_probes()
+  assert rows[0]["regime"] == {"market_regime": "trending", "strength": "strong"}   # only the two keys
+  assert rows[1]["regime"] is None
+
+
+def test_trail_record_is_split_by_regime_and_only_for_the_trail():
+  """The trail is right in chop and wrong in a trend. The split is what lets a regime-adaptive trail
+  be justified — or refused — on evidence from BOTH regimes rather than one."""
+  def p(taken, bracket, who, regime):
+    return {"realizedR": taken, "setupFamily": "continuation", "closedBy": who,
+            "regime": regime, "outcome": {"resolved": "take_profit", "bracketR": bracket}}
+  rows = ([p(0.3, 1.8, "protection", {"market_regime": "trending", "strength": "strong"})] * 4
+          + [p(0.2, -1.0, "protection", {"market_regime": "ranging", "strength": "weak"})] * 3
+          + [p(0.9, 0.1, "agent", {"market_regime": "trending", "strength": "strong"})]       # model close: excluded
+          + [p(0.1, 1.0, "protection", None)])                                                  # untagged: excluded
+  out = exit_discipline_stats(rows)
+  tbr = out["trailByRegime"]
+  assert set(tbr) == {"trending/strong", "ranging/weak"}
+  assert tbr["trending/strong"]["n"] == 4 and tbr["trending/strong"]["deltaR"] == pytest.approx(4 * (0.3 - 1.8))
+  assert tbr["ranging/weak"]["n"] == 3 and tbr["ranging/weak"]["deltaR"] == pytest.approx(3 * (0.2 + 1.0))
+  assert out["otherExits"]["protection"]["n"] == 8     # the untagged one still counts as a trail exit

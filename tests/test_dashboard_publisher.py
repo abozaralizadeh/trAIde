@@ -551,7 +551,7 @@ class TestExitDisciplinePanel:
     out = DashboardPublisher(cfg)._build_exit_discipline(MemoryStore(str(tmp_path / "m.json")))
     assert out == {"verdict": "insufficient data", "n": 0, "takenR": 0, "bracketR": 0,
                    "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0, "byFamily": {},
-                   "otherExits": {}}
+                   "otherExits": {}, "trailByRegime": {}}
 
 
 class TestTakerFlowPanel:

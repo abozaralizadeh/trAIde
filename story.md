@@ -41,11 +41,14 @@ Save under `docs/story/` and link here. Dashboard discloses % and R only — nev
 | Sep 19 | Exit scoreboard blamed the model for the trailing stop. | 16 trail exits vs 1 model close |
 | Sep 20 | Test suite was starting a LIVE trading loop on every run. Found by counting threads. | — |
 | Sep 20 | Dependency refresh, LangSmith deprecated endpoint fixed, deploy script installs deps. | 734 tests |
+| Sep 19–22 | Second good stretch, rally continues. Continuation trading on measured edge (t≈2 at its own 240m horizon). | 40 closes, 82% win, +11.3R; equity ~$70 → $74.6 |
+| Sep 22 | Model's own close on a long→short flip was invisible to its scoreboard (stamped with the new short's lifecycle). | 1 case, fixed |
+| Sep 22 | Trailing stop cut 30 winners early in the rally — but every exit is trend-tagged; no chop data yet, so no adaptive trail shipped. | −10.77R vs brackets, all `trending` |
 
 ## Where it stands (Sep 20, 2026)
 
-All-time: 152 closed trades, about −10R, roughly −$3. Honest equity curve still down double digits
-since June. Last ~5 days: +9.6R at 79% — one regime, so treated as encouraging, not proven.
+All-time: 190 closed trades, +1.2R, about +$1.9 (55% win). Honest equity curve still down since June
+(the pre-August losses), but the last week is +11.3R at 82% — one regime, so encouraging, not proven.
 
 ## Recurring themes (good angles for posts)
 

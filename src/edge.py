@@ -1116,6 +1116,7 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
   bracket: list[float] = []
   by_family: Dict[str, list] = {}
   others: Dict[str, list] = {}
+  by_regime: Dict[str, list] = {}
   for row in probes or []:
     if not isinstance(row, dict):
       continue
@@ -1135,6 +1136,10 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
       # Real information about the TRAIL, but not a decision the model made — see the note below.
       bucket = others.setdefault(who or "unattributed", [])
       bucket.append((t, b))
+      reg = row.get("regime") if isinstance(row.get("regime"), dict) else None
+      if reg and who == "protection":
+        rkey = f"{reg.get('market_regime') or '?'}/{reg.get('strength') or '?'}"
+        by_regime.setdefault(rkey, []).append((t, b))
       continue
     taken.append(t)
     bracket.append(b)
@@ -1155,6 +1160,12 @@ def exit_discipline_stats(probes, min_samples: int = 8) -> Dict[str, Any]:
     "otherExits": {
       k: {"n": len(v), "deltaR": round(sum(t for t, _ in v) - sum(b for _, b in v), 3)}
       for k, v in sorted(others.items())
+    },
+    # The trail's record split by the entry's regime. It is expected to be negative in a trend and
+    # positive in chop; a regime-adaptive trail is only justified once BOTH rows exist.
+    "trailByRegime": {
+      k: {"n": len(v), "deltaR": round(sum(t for t, _ in v) - sum(b for _, b in v), 3)}
+      for k, v in sorted(by_regime.items())
     },
   }
   if n < max(1, int(min_samples)):

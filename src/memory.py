@@ -1466,6 +1466,7 @@ class MemoryStore:
     realized_r: Any = None,
     setup_family: Optional[str] = None,
     closed_by: Optional[str] = None,
+    regime: Optional[Dict[str, Any]] = None,
   ) -> None:
     """Record an EARLY close so it can later be scored against the bracket it overrode.
 
@@ -1519,6 +1520,12 @@ class MemoryStore:
       "realizedR": rr,
       "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
       "closedBy": (str(closed_by).strip().lower() or None) if closed_by else None,
+      # The entry's own regime read (market_regime / strength) so trail-vs-bracket can be split by the
+      # market it happened in. The trail is right in chop and wrong in a trend; a regime-adaptive
+      # trail needs evidence from BOTH, and this is where that evidence accumulates on its own.
+      "regime": {
+        k: str(regime.get(k)) for k in ("market_regime", "strength") if isinstance(regime, dict) and regime.get(k)
+      } if isinstance(regime, dict) else None,
       "outcome": {},
     }
     with self._lock:
