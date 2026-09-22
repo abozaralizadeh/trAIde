@@ -44,6 +44,7 @@ Save under `docs/story/` and link here. Dashboard discloses % and R only — nev
 | Sep 19–22 | Second good stretch, rally continues. Continuation trading on measured edge (t≈2 at its own 240m horizon). | 40 closes, 82% win, +11.3R; equity ~$70 → $74.6 |
 | Sep 22 | Model's own close on a long→short flip was invisible to its scoreboard (stamped with the new short's lifecycle). | 1 case, fixed |
 | Sep 22 | Trailing stop cut 30 winners early in the rally — but every exit is trend-tagged; no chop data yet, so no adaptive trail shipped. | −10.77R vs brackets, all `trending` |
+| Sep 22 | Restart audit: only one thing lived solely in-process — the protection R-anchor. A winner already at breakeven before a restart lost its trail for good. Now re-seeded from the recorded trade. | 1 silent failure mode, closed |
 
 ## Where it stands (Sep 20, 2026)
 

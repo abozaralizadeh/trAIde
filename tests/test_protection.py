@@ -793,3 +793,83 @@ def test_trail_without_a_noise_band_is_unchanged():
     assert decide_protection(noise_band_r=bad, **base)["stopPrice"] == pytest.approx(
       decide_protection(**base)["stopPrice"])
 
+
+
+# ── restart safety: the manager's in-memory anchors are re-seeded from the recorded trade ─────────
+
+def _restart_snap(*, stop_price, mark=108.0):
+  """A long from 100 whose live stop sits at `stop_price`. After a breakeven ratchet that stop is
+  ABOVE entry, which is exactly the case the live capture cannot handle on a fresh process."""
+  return SimpleNamespace(
+    futures_enabled=True,
+    futures_account={"accountEquity": 1000},
+    futures_positions=[{
+      "symbol": "ETHUSDTM", "currentQty": 5, "avgEntryPrice": 100.0,
+      "markPrice": mark, "unrealisedPnl": (mark - 100.0) * 5,
+      "openingTimestamp": 1000,
+    }],
+    futures_stop_orders=[{
+      "symbol": "ETHUSDTM", "side": "sell", "stop": "down", "stopPrice": stop_price, "reduceOnly": True,
+    }],
+    total_usdt=1000,
+  )
+
+
+def _restart_mgr(ctx):
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True, dry_run=True)
+  # run() returns [] with no client at all; dry_run means the stub is never actually called.
+  return ProtectionManager(cfg, SimpleNamespace(), trade_context_lookup=lambda fsym, pos: dict(ctx))
+
+
+def test_after_a_restart_a_breakeven_winner_regains_its_1r_anchor_from_the_recorded_stop():
+  """Live: a fresh process sees stop 100.15 > entry 100, so entry-stop <= 0 and the anchor is never
+  captured -> risk_override None -> trail/breakeven/early-cut silently inert for the position's whole
+  remaining life. The recorded entry stop (entry 100, stop 90 => 10.0) restores it."""
+  inert = _restart_mgr({})
+  inert.run(_restart_snap(stop_price=100.15))
+  assert "ETHUSDTM" not in inert._init_risk, "sanity: without seeding the anchor is lost"
+
+  seeded = _restart_mgr({"initRiskPx": 10.0, "noiseBandR": 0.4})
+  actions = seeded.run(_restart_snap(stop_price=100.15))
+  assert seeded._init_risk["ETHUSDTM"] == pytest.approx(10.0)
+  # ...and the R-based trail is ALIVE again: mark 108 = +0.8R peak -> it ratchets the stop up.
+  assert any(a.get("action") == "move_breakeven" for a in actions), actions
+
+
+def test_live_capture_wins_over_the_recorded_stop_when_a_real_stop_is_visible():
+  """On a normal (non-restart) poll the stop is still below entry; the live distance is the truth
+  about what is actually placed and must not be overridden by the recorded plan."""
+  mgr = _restart_mgr({"initRiskPx": 10.0})
+  mgr.run(_restart_snap(stop_price=92.0, mark=101.0))     # live risk = 8
+  assert mgr._init_risk["ETHUSDTM"] == pytest.approx(8.0)
+
+
+def test_recorded_peak_can_only_raise_the_in_memory_peak():
+  """A restart resets the peak to the current mark, which would let the trail re-arm from scratch.
+  The recorded peak (pnl / qty) restores what this lifecycle already reached — and never lowers it."""
+  higher = _restart_mgr({"initRiskPx": 10.0, "peakFePx": 12.0})
+  higher.run(_restart_snap(stop_price=100.15, mark=108.0))          # live peak = 8
+  assert higher._peak_fe["ETHUSDTM"] == pytest.approx(12.0)
+  lower = _restart_mgr({"initRiskPx": 10.0, "peakFePx": 5.0})
+  lower.run(_restart_snap(stop_price=100.15, mark=108.0))
+  assert lower._peak_fe["ETHUSDTM"] == pytest.approx(8.0)
+
+
+def test_junk_context_values_never_seed_anything():
+  for junk in ({"initRiskPx": 0}, {"initRiskPx": -3}, {"initRiskPx": "x"}, {"peakFePx": "nan"}, None):
+    mgr = ProtectionManager(_cfg(trail_enabled=True, dry_run=True), SimpleNamespace(),
+                            trade_context_lookup=lambda f, p, j=junk: j)
+    mgr.run(_restart_snap(stop_price=100.15))
+    assert "ETHUSDTM" not in mgr._init_risk
+
+
+def test_trade_context_seeds_peak_only_for_the_current_lifecycle():
+  """Structural guard on the main.py lookup: a PREVIOUS lifecycle's peak on the same symbol must not
+  be handed to a new position. The lookup keys the recorded extremes on openTime:side."""
+  from pathlib import Path
+  src = Path(__file__).resolve().parents[1].joinpath("src", "main.py").read_text()
+  i = src.find("def _trade_context(")
+  body = src[i:i + 3000]
+  assert 'ext.get("lifecycleKey") == key' in body
+  assert 'key = f"{opened}:{side}"' in body
+  assert '"initRiskPx"' in body and '"peakFePx"' in body

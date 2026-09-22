@@ -896,6 +896,11 @@ async def trading_loop(
     None for every other playbook, leaving their management completely unchanged.
     ``noiseBandR`` — the entry's own ATR stop multiple, inverted into R, so the trail can ride one
     noise band behind the peak instead of a fixed slice of risk.
+    ``initRiskPx`` / ``peakFePx`` — the trade's ORIGINAL stop distance and its recorded peak favourable
+    excursion (price units), so a process restart does not erase them. ProtectionManager keeps both in
+    memory and captures the risk only when it sees a stop BELOW entry; a winner whose stop had already
+    been ratcheted to breakeven before a restart would otherwise never regain its 1R anchor, and every
+    R-based rule (trail, breakeven, early cut) would go silently inert for the rest of that position.
 
     Looked up here rather than inside ProtectionManager so that module keeps no memory dependency.
     """
@@ -916,6 +921,24 @@ async def trading_loop(
           atr_mult = 0.0
         if atr_mult > 0:
           out["noiseBandR"] = 1.0 / atr_mult
+        try:
+          _e = float(ctx.get("fillPrice") or ctx.get("entryPrice") or 0.0)
+          _sl = float(ctx.get("stopLossPrice") or 0.0)
+          if _e > 0 and _sl > 0 and abs(_e - _sl) > 0:
+            out["initRiskPx"] = abs(_e - _sl)
+        except (TypeError, ValueError):
+          pass
+      # Recorded peak for THIS lifecycle only (key = openTime:side), converted from pnl to price.
+      try:
+        ext = memory.get_position_extremes(normalize_symbol(fsym)) or {}
+        qty = abs(float(pos.get("currentQty") or 0.0))
+        key = f"{opened}:{side}"
+        if ext.get("lifecycleKey") == key and qty > 0 and ext.get("peakPnl") is not None:
+          _peak_pnl = float(ext.get("peakPnl") or 0.0)
+          if _peak_pnl > 0:
+            out["peakFePx"] = _peak_pnl / qty
+      except Exception:
+        pass
     except Exception:
       logger.debug("trade-context lookup failed for %s", fsym, exc_info=True)
     return out

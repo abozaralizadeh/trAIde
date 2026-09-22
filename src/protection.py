@@ -515,6 +515,20 @@ class ProtectionManager:
             _tc = self._trade_context_lookup(fsym, pos) or {}
             hold_until = _tc.get("holdUntilTs")
             noise_band = _tc.get("noiseBandR")
+            # Restart safety. Both dicts below live only in this process. The live capture above
+            # only fires when a stop is still BELOW entry, so after a restart a winner already
+            # ratcheted to breakeven would never regain its 1R anchor and every R-based rule would go
+            # silently inert for it. The recorded entry stop is the same number the live capture
+            # would have seen on the trade's first poll; the recorded peak can only RAISE the
+            # in-memory peak to a level this trade already reached, which is what the trail would
+            # already have locked. Live values win whenever they exist.
+            _rec_risk = _to_float(_tc.get("initRiskPx"))
+            if fsym not in self._init_risk and _rec_risk and _rec_risk > 0:
+              self._init_risk[fsym] = _rec_risk
+            _rec_peak = _to_float(_tc.get("peakFePx"))
+            if _rec_peak and _rec_peak > 0 and _rec_peak > self._peak_fe.get(fsym, 0.0):
+              self._peak_fe[fsym] = _rec_peak
+              peak_fe = _rec_peak
           except Exception:  # a lookup failure must never disable the guards
             logger.debug("trade-context lookup failed for %s", fsym, exc_info=True)
             hold_until = noise_band = None
