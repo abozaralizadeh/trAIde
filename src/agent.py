@@ -5,11 +5,12 @@ import json
 import logging
 import math
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 import httpx
 import requests
@@ -194,14 +195,54 @@ class _RetryDeploymentMissTransport(httpx.AsyncBaseTransport):
   (a deployment genuinely absent everywhere is a config error and must stay loud).
   """
 
-  def __init__(self, inner: httpx.AsyncBaseTransport, attempts: int = _DEPLOYMENT_MISS_RETRIES):
-    self._inner = inner
+  def __init__(
+    self,
+    inner: httpx.AsyncBaseTransport | None = None,
+    attempts: int = _DEPLOYMENT_MISS_RETRIES,
+    *,
+    factory: Callable[[], httpx.AsyncBaseTransport] = httpx.AsyncHTTPTransport,
+  ):
+    # `inner` pins one transport (tests). Production leaves it None and gets one pool PER EVENT
+    # LOOP: the client is built once in main, but every agent run is its own `asyncio.run` in a
+    # worker thread. A single shared pool keeps run #1's keep-alive sockets, and on run #2 httpcore
+    # tries to close the expired one on the loop that created it — which asyncio.run already
+    # closed — so the call raises "RuntimeError: Event loop is closed". On 2026-09-22 that killed
+    # every run after the first one following the deploy (41 in a row, the bot went dark ~28h).
+    self._fixed = inner
+    self._factory = factory
+    self._per_loop: dict[asyncio.AbstractEventLoop, httpx.AsyncBaseTransport] = {}
+    self._lock = threading.Lock()
     self._attempts = max(1, int(attempts))
+
+  def _inner(self) -> httpx.AsyncBaseTransport:
+    if self._fixed is not None:
+      return self._fixed
+    loop = asyncio.get_running_loop()
+    with self._lock:
+      # Drop pools whose loop is gone. Their sockets cannot be closed from here (that is the bug),
+      # and holding them would keep every dead loop alive for the life of the process.
+      for dead in [lp for lp in self._per_loop if lp.is_closed()]:
+        del self._per_loop[dead]
+      transport = self._per_loop.get(loop)
+      if transport is None:
+        transport = self._per_loop[loop] = self._factory()
+      return transport
+
+  async def aclose(self) -> None:
+    if self._fixed is not None:
+      await self._fixed.aclose()
+      return
+    loop = asyncio.get_running_loop()
+    with self._lock:
+      transport = self._per_loop.pop(loop, None)
+    if transport is not None:
+      await transport.aclose()
 
   async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
     last: httpx.Response | None = None
+    inner = self._inner()
     for attempt in range(self._attempts):
-      response = await self._inner.handle_async_request(request)
+      response = await inner.handle_async_request(request)
       if response.status_code != 404:
         return response
       body = await response.aread()
@@ -230,7 +271,7 @@ class _RetryDeploymentMissTransport(httpx.AsyncBaseTransport):
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
   # Prefer APIM when subscription key is provided; else use direct Azure OpenAI.
-  http_client = httpx.AsyncClient(transport=_RetryDeploymentMissTransport(httpx.AsyncHTTPTransport()))
+  http_client = httpx.AsyncClient(transport=_RetryDeploymentMissTransport())
   if cfg.apim.subscription_key:
     return AsyncAzureOpenAI(
       api_key=cfg.apim.subscription_key,
