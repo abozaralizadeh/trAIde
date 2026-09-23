@@ -47,6 +47,7 @@ Save under `docs/story/` and link here. Dashboard discloses % and R only — nev
 | Sep 22 | Restart audit: only one thing lived solely in-process — the protection R-anchor. A winner already at breakeven before a restart lost its trail for good. Now re-seeded from the recorded trade. | 1 silent failure mode, closed |
 | Sep 23 | "The better the bot traded, the blinder its macro guard became." Winning = always holding positions = research never ran = calendar never refreshed. Code now schedules it. | 67h stale, 1 event; CPI + FOMC missing |
 | Sep 22–23 | The fix for one outage caused the next. The retry transport added for the Sep 14 dead backend pinned ONE connection pool for the whole process, but every agent run is its own event loop — run #2 tried to close run #1's socket on a dead loop. First run after deploy worked; every run after died. Protection kept guarding open positions the whole time. | 41 failed runs in a row, ~28h without the model |
+| Sep 23 | The dashboard said "crash" during a winning week. 1D is only two daily points, autoscale stretched a −0.35% day across the whole chart, and the line was coloured vs the June start — so a +12.4% week drew red. Now coloured by the viewed range, with a return badge and a minimum scale. | 1W +12.41%, 1D −0.35% |
 
 ## Where it stands (Sep 20, 2026)
 
