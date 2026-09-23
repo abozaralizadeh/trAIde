@@ -729,6 +729,24 @@ def _collect_run_artifacts(new_items: List[Any]) -> Dict[str, Any]:
   }
 
 
+def _calendar_brief(state: Dict[str, Any] | None) -> str:
+  """One line telling the Research Agent what the calendar currently holds, so it never has to call the
+  (overwriting) log tool just to find out whether a refresh is needed."""
+  try:
+    st = state or {}
+    events = [e for e in (st.get("events") or []) if isinstance(e, dict)]
+    upd = st.get("updated")
+    now = time.time()
+    age = f"{(now - float(upd)) / 3600:.0f}h ago" if upd else "never"
+    future = [e for e in events if float(e.get("ts") or 0) > now]
+    listing = "; ".join(
+      f"{datetime.fromtimestamp(float(e['ts']), timezone.utc):%Y-%m-%d %H:%M} UTC {e.get('name', '')}" for e in future[:8]
+    ) or "none"
+    return f"- CURRENT CALENDAR: last refreshed {age}; {len(future)} upcoming event(s): {listing}."
+  except Exception:
+    return "- CURRENT CALENDAR: unavailable."
+
+
 def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
@@ -738,6 +756,8 @@ def run_trading_agent(
   langsmith_client: Any | None = None,
   recent_fills: Dict[str, Any] | None = None,
   force_research: bool = False,
+  refresh_calendar: bool = False,
+  calendar_state: Dict[str, Any] | None = None,
   safety_state: Any | None = None,
   entry_token: str | None = None,
 ) -> dict[str, Any]:
@@ -1693,6 +1713,19 @@ def run_trading_agent(
     f"- PAPER_TRADING={snapshot.paper_trading}. When true, simulate orders via the tool.\n"
   )
 
+  if refresh_calendar:
+    # Code decided the macro calendar is stale or empty (see regime.macro_calendar_refresh_reason).
+    # Deliberately SCOPED: it is allowed while positions are open because it is short and never
+    # touches the coin list — the two harms the flat-only research rule exists to prevent.
+    instructions = (
+      "## 🗓️ MACRO CALENDAR REFRESH REQUIRED THIS RUN (do this first, then continue normally):\n"
+      "The scheduled-release calendar that drives the pre-event entry blackout is stale or empty. Hand off "
+      "to the Research Agent with ONE task: refresh the macro calendar via log_macro_calendar. Tell it NOT "
+      "to change the coin list in this handoff. When it hands back, carry on with your normal run — "
+      "manage open positions and evaluate entries exactly as you otherwise would.\n\n"
+      + instructions
+    )
+
   if force_research:
     # The trading loop detected several consecutive runs with no executed trade. Force a
     # research handoff up front so the Research Agent refreshes the coin universe instead of
@@ -1744,11 +1777,15 @@ def run_trading_agent(
       "log_macro_calendar reports the calendar is empty or more than ~24h old, use web_search to look up "
       "the official schedule (BLS and Federal Reserve release calendars, or any economic calendar) and "
       "call log_macro_calendar with the upcoming high-impact US releases — CPI, PCE, Non-Farm Payrolls, "
-      "FOMC statements and Fed chair appearances — for the next two weeks. These dates are published a "
+      "FOMC statements and Fed chair appearances — for the next SIX weeks. Six, because FOMC meets roughly "
+      "every six weeks and the others are monthly: that window always contains at least one of each, so "
+      "no release type can silently drop out between refreshes (a two-week window once came back holding "
+      "only NFP, missing a PCE print days away). These dates are published a "
       "year ahead, so this is a lookup, not a forecast, and it costs one call every day or two. Pass exact "
       "UTC unix timestamps (CPI and NFP are 08:30 ET, FOMC statements 14:00 ET — convert, and mind US "
       "daylight saving). Send the FULL forward list each time; it replaces the calendar rather than "
-      "appending. An empty calendar silently disables the guard, so treat a stale one as a real gap.\n\n"
+      "appending. An empty calendar silently disables the guard, so treat a stale one as a real gap.\n"
+      + _calendar_brief(calendar_state) + "\n\n"
       "## COIN-LIST CURATION (your core job — act, don't just suggest):\n"
       "- FIRST call list_coins. Its quarantined array is an adaptive, expiring blocklist derived from failed volatility/data "
       "checks. Exclude those symbols from deep validation and add_coin attempts until retryAfter; do not spend tools proving "

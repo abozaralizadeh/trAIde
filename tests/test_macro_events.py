@@ -113,3 +113,66 @@ def test_past_events_are_swept_but_stay_available_for_the_after_window(tmp_path)
   data["macro_events"][0]["ts"] = now - 3 * 86400     # long gone
   m._write(m._prune(data))
   assert m.macro_events() == []
+
+
+# --- code decides when the calendar needs a refresh ------------------------------------------------
+
+def test_refresh_reason_covers_never_stale_and_dry():
+  """2026-09-23: the calendar sat 67h stale holding ONE event, because refreshing was left to the model
+  and research never ran while positions were open. Code now decides."""
+  from src.regime import macro_calendar_refresh_reason as reason
+  now = 1_800_000_000.0
+  future = [{"name": "NFP", "ts": now + 9 * 86400, "impact": "high"}]
+  assert reason([], None, now) == "never refreshed"
+  assert reason(future, now - 67 * 3600, now) == "stale (67h old)"
+  assert reason([{"name": "x", "ts": now - 60}], now - 3600, now) == "no upcoming events"
+  assert reason(future, now - 3600, now) is None
+
+
+def test_refresh_reason_tolerates_junk():
+  from src.regime import macro_calendar_refresh_reason as reason
+  now = 1_800_000_000.0
+  assert reason(None, "bad", now) == "never refreshed"
+  assert reason(["junk", {"ts": "x"}], now - 60, now) == "no upcoming events"
+  assert reason([], now - 60, "not-a-time") is None
+
+
+def test_calendar_state_returns_the_whole_store_unfiltered(tmp_path):
+  """macro_events() windows to 72h; the refresh decision needs everything, e.g. an event 9 days out."""
+  m = MemoryStore(str(tmp_path / "m.json"))
+  now = time.time()
+  m.record_macro_events([{"name": "FOMC", "ts": now + 30 * 86400, "impact": "high"}])
+  st = m.macro_calendar_state()
+  assert [e["name"] for e in st["events"]] == ["FOMC"]
+  assert st["updated"] and abs(st["updated"] - now) < 5
+
+
+def test_calendar_brief_tells_the_research_agent_what_is_stored():
+  from src.agent import _calendar_brief
+  now = time.time()
+  line = _calendar_brief({"events": [{"name": "US CPI", "ts": now + 86400}], "updated": now - 67 * 3600})
+  assert "67h ago" in line and "1 upcoming" in line and "US CPI" in line
+  assert "never" in _calendar_brief({"events": [], "updated": None})
+  assert _calendar_brief(None).startswith("- CURRENT CALENDAR")
+
+
+def test_the_calendar_refresh_is_wired_and_not_blocked_by_open_positions():
+  """The whole bug was an orchestration gap, so assert the ORCHESTRATION, in source. A pure-function
+  test passes even if main.py never calls it — the lesson from the TF-conflict freeze."""
+  from pathlib import Path
+  root = Path(__file__).resolve().parents[1] / "src"
+  main = (root / "main.py").read_text()
+  agent = (root / "agent.py").read_text()
+  i = main.find("refresh_calendar_for_run = bool(")
+  assert i != -1, "main.py must decide the calendar refresh"
+  decision = main[i:i + 250]
+  assert "open_book" not in decision, "calendar refresh must NOT be vetoed by open positions"
+  assert "_CALENDAR_RETRY_SEC" in decision, "a failing model must be retried on a cooldown, not every poll"
+  assert "refresh_calendar=refresh_calendar_for_run" in main
+  assert "calendar_state=_cal" in main
+  j = agent.find("if refresh_calendar:")
+  assert j != -1, "agent.py must handle the refresh flag"
+  scoped = agent[j:j + 900]
+  assert "Research Agent" in scoped and "log_macro_calendar" in scoped
+  assert "NOT" in scoped and "coin list" in scoped, "the calendar handoff must be scoped away from the coin list"
+  assert "_calendar_brief(calendar_state)" in agent, "the Research Agent must see what is stored"

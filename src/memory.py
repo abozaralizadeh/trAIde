@@ -1411,6 +1411,13 @@ class MemoryStore:
         out.append(row)
     return sorted(out, key=lambda e: e["ts"])
 
+  def macro_calendar_state(self) -> Dict[str, Any]:
+    """The whole stored calendar and its refresh time, unfiltered — for deciding whether to refresh."""
+    with self._lock:
+      data = self._read()
+    rows = [dict(e) for e in (data.get("macro_events") or []) if isinstance(e, dict)]
+    return {"events": sorted(rows, key=lambda e: e.get("ts") or 0), "updated": data.get("macro_events_updated")}
+
   def macro_calendar_age_hours(self) -> Optional[float]:
     """Hours since the calendar was last refreshed, or None if never — so staleness is visible."""
     with self._lock:

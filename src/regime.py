@@ -628,6 +628,52 @@ def macro_event_window(
   return best[1] if best else None
 
 
+def macro_calendar_refresh_reason(
+  events,
+  updated_ts,
+  now_ts,
+  *,
+  max_age_hours: float = 24.0,
+) -> str | None:
+  """Why the macro calendar needs refreshing now, or None when it is current.
+
+  The schedule itself is published a year ahead, so a refresh is only needed to roll the window
+  forward and pick up the rare rescheduling — daily is enough, which is where ``max_age_hours``
+  comes from; it is a property of how the data is published, not of any market regime.
+
+  This decision lives in CODE because leaving it to the model failed in a specific, self-reinforcing
+  way (2026-09-23): the refresh only ran when the Research Agent ran, research is forced only after
+  several runs with no trade, and forcing is blocked while positions are open. During a winning
+  trend the book is almost never flat, so research never ran and the calendar sat 67h stale holding a
+  single event — the better the bot traded, the blinder the macro guard became.
+
+  Returns "never refreshed", "stale (NNh old)", or "no upcoming events" — or None.
+  """
+  try:
+    now = float(now_ts)
+  except (TypeError, ValueError):
+    return None
+  try:
+    updated = float(updated_ts) if updated_ts is not None else None
+  except (TypeError, ValueError):
+    updated = None
+  if updated is None or not math.isfinite(updated) or updated <= 0:
+    return "never refreshed"
+  age_h = (now - updated) / 3600.0
+  if age_h > float(max_age_hours):
+    return f"stale ({age_h:.0f}h old)"
+  upcoming = 0
+  for row in events or []:
+    try:
+      if isinstance(row, dict) and float(row.get("ts")) > now:
+        upcoming += 1
+    except (TypeError, ValueError):
+      continue
+  if upcoming == 0:
+    return "no upcoming events"
+  return None
+
+
 def macro_event_entry_block(window, *, enabled: bool = True) -> str | None:
   """Reason to decline NEW risk right now because a scheduled release is imminent, else None.
 

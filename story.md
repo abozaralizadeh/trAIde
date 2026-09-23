@@ -45,6 +45,7 @@ Save under `docs/story/` and link here. Dashboard discloses % and R only — nev
 | Sep 22 | Model's own close on a long→short flip was invisible to its scoreboard (stamped with the new short's lifecycle). | 1 case, fixed |
 | Sep 22 | Trailing stop cut 30 winners early in the rally — but every exit is trend-tagged; no chop data yet, so no adaptive trail shipped. | −10.77R vs brackets, all `trending` |
 | Sep 22 | Restart audit: only one thing lived solely in-process — the protection R-anchor. A winner already at breakeven before a restart lost its trail for good. Now re-seeded from the recorded trade. | 1 silent failure mode, closed |
+| Sep 23 | "The better the bot traded, the blinder its macro guard became." Winning = always holding positions = research never ran = calendar never refreshed. Code now schedules it. | 67h stale, 1 event; CPI + FOMC missing |
 
 ## Where it stands (Sep 20, 2026)
 

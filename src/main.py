@@ -23,7 +23,7 @@ from .dashboard_publisher import DashboardPublisher
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
 from .memory import MemoryStore
 from .protection import ProtectionManager
-from .regime import carry_hold_deadline, held_position_noise_pct
+from .regime import carry_hold_deadline, held_position_noise_pct, macro_calendar_refresh_reason
 from .safety import TradingSafetyState
 from .telegram import TelegramNotifier
 from .utils import normalize_symbol
@@ -31,6 +31,7 @@ from .utils import normalize_symbol
 logger = logging.getLogger(__name__)
 
 _AGENT_RUN_TIMEOUT_SEC = 20 * 60
+_CALENDAR_RETRY_SEC = 6 * 3600   # min gap between calendar-refresh attempts if one fails
 _AGENT_SHUTDOWN_GRACE_SEC = 30
 _PRICE_NOISE_MULTIPLIER = 4.0
 # Ceiling on the adaptive trigger, as a multiple of the base trigger. 2.0 keeps worst-case blindness
@@ -859,6 +860,13 @@ async def trading_loop(
   consecutive_no_trade_runs = 0  # runs where the agent placed no order (drives forced research)
   force_research = False         # when True, next agent run must hand off to Research first
   last_forced_research_ts = 0.0  # wall-clock of the last forced research handoff (cooldown gate)
+  # Calendar-only research is decided by CODE and, unlike the whole-market overhaul, is allowed while
+  # positions are open: it is one web lookup and one tool call, and it never touches the coin list, so
+  # neither harm the flat-only rule guards against (long protection blind spots, add-on temptation)
+  # applies. Retried at most every _CALENDAR_RETRY_SEC if a run fails to refresh — roughly four
+  # attempts a day, so a model that keeps missing it cannot turn this into a cost leak.
+  last_calendar_attempt_ts = 0.0
+  agent_task_calendar_refresh = False
   pending_trigger_moves: Dict[str, float] = {}  # strongest move per symbol, retained until reviewed
   pending_agent_triggers: set[str] = set()
   agent_task: asyncio.Task | None = None
@@ -1211,6 +1219,15 @@ async def trading_loop(
 
         threshold = cfg.trading.research_handoff_after_no_trade_runs
         research_cooldown_sec = cfg.trading.research_handoff_cooldown_min * 60
+        if agent_task_calendar_refresh:
+          last_calendar_attempt_ts = time.time()
+          _cal_after = memory.macro_calendar_state()
+          _still = macro_calendar_refresh_reason(_cal_after["events"], _cal_after["updated"], time.time())
+          if _still:
+            logger.warning("MACRO CALENDAR: refresh run finished but calendar is still %s; retrying in %.0fh.",
+                           _still, _CALENDAR_RETRY_SEC / 3600)
+          else:
+            logger.info("MACRO CALENDAR: refreshed (%d events stored).", len(_cal_after["events"]))
         if agent_task_forced_research:
           consecutive_no_trade_runs = 0
           force_research = False
@@ -1711,6 +1728,15 @@ async def trading_loop(
         if kind:
           events_for_agent.setdefault(kind, []).append(event.get("payload"))
       force_research_for_run = bool(force_research and not open_book)
+      _cal = memory.macro_calendar_state()
+      _cal_reason = macro_calendar_refresh_reason(_cal["events"], _cal["updated"], time.time())
+      refresh_calendar_for_run = bool(
+        cfg.regime.macro_events_enabled and _cal_reason
+        and time.time() - last_calendar_attempt_ts >= _CALENDAR_RETRY_SEC
+      )
+      if refresh_calendar_for_run:
+        logger.info("MACRO CALENDAR: %s — this run will hand off to Research for a calendar-only refresh.", _cal_reason)
+      agent_task_calendar_refresh = refresh_calendar_for_run
       agent_task_triggers = agent_triggers
       agent_task_forced_research = force_research_for_run
       agent_task_token = run_token
@@ -1722,6 +1748,8 @@ async def trading_loop(
         run_trading_agent, cfg, snapshot, kucoin, kucoin_futures, azure_client, ls_client,
         recent_fills=events_for_agent or None,
         force_research=force_research_for_run,
+        refresh_calendar=refresh_calendar_for_run,
+        calendar_state=_cal,
         safety_state=safety,
         entry_token=run_token,
       ))
