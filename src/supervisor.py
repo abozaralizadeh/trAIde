@@ -14,12 +14,68 @@ from .config import AppConfig
 from .llm_runtime import STATELESS_RUN_CONFIG
 from .conversation_memory import ConversationMemory
 from .kucoin import KucoinClient, KucoinFuturesClient
+from .edge import (
+  annotate_family_stakes,
+  confidence_edge_stats,
+  gate_scoreboard_from_store,
+  probe_cost_pct,
+  safe_family_horizons,
+  signal_edge_stats,
+)
 from .memory import MemoryStore
 
 logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SRC_DIR = Path(__file__).resolve().parent
+
+
+def edge_scoreboard(memory: Any, cfg: Any) -> Dict[str, Any]:
+  """The bot's own measured scoreboard, as the owner's Supervisor sees it.
+
+  Per playbook and per side: n, net of cost, SE, t, verdict, and the standAside / stake the order path
+  would apply right now to an entry on each side (``edge.annotate_family_stakes`` — the same
+  functions, so no second rule; a pooled row is standAside only when both sides are). Plus, per model,
+  whether stated confidence ranks the calls (``edge.confidence_edge_stats``). This answers "why did it
+  refuse continuation?" and "does the new model's confidence mean anything?" without reading the raw
+  memory file. Cost is ``edge.probe_cost_pct`` — the one 2 x (taker + measured slippage) basis the
+  dashboard and the gate scoreboard use.
+
+  ``by_market_state`` and other models' ``confidenceEdge`` rows are report-only evidence for the OWNER:
+  the Trading Agent is deliberately never shown them (one regime's evidence), so the Supervisor must not
+  relay them into a note unless the owner explicitly asks. Never raises — returns {"error": ...} instead.
+  """
+  try:
+    cost = probe_cost_pct(memory, cfg)
+    probes = memory.signal_probes(limit=0)
+    horizons = safe_family_horizons(memory)
+    # The owner's view also carries the report-only split by market state (breadth24 terciles); the
+    # Trading Agent's copy never does — no per-state record reaches the model.
+    stats = signal_edge_stats(probes, cost_pct=cost, family_horizons=horizons, market_state_split=True)
+    explore = float(getattr(getattr(cfg, "edge", None), "explore_unproven_family_factor", 0.4) or 0.0)
+    stand_aside = bool(getattr(getattr(cfg, "edge", None), "stand_aside_no_edge_family", True))
+    return {
+      "signalEdge": annotate_family_stakes(stats, explore_factor=explore, stand_aside_enabled=stand_aside),
+      "familyHorizonsMin": horizons,
+      "confidenceEdge": confidence_edge_stats(probes, cost_pct=cost, family_horizons=horizons),
+    }
+  except Exception as exc:
+    return {"error": str(exc)}
+
+
+def gate_scoreboard_report(memory: Any, cfg: Any) -> Dict[str, Any]:
+  """What each directional gate blocks against what it allows, for the owner. REPORT-ONLY.
+
+  ``edge.gate_scoreboard`` over the store (gate-state day cells as the headline, hard refusals vs the
+  admitted calls beside it), at the same cost basis as the edge scoreboard. The Trading Agent never sees
+  it — a 'this gate's refusals pay' line would invite relabelling calls past the declared-setup hatches —
+  so the Supervisor must not relay a gate verdict to it as a note unless the owner explicitly asks.
+  Never raises — returns {"error": ...} instead.
+  """
+  try:
+    return gate_scoreboard_from_store(memory, cost_pct=probe_cost_pct(memory, cfg))
+  except Exception as exc:
+    return {"error": str(exc)}
 
 
 def _build_openai_client(cfg: AppConfig) -> AsyncAzureOpenAI:
@@ -118,6 +174,23 @@ def run_supervisor_agent(
   async def get_performance_summary() -> Dict[str, Any]:
     """Get trading performance summary (win rate, PnL, trade counts)."""
     return memory.performance_summary()
+
+  @function_tool
+  async def get_edge_scoreboard() -> Dict[str, Any]:
+    """The bot's measured edge per playbook AND per side (n, net of cost, SE, t, verdict, and the
+    standAside/stake the order path applies now to an entry on each side), plus per-model confidence
+    informativeness. by_market_state and other models' confidenceEdge rows are report-only evidence for
+    the OWNER: never put a per-market-state verdict or another model's confidence verdict in a note to
+    the trading agent unless the owner explicitly asks — it is one regime's evidence, and the trading
+    agent is deliberately never shown it."""
+    return edge_scoreboard(memory, cfg)
+
+  @function_tool
+  async def get_gate_scoreboard() -> Dict[str, Any]:
+    """REPORT-ONLY: per directional gate and side, what the gate blocks vs what it allows (net of cost,
+    matched by day, day-clustered SE, verdict only at n>=20 over >=3 days) — from model-independent gate-state readings
+    and from the calls each gate hard-refused. Never relay a gate verdict to the trading agent unasked."""
+    return gate_scoreboard_report(memory, cfg)
 
   @function_tool
   async def get_positions() -> Dict[str, Any]:
@@ -385,6 +458,17 @@ def run_supervisor_agent(
     "## Capabilities:\n"
     "- Read and search application logs\n"
     "- Read agent memory (trades, decisions, plans, positions, performance)\n"
+    "- Read the measured edge scoreboard (get_edge_scoreboard): per playbook and per side, why a family is "
+    "at zero stake, and whether each model's stated confidence ranks its calls. Its by_market_state split "
+    "and other models' confidenceEdge rows are report-only evidence for the OWNER: do not put a "
+    "per-market-state verdict or another model's confidence verdict in a note to the trading agent unless "
+    "the owner explicitly asks — it is one regime's evidence, and the trading agent is deliberately never "
+    "shown it\n"
+    "- Read the gate scoreboard (get_gate_scoreboard): what each directional gate (daily exhaustion, "
+    "opposing daily, 1h alignment, timeframe conflict, BTC correlation, 24h move, bench, confidence floor) "
+    "blocks against what it allows. It is report-only evidence for the OWNER: do not pass a gate verdict "
+    "to the trading agent in a note unless the owner explicitly asks — a 'this gate costs money' line in "
+    "its prompt invites relabelling calls past the gates, and a verdict needs months across regimes\n"
     "- Read source code files\n"
     "- View non-secret configuration\n"
     "- Fetch live KuCoin account balances and positions\n"
@@ -430,6 +514,8 @@ def run_supervisor_agent(
       search_logs,
       read_memory,
       get_performance_summary,
+      get_edge_scoreboard,
+      get_gate_scoreboard,
       get_positions,
       get_recent_decisions,
       get_recent_trades,

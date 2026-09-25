@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import signal
 import sys
 import threading
@@ -17,13 +18,26 @@ from .agent import (
   TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client,
   _to_futures_symbol,
 )
-from .analytics import flow_reading_max_age_sec, taker_flow_summary
+from .analytics import flow_reading_max_age_sec, market_state, taker_flow_summary
 from .config import load_config
 from .dashboard_publisher import DashboardPublisher
+from .edge import gate_scoreboard_from_store, gate_scoreboard_log_line, gate_state_cells, probe_cost_pct
 from .kucoin import KucoinClient, KucoinFuturesClient, KucoinAccount, KucoinTicker
-from .memory import MemoryStore
-from .protection import ProtectionManager
-from .regime import carry_hold_deadline, held_position_noise_pct, macro_calendar_refresh_reason
+from .memory import (
+  EXIT_PROBE_EXPIRE_HOURS,
+  MemoryStore,
+  _lease_settle_tolerance_sec,
+  funding_received_from_history,
+  position_open_time,
+  sanitize_market_state,
+)
+from .position_context import carry_refresh_targets, exit_probe_inputs, trade_context
+from .protection import ProtectionManager, replay_protection_stack
+from .protection import _replay_bar as _validated_futures_bar
+from .regime import (
+  first_settlement_after, first_settlement_in_history, funding_clock_from_rate, held_position_noise_pct,
+  macro_calendar_refresh_reason,
+)
 from .safety import TradingSafetyState
 from .telegram import TelegramNotifier
 from .utils import normalize_symbol
@@ -151,6 +165,509 @@ def _crossed_auto_triggers(
     if (condition == "above" and current >= target) or (condition == "below" and current <= target):
       crossed.append((trigger, current))
   return crossed
+
+
+# ── Measurement I/O on the survival thread: bounded per poll, backed off across polls (2026-09-25) ────
+#
+# Probe settlement, the stack replays and the market-state refresh run in the poll-loop thread right
+# after the protection pass. Settlement used to read the snapshot tickers (zero calls); on futures marks
+# it makes serial public calls per due symbol, and with no cap, no deadline and no memory of failures a
+# hanging endpoint cost up to 20 symbols x 15s per poll — delaying the NEXT poll's ratchet, trail and
+# naked-position repair (the scratch log already showed ~78s polls against POLL_INTERVAL_SEC=60). Three
+# bounds, all derived from the loop's own cadence rather than tuned: a per-poll wall-clock budget (a
+# quarter of the poll interval), a per-symbol retry backoff that doubles from one poll interval up to the
+# row's remaining settle tolerance, and a short HTTP timeout for these reads only. Deferred rows simply
+# wait; the existing tolerance rules write them off honestly.
+
+_MEASURE_BUDGET_FRACTION = 0.25     # share of the poll interval measurement I/O may take per poll
+_MEASURE_TIMEOUT_SEC = 5.0          # HTTP timeout for measurement reads (orders/positions keep 15s)
+
+
+class _MeasurementBudget:
+  """A per-poll wall-clock budget for measurement I/O. ``spent()`` is checked before every exchange call;
+  ``defer()`` counts a call skipped because the budget ran out (logged once per poll by the loop)."""
+
+  def __init__(self, seconds: float, *, clock: Callable[[], float] = time.monotonic) -> None:
+    self._clock = clock
+    self.seconds = max(0.0, float(seconds))
+    self._deadline = clock() + self.seconds
+    self.deferred = 0
+
+  def spent(self) -> bool:
+    return self._clock() >= self._deadline
+
+  def defer(self, n: int = 1) -> None:
+    self.deferred += int(n)
+
+
+def _budget_spent(budget: Optional[_MeasurementBudget]) -> bool:
+  """True (and counted) when a budget is given and exhausted; no budget = unbounded (tests, scripts)."""
+  if budget is not None and budget.spent():
+    budget.defer()
+    return True
+  return False
+
+
+class _MeasureBackoff:
+  """Loop-owned per-key retry backoff for measurement fetches: ``{key: (retry_after, failures)}``.
+
+  A failing symbol is re-asked after one poll interval, then 2, 4, 8... — capped at the remaining
+  settle tolerance of the row that needs it (``cap_sec``), because past that the row is written off
+  anyway. Success clears the key. Without it a hanging mark endpoint was re-asked every 60s for 9.6h
+  (an unresolved exit probe) or 48 polls (a 240m horizon). Pure bookkeeping; never raises.
+  """
+
+  def __init__(self, base_sec: float) -> None:
+    self.base = max(1.0, float(base_sec))
+    self._state: Dict[Any, tuple[float, int]] = {}
+
+  def ready(self, key: Any, now: float) -> bool:
+    got = self._state.get(key)
+    return got is None or float(now) >= got[0]
+
+  def failed(self, key: Any, now: float, cap_sec: Optional[float] = None) -> float:
+    failures = (self._state.get(key) or (0.0, 0))[1] + 1
+    delay = self.base * (2 ** min(failures - 1, 30))
+    if cap_sec is not None and math.isfinite(float(cap_sec)):
+      delay = min(delay, max(self.base, float(cap_sec)))
+    self._state[key] = (float(now) + delay, failures)
+    return delay
+
+  def ok(self, key: Any) -> None:
+    self._state.pop(key, None)
+
+
+def _measurement_client(kucoin_futures, timeout_sec: float = _MEASURE_TIMEOUT_SEC):
+  """The futures client with a short HTTP timeout for measurement reads (``with_timeout``), or the client
+  itself when it cannot make one (fakes, older clients). Never raises."""
+  if kucoin_futures is None:
+    return None
+  make = getattr(kucoin_futures, "with_timeout", None)
+  if callable(make):
+    try:
+      return make(timeout_sec)
+    except Exception as exc:
+      logger.warning("MEASUREMENT: short-timeout client unavailable (%s) — using the default timeout", exc)
+  return kucoin_futures
+
+
+def _futures_settlement_marks(symbols, kucoin_futures, snapshot, *, budget: Optional[_MeasurementBudget] = None,
+                              backoff: Optional[_MeasureBackoff] = None, now: Optional[float] = None
+                              ) -> Dict[str, float]:
+  """FUTURES mark prices for the symbols whose probes settle this poll — never the spot ticker.
+
+  A held position's own ``markPrice`` (already in the snapshot) is used first; anything else costs one
+  small public ``get_mark_price`` call, made once per symbol per poll and only for symbols that are
+  actually due, so this is a handful of calls rather than a 1.4 MB ``/contracts/active`` pull every
+  minute. A symbol whose mark cannot be read is left OUT — never filled from spot, because a spot
+  price against a futures base is exactly the basis error this map exists to remove. Its probes wait
+  and the settle tolerance records them as unmeasured if the mark never comes. Failures are isolated
+  per symbol and logged at WARNING: a silent settle outage freezes every edge verdict (2026-09).
+
+  ``symbols`` may be a ``{symbol: cutoff_ts}`` map (memory.settlement_cutoffs): symbols are then asked
+  in order of their earliest cutoff, so a limited ``budget`` goes to the measurements that would be
+  lost first, and a failing symbol's ``backoff`` is capped at its remaining tolerance. Once the budget
+  is spent the remaining symbols wait for a later poll.
+  """
+  now_ts = time.time() if now is None else float(now)
+  cutoffs = dict(symbols) if isinstance(symbols, dict) else {s: float("inf") for s in (symbols or ())}
+  marks: Dict[str, float] = {}
+  held: Dict[str, float] = {}
+  for position in getattr(snapshot, "futures_positions", None) or []:
+    if not isinstance(position, dict):
+      continue
+    symbol = normalize_symbol(position.get("symbol") or "")
+    try:
+      mark = float(position.get("markPrice") or 0)
+    except (TypeError, ValueError):
+      continue
+    if symbol and math.isfinite(mark) and mark > 0:
+      held[symbol] = mark
+  for symbol in sorted((s for s in cutoffs if s), key=lambda s: (cutoffs[s], s)):
+    if symbol in held:
+      marks[symbol] = held[symbol]
+      continue
+    if kucoin_futures is None:
+      continue
+    futures_symbol = _to_futures_symbol(symbol)
+    if not futures_symbol:
+      continue
+    key = ("mark", futures_symbol)
+    if backoff is not None and not backoff.ready(key, now_ts):
+      continue
+    if _budget_spent(budget):
+      continue
+    try:
+      value = float((kucoin_futures.get_mark_price(futures_symbol) or {}).get("value") or 0)
+    except Exception as exc:
+      retry = backoff.failed(key, now_ts, cap_sec=cutoffs[symbol] - now_ts) if backoff is not None else None
+      logger.warning("PROBE SETTLE: futures mark for %s unavailable (%s) — its due probes wait%s "
+                     "and are written off as unmeasured if it never comes", futures_symbol, exc,
+                     f" (next try in {retry:.0f}s)" if retry is not None else "")
+      continue
+    if backoff is not None:
+      backoff.ok(key)
+    if math.isfinite(value) and value > 0:
+      marks[symbol] = value
+  return marks
+
+
+class _PollFundingCredit:
+  """``funding_received(symbol, side, t0, t1)`` for one poll: lazy, memoized per symbol, never raises.
+
+  Fetches ``get_funding_rate_history`` for a symbol the first time a probe on it settles this poll and
+  reuses it for every other probe on that symbol (re-fetching only if a later probe needs an earlier
+  start). A symbol whose fetch fails is not retried inside the same poll. Returns the funding a
+  position on ``side`` would have RECEIVED over (t0, t1] as a fraction of notional — longs receive
+  ``-rate``, shorts ``+rate`` — or None when it cannot be known (the probe then carries no credit).
+  """
+
+  _FAILED = object()
+
+  def __init__(self, kucoin_futures, now: float, *, budget: Optional[_MeasurementBudget] = None,
+               backoff: Optional[_MeasureBackoff] = None) -> None:
+    self._client = kucoin_futures
+    self._now = float(now)
+    self._memo: Dict[str, Any] = {}
+    self._budget = budget
+    self._backoff = backoff
+
+  def __call__(self, symbol: str, side: str, t0: float, t1: float) -> Optional[float]:
+    if self._client is None:
+      return None
+    futures_symbol = _to_futures_symbol(normalize_symbol(symbol or ""))
+    if not futures_symbol:
+      return None
+    start_ms = int(float(t0) * 1000)
+    cached = self._memo.get(futures_symbol)
+    if cached is self._FAILED:
+      return None
+    if cached is None or cached[0] > start_ms:
+      key = ("funding", futures_symbol)
+      if self._backoff is not None and not self._backoff.ready(key, self._now):
+        return None       # unknown this poll: memory keeps f{h} None and backfills it later
+      if _budget_spent(self._budget):
+        return None
+      try:
+        rows = self._client.get_funding_rate_history(
+          futures_symbol, start_at=start_ms, end_at=int((self._now + 60) * 1000),
+        )
+        # A non-list payload is NOT "no settlements": caching [] here once stamped a silent 0.0.
+        if not isinstance(rows, list):
+          raise ValueError(f"funding history payload is {type(rows).__name__}, not a list")
+      except Exception as exc:
+        if self._backoff is not None:
+          self._backoff.failed(key, self._now)
+        logger.warning("PROBE FUNDING: history for %s unavailable (%s) — the credit stays unknown and is "
+                       "backfilled on a later poll", futures_symbol, exc)
+        self._memo[futures_symbol] = self._FAILED
+        return None
+      if self._backoff is not None:
+        self._backoff.ok(key)
+      cached = (start_ms, rows)
+      self._memo[futures_symbol] = cached
+    return funding_received_from_history(cached[1], side, t0, t1)
+
+
+class _PollLeaseExtremes:
+  """``lease_extremes(symbol, t0, t1)`` for one poll: the ``(low, high)`` a contract traded over a probe's
+  order lease. Never raises.
+
+  Read from 1m FUTURES bars whose OPEN time falls in ``[t0, t1)`` — the lease's own minutes; the partial
+  minute before the call is left out, so a low printed just before the call is never counted as a fill.
+  Every bar must prove its column order (``protection._replay_bar``: high = row max, low = row min —
+  futures rows are ``[ts, open, HIGH, LOW, close]``, and a spot-order misread once reversed a finding).
+  One paged fetch per symbol per poll serves every due probe on it; a symbol that fails is not retried
+  inside the same poll (WARNING) and simply waits — memory writes it off after its tolerance. Returns
+  None when there is no bar inside the window yet.
+
+  Why a probe needs this (2026-09-25): the execution map could only see the depths the model actually
+  rested at, so once it stops resting deep, the deep buckets go blind — exactly the regime (chop,
+  range-edge fades) where deep limits might pay again. With the lease low/high, `edge.execution_map`
+  scores EVERY call at EVERY depth.
+  """
+
+  _FAILED = object()
+
+  def __init__(self, kucoin_futures, *, budget: Optional[_MeasurementBudget] = None,
+               backoff: Optional[_MeasureBackoff] = None, now: Optional[float] = None) -> None:
+    self._client = kucoin_futures
+    self._memo: Dict[str, Any] = {}
+    self._budget = budget
+    self._backoff = backoff
+    self._now = time.time() if now is None else float(now)
+
+  def __call__(self, symbol: str, t0: float, t1: float) -> Optional[tuple]:
+    if self._client is None:
+      return None
+    futures_symbol = _to_futures_symbol(normalize_symbol(symbol or ""))
+    if not futures_symbol:
+      return None
+    lo_s, hi_s = float(t0), float(t1)
+    cached = self._memo.get(futures_symbol)
+    if cached is self._FAILED:
+      return None
+    if cached is None or cached[0] > lo_s or cached[1] < hi_s:
+      start = lo_s if cached is None else min(lo_s, cached[0])
+      end = hi_s if cached is None else max(hi_s, cached[1])
+      key = ("lease", futures_symbol)
+      if self._backoff is not None and not self._backoff.ready(key, self._now):
+        return None
+      if _budget_spent(self._budget):
+        return None
+      try:
+        bars = [_validated_futures_bar(row) for row in _fetch_futures_1m_bars(
+          self._client, futures_symbol, start, end, budget=self._budget)]
+      except _BudgetSpent:
+        return None       # not a failure: the rest waits for a later poll
+      except Exception as exc:
+        if self._backoff is not None:
+          # Capped at the lease's own retry window: past it the probe's extremes are written off.
+          self._backoff.failed(key, self._now, cap_sec=_lease_settle_tolerance_sec((hi_s - lo_s) / 60.0))
+        logger.warning("PROBE LEASE: 1m futures bars for %s unavailable (%s) — lease extremes wait",
+                       futures_symbol, exc)
+        self._memo[futures_symbol] = self._FAILED
+        return None
+      if self._backoff is not None:
+        self._backoff.ok(key)
+      cached = (start, end, bars)
+      self._memo[futures_symbol] = cached
+    inside = [bar for bar in cached[2] if lo_s <= bar[0] < hi_s]
+    if not inside:
+      return None
+    return min(bar[3] for bar in inside), max(bar[2] for bar in inside)
+
+
+def _settle_probes_on_futures(memory, kucoin_futures, snapshot, spot_prices, now: float | None = None, *,
+                              budget: Optional[_MeasurementBudget] = None,
+                              backoff: Optional[_MeasureBackoff] = None) -> Dict[str, float]:
+  """Settle signal and exit probes on the market that actually fills: the FUTURES MARK, plus funding.
+
+  Until 2026-09-25 the loop passed its SPOT ticker map (``live_prices``) straight into both settle
+  steps while the probe base was the futures mark. On extreme-funding coins the perp/spot basis was
+  then scored as a directional return: ONE-USDT on 09-20 traded ~0.0050 spot vs ~0.0038 perp, its
+  probes recorded +25% at 5m on a +2.5% contract move, and `funding_carry` read t=1.90 ("paying",
+  sized 0.94x) where futures settlement gives t~0.90 — a coin flip on the stand-aside line. Every other
+  family was within ~0.06% either way, which is how the bias hid.
+
+  ``spot_prices`` still settles the rare probe whose base fell back to spot (``priceSource`` spot) and
+  is still what the auto-triggers read — this step only takes over settlement. Total by construction:
+  every stage is isolated and logged at WARNING, nothing here can alter a trading decision or raise
+  into the poll loop. Returns the futures mark map it settled with (for logging and tests).
+
+  ``budget`` / ``backoff`` (loop-owned) bound the exchange calls this makes on the survival thread: the
+  most urgent symbols first, nothing once the per-poll budget is spent, and a failing symbol re-asked
+  on a doubling backoff instead of every poll (see ``_MeasurementBudget``).
+  """
+  now_ts = time.time() if now is None else float(now)
+  marks: Dict[str, float] = {}
+  try:
+    cutoffs = getattr(memory, "settlement_cutoffs", None)
+    due = cutoffs(now_ts) if callable(cutoffs) else memory.symbols_due_for_settlement(now_ts)
+  except Exception as exc:
+    logger.warning("PROBE SETTLE: could not list due probes (%s) — settling with no futures marks", exc)
+    due = set()
+  try:
+    marks = _futures_settlement_marks(due, kucoin_futures, snapshot, budget=budget, backoff=backoff, now=now_ts)
+  except Exception as exc:
+    logger.warning("PROBE SETTLE: futures mark map failed (%s) — due probes wait this poll", exc)
+    marks = {}
+  funding = (_PollFundingCredit(kucoin_futures, now_ts, budget=budget, backoff=backoff)
+             if kucoin_futures is not None else None)
+  # Each probe's order-lease low/high, for the execution map's every-call-every-depth counterfactual.
+  lease = (_PollLeaseExtremes(kucoin_futures, budget=budget, backoff=backoff, now=now_ts)
+           if kucoin_futures is not None else None)
+  # Separate try blocks: a failing signal settle must not also cost the exit probes their poll.
+  try:
+    memory.settle_signal_probes(marks, spot_prices=spot_prices, funding_received=funding,
+                                lease_extremes=lease)
+  except Exception as exc:
+    logger.warning("SIGNAL PROBE settle failed (%s) — edge verdicts go stale while this repeats", exc)
+  try:
+    memory.settle_exit_probes(marks)
+  except Exception as exc:
+    logger.warning("EXIT PROBE settle failed (%s) — exitDiscipline goes stale while this repeats", exc)
+  # Gate-state rows whose every horizon is now stamped fold into their day cells (the gate scoreboard's
+  # long-horizon store); edge.gate_state_cells owns the return arithmetic and the de-overlap. Own try.
+  try:
+    memory.fold_settled_gate_states(gate_state_cells)
+  except Exception as exc:
+    logger.warning("GATE STATE FOLD failed (%s) — settled state rows wait for the next poll", exc)
+  return marks
+
+
+_GATE_SCOREBOARD_LOG_SEC = 3600   # the report-only gate scoreboard is logged at most this often
+
+
+def _log_gate_scoreboard(memory, cfg, last: Dict[str, float], now: float | None = None) -> bool:
+  """At most once an hour, one INFO line: what each directional gate blocks vs what it allows.
+
+  REPORT-ONLY and deliberately NOT in the trading prompt (edge.gate_scoreboard says why). The line is
+  what lets the operator see — from the log alone — that gate-state rows are still flowing (a stalled
+  probe feed froze every edge verdict for days in Sep 2026) and how far each gate is from a verdict.
+  Returns True when it logged. Total: never raises into the loop.
+  """
+  now_ts = time.time() if now is None else float(now)
+  if now_ts - float(last.get("ts") or 0.0) < _GATE_SCOREBOARD_LOG_SEC:
+    return False
+  last["ts"] = now_ts
+  try:
+    board = gate_scoreboard_from_store(memory, cost_pct=probe_cost_pct(memory, cfg))
+    logger.info("GATE SCOREBOARD (report-only): %s", gate_scoreboard_log_line(board))
+  except Exception as exc:
+    logger.warning("GATE SCOREBOARD log failed (%s)", exc)
+  return True
+
+
+# Live-exit-stack replay of the model's early closes (exitDiscipline's benchmark), 2026-09-25.
+_STACK_MAX_PER_POLL = 2              # replays per poll: a few small kline pages each, after protection
+_STACK_KLINE_PAGE_BARS = 200         # KuCoin futures kline page size (1m bars per request)
+_STACK_RETRY_SEC = 15 * 60           # a failed replay is retried at most this often
+_STACK_GIVE_UP_SEC = 24 * 3600       # ...and recorded as unavailable this long after its horizon
+_STACK_MIN_COVERAGE_SEC = 15 * 60    # a replay whose bars stop this far short of the horizon is incomplete
+
+
+class _BudgetSpent(RuntimeError):
+  """The per-poll measurement budget ran out mid-fetch: not a failure, the work resumes next poll."""
+
+
+def _fetch_futures_1m_bars(kucoin_futures, fsym: str, start_s: float, end_s: float, *,
+                           budget: Optional[_MeasurementBudget] = None) -> list:
+  """Raw 1m FUTURES kline rows covering [start_s, end_s], paged, de-duplicated by timestamp.
+
+  Rows are returned as the exchange sends them ([ts_ms, open, HIGH, LOW, close, ...]);
+  replay_protection_stack validates each one's column order. Raises on any page failure — a partial
+  window must never be replayed as if it were complete — and raises ``_BudgetSpent`` when the per-poll
+  measurement budget runs out before the next page (a long hold's replay can need tens of pages).
+  """
+  page = _STACK_KLINE_PAGE_BARS * 60
+  by_ts: Dict[float, list] = {}
+  t = int(start_s) // 60 * 60
+  while t <= end_s:
+    if _budget_spent(budget):
+      raise _BudgetSpent(f"measurement budget spent before the page at {int(t)}")
+    rows = kucoin_futures.get_candles(fsym, granularity=1, start_at=int(t * 1000),
+                                      end_at=int(min(end_s, t + page) * 1000))
+    for row in rows or []:
+      try:
+        by_ts[float(row[0])] = row
+      except (TypeError, ValueError, IndexError):
+        continue
+    t += page
+  return [by_ts[k] for k in sorted(by_ts)]
+
+
+def _score_exit_probe_stacks(
+  memory,
+  kucoin_futures,
+  protection_cfg,
+  *,
+  now: float | None = None,
+  attempts: Dict[tuple, float] | None = None,
+  max_per_poll: int = _STACK_MAX_PER_POLL,
+  expire_hours: float = EXIT_PROBE_EXPIRE_HOURS,
+  budget: Optional[_MeasurementBudget] = None,
+) -> int:
+  """Replay the LIVE exit stack for matured agent-closed exit probes and store ``stackR``. Never raises.
+
+  exitDiscipline scores the model's early closes; its benchmark must be what the SYSTEM would have done
+  had the model not closed — the bracket plus breakeven/trail/carry hold — not the bare bracket (on the
+  5 attributed closes at the time: -6.23R vs the bracket, ~-3.5R vs the stack, and the sign of that gap
+  depends on the regime). For at most ``max_per_poll`` agent probes (oldest first) whose horizon
+  (``ts`` + ``expire_hours``, the same one bracketR expires on) has passed and that carry the replay
+  inputs but no stack result yet: fetch 1m futures bars from the fill to the horizon, run
+  protection.replay_protection_stack with ``protection_cfg`` — pass ProtectionManager's EFFECTIVE cfg
+  (``protection.cfg``: breakeven_fee_pct raised to the round-trip cost), not the raw config — and store
+  the result with memory.set_exit_probe_stack. Replaying from the FILL also rebuilds any ratchet the
+  stop had made before the close, which the bracket probe ignored.
+
+  A failure is logged at WARNING and retried no more than every 15 minutes (``attempts``, owned by the
+  loop); a row still failing a day after its horizon is stored as ``unavailable`` and is excluded from
+  exitDiscipline (counted as ``stackUnavailable``, never scored on its bracket instead).
+  Returns the number of rows stored.
+  """
+  if kucoin_futures is None or protection_cfg is None:
+    return 0
+  now_ts = time.time() if now is None else float(now)
+  memo = attempts if attempts is not None else {}
+  horizon_sec = float(expire_hours) * 3600.0
+  stored = 0
+  try:
+    rows = memory.exit_probes(limit=200)
+  except Exception as exc:
+    logger.warning("EXIT STACK: could not read exit probes (%s)", exc)
+    return 0
+  due = []
+  for row in rows:
+    try:
+      if str(row.get("closedBy") or "").lower() != "agent" or row.get("stack"):
+        continue
+      ts0 = float(row.get("ts"))
+      fill_ts = float(row.get("fillTs"))
+      init_risk = float(row.get("initRiskPx"))
+      if not (fill_ts > 0 and init_risk > 0 and math.isfinite(fill_ts) and math.isfinite(init_risk)):
+        continue
+      if now_ts < ts0 + horizon_sec:
+        continue
+      key = (row.get("symbol"), int(ts0))
+      if now_ts - memo.get(key, 0.0) < _STACK_RETRY_SEC:
+        continue
+      due.append((ts0, row))
+    except (TypeError, ValueError):
+      continue
+  for ts0, row in sorted(due, key=lambda item: item[0])[:max(0, int(max_per_poll))]:
+    if _budget_spent(budget):
+      break                     # the rest waits for a later poll; not a failed attempt
+    symbol = row.get("symbol")
+    key = (symbol, int(ts0))
+    memo[key] = now_ts
+    end_ts = ts0 + horizon_sec
+    try:
+      fsym = _to_futures_symbol(normalize_symbol(symbol or ""))
+      if not fsym:
+        raise ValueError("no futures contract mapping")
+      fill_ts = float(row["fillTs"])
+      try:
+        bars = _fetch_futures_1m_bars(kucoin_futures, fsym, fill_ts - 60, end_ts, budget=budget)
+      except _BudgetSpent:
+        memo.pop(key, None)     # ran out of time mid-fetch: retry next poll, not in 15 minutes
+        break
+      result = replay_protection_stack(
+        bars,
+        side_long=str(row.get("positionSide") or "").lower() == "long",
+        entry=float(row["entryPrice"]),
+        stop=float(row["stopPrice"]),
+        take_profit=float(row["takeProfitPrice"]),
+        cfg=protection_cfg,
+        init_risk=float(row["initRiskPx"]),
+        fill_ts=fill_ts,
+        end_ts=end_ts,
+        noise_band_r=row.get("noiseBandR"),
+        hold_until_ts=row.get("holdUntilTs"),
+        open_until_ts=ts0,
+      )
+      if result.get("resolvedBy") == "expired" and float(result.get("resolvedTs") or 0) < end_ts - _STACK_MIN_COVERAGE_SEC:
+        raise ValueError("bars stop short of the horizon — incomplete window, retrying later")
+      if memory.set_exit_probe_stack(
+        symbol, ts0, result.get("stackR"), result.get("resolvedBy"), result.get("resolvedTs"),
+        "live_1m_replay", pre_close_exit_suppressed=result.get("preCloseExitSuppressed"),
+      ):
+        stored += 1
+        logger.info("EXIT STACK: %s close @ %d scored against the live stack: taken %+.2fR vs stack %+.2fR (%s)",
+                    symbol, int(ts0), float(row.get("realizedR") or 0.0), float(result.get("stackR") or 0.0),
+                    result.get("resolvedBy"))
+    except Exception as exc:
+      if now_ts - end_ts > _STACK_GIVE_UP_SEC:
+        logger.warning("EXIT STACK: %s close @ %d could not be replayed for a day (%s) — stored as "
+                       "unavailable; excluded from exitDiscipline", symbol, int(ts0), exc)
+        try:
+          memory.set_exit_probe_stack(symbol, ts0, None, "unavailable", None, f"gave_up: {exc}"[:200])
+        except Exception:
+          pass
+      else:
+        logger.warning("EXIT STACK: replay for %s close @ %d failed (%s) — stackR unset, retrying later",
+                       symbol, int(ts0), exc)
+  return stored
 
 
 def _adaptive_price_trigger_threshold(
@@ -628,8 +1145,339 @@ def _live_extremes_map(snapshot) -> Dict[str, dict]:
       "unrealizedPnl": upnl,
       "positionOpenTime": p.get("openingTimestamp") or p.get("openTime"),
       "positionSide": "long" if qty > 0 else "short",
+      # For the PRICE-space trail peak (memory.update_position_extremes -> peakFePx), keyed on the
+      # same (openTime, side, |qty|, avgEntry) identity ProtectionManager resets on. The open time is
+      # read in ProtectionManager's own key order, which `positionOpenTime` above does not use.
+      "lifecycleOpenTime": position_open_time(p),
+      "markPrice": p.get("markPrice"),
+      "avgEntryPrice": p.get("avgEntryPrice"),
     }
   return out
+
+
+class _FundingClock:
+  """The exchange's own funding-settlement clock per contract, for HELD funding_carry positions.
+
+  ``clock(fsym) -> (next_settlement_ts, interval_sec)`` in epoch seconds, or None when unknown. Read
+  from ``get_funding_rate``: ``fundingTime`` is the next settlement (ms), ``granularity`` the interval
+  (ms). KuCoin changes a contract's interval as funding moves (ONE 8h->1h on 2026-09-17, G 4h->1h on
+  09-20), so a clock is refetched once its cached settlement has passed or it is older than
+  ``REFRESH_SEC``.
+
+  CACHE-ONLY LOOKUPS, NETWORK ONLY IN ``refresh`` (2026-09-25 review). ``__call__``, ``settlement_since``
+  and ``rate`` never touch the network: ProtectionManager.run calls the lookup under ``order_lock`` (and
+  on the degraded-snapshot path that exists precisely for a flaky exchange), and a hanging funding
+  endpoint used to cost up to the 15s request timeout per held carry position per poll there —
+  delaying later positions' hard caps and blocking the agent's order mutations. Only the poll loop
+  calls ``refresh``, OUTSIDE the lock and before protection, the same split as ``_MarketStateClock``.
+
+  ``refresh`` also reads the contract's funding HISTORY since each carry's fill until it shows the first
+  settlement after it (then never again for that fill), so ``carry_hold_deadline`` can tell whether a
+  payment has actually happened instead of walking a changed grid into the past (W2). A settlement the
+  previous clock promised at or before now that the history does not list yet (publication lag) is
+  taken as paid at that time, so a lag can never re-engage a hold.
+
+  Total by construction: a failed fetch keeps the last cached values, logs WARNING once per failure
+  streak, and is not retried for ``RETRY_SEC`` — a hanging endpoint costs at most one timeout per
+  symbol per ``RETRY_SEC``, never one per poll. With no clock the hold falls back to the clock stamped
+  on the entry, then the 8h grid — never to "no hold".
+  """
+
+  REFRESH_SEC = 15 * 60
+  RETRY_SEC = 5 * 60
+
+  def __init__(self, kucoin_futures, *, time_fn: Callable[[], float] = time.time) -> None:
+    self._client = kucoin_futures
+    self._time = time_fn
+    self._cache: Dict[str, tuple[float, float, float]] = {}
+    self._rates: Dict[str, float] = {}
+    self._failed_at: Dict[str, float] = {}
+    # (fsym, fill_ts) -> (checked_at, first settlement after the fill or None)
+    self._paid: Dict[tuple, tuple[float, Optional[float]]] = {}
+    self._hist_failed_at: Dict[tuple, float] = {}
+    self._warned: set = set()
+    self._lock = threading.Lock()
+
+  # ── network: the poll loop only ──
+
+  def refresh(self, targets: Any) -> int:
+    """Refetch due clocks (and, for ``{fsym: fill_ts}`` targets, the settlement history since the fill)
+    for the held carry contracts. Returns the number of successful fetches. Never raises."""
+    try:
+      items = list(targets.items()) if isinstance(targets, dict) else [(t, None) for t in (targets or ())]
+    except Exception:
+      return 0
+    done = 0
+    held_keys = set()
+    for fsym, fill in items:
+      if not fsym:
+        continue
+      try:
+        fill_f = float(fill) if fill is not None else None
+      except (TypeError, ValueError):
+        fill_f = None
+      if fill_f is not None and not (math.isfinite(fill_f) and fill_f > 0):
+        fill_f = None
+      try:
+        now = float(self._time())
+        with self._lock:
+          prev = self._cache.get(fsym)
+        done += int(self._refresh_clock(fsym, now))
+        if fill_f is not None:
+          held_keys.add((fsym, fill_f))
+          done += int(self._refresh_history(fsym, fill_f, now, prev))
+      except Exception as exc:  # belt and braces: each step is already total
+        logger.warning("CARRY CLOCK: refresh for %s failed (%s)", fsym, exc)
+    if isinstance(targets, dict):
+      with self._lock:   # forget fills no longer held (bounded state)
+        for key in [k for k in self._paid if k not in held_keys]:
+          self._paid.pop(key, None)
+        for key in [k for k in self._hist_failed_at if k not in held_keys]:
+          self._hist_failed_at.pop(key, None)
+    return done
+
+  def _warn_once(self, key: Any, message: str, *args: Any) -> None:
+    with self._lock:
+      first = key not in self._warned
+      self._warned.add(key)
+    if first:
+      logger.warning(message, *args)
+
+  def _refresh_clock(self, fsym: str, now: float) -> bool:
+    with self._lock:
+      cached = self._cache.get(fsym)
+      failed_at = self._failed_at.get(fsym)
+    if cached is not None:
+      fetched_at, next_ts, _interval = cached
+      if now < next_ts and (now - fetched_at) <= self.REFRESH_SEC:
+        return False
+    if failed_at is not None and now - failed_at < self.RETRY_SEC:
+      return False
+    try:
+      if self._client is None:
+        raise RuntimeError("no futures client")
+      payload = self._client.get_funding_rate(fsym)
+      clock = funding_clock_from_rate(payload)
+      if clock is None:
+        raise ValueError("payload has no usable fundingTime/granularity")
+    except Exception as exc:
+      with self._lock:
+        self._failed_at[fsym] = now
+      self._warn_once(
+        fsym, "CARRY CLOCK: funding clock for %s unavailable (%s) — carry hold uses %s; retried every %dmin",
+        fsym, exc,
+        "the last cached clock" if cached is not None else "the clock stamped at entry, else the 8h grid",
+        self.RETRY_SEC // 60,
+      )
+      return False
+    try:
+      rate = float((payload or {}).get("value"))
+    except (TypeError, ValueError, AttributeError):
+      rate = None
+    with self._lock:
+      self._cache[fsym] = (now, clock[0], clock[1])
+      if rate is not None and math.isfinite(rate):
+        self._rates[fsym] = rate
+      self._failed_at.pop(fsym, None)
+      self._warned.discard(fsym)
+    return True
+
+  def _refresh_history(self, fsym: str, fill: float, now: float, prev: Optional[tuple]) -> bool:
+    key = (fsym, fill)
+    with self._lock:
+      known = self._paid.get(key)
+      failed_at = self._hist_failed_at.get(key)
+      clock = self._cache.get(fsym)
+    if known is not None and known[1] is not None:
+      return False                               # the first payment is on record: permanent
+    if failed_at is not None and now - failed_at < self.RETRY_SEC:
+      return False
+    if known is not None:
+      checked_at = known[0]
+      settled_since = False
+      if clock is not None:
+        nxt = first_settlement_after(checked_at, clock[1], clock[2])
+        settled_since = nxt is not None and nxt <= now
+      if not settled_since and now - checked_at <= self.REFRESH_SEC:
+        return False
+    try:
+      if self._client is None:
+        raise RuntimeError("no futures client")
+      rows = self._client.get_funding_rate_history(
+        fsym, start_at=int(fill * 1000), end_at=int((now + 60) * 1000))
+      usable, first = first_settlement_in_history(rows, fill)
+      if not usable:
+        raise ValueError("history payload is not a list")
+    except Exception as exc:
+      with self._lock:
+        self._hist_failed_at[key] = now
+      self._warn_once(("hist", fsym), "CARRY HISTORY: funding history for %s unavailable (%s) — the carry "
+                      "hold judges the first payment from the clocks; retried every %dmin",
+                      fsym, exc, self.RETRY_SEC // 60)
+      return False
+    if first is None and prev is not None and fill < prev[1] <= now:
+      # The clock we held promised a settlement that has passed; the history just has not listed it.
+      first = prev[1]
+    with self._lock:
+      self._paid[key] = (now, first)
+      self._hist_failed_at.pop(key, None)
+      self._warned.discard(("hist", fsym))
+    return True
+
+  # ── cache only: safe under order_lock ──
+
+  def __call__(self, fsym: str) -> Optional[tuple[float, float]]:
+    """The last clock ``refresh`` read for ``fsym``, or None. Cache only — never a network call."""
+    with self._lock:
+      cached = self._cache.get(fsym)
+    return (cached[1], cached[2]) if cached is not None else None
+
+  def settlement_since(self, fsym: str, fill_ts: Any) -> tuple[Optional[float], Optional[float]]:
+    """``(first_paid_ts, unpaid_as_of_ts)`` for the carry filled at ``fill_ts`` — see
+    regime.carry_hold_deadline. ``(None, None)`` when the history is unknown. Cache only."""
+    try:
+      key = (fsym, float(fill_ts))
+    except (TypeError, ValueError):
+      return None, None
+    with self._lock:
+      known = self._paid.get(key)
+    if known is None:
+      return None, None
+    checked_at, first = known
+    return (first, None) if first is not None else (None, checked_at)
+
+  def rate(self, fsym: str) -> Optional[float]:
+    """The per-settlement funding rate read with the last successful clock fetch, or None.
+
+    Cache only — never a network call — so the agent's entry thesis can show the carry's CURRENT rate
+    next to the one stamped at entry for free (the clock is refreshed for held carry positions anyway).
+    """
+    with self._lock:
+      return self._rates.get(fsym)
+
+
+def _futures_candles_for_analytics(rows: Any) -> list:
+  """FUTURES kline rows ([ts_ms, open, HIGH, LOW, close, vol, turnover]) -> analytics column order
+  ([ts_s, open, close, high, low, vol, turnover]). Every row must prove its column order first
+  (protection._replay_bar: high is the row max, low the row min) or ValueError — a replay once read
+  futures candles in spot order and reversed a finding."""
+  out = []
+  for row in rows or []:
+    ts, o, h, l, c = _validated_futures_bar(row)
+    vol = row[5] if len(row) > 5 else 0
+    turnover = row[6] if len(row) > 6 else 0
+    out.append([ts, o, c, h, l, vol, turnover])
+  return out
+
+
+class _MarketStateClock:
+  """The market-state block (analytics.market_state), refreshed at most hourly BY THE POLL LOOP.
+
+  ``refresh()`` is the only method that touches the network — about three public calls an hour
+  (/contracts/active, then XBTUSDTM 1D and 1h klines) — and only the poll loop calls it, after the
+  profit-lock and probe settlement. ``current()`` is cache-only, so the order path, the agent run and
+  the exit-probe recorder read it for free and nothing trading-critical ever waits on it.
+
+  Total by construction: a failed refresh keeps the last reading, logs WARNING once per failure streak,
+  and is retried after ``RETRY_SEC``; a BTC-candle failure only drops the BTC fields. A reading older
+  than two refresh periods is withheld (``current`` -> None) — a stale state stamped as current would
+  be worse than a missing one, which the splits count as untagged.
+  """
+
+  REFRESH_SEC = 3600
+  RETRY_SEC = 15 * 60
+
+  def __init__(self, kucoin_futures, *, min_turnover: float, min_age_days: float,
+               time_fn: Callable[[], float] = time.time) -> None:
+    self._client = kucoin_futures
+    self._min_turnover = float(min_turnover or 0.0)
+    self._min_age_days = float(min_age_days or 0.0)
+    self._time = time_fn
+    self._value: Optional[Dict[str, Any]] = None
+    self._fetched_at = 0.0
+    self._last_attempt = 0.0
+    self._failing = False
+    self._lock = threading.Lock()
+
+  def refresh(self) -> bool:
+    """Refresh when due; True when a new reading was stored. Never raises."""
+    now = float(self._time())
+    with self._lock:
+      fresh = self._value is not None and now - self._fetched_at < self.REFRESH_SEC
+      backing_off = self._failing and now - self._last_attempt < self.RETRY_SEC
+      if fresh or backing_off or self._client is None:
+        return False
+      self._last_attempt = now
+    try:
+      contracts = self._client.list_active_contracts()
+      if not contracts:
+        raise ValueError("empty contract list")
+    except Exception as exc:
+      with self._lock:
+        first = not self._failing
+        self._failing = True
+      if first:
+        logger.warning("MARKET STATE: contract list unavailable (%s) — %s", exc,
+                       "keeping the last reading" if self._value is not None else "entries record none")
+      return False
+    daily = hourly = None
+    try:
+      daily = _futures_candles_for_analytics(self._client.get_candles(
+        "XBTUSDTM", granularity=1440, start_at=int((now - 60 * 86400) * 1000), end_at=int(now * 1000)))
+    except Exception as exc:
+      logger.warning("MARKET STATE: BTC daily candles unavailable (%s) — btcDailyAdx/bias omitted", exc)
+    try:
+      hourly = _futures_candles_for_analytics(self._client.get_candles(
+        "XBTUSDTM", granularity=60, start_at=int((now - 80 * 3600) * 1000), end_at=int(now * 1000)))
+    except Exception as exc:
+      logger.warning("MARKET STATE: BTC hourly candles unavailable (%s) — btc72h omitted", exc)
+    try:
+      state = sanitize_market_state(market_state(
+        contracts, now, min_turnover=self._min_turnover, min_age_days=self._min_age_days,
+        btc_daily_candles=daily, btc_hourly_candles=hourly,
+      ))
+    except Exception as exc:
+      state = None
+      logger.warning("MARKET STATE: computation failed (%s)", exc)
+    if not state:
+      with self._lock:
+        first = not self._failing
+        self._failing = True
+      if first:
+        logger.warning("MARKET STATE: no usable reading from %d contracts — entries record none", len(contracts))
+      return False
+    with self._lock:
+      self._value, self._fetched_at, self._failing = state, now, False
+    logger.info("MARKET STATE: breadth24=%s basketMedian24h=%s btc24h=%s btc72h=%s btcDailyAdx=%s (%s)",
+                state.get("breadth24"), state.get("basketMedian24h"), state.get("btc24h"),
+                state.get("btc72h"), state.get("btcDailyAdx"), state.get("btcDailyBias"))
+    return True
+
+  def current(self) -> Optional[Dict[str, Any]]:
+    """The latest reading (a copy), or None when there is none or it is older than two refresh periods."""
+    now = float(self._time())
+    with self._lock:
+      if self._value is None or now - self._fetched_at > 2 * self.REFRESH_SEC:
+        return None
+      return dict(self._value)
+
+
+def _make_trade_context_lookup(memory, kucoin_futures, *, time_fn: Callable[[], float] = time.time):
+  """ProtectionManager's ``trade_context_lookup``: position_context.trade_context on the live clock.
+
+  A thin wrapper so the loop and the tests build the SAME callable — the carry hold must see the
+  contract's own funding clock, and a wiring slip here (not in the pure helpers) is exactly the kind
+  of bug a helper-only test misses.
+  """
+  # The clock's refresh runs on the survival thread (before the protection pass), so it reads with the
+  # short measurement timeout — never the 15s an order call is allowed.
+  clock = _FundingClock(_measurement_client(kucoin_futures), time_fn=time_fn)
+
+  def _trade_context(fsym: str, pos: Any) -> Dict[str, Any]:
+    return trade_context(memory, fsym, pos, time_fn(), funding_clock=clock)
+
+  _trade_context.funding_clock = clock  # type: ignore[attr-defined]  # exposed for inspection/tests
+  return _trade_context
 
 
 def _futures_position_fingerprint(positions: list[dict] | None) -> tuple[tuple[str, float, float], ...]:
@@ -897,59 +1745,23 @@ async def trading_loop(
   elif cfg.dashboard.enabled:
     logger.warning("Dashboard publishing requested but DISABLED: %s", dashboard.disabled_reason())
 
-  def _trade_context(fsym: str, pos: Any) -> Dict[str, Any]:
-    """Facts about the trade behind an open position that its exit mechanics need.
-
-    ``holdUntilTs`` — a declared funding-carry trade is held to the settlement it was opened for;
-    None for every other playbook, leaving their management completely unchanged.
-    ``noiseBandR`` — the entry's own ATR stop multiple, inverted into R, so the trail can ride one
-    noise band behind the peak instead of a fixed slice of risk.
-    ``initRiskPx`` / ``peakFePx`` — the trade's ORIGINAL stop distance and its recorded peak favourable
-    excursion (price units), so a process restart does not erase them. ProtectionManager keeps both in
-    memory and captures the risk only when it sees a stop BELOW entry; a winner whose stop had already
-    been ratcheted to breakeven before a restart would otherwise never regain its 1R anchor, and every
-    R-based rule (trail, breakeven, early cut) would go silently inert for the rest of that position.
-
-    Looked up here rather than inside ProtectionManager so that module keeps no memory dependency.
-    """
-    out: Dict[str, Any] = {}
-    try:
-      side = str(pos.get("positionSide") or ("long" if float(pos.get("currentQty") or 0) > 0 else "short"))
-      opened = next(
-        (pos.get(k) for k in ("openingTimestamp", "openingTime", "openTime", "createdAt")
-         if pos.get(k) not in (None, "")),
-        None,
-      )
-      ctx = memory.entry_context_for_position(fsym, opened, side)
-      out["holdUntilTs"] = carry_hold_deadline(ctx, time.time())
-      if isinstance(ctx, dict):
-        try:
-          atr_mult = float(ctx.get("stopAtrMult") or 0.0)
-        except (TypeError, ValueError):
-          atr_mult = 0.0
-        if atr_mult > 0:
-          out["noiseBandR"] = 1.0 / atr_mult
-        try:
-          _e = float(ctx.get("fillPrice") or ctx.get("entryPrice") or 0.0)
-          _sl = float(ctx.get("stopLossPrice") or 0.0)
-          if _e > 0 and _sl > 0 and abs(_e - _sl) > 0:
-            out["initRiskPx"] = abs(_e - _sl)
-        except (TypeError, ValueError):
-          pass
-      # Recorded peak for THIS lifecycle only (key = openTime:side), converted from pnl to price.
-      try:
-        ext = memory.get_position_extremes(normalize_symbol(fsym)) or {}
-        qty = abs(float(pos.get("currentQty") or 0.0))
-        key = f"{opened}:{side}"
-        if ext.get("lifecycleKey") == key and qty > 0 and ext.get("peakPnl") is not None:
-          _peak_pnl = float(ext.get("peakPnl") or 0.0)
-          if _peak_pnl > 0:
-            out["peakFePx"] = _peak_pnl / qty
-      except Exception:
-        pass
-    except Exception:
-      logger.debug("trade-context lookup failed for %s", fsym, exc_info=True)
-    return out
+  # Facts about the trade behind each open position (carry hold on the contract's own funding clock,
+  # noise band, original risk, recorded peak) — see position_context.trade_context. Built by a module
+  # factory so the exact lookup the live manager receives is executable in tests.
+  _trade_context = _make_trade_context_lookup(memory, kucoin_futures)
+  _stack_attempts: Dict[tuple, float] = {}   # exit-probe stack replays: (symbol, ts) -> last attempt
+  _gate_log_last: Dict[str, float] = {}      # hourly GATE SCOREBOARD log line
+  # Hourly market-state reading (breadth over the screener's own universe, BTC 24h/72h, BTC daily ADX),
+  # stamped on entries and probes so verdicts can be split by market. Refreshed only by this loop.
+  # Measurement reads on this thread (probe settlement, stack replays, market state) use a short HTTP
+  # timeout, a per-poll wall-clock budget and a cross-poll backoff — see _MeasurementBudget.
+  _measure_client = _measurement_client(kucoin_futures)
+  _measure_backoff = _MeasureBackoff(float(cfg.trading.poll_interval_sec or 60))
+  _market_state = _MarketStateClock(
+    _measure_client,
+    min_turnover=cfg.trading.screener_min_turnover_usd_24h,
+    min_age_days=cfg.trading.min_futures_listing_age_days,
+  )
 
   protection = ProtectionManager(
     cfg.profit_protection, kucoin_futures, notifier=notifier,
@@ -1381,21 +2193,11 @@ async def trading_loop(
     if _dropped:
       logger.debug("taker-flow: forgot %d stale symbol reading(s)", _dropped)
 
+    # SPOT tickers: what the auto-triggers below compare against. NOT what probes settle on.
     live_prices = {
       normalize_symbol(symbol): float(ticker.price)
       for symbol, ticker in snapshot.tickers.items()
     }
-    # Settle signal-edge probes from the snapshot we already have: stamp the forward price on any
-    # entry signal whose measurement horizon has elapsed. This is the feedback loop that tells the bot
-    # whether its DIRECTION CALLS predict, as opposed to whether its exits were lucky — see
-    # memory.settle_signal_probes / edge.signal_edge_stats. Read-only w.r.t. trading behaviour.
-    try:
-      memory.settle_signal_probes(live_prices)
-      # Same idea one step later in the trade: resolve each recorded discretionary close against what
-      # the bracket it overrode would have returned.
-      memory.settle_exit_probes(live_prices)
-    except Exception as exc:
-      logger.debug("Signal-probe settle skipped: %s", exc)
     for stored_trigger, observed_price in _crossed_auto_triggers(memory.latest_triggers(), live_prices):
       symbol = normalize_symbol(stored_trigger.get("symbol") or "")
       condition = str(stored_trigger.get("condition") or "").lower()
@@ -1429,6 +2231,15 @@ async def trading_loop(
     except Exception as exc:
       logger.warning("Failed to update position extremes: %s", exc)
 
+    # The carry hold's funding clock (and settlement history since each carry's fill) is refreshed
+    # HERE, before the protection pass and OUTSIDE order_lock: ProtectionManager's lookup under the lock
+    # only reads its cache, so a hanging funding endpoint can never hold the lock or delay another
+    # position's hard cap (2026-09-25 review). Held funding_carry positions only; backs off on failure.
+    try:
+      _trade_context.funding_clock.refresh(carry_refresh_targets(memory, snapshot.futures_positions))
+    except Exception as exc:  # refresh is total; belt and braces
+      logger.warning("CARRY CLOCK: refresh step failed (%s) — the hold uses the cached/stamped clock", exc)
+
     # Code-driven profit protection: ratchet stops to breakeven and cap give-back on
     # live futures positions every poll, independent of whether the agent runs. Never raises.
     try:
@@ -1438,6 +2249,43 @@ async def trading_loop(
         logger.info("Profit-lock actions taken: %s", protection_actions)
     except Exception as exc:
       logger.warning("Profit-lock run failed: %s", exc)
+
+    # Settle signal-edge probes: stamp the forward price on any entry signal whose measurement horizon
+    # has elapsed, and resolve each recorded early close against the bracket it overrode. This is the
+    # feedback loop that tells the bot whether its DIRECTION CALLS predict, as opposed to whether its
+    # exits were lucky — see memory.settle_signal_probes / edge.signal_edge_stats. It settles on the
+    # FUTURES MARK (+ funding), the market the base was read from and the brackets trigger on; the
+    # spot `live_prices` map scored the perp/spot basis as edge until 2026-09-25 and now only feeds
+    # the auto-triggers above. Placed AFTER the profit-lock on purpose: it makes a few small public
+    # calls (a mark per due symbol, funding history), and measurement must never delay survival.
+    # Total: never raises, never touches a trading decision, logs failures at WARNING.
+    # Every exchange call from here to the market-state refresh shares ONE per-poll budget (a quarter of
+    # the poll interval), so a hanging public endpoint can never stretch the loop past the next
+    # protection pass; deferred work waits for a later poll and the tolerance rules stay honest.
+    _measure_budget = _MeasurementBudget(_MEASURE_BUDGET_FRACTION * float(cfg.trading.poll_interval_sec or 60))
+    _settle_probes_on_futures(memory, _measure_client, snapshot, live_prices,
+                              budget=_measure_budget, backoff=_measure_backoff)
+    # Score matured agent closes against the LIVE exit stack (bracket + trail/breakeven + carry hold),
+    # replayed on 1m futures bars with ProtectionManager's EFFECTIVE cfg — exitDiscipline's benchmark.
+    # At most 2 per poll, only after a close's 8h horizon; total, never raises, WARNING on failure.
+    try:
+      _score_exit_probe_stacks(memory, _measure_client, protection.cfg, attempts=_stack_attempts,
+                               budget=_measure_budget)
+    except Exception as exc:
+      logger.warning("EXIT STACK: scoring step failed (%s) — exitDiscipline goes stale while this repeats", exc)
+    # Market state: at most one refresh an hour (~3 public calls), after survival and settlement, so it
+    # never delays either; the agent run, the order path and the exit probes only read its cache.
+    try:
+      if not _budget_spent(_measure_budget):
+        _market_state.refresh()
+    except Exception as exc:  # refresh is total; belt and braces
+      logger.warning("MARKET STATE: refresh step failed (%s)", exc)
+    if _measure_budget.deferred:
+      logger.warning("MEASUREMENT BUDGET: %.0fs spent this poll; %d exchange call(s) deferred to later polls "
+                     "(their rows wait, and are written off only past their settle tolerance)",
+                     _measure_budget.seconds, _measure_budget.deferred)
+    # Report-only gate scoreboard, at most hourly, after survival and settlement. Total.
+    _log_gate_scoreboard(memory, cfg, _gate_log_last)
 
     # Retain throttled moves until the model actually reviews them. Without this queue, a trigger
     # followed by a quiet poll vanished and the adaptive shorter cooldown never got another chance.
@@ -1616,9 +2464,17 @@ async def trading_loop(
                 realized_r=_taken, setup_family=_ctx.get("setupFamily"),
                 closed_by="agent" if memory.recent_agent_close(sym) else "protection",
                 regime=_ctx.get("regime") if isinstance(_ctx.get("regime"), dict) else None,
+                # What the live-stack replay needs (fill, original risk, noise band, carry hold) and the
+                # entry-bias tags (counterAtEntry / htfAligned) that split the model's exit record.
+                **exit_probe_inputs(_ctx, position_side),
+                # The market the trade was ENTERED in (splits the trail's record: trailByMarketState)
+                # and the loop's current reading at the close. Cache reads only.
+                market_state=_ctx.get("marketState") if isinstance(_ctx.get("marketState"), dict) else None,
+                market_state_at_exit=_market_state.current(),
               )
-        except Exception:
-          logger.debug("exit-probe recording failed for %s", sym, exc_info=True)
+        except Exception as exc:
+          logger.warning("EXIT PROBE: recording failed for %s (%s) — exitDiscipline misses this close",
+                         sym, exc)
       except Exception as exc:
         logger.warning("Failed to record triggered close: %s", exc)
 
@@ -1752,6 +2608,12 @@ async def trading_loop(
         calendar_state=_cal,
         safety_state=safety,
         entry_token=run_token,
+        # The same lock-protected live clock the carry hold uses, so entryThesis shows the settlement
+        # ProtectionManager is actually holding for (cache only after the first read).
+        funding_clock=_trade_context.funding_clock,
+        # Cache-only reader of the hourly market state: shown to the model as plain numbers and stamped
+        # on each entry and probe. Never fetches.
+        market_state=_market_state.current,
       ))
     else:
       idle_polls += 1

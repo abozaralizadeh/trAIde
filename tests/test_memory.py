@@ -472,6 +472,52 @@ def test_position_extremes_reset_when_exchange_lifecycle_changes(store):
     assert ext["positionOpenTime"] == 2000
 
 
+def _fe_row(qty, entry, mark, *, mult=10.0, opened=1790252000000):
+    """One row as main._live_extremes_map builds it from a KuCoin position."""
+    return {"netSize": qty, "unrealizedPnl": (mark - entry) * qty * mult,
+            "positionOpenTime": opened, "positionSide": "long" if qty > 0 else "short",
+            "lifecycleOpenTime": opened, "markPrice": mark, "avgEntryPrice": entry}
+
+
+class TestPriceSpacePeakForTheTrail:
+    """peakFePx: the restart peak the trail uses, in PRICE units, keyed on ProtectionManager's own
+    (openTime, side, |qty|, avgEntry) identity. peakPnl/lifecycleKey keep their meaning for closes/MFE."""
+
+    def test_price_peak_ignores_the_contract_multiplier(self, store):
+        store.update_position_extremes({"H-USDT": _fe_row(-11, 0.06008, 0.05950)})
+        store.update_position_extremes({"H-USDT": _fe_row(-11, 0.06008, 0.05905)})
+        store.update_position_extremes({"H-USDT": _fe_row(-11, 0.06008, 0.05980)})
+        ext = store.get_position_extremes("H-USDT")
+        assert ext["peakFePx"] == pytest.approx(0.00103)            # short: entry - mark
+        assert ext["peakPnl"] / 11 == pytest.approx(0.0103)        # USD/contracts = 10x the price
+
+    def test_add_on_resets_the_price_peak_but_not_the_lifecycle_usd_peak(self, store):
+        store.update_position_extremes({"H-USDT": _fe_row(1, 1.0, 1.018)})
+        store.update_position_extremes({"H-USDT": _fe_row(2, 1.009, 1.015)})
+        ext = store.get_position_extremes("H-USDT")
+        assert ext["peakFePx"] == pytest.approx(0.006)             # new baseline vs the new avgEntry
+        assert ext["peakPnl"] == pytest.approx(0.18)               # lifecycle MFE unchanged: max(0.18, 0.12)
+        assert ext["lifecycleKey"] == "1790252000000:long"
+
+    def test_partial_reduction_resets_the_price_peak(self, store):
+        store.update_position_extremes({"H-USDT": _fe_row(2, 1.0, 1.018)})
+        store.update_position_extremes({"H-USDT": _fe_row(1, 1.0, 1.010)})
+        assert store.get_position_extremes("H-USDT")["peakFePx"] == pytest.approx(0.010)
+
+    def test_rows_without_mark_or_entry_keep_only_the_usd_fields(self, store):
+        store.update_position_extremes({"ETH-USDT": {"netSize": 1.0, "unrealizedPnl": 5.0}})
+        ext = store.get_position_extremes("ETH-USDT")
+        assert ext["peakPnl"] == 5.0 and "peakFePx" not in ext and "peakFeKey" not in ext
+
+    def test_peak_fe_key_side_comes_from_the_sign_of_qty(self):
+        from src.memory import peak_fe_key
+        assert peak_fe_key(1790252000000, 3, 1.0) == "1790252000000|long|3.0|1.0"
+        assert peak_fe_key("1790252000000", "-3", "1.0") == "1790252000000|short|3.0|1.0"
+        assert peak_fe_key(None, 3, 1.0) == "None|long|3.0|1.0"
+        for bad in ((1, 0, 1.0), (1, 3, 0), (1, "x", 1.0), (1, 3, float("nan"))):
+            assert peak_fe_key(*bad) is None
+
+
 def test_extremes_cleared_when_position_closes(store):
     store.record_trade("BTC-USDT", "buy", 100.0, paper=False, price=50000.0, size=0.002)
     pos = store.positions(prices={"BTC-USDT": 51000.0})
@@ -1146,3 +1192,622 @@ class TestSignalProbesReadAll:
     assert len(m.signal_probes(limit=0)) == 40
     assert len(m.signal_probes(limit=10)) == 10
     assert len(m.signal_probes()) == 40        # default 200 > stored
+
+
+# ── Settling on the market that fills (futures mark + funding), never the spot ticker ─────────────
+
+def _shift_probe_clock(store, seconds: int, bucket: str = "signal_probes") -> None:
+  """Age EVERY row in ``bucket`` by ``seconds``, as the live loop's clock would."""
+  data = store._read()
+  for row in data.get(bucket) or []:
+    row["ts"] -= seconds
+  store._write(data)
+
+
+class TestProbeSettlementMarket:
+  """ONE-USDT, 2026-09-20: spot ~0.0050 while the ONEUSDTM mark sat ~0.0038. A probe based on the
+  futures mark and settled on spot recorded a +25% '5-minute return' on a +2.5% contract move, and
+  eight of them lifted funding_carry from stood-aside to full size in a day."""
+
+  def test_a_futures_based_probe_settles_on_the_futures_mark_and_a_spot_one_on_spot(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 0.0039, "funding_carry", price_source="futures_mark")
+    m.record_signal_probe("TWO-USDT", "buy", 0.0049, "funding_carry", price_source="spot")
+    _shift_probe_clock(m, 6 * 60)            # just past the 5m horizon
+    futures = {"ONE-USDT": 0.0038, "TWO-USDT": 0.0038}
+    spot = {"ONE-USDT": 0.0050, "TWO-USDT": 0.0050}
+    assert m.settle_signal_probes(futures, spot_prices=spot) == 2
+    by_sym = {r["symbol"]: r["entryContext"] for r in m.signal_probes(limit=0)}
+    assert by_sym["ONE-USDT"]["priceSource"] == "futures_mark"
+    assert by_sym["ONE-USDT"]["signalProbe"]["m5"] == 0.0038      # NOT the 0.0050 spot ticker
+    assert by_sym["TWO-USDT"]["signalProbe"]["m5"] == 0.0050      # its base was spot, so is its settle
+
+  def test_legacy_rows_without_a_source_stamp_count_as_futures(self, tmp_path):
+    """The base has been the futures mark since 2026-07-19; every retained probe is newer."""
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 0.0039, "funding_carry")
+    assert "priceSource" not in m.signal_probes(limit=0)[0]["entryContext"]
+    _shift_probe_clock(m, 6 * 60)
+    assert m.settle_signal_probes({"ONE-USDT": 0.0038}, spot_prices={"ONE-USDT": 0.0050}) == 1
+    assert m.signal_probes(limit=0)[0]["entryContext"]["signalProbe"]["m5"] == 0.0038
+
+  def test_no_futures_mark_means_wait_then_unmeasured_never_a_spot_fallback(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 0.0039, "funding_carry", price_source="futures_mark")
+    _shift_probe_clock(m, 6 * 60)
+    # Only spot is known this poll: the futures-based probe waits rather than borrowing it.
+    assert m.settle_signal_probes({}, spot_prices={"ONE-USDT": 0.0050}) == 0
+    assert "m5" not in m.signal_probes(limit=0)[0]["entryContext"]["signalProbe"]
+    # Past the 5m tolerance with still no mark: recorded as missed, never back-stamped.
+    _shift_probe_clock(m, 5 * 60)
+    assert m.settle_signal_probes({}, spot_prices={"ONE-USDT": 0.0050}) == 1
+    assert m.signal_probes(limit=0)[0]["entryContext"]["signalProbe"]["m5"] is None
+
+  def test_funding_credit_is_stamped_beside_the_price_for_the_horizon_window(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 0.0039, "funding_carry", price_source="futures_mark")
+    _shift_probe_clock(m, 61 * 60)
+    ts0 = m.signal_probes(limit=0)[0]["ts"]
+    calls = []
+
+    def funding(symbol, side, t0, t1):
+      calls.append((symbol, side, t0, t1))
+      return 0.0025
+
+    assert m.settle_signal_probes({"ONE-USDT": 0.0040}, funding_received=funding) == 3
+    probe = m.signal_probes(limit=0)[0]["entryContext"]["signalProbe"]
+    assert probe["m60"] == 0.0040 and probe["f60"] == 0.0025
+    assert probe["m5"] is None and "f5" not in probe          # a written-off horizon earns no credit
+    assert calls == [("ONE-USDT", "long", ts0, calls[0][3])]
+    assert calls[0][3] >= ts0 + 60 * 60                        # window ends at the observation
+
+  def test_a_failing_funding_lookup_never_costs_the_price_stamp(self, tmp_path, caplog):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "sell", 0.0039, "funding_carry", price_source="futures_mark")
+    _shift_probe_clock(m, 6 * 60)
+
+    def broken(*_a):
+      raise RuntimeError("funding endpoint down")
+
+    with caplog.at_level("WARNING"):
+      assert m.settle_signal_probes({"ONE-USDT": 0.0038}, funding_received=broken) == 1
+    probe = m.signal_probes(limit=0)[0]["entryContext"]["signalProbe"]
+    # The price still stamps; the credit is recorded UNKNOWN (None), never absent-as-zero (W3).
+    assert probe["m5"] == 0.0038 and "f5" in probe and probe["f5"] is None
+    assert isinstance(probe["t5"], int)                          # when the price was observed
+    assert any("PROBE FUNDING" in r.message for r in caplog.records)
+
+  def test_an_unknown_credit_is_backfilled_for_its_own_window_on_a_later_poll(self, tmp_path):
+    """W3 (2026-09-25 review): one transient failure used to lose the carry credit for good — the
+    horizon was never due again and absent scored as zero (-0.8% at 240m on a 1h carry at -0.2%)."""
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "sell", 0.0039, "funding_carry", price_source="futures_mark")
+    _shift_probe_clock(m, 6 * 60)
+
+    def broken(*_a):
+      raise RuntimeError("503 transient")
+
+    assert m.settle_signal_probes({"ONE-USDT": 0.0038}, funding_received=broken) == 1
+    data = m._read()
+    row = data["signal_probes"][0]
+    observed = row["ts"] + 5 * 60 + 30                          # the price was read 30s after the horizon
+    row["entryContext"]["signalProbe"]["t5"] = observed
+    m._write(data)
+    calls = []
+
+    def healthy(symbol, side, t0, t1):
+      calls.append((symbol, side, t0, t1))
+      return 0.002
+
+    assert m.settle_signal_probes({"ONE-USDT": 0.0038}, funding_received=healthy) == 1
+    probe = m.signal_probes(limit=0)[0]["entryContext"]["signalProbe"]
+    assert probe["f5"] == pytest.approx(0.002) and "t5" not in probe
+    assert calls == [("ONE-USDT", "short", row["ts"], observed)]  # the horizon's window, never 'now'
+    assert m.settle_signal_probes({"ONE-USDT": 0.0038}, funding_received=healthy) == 0   # done
+    assert len(calls) == 1
+
+  def test_past_its_window_an_unknown_credit_stays_unknown_and_carry_scoring_skips_it(self, tmp_path):
+    from src.edge import _probe_observations, signal_edge_stats
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "sell", 0.0039, "funding_carry", price_source="futures_mark")
+    m.record_signal_probe("TWO-USDT", "sell", 1.0, "continuation", price_source="futures_mark")
+    _shift_probe_clock(m, 6 * 60)
+
+    def broken(*_a):
+      raise RuntimeError("503 transient")
+
+    assert m.settle_signal_probes({"ONE-USDT": 0.0038, "TWO-USDT": 0.99}, funding_received=broken) == 2
+    _shift_probe_clock(m, 10 * 60)                               # past the 5m backfill window
+    calls = []
+    assert m.settle_signal_probes({}, funding_received=lambda *a: calls.append(a) or 0.002,
+                                  horizons_min=(5,)) == 0
+    assert calls == []                                           # a dead symbol is not asked forever
+    rows = m.signal_probes(limit=0)
+    assert all(r["entryContext"]["signalProbe"]["f5"] is None for r in rows)
+    got = {r["symbol"]: signed for r, _c, _h, signed in _probe_observations(rows, (5,))}
+    assert "ONE-USDT" not in got                                 # carry: unknown is not zero
+    assert got["TWO-USDT"] == pytest.approx(0.01)                # non-carry: absent/None = zero, as before
+    assert signal_edge_stats(rows, horizons_min=(5,))["unknownFundingCredit"] == 1
+
+  def test_one_malformed_row_does_not_starve_the_rest(self, tmp_path, caplog):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 0.0039, "funding_carry", price_source="futures_mark")
+    m.record_signal_probe("TWO-USDT", "buy", 1.0, "continuation", price_source="futures_mark")
+    _shift_probe_clock(m, 6 * 60)
+    data = m._read()
+    data["signal_probes"][0]["ts"] = "not-a-time"
+    m._write(data)
+    with caplog.at_level("WARNING"):
+      assert m.settle_signal_probes({"ONE-USDT": 0.0038, "TWO-USDT": 1.01}) == 1
+    assert any("SIGNAL PROBE settle failed" in r.message for r in caplog.records)
+
+  def test_symbols_due_lists_only_what_needs_a_futures_mark_now(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_signal_probe("DUE-USDT", "buy", 1.0, "continuation", price_source="futures_mark")
+    m.record_signal_probe("SPOT-USDT", "buy", 1.0, "continuation", price_source="spot")
+    m.record_signal_probe("NEW-USDT", "buy", 1.0, "continuation", price_source="futures_mark")
+    data = m._read()
+    for row in data["signal_probes"]:
+      if row["symbol"] in ("DUE-USDT", "SPOT-USDT"):
+        row["ts"] -= 6 * 60                  # 5m horizon due now
+    m._write(data)
+    m.record_exit_probe("EXIT-USDT", "long", 100.0, 90.0, 130.0, 101.0, realized_r=0.1)
+    m.record_exit_probe("OLD-USDT", "long", 100.0, 90.0, 130.0, 101.0, realized_r=0.1)
+    data = m._read()
+    data["exit_probes"][1]["ts"] -= 30 * 3600  # far past its measurable life
+    m._write(data)
+    assert m.symbols_due_for_settlement() == {"DUE-USDT", "EXIT-USDT"}
+
+
+class TestFundingReceivedFromHistory:
+  """KuCoin: a positive rate means longs pay shorts. A long RECEIVES -rate, a short +rate."""
+
+  T = 1_790_000_000                                             # a real epoch (seconds)
+  HIST = [
+    {"fundingRate": 0.001, "timepoint": (T + 100) * 1000},        # inside, in ms (KuCoin's unit)
+    {"fundingRate": -0.0004, "timepoint": T + 3700},              # inside, in seconds
+    {"fundingRate": -0.0004, "timepoint": (T + 3700) * 1000},     # the same settlement again (paged)
+    {"fundingRate": 0.5, "timepoint": (T - 1000) * 1000},         # before the window
+    {"fundingRate": 0.5, "timepoint": (T + 20_000) * 1000},       # after the window
+    {"fundingRate": "junk", "timepoint": (T + 200) * 1000},
+  ]
+
+  def test_sign_follows_the_side_that_is_paid(self):
+    from src.memory import funding_received_from_history as fr
+    t0, t1 = self.T, self.T + 10_000
+    assert fr(self.HIST, "long", t0, t1) == pytest.approx(-(0.001 - 0.0004))
+    assert fr(self.HIST, "short", t0, t1) == pytest.approx(0.001 - 0.0004)
+    assert fr(self.HIST, "buy", t0, t1) == pytest.approx(-0.0006)
+
+  def test_window_is_open_at_the_start_and_closed_at_the_end(self):
+    from src.memory import funding_received_from_history as fr
+    hist = [{"fundingRate": 0.001, "timepoint": self.T * 1000}]
+    assert fr(hist, "short", self.T, self.T + 100) == 0.0         # opened AT the settlement: not paid
+    assert fr(hist, "short", self.T - 1000, self.T) == pytest.approx(0.001)
+
+  def test_unusable_input_is_unknown_not_zero(self):
+    from src.memory import funding_received_from_history as fr
+    assert fr(self.HIST, "sideways", 0, 1) is None
+    assert fr(None, "long", 0, 1) is None
+    assert fr([], "long", 0, 1) == 0.0
+
+
+class TestExitProbeStaleness:
+  """XMR, 2026-09-12: an exit probe was resolved as a STOP seven days later, when its ticker reappeared.
+  A bracket outcome is only an outcome inside the probe's measurable life."""
+
+  def _probe(self, tmp_path, age_sec):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_exit_probe("XMR-USDT", "long", 100.0, 90.0, 130.0, 101.0, realized_r=0.1)
+    data = m._read()
+    data["exit_probes"][0]["ts"] -= age_sec
+    m._write(data)
+    return m
+
+  def test_no_price_past_expiry_plus_tolerance_is_unmeasured(self, tmp_path):
+    m = self._probe(tmp_path, 10 * 3600)     # 8h life + 96min tolerance < 10h
+    assert m.settle_exit_probes({}) == 1
+    out = m.exit_probes()[0]["outcome"]
+    assert out["resolved"] == "unmeasured" and out["bracketR"] is None
+
+  def test_a_late_price_does_not_resolve_it_as_stop_or_target(self, tmp_path):
+    m = self._probe(tmp_path, 7 * 86400)
+    assert m.settle_exit_probes({"XMR-USDT": 80.0}) == 1       # far through the stop, a week late
+    out = m.exit_probes()[0]["outcome"]
+    assert out["resolved"] == "unmeasured" and out["bracketR"] is None
+    assert m.settle_exit_probes({"XMR-USDT": 200.0}) == 0      # final: never re-scored
+
+  def test_inside_its_life_it_still_resolves_normally(self, tmp_path):
+    m = self._probe(tmp_path, 9 * 3600)      # past expiry, inside the tolerance
+    assert m.settle_exit_probes({"XMR-USDT": 105.0}) == 1
+    assert m.exit_probes()[0]["outcome"]["resolved"] == "expired"
+
+
+def test_a_direction_call_names_the_model_and_its_stated_confidence(tmp_path):
+    """Seven absolute confidence thresholds shape entries and a model swap re-scales the number; none
+    of it was measurable because no probe said which model spoke or how sure it claimed to be."""
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.record_signal_probe("SPX-USDT", "sell", 1.0, "continuation",
+                              model="gpt-6-luna", confidence=0.78, min_confidence=0.75)
+    ctx = store.signal_probes(limit=0)[0]["entryContext"]
+    assert (ctx["model"], ctx["confidence"], ctx["minConfidence"]) == ("gpt-6-luna", 0.78, 0.75)
+
+    # An unusable value is dropped, never stored as a fake number; an old-style call stamps nothing.
+    store.record_signal_probe("ADA-USDT", "buy", 1.0, "continuation",
+                              model="  ", confidence="high", min_confidence=float("nan"))
+    store.record_signal_probe("DOT-USDT", "buy", 1.0, "continuation")
+    for sym in ("ADA-USDT", "DOT-USDT"):
+        row = next(p for p in store.signal_probes(limit=0) if p["symbol"] == sym)["entryContext"]
+        assert not {"model", "confidence", "minConfidence"} & set(row)
+
+
+# ── Execution-map stamps and order-lease extremes on signal probes (2026-09-25) ────────────────────────
+
+def test_a_direction_call_carries_its_planned_execution(tmp_path):
+    """What edge.execution_map's counterfactual and crossBand need: the ATR15, the planned bracket, the
+    lease, and the net RR if crossed at the live price. Recorded only; unusable values are dropped."""
+    store = MemoryStore(str(tmp_path / "memory.json"))
+    store.record_signal_probe("SPX-USDT", "sell", 1.0, "continuation", atr15_pct=1.8, planned_entry=1.01,
+                              planned_stop=1.03, planned_tp=0.95, crossed_net_rr=1.37, lease_min=15)
+    ctx = store.signal_probes(limit=0)[0]["entryContext"]
+    assert (ctx["atr15Pct"], ctx["plannedEntry"], ctx["plannedStop"], ctx["plannedTp"]) == (1.8, 1.01, 1.03, 0.95)
+    assert (ctx["crossedNetRr"], ctx["leaseMin"]) == (1.37, 15.0)
+    store.record_signal_probe("ADA-USDT", "buy", 1.0, "continuation", atr15_pct=-1, planned_stop=float("nan"),
+                              crossed_net_rr=0.0, lease_min=None)
+    ada = next(p for p in store.signal_probes(limit=0) if p["symbol"] == "ADA-USDT")["entryContext"]
+    assert ada["crossedNetRr"] == 0.0                   # costs ate the reward: a real value, kept
+    assert not {"atr15Pct", "plannedStop", "leaseMin"} & set(ada)
+
+
+class _LeaseSpy:
+    def __init__(self, result=(0.98, 1.02), exc=None):
+        self.result, self.exc, self.calls = result, exc, []
+
+    def __call__(self, symbol, t0, t1):
+        self.calls.append((symbol, t0, t1))
+        if self.exc:
+            raise self.exc
+        return self.result
+
+
+class TestProbeLeaseExtremes:
+    """Every call gets the low/high its contract traded over the order lease, so the execution map can
+    say whether a limit at ANY depth would have filled — not only at the depth the model used."""
+
+    def _probe(self, tmp_path, **kw):
+        m = MemoryStore(str(tmp_path / "m.json"))
+        m.record_signal_probe("SPX-USDT", "sell", 1.0, "continuation", atr15_pct=1.0, lease_min=15, **kw)
+        return m
+
+    def test_stamped_once_after_the_lease_and_its_last_bar(self, tmp_path):
+        m = self._probe(tmp_path)
+        spy = _LeaseSpy()
+        _shift_probe_clock(m, 15 * 60 + 30)        # lease over, but its last 1m bar is still open
+        m.settle_signal_probes({}, lease_extremes=spy)
+        assert spy.calls == []
+        _shift_probe_clock(m, 60)
+        m.settle_signal_probes({}, lease_extremes=spy)
+        ts = m.signal_probes(limit=0)[0]["ts"]
+        assert spy.calls == [("SPX-USDT", float(ts), float(ts) + 900.0)]
+        ctx = m.signal_probes(limit=0)[0]["entryContext"]
+        assert (ctx["leaseLow"], ctx["leaseHigh"]) == (0.98, 1.02)
+        m.settle_signal_probes({}, lease_extremes=spy)
+        assert len(spy.calls) == 1                  # stamped once
+
+    def test_unavailable_bars_retry_then_are_written_off_and_never_back_filled(self, tmp_path):
+        m = self._probe(tmp_path)
+        _shift_probe_clock(m, 17 * 60)
+        m.settle_signal_probes({}, lease_extremes=_LeaseSpy(result=None))
+        assert "leaseLow" not in m.signal_probes(limit=0)[0]["entryContext"]     # still waiting
+        _shift_probe_clock(m, 30 * 60)              # past lease + one bar + the tolerance
+        late = _LeaseSpy()
+        m.settle_signal_probes({}, lease_extremes=late)
+        ctx = m.signal_probes(limit=0)[0]["entryContext"]
+        assert late.calls == [] and ctx["leaseLow"] is None and ctx["leaseHigh"] is None
+        m.settle_signal_probes({}, lease_extremes=_LeaseSpy())
+        assert m.signal_probes(limit=0)[0]["entryContext"]["leaseLow"] is None      # never back-filled
+
+    def test_a_raising_lookup_warns_and_never_costs_the_price_stamps(self, tmp_path, caplog):
+        m = self._probe(tmp_path)
+        _shift_probe_clock(m, 16 * 60)
+        with caplog.at_level("WARNING"):
+            m.settle_signal_probes({"SPX-USDT": 0.99}, lease_extremes=_LeaseSpy(exc=RuntimeError("klines down")))
+        ctx = m.signal_probes(limit=0)[0]["entryContext"]
+        assert ctx["signalProbe"]["m15"] == 0.99 and "leaseLow" not in ctx
+        assert any("PROBE LEASE" in r.message and r.levelname == "WARNING" for r in caplog.records)
+
+    def test_only_probes_that_stamped_a_lease_qualify(self, tmp_path):
+        m = MemoryStore(str(tmp_path / "m.json"))
+        m.record_signal_probe("SPX-USDT", "sell", 1.0, "continuation")              # recorded before the stamp
+        m.record_trade("SPX-USDT", "sell", 10.0, price=1.01, venue="futures", filled=False,
+                       entry_context={"marketPriceAtSignal": 1.0, "positionSide": "short", "leaseMin": 15})
+        _shift_probe_clock(m, 40 * 60)
+        _shift_probe_clock(m, 17 * 60, bucket="trades")        # the trade row WOULD be due, if it qualified
+        spy = _LeaseSpy()
+        m.settle_signal_probes({}, lease_extremes=spy)
+        assert spy.calls == []
+        assert "leaseLow" not in m.signal_probes(limit=0)[0]["entryContext"]
+        assert all("leaseLow" not in (t.get("entryContext") or {}) for t in m._read()["trades"])
+
+    def test_without_a_lookup_nothing_is_written_off(self, tmp_path):
+        """Callers that do not inject the lookup (older call sites, tests) must not burn the window."""
+        m = self._probe(tmp_path)
+        _shift_probe_clock(m, 40 * 60)
+        m.settle_signal_probes({})
+        assert "leaseLow" not in m.signal_probes(limit=0)[0]["entryContext"]
+
+
+# ── Market state on probes, and data-quality failures for the screener (2026-09-25) ──────────────────
+
+from src.memory import MAX_ANALYSIS_FAILURES, sanitize_market_state  # noqa: E402
+
+_STATE = {"asOf": 1_790_300_000, "universe": 68, "breadth24": 0.07, "basketMedian24h": -6.2,
+          "btc24h": -1.4, "btc72h": 2.1, "btcDailyAdx": 18.5, "btcDailyBias": "Bullish", "extra": "junk"}
+
+
+class TestMarketStateSanitizer:
+  def test_keeps_the_whitelisted_numbers(self):
+    out = sanitize_market_state(_STATE)
+    assert out == {"asOf": 1_790_300_000, "universe": 68, "breadth24": 0.07, "basketMedian24h": -6.2,
+                   "btc24h": -1.4, "btc72h": 2.1, "btcDailyAdx": 18.5, "btcDailyBias": "bullish"}
+
+  def test_out_of_domain_values_are_dropped_not_clamped(self):
+    out = sanitize_market_state({"breadth24": 1.4, "btcDailyAdx": -3, "btc24h": float("nan"),
+                                 "btcDailyBias": "sideways", "basketMedian24h": "x", "btc72h": 1.0})
+    assert out == {"btc72h": 1.0}
+
+  def test_a_block_with_no_reading_is_none(self):
+    assert sanitize_market_state({"asOf": 5, "universe": 3}) is None
+    assert sanitize_market_state(None) is None and sanitize_market_state("x") is None
+
+
+class TestProbesCarryTheMarketState:
+  def test_signal_probe_stamps_the_sanitized_block(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "p.json"))
+    m.record_signal_probe("SPX-USDT", "sell", 1.0, "continuation", market_state=_STATE)
+    ctx = m.signal_probes(limit=0)[0]["entryContext"]
+    assert ctx["marketState"] == sanitize_market_state(_STATE)
+
+  def test_signal_probe_without_a_reading_has_no_key(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "p.json"))
+    m.record_signal_probe("SPX-USDT", "sell", 1.0, "continuation")
+    assert "marketState" not in m.signal_probes(limit=0)[0]["entryContext"]
+
+  def test_exit_probe_stamps_entry_and_exit_states(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "x.json"))
+    at_exit = dict(_STATE, breadth24=0.66)
+    m.record_exit_probe("ONE-USDT", "long", 100.0, 90.0, 130.0, 101.0, realized_r=0.1,
+                        closed_by="protection", market_state=_STATE, market_state_at_exit=at_exit)
+    row = m.exit_probes(limit=10)[0]
+    assert row["marketState"]["breadth24"] == 0.07 and row["marketStateAtExit"]["breadth24"] == 0.66
+    m.record_exit_probe("TWO-USDT", "long", 100.0, 90.0, 130.0, 101.0, realized_r=0.1)
+    assert m.exit_probes(limit=10)[-1]["marketState"] is None
+
+
+class TestAnalysisFailures:
+  def test_record_read_and_expire_on_its_own_retry_time(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "af.json"))
+    now = time.time()
+    m.record_analysis_failure("TAKE-USDT", reason="1hour: 6 candle gap(s)", retry_after=now + 7200)
+    got = m.analysis_failures(now=now)["TAKE-USDT"]
+    assert got["reason"] == "1hour: 6 candle gap(s)" and got["remainingHours"] == pytest.approx(2.0, abs=0.1)
+    assert m.analysis_failures(now=now + 7201) == {}
+
+  def test_a_retry_already_past_is_not_stored(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "af.json"))
+    m.record_analysis_failure("TAKE-USDT", reason="x", retry_after=time.time() - 1)
+    m.record_analysis_failure("TAKE-USDT", reason="x", retry_after="soon")
+    assert m.analysis_failures() == {}
+
+  def test_clear_and_one_row_per_symbol(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "af.json"))
+    now = time.time()
+    m.record_analysis_failure("TAKEUSDTM", reason="old", retry_after=now + 100)
+    m.record_analysis_failure("TAKE-USDT", reason="new", retry_after=now + 200)
+    assert list(m.analysis_failures()) == ["TAKE-USDT"] and m.analysis_failures()["TAKE-USDT"]["reason"] == "new"
+    assert m.clear_analysis_failure("TAKE-USDT") is True
+    assert m.analysis_failures() == {} and m.clear_analysis_failure("TAKE-USDT") is False
+
+  def test_it_survives_the_models_remove_coin(self, tmp_path):
+    """Kept apart from the coins list, which remove_coin overwrites and which is capped at 50."""
+    m = MemoryStore(str(tmp_path / "af.json"))
+    m.record_analysis_failure("TAKE-USDT", reason="gaps", retry_after=time.time() + 3600)
+    m.remove_coin("TAKE-USDT", reason="model pruned it", exit_plan="none")
+    assert "TAKE-USDT" in m.analysis_failures()
+
+  def test_the_store_is_capped(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "af.json"))
+    now = time.time()
+    for i in range(MAX_ANALYSIS_FAILURES + 5):
+      m.record_analysis_failure(f"C{i}-USDT", reason="x", retry_after=now + 3600, now=now + i)
+    stored = m.analysis_failures(now=now)
+    assert len(stored) == MAX_ANALYSIS_FAILURES and "C0-USDT" not in stored
+
+
+# ── Gate probes: what each directional gate blocks, kept OUT of the family verdicts (2026-09-25) ─────
+
+
+def _age_gate_rows(store, seconds: int) -> None:
+  """Age every gate-probe row by ``seconds``, as the live loop's clock would."""
+  data = store._read()
+  for row in data.get("gate_probes") or []:
+    row["ts"] -= seconds
+  store._write(data)
+
+
+class TestGateProbeStore:
+  """The directional gates returned before the signal probe, so a refused call left no evidence (8 hard
+  refusals on 09-22..24, 0 probes). Refusals and model-independent gate-state readings now record into
+  their own bucket — which must never leak into signal_probes() and so into any family verdict."""
+
+  def test_signal_probes_never_include_gate_probes(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 1.0, "continuation", price_source="futures_mark")
+    assert m.record_gate_probe("TWO-USDT", "buy", 2.0, "h1_align", setup_family="continuation",
+                               price_source="futures_mark") is True
+    assert m.record_gate_state_probes("THREE-USDT", 3.0, {"long": ["anti_fomo"], "short": []},
+                                      price_source="futures_mark") == 2
+    assert [r["symbol"] for r in m.signal_probes(limit=0)] == ["ONE-USDT"]
+    kinds = sorted((r["symbol"], r["entryContext"]["gateProbe"]) for r in m.gate_probes())
+    assert kinds == [("THREE-USDT", "state"), ("THREE-USDT", "state"), ("TWO-USDT", "refusal")]
+
+  def test_a_refusal_row_carries_the_gate_the_call_and_the_market(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_probe("SPX-USDT", "sell", 1.02, "confidence_floor", setup_family="Continuation",
+                        price_source="futures_mark", model="gpt-6-luna", confidence=0.72,
+                        regime={"daily_bias": "bullish", "daily_exhausted": True, "intraday_bias_1h": "bearish",
+                                "analyzed_at": 123.0, "intraday_vwap": 1.0})
+    ctx = m.gate_probes()[0]["entryContext"]
+    assert ctx["gateProbe"] == "refusal" and ctx["gate"] == "confidence_floor" and ctx["gates"] == ["confidence_floor"]
+    assert ctx["positionSide"] == "short" and ctx["marketPriceAtSignal"] == 1.02
+    assert ctx["setupFamily"] == "continuation" and ctx["model"] == "gpt-6-luna" and ctx["confidence"] == 0.72
+    # Only the bias/flag fields travel: no prices, no timestamps from the gate state.
+    assert ctx["regime"] == {"daily_bias": "bullish", "daily_exhausted": True, "intraday_bias_1h": "bearish"}
+
+  def test_a_structural_or_unknown_gate_is_not_recorded(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "g.json"))
+    assert m.record_gate_probe("SPX-USDT", "buy", 1.0, "pending_entry") is False
+    assert m.record_gate_probe("SPX-USDT", "buy", 1.0, "made_up") is False
+    assert m.record_gate_probe("SPX-USDT", "sideways", 1.0, "h1_align") is False
+    assert m.record_gate_probe("SPX-USDT", "buy", float("nan"), "h1_align") is False
+    assert m.gate_probes() == []
+
+  def test_a_loud_gate_cannot_evict_a_quiet_ones_refusals(self, tmp_path, monkeypatch):
+    import src.memory as memory_mod
+    monkeypatch.setattr(memory_mod, "MAX_GATE_PROBES_PER_GATE", 3)
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_probe("Q-USDT", "buy", 1.0, "correlation")
+    for i in range(10):
+      m.record_gate_probe(f"L{i}-USDT", "buy", 1.0, "anti_fomo")
+    by_gate = {}
+    for r in m.gate_probes():
+      by_gate.setdefault(r["entryContext"]["gate"], []).append(r["symbol"])
+    assert by_gate["correlation"] == ["Q-USDT"]
+    assert by_gate["anti_fomo"] == ["L7-USDT", "L8-USDT", "L9-USDT"]      # newest kept, in order
+
+  def test_state_rows_are_one_per_symbol_side_per_widest_horizon(self, tmp_path):
+    from src.memory import GATE_STATE_WINDOW_MIN
+    m = MemoryStore(str(tmp_path / "g.json"))
+    now = time.time()
+    assert m.record_gate_state_probes("A-USDT", 1.0, {"long": [], "short": ["h1_align"]}, now=now) == 2
+    # Another analysis minutes later: both sides already have a row inside the window.
+    assert m.record_gate_state_probes("A-USDT", 1.0, {"long": ["anti_fomo"], "short": []}, now=now + 600) == 0
+    # A different symbol is its own key.
+    assert m.record_gate_state_probes("B-USDT", 1.0, {"long": [], "short": []}, now=now + 600) == 2
+    # Once the widest horizon has passed, the next reading is a new, non-overlapping row.
+    later = now + GATE_STATE_WINDOW_MIN * 60 + 1
+    assert m.record_gate_state_probes("A-USDT", 1.0, {"long": [], "short": []}, now=later) == 2
+    assert GATE_STATE_WINDOW_MIN == 240
+
+  def test_gate_rows_settle_on_the_futures_mark_with_a_credit_signed_per_side(self, tmp_path):
+    """A state reading writes a long and a short row at the SAME instant. Their funding credits have
+    opposite signs, so a credit map keyed without the side would hand one row the other's credit."""
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_state_probes("ONE-USDT", 0.0040, {"long": [], "short": ["anti_fomo"]},
+                               price_source="futures_mark")
+    _age_gate_rows(m, 61 * 60)
+
+    def funding(symbol, side, t0, t1):
+      return 0.002 if side == "long" else -0.002
+
+    # Futures map settles it; the spot map is ignored for a futures-based row.
+    m.settle_signal_probes({"ONE-USDT": 0.0041}, spot_prices={"ONE-USDT": 0.0050}, funding_received=funding)
+    by_side = {r["entryContext"]["positionSide"]: r["entryContext"]["signalProbe"] for r in m.gate_probes()}
+    assert by_side["long"]["m60"] == 0.0041 and by_side["short"]["m60"] == 0.0041
+    assert by_side["long"]["f60"] == 0.002 and by_side["short"]["f60"] == -0.002
+    assert m.signal_probes(limit=0) == []
+
+  def test_symbols_due_includes_gate_rows(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_probe("DUE-USDT", "buy", 1.0, "bench", price_source="futures_mark")
+    _age_gate_rows(m, 6 * 60)
+    assert m.symbols_due_for_settlement() == {"DUE-USDT"}
+
+  def test_fully_settled_state_rows_fold_into_day_cells_once(self, tmp_path):
+    from src.edge import gate_state_cells
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_state_probes("A-USDT", 100.0, {"long": ["h1_align"], "short": []}, price_source="futures_mark")
+    m.record_gate_probe("R-USDT", "buy", 1.0, "h1_align", price_source="futures_mark")
+    data = m._read()
+    for row in data["gate_probes"]:
+      row["entryContext"]["signalProbe"] = {"m5": 101.0, "m15": None, "m60": 102.0}   # m240 pending
+    m._write(data)
+    assert m.fold_settled_gate_states(gate_state_cells) == 0            # not fully settled: nothing folds
+    data = m._read()
+    for row in data["gate_probes"]:
+      row["entryContext"]["signalProbe"]["m240"] = 98.0
+    m._write(data)
+    assert m.fold_settled_gate_states(gate_state_cells) == 2            # both state sides; never the refusal
+    left = m.gate_probes()
+    assert [r["entryContext"]["gateProbe"] for r in left] == ["refusal"]
+    days = m.gate_state_days()
+    (day, cell), = days.items()
+    assert cell["long"]["60"][0] == 1 and cell["long"]["60"][1] == pytest.approx(0.02)
+    assert cell["long"]["60"][2] == {"h1_align": [1, pytest.approx(0.02)]}
+    assert cell["short"]["240"][1] == pytest.approx(0.02) and cell["short"]["240"][2] == {}
+    assert "15" not in cell["long"]                                      # a missed horizon adds nothing
+    # Stored compactly (one string per day — the file is written with indent=2).
+    assert isinstance(m._read()["gate_state_days"][day], str)
+    assert m.fold_settled_gate_states(gate_state_cells) == 0            # counted exactly once
+
+  def test_folding_adds_to_an_existing_day(self, tmp_path):
+    from src.edge import gate_state_cells
+    m = MemoryStore(str(tmp_path / "g.json"))
+    now = time.time()
+    for k, sym in enumerate(("A-USDT", "B-USDT")):
+      m.record_gate_state_probes(sym, 100.0, {"long": ["anti_fomo"]}, now=now + k)
+      data = m._read()
+      for row in data["gate_probes"]:
+        row["entryContext"]["signalProbe"] = {"m5": None, "m15": None, "m60": None, "m240": 101.0 + k}
+      m._write(data)
+      assert m.fold_settled_gate_states(gate_state_cells) == 1
+    (cell,) = m.gate_state_days().values()
+    assert cell["long"]["240"][0] == 2 and cell["long"]["240"][1] == pytest.approx(0.01 + 0.02)
+    assert cell["long"]["240"][2]["anti_fomo"][0] == 2
+
+  def test_a_failing_fold_function_keeps_the_rows(self, tmp_path, caplog):
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_state_probes("A-USDT", 100.0, {"long": []})
+    data = m._read()
+    data["gate_probes"][0]["entryContext"]["signalProbe"] = {"m5": 1, "m15": 1, "m60": 1, "m240": 1}
+    m._write(data)
+
+    def boom(_rows):
+      raise RuntimeError("scorer exploded")
+
+    with caplog.at_level("WARNING"):
+      assert m.fold_settled_gate_states(boom) == 0
+    assert len(m.gate_probes()) == 1 and m.gate_state_days() == {}
+    assert any("GATE STATE FOLD failed" in r.message for r in caplog.records)
+
+  def test_day_cells_are_kept_by_count(self, tmp_path, monkeypatch):
+    import json
+    import src.memory as memory_mod
+    monkeypatch.setattr(memory_mod, "MAX_GATE_STATE_DAYS", 2)
+    m = MemoryStore(str(tmp_path / "g.json"))
+    data = m._read()
+    data["gate_state_days"] = {str(d): json.dumps({"long": {"240": [1, 0.01, {}]}}) for d in (20001, 20003, 20002)}
+    data["gate_state_days"]["junk"] = "{}"
+    data["gate_state_days"]["20004"] = "not json"
+    m._write(data)
+    m._prune(data)
+    assert sorted(data["gate_state_days"]) == ["20002", "20003"]
+
+  def test_an_older_store_is_not_rewritten_just_to_add_gate_keys(self, tmp_path):
+    import json
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_signal_probe("ONE-USDT", "buy", 1.0, "continuation")
+    raw = json.loads((tmp_path / "g.json").read_text())
+    assert "gate_probes" not in raw and "gate_state_days" not in raw
+
+
+def test_a_direction_call_records_which_gates_it_met_and_the_hatch_that_admitted_it(tmp_path):
+  m = MemoryStore(str(tmp_path / "g.json"))
+  m.record_signal_probe("A-USDT", "buy", 1.0, "breakout",
+                        gates_passed=[{"gate": "h1_align", "hatch": "declared"}, {"gate": "made_up", "hatch": "x"}, "junk"])
+  m.record_signal_probe("B-USDT", "buy", 1.0, "continuation", gates_passed=[])
+  m.record_signal_probe("C-USDT", "buy", 1.0, "continuation")
+  by_sym = {r["symbol"]: r["entryContext"] for r in m.signal_probes(limit=0)}
+  assert by_sym["A-USDT"]["gatesPassed"] == [{"gate": "h1_align", "hatch": "declared"}]
+  assert by_sym["B-USDT"]["gatesPassed"] == []          # faced none: a real baseline row
+  assert "gatesPassed" not in by_sym["C-USDT"]          # not stamped: never counted as 'faced none'

@@ -44,6 +44,7 @@ from .analytics import (
   INTERVAL_SECONDS,
   candles_to_dataframe,
   compute_indicators,
+  qualified_perp_row,
   summarize_interval,
   summarize_multi_timeframe,
 )
@@ -58,6 +59,9 @@ from .kucoin import (
 )
 from .edge import (
   adaptive_stop_atr_mult,
+  annotate_family_stakes,
+  confidence_edge_for_prompt,
+  confidence_edge_stats,
   signal_edge_stats,
   exit_discipline_stats,
   family_scoring_horizons,
@@ -65,12 +69,14 @@ from .edge import (
   expectancy_size_factor,
   edge_stats,
   entry_quality_stats,
+  execution_map,
   loss_streak_size_factor,
   measured_slippage_pct,
   symbol_bench_until,
   taker_flow_edge_stats,
 )
-from .memory import MAX_SIGNAL_PROBES, MemoryStore
+from .memory import MAX_CLOSED_TRADES, MAX_SIGNAL_PROBES, MemoryStore
+from .position_context import entry_thesis
 from .protection import should_block_chase
 from .regime import (
   allow_reversal_long,
@@ -494,6 +500,9 @@ def _strip_citation_tokens(text: str) -> str:
   return _CITATION_TOKEN_RE.sub("", _CITATION_PUA_RE.sub("", text)).strip()
 
 
+NOT_TRADEABLE_HERE = "no spot route — this bot cannot add/trade it"
+
+
 def _screen_contracts(
   contracts: list,
   *,
@@ -504,6 +513,7 @@ def _screen_contracts(
   side: str = "both",
   top_n: int = 15,
   max_abs_change_pct: float | None = None,
+  tradeable: Callable[[str], bool | None] | None = None,
 ) -> Dict[str, Any]:
   """Rank the full active-perp universe into a shortlist of tradable opportunities. Pure/testable.
 
@@ -511,6 +521,15 @@ def _screen_contracts(
   bar the entry guard enforces — no fresh micro-caps), then ranks by ``sort_by`` and optionally keeps
   only one side. This is the market EYES the research scout was missing: it can only look at coins it
   already names, so it never discovered the mover in a 500-coin field.
+
+  ``tradeable(futures_symbol)`` is the EXECUTION layer's reachability (``_bot_can_trade`` over the live
+  spot symbol list, shared with add_coin so the two can never disagree). A row it answers False for is
+  dropped BEFORE the top-n cut and named in ``excluded`` instead of taking a slot: on 2026-09-24 about
+  16% of qualified perps had no spot pair (FHE, TAKE, 1000BONK, stock perps), they took 4 of 13
+  short-side slots in one snapshot, and 43 tool calls in 52h failed only because of it. None (the spot
+  list is unavailable) keeps the row — fail OPEN, so a lookup outage can never blind the screener — and
+  ``tradeableCheck`` says which happened. This removes nothing the bot could trade: add_coin and the
+  order tools already refuse these symbols; it just stops the model spending turns finding that out.
   """
   qualified: list[Dict[str, Any]] = []
   scanned = 0
@@ -521,20 +540,11 @@ def _screen_contracts(
     if not sym.endswith("USDTM"):
       continue
     scanned += 1
-    if str(c.get("status") or "Open").lower() != "open":
+    base = qualified_perp_row(c, min_turnover=min_turnover, min_age_days=min_age_days, now=now)
+    if base is None:
       continue
-    turnover = _to_float(c.get("turnoverOf24h")) or 0.0
-    if min_turnover > 0 and turnover < min_turnover:
-      continue
-    age_days = None
-    fo = _to_float(c.get("firstOpenDate"))
-    if fo:
-      fo_s = fo / 1000.0 if fo > 1e12 else fo
-      age_days = (now - fo_s) / 86400.0
-      if min_age_days > 0 and age_days < min_age_days:
-        continue
-    chg = _to_float(c.get("priceChgPct"))
-    chg_pct = chg * 100 if chg is not None else None
+    chg_pct = base["chgPct"]
+    age_days = base["ageDays"]
     # Extreme 24h movers are usually already extended and frequently fail the downstream ATR gate.
     # Excluding them here stops the research loop from repeatedly selecting an untradeable top mover
     # (LAB monopolised dozens of July 13 cycles this way) and rotates to the next liquid candidate.
@@ -544,10 +554,14 @@ def _screen_contracts(
       "symbol": _normalize_symbol(sym),
       "futuresSymbol": sym,
       "chgPct24h": round(chg_pct, 2) if chg_pct is not None else None,
-      "turnover24hUsd": round(turnover),
+      "turnover24hUsd": round(base["turnover"]),
       "funding": _to_float(c.get("fundingFeeRate")),
       "markPrice": _to_float(c.get("markPrice")) or _to_float(c.get("lastTradePrice")),
       "ageDays": round(age_days, 1) if age_days is not None else None,
+      # The exchange's own class for the contract (CRYPTO / STOCK / METAL / COMMODITY). A stock perp
+      # trades on its underlying's session and gaps across the close — a risk the survival code does
+      # not model, which is one reason perp-only names stay unreachable here.
+      "assetClass": base["assetClass"],
     })
 
   s = (side or "both").lower()
@@ -567,7 +581,140 @@ def _screen_contracts(
     qualified.sort(key=lambda r: (abs(r["chgPct24h"] or 0), r["turnover24hUsd"] or 0), reverse=True)
 
   n = max(1, min(int(top_n or 15), 40))
-  return {"scanned": scanned, "qualified": len(qualified), "results": qualified[:n]}
+  results: list[Dict[str, Any]] = []
+  excluded: Dict[str, str] = {}
+  checked: set[bool | None] = set()
+  for row in qualified:
+    if len(results) >= n:
+      break
+    verdict = None
+    if tradeable is not None:
+      try:
+        verdict = tradeable(row["futuresSymbol"])
+      except Exception:
+        verdict = None                   # fail open, row by row
+      checked.add(verdict if verdict in (True, False) else None)
+    if verdict is False:
+      excluded[row["symbol"]] = NOT_TRADEABLE_HERE
+      continue
+    results.append(row)
+  out: Dict[str, Any] = {"scanned": scanned, "qualified": len(qualified), "results": results}
+  if tradeable is not None:
+    out["tradeableCheck"] = "unavailable" if None in checked else "applied"
+    out["excluded"] = excluded
+  return out
+
+
+def _bot_can_trade(symbol: str, spot_symbols: set[str] | None) -> bool | None:
+  """Can THIS bot's execution layer add and trade ``symbol`` ('X-USDT' or a perp 'XUSDTM')? Pure.
+
+  Execution here is spot-anchored: add_coin validates on the spot ticker, the universe, snapshot prices
+  and every order tool map 'BASE-USDT' -> 'BASEUSDTM'. So a contract is reachable exactly when its
+  normalized spot pair is live and trading (``enableTrading``) AND that pair maps back to the same
+  contract. Exact names, never a loose base match: 1000BONKUSDTM normalizes to 1000BONK-USDT, which is
+  not listed (the spot pair is BONK-USDT — matching those would mix prices 1000x); and the round trip
+  rejects a name like 'BTCUSDTM' whose pair BTC-USDT the execution layer would trade as XBTUSDTM. Tied to
+  the live exchange list, not a coin list, so it follows listings and delistings by itself.
+  ``spot_symbols`` None = unknown -> None (callers fail open).
+  """
+  if spot_symbols is None:
+    return None
+  raw = str(symbol or "").strip().upper()
+  spot = _normalize_symbol(raw)
+  fsym = _to_futures_symbol(spot)
+  if not fsym:
+    return False
+  if raw.endswith("USDTM") and fsym != raw.replace("-", ""):
+    return False
+  return spot in spot_symbols
+
+
+def _summarize_tool_output(output: Any) -> str | None:
+  """One decision-feed line for a Trading Agent tool result (log, Telegram, Supervisor's read_logs).
+
+  Failures are checked FIRST. Until 2026-09-25 any output carrying an orderId printed as 'live order',
+  so a lease-guard refusal ({rejected, orderId}) or a failed cancel ({error, orderId}) read as a live
+  order: 10 cancel outcomes in two days were mislabelled that way (6 lease rejections, 2+ exchange
+  errors) and only 2 cancels printed correctly. No tool returns an orderId together with error/rejected
+  for an order that actually went live, so the reorder cannot hide a real one. A cancel whose exchange
+  response is empty is NOT called a failure — KuCoin can return null data on a successful cancel — it
+  is labelled neutrally.
+  """
+  if not isinstance(output, dict):
+    return None
+  sym = output.get("symbol") or output.get("requested") or output.get("futuresSymbol")
+  if output.get("skipped"):
+    return f"decline: {output.get('reason','unspecified')} (conf={output.get('confidence')})"
+  if output.get("rejected"):
+    return f"rejected: {output.get('reason','unspecified')}" + (f" [{sym}]" if sym else "")
+  if output.get("error"):
+    return f"error: {output.get('error')}" + (f" [{sym}]" if sym else "")
+  if "cancelled" in output:
+    cancelled = output.get("cancelled")
+    ref = output.get("orderId") or (cancelled.get("orderId") if isinstance(cancelled, dict) else None) or sym or "unknown"
+    if cancelled:
+      return f"cancelled order: {ref}"
+    return f"cancel sent: {ref} (exchange returned no confirmation)"
+  if output.get("paper") and output.get("orderRequest"):
+    req = output.get("orderRequest", {})
+    rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
+    suffix = f" rationale={rationale}" if rationale else ""
+    return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')} (pnl=n/a){suffix}"
+  if output.get("orderId") or output.get("orderRequest"):
+    side = output.get("side") or output.get("orderRequest", {}).get("side")
+    osym = output.get("symbol") or output.get("orderRequest", {}).get("symbol")
+    rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
+    suffix = f" rationale={rationale}" if rationale else ""
+    return f"live order: {side} {osym} (orderId={output.get('orderId')}) (pnl=n/a){suffix}"
+  if output.get("transfer"):
+    t = output.get("transfer", {})
+    return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"
+  return None
+
+
+MARKET_STATE_PROMPT_KEYS = (
+  "breadth24", "universe", "basketMedian24h", "btc24h", "btc72h", "btcDailyAdx", "btcDailyBias",
+)
+
+
+def _market_state_for_prompt(state: Any, now: float) -> Dict[str, Any] | None:
+  """The current market state for the model: raw numbers and a legend, nothing else. Pure.
+
+  Deliberately NO per-state record here (no "your R when breadth was high") and no sizing factor. The
+  finding that proposed one (MKT-1, 2026-09-24) rested on the Sep 17-22 rally: 74 of the 99
+  high-breadth closes were that one week, and outside it high-breadth longs lost like low-breadth ones.
+  A per-bucket line would have trained the model on one episode — and a negative low-breadth record
+  starves itself, since calls only accrue when the model trades. So the model gets the reading; the
+  record accrues on every entry and probe (marketState) until several distinct episodes can judge it.
+  """
+  if not isinstance(state, dict):
+    return None
+  out: Dict[str, Any] = {k: state[k] for k in MARKET_STATE_PROMPT_KEYS if state.get(k) is not None}
+  if not out:
+    return None
+  try:
+    out["ageMin"] = round(max(0.0, float(now) - float(state.get("asOf"))) / 60.0)
+  except (TypeError, ValueError):
+    pass
+  out["note"] = (
+    "The market right now, measured, not judged: breadth24 = share of the liquid, mature crypto perps "
+    "(the scan's own universe, `universe` of them) up over 24h; basketMedian24h = their median 24h "
+    "change %; btc24h/btc72h = BTC's change %; btcDailyAdx = BTC daily trend strength (low = ranging) "
+    "next to btcDailyBias. Recorded on every entry and signal probe so your record can later be split "
+    "by market state. No rule is attached to these numbers."
+  )
+  return out
+
+
+def _exit_discipline_for_prompt(stats: Any) -> Any:
+  """exitDiscipline as the model sees it: everything except the per-market-state trail split.
+
+  trailByMarketState is an R line per breadth tercile — exactly the per-bucket record the market-state
+  work keeps away from the model while the sample spans one regime. It stays on the dashboard.
+  """
+  if not isinstance(stats, dict):
+    return stats
+  return {k: v for k, v in stats.items() if k != "trailByMarketState"}
 
 
 def _to_futures_symbol(spot_symbol: str) -> str | None:
@@ -590,6 +737,37 @@ def _resolve_allowed_spot_symbol(symbol: str, allowed_symbols: set[str]) -> str 
   if spot_symbol in allowed_symbols:
     return spot_symbol
   return None
+
+
+def _attach_entry_theses(
+  user_state: Dict[str, Any],
+  memory: Any,
+  now_ts: float,
+  *,
+  funding_clock: Any = None,
+) -> int:
+  """Add ``entryThesis`` to each ``futuresPositions`` row the model sees; return how many got one.
+
+  The row itself is raw exchange data, which left the model unable to tell whether a 15m/1h opposition
+  was NEW or the condition it entered into (STEP 1b). The thesis is the entry's own record — playbook,
+  entry biases, planned bracket, current R, noise band, and for a carry the settlement clock — built by
+  position_context.entry_thesis. A row whose entry cannot be matched simply gets no block: omitted, never
+  guessed. Total: a failure on one row never touches another or the run.
+  """
+  count = 0
+  rows = user_state.get("futuresPositions") if isinstance(user_state, dict) else None
+  for row in rows or []:
+    if not isinstance(row, dict):
+      continue
+    try:
+      thesis = entry_thesis(memory, row, now_ts, funding_clock=funding_clock)
+    except Exception as exc:  # entry_thesis is total; belt and braces
+      logger.warning("ENTRY THESIS: %s skipped (%s)", row.get("symbol"), exc)
+      thesis = None
+    if thesis:
+      row["entryThesis"] = thesis
+      count += 1
+  return count
 
 
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
@@ -801,6 +979,8 @@ def run_trading_agent(
   calendar_state: Dict[str, Any] | None = None,
   safety_state: Any | None = None,
   entry_token: str | None = None,
+  funding_clock: Any | None = None,
+  market_state: Callable[[], Dict[str, Any] | None] | None = None,
 ) -> dict[str, Any]:
   # Azure OpenAI async client configured for Agents SDK.
   if openai_client is None:
@@ -882,6 +1062,23 @@ def run_trading_agent(
     _btc_bias_cache["v"] = bias
     return bias
 
+  def _btc_daily_bias_peek() -> str | None:
+    """BTC's daily bias ONLY if this run already knows it — never fills the cache, never fetches.
+
+    For report-only telemetry (tools._gates_against_now). ``_btc_daily_bias`` caches its FIRST answer
+    for the whole run and, before BTC is analysed, falls back to a raw forming-bar spot fetch that is
+    not neutralised for exhaustion/weak ADX. 2026-09-25 review: the gate-state telemetry called it at
+    the end of every analysis, so analysing SOL before BTC froze the raw 'bearish' into the cache and
+    the LIVE correlation veto then refused an alt long the closed-bar 'neutral' gate would have allowed
+    (and moved the relative-strength size factor). Telemetry must never decide which answer the gate
+    gets. None = unknown this run."""
+    if "v" in _btc_bias_cache:
+      return _btc_bias_cache["v"]
+    gate = _daily_gate_state.get("BTC-USDT")
+    if gate and gate.get("daily_bias"):
+      return str(gate.get("daily_bias"))
+    return None
+
   _edge_cache: Dict[str, Any] = {}
 
   def _edge_state() -> Dict[str, Any]:
@@ -951,14 +1148,34 @@ def run_trading_agent(
           _tf = taker_flow_edge_stats(_probes, cost_pct=_cost)
           if _tf.get("verdict") != "insufficient data":
             state["taker_flow_edge"] = _tf
-          # EXIT DISCIPLINE: were the discretionary closes better than the brackets they overrode?
+          # CONFIDENCE: does each model's stated confidence rank its own calls (within a day, so a
+          # regime's level shift is not mistaken for information)? Report-only; never raises.
+          state["confidence_edge"] = confidence_edge_stats(
+            _probes, cost_pct=_cost, family_horizons=_fam_horizons,
+          )
+          # EXECUTION MAP: fill rate and realized R by resting distance (ATR15), from the SAME limit-entry
+          # records performanceSummary.limitFillRate counts plus the whole retained closes list, and a
+          # counterfactual over every call at every depth. Replaces the static "0.5-1.5 x ATR" line and
+          # the unreproduced Jul-30 crossing figures the prompt used to carry. Data only; its own try so
+          # a failure here costs the map, never the signal edge or the stand-aside that reads it.
+          try:
+            state["execution_map"] = execution_map(
+              memory.limit_entry_records(), memory.realized_closes(limit=MAX_CLOSED_TRADES),
+              probes=_probes, cost_pct=_cost, family_horizons=_fam_horizons,
+              rr_floor=cfg.trading.min_futures_rr,
+            )
+          except Exception as _xm_exc:
+            logger.warning("EXECUTION MAP unavailable this run (%s) — the model sees none", _xm_exc)
+          # EXIT DISCIPLINE: were the discretionary closes better than leaving the position to the system
+          # (bracket + trail/breakeven + carry hold, replayed on 1m futures bars)?
           state["exit_discipline"] = exit_discipline_stats(memory.exit_probes(limit=200))
           _xd = state["exit_discipline"]
           if _xd.get("verdict") == "closes destroy value":
             logger.warning(
-              "EXIT DISCIPLINE: %d discretionary closes returned %+.2fR where their brackets would have "
-              "returned %+.2fR (%+.3fR/trade) — closing early is costing more than it saves",
-              _xd.get("n"), _xd.get("takenR"), _xd.get("bracketR"), _xd.get("deltaRPerTrade") or 0.0,
+              "EXIT DISCIPLINE: %d discretionary closes returned %+.2fR where leaving them to the system "
+              "would have returned %+.2fR (%+.3fR/trade, stack-scored closes only) — closing early is "
+              "costing more than it saves",
+              _xd.get("n"), _xd.get("takenR"), _xd.get("benchmarkR"), _xd.get("deltaRPerTrade") or 0.0,
             )
           _se = state["signal_edge"]
           if _se.get("verdict") == "no edge":
@@ -1252,6 +1469,8 @@ def run_trading_agent(
     _futures_margin_mode=_futures_margin_mode,
     _apply_cross_leverage=_apply_cross_leverage,
     _btc_daily_bias=_btc_daily_bias,
+    # Read-only view of the same bias for report-only telemetry: never fills the decision cache.
+    _btc_daily_bias_peek=_btc_daily_bias_peek,
     _edge_state=_edge_state,
     _fee_adjusted_breakeven=_fee_adjusted_breakeven,
     _get_contract_spec=_get_contract_spec,
@@ -1261,6 +1480,8 @@ def run_trading_agent(
     _stop_distance_ok=_stop_distance_ok,
     safety_state=safety_state,
     entry_token=entry_token,
+    # Cache-only reader of the poll loop's hourly market state; stamped on every entry and probe.
+    market_state=market_state,
   ))
   place_market_order = _tools.place_market_order
   place_limit_order = _tools.place_limit_order
@@ -1323,9 +1544,9 @@ def run_trading_agent(
     "genuine edge that the risk caps can size safely.\n"
     "- Trade STRENGTH. The account's biggest missed profits came from correctly identifying the market's strongest "
     "trend (e.g. a coin up hundreds of percent in a month) and then either never filling a too-passive limit or being "
-    "shaken out of the runner. Prefer the clearest trend/relative-strength leader with room to its target; for a "
-    "high-conviction continuation you may take a MARKETABLE entry (cross the spread slightly) rather than resting a "
-    "passive limit that never fills — the bracket still attaches, so the fill is protected.\n"
+    "shaken out of the runner. Prefer the clearest trend/relative-strength leader with room to its target; a "
+    "MARKETABLE entry (crossing the spread) is one option alongside a resting limit — pick between them by "
+    "executionMap's fillAdjustedR, not by how confident you feel. The bracket attaches either way.\n"
     "- Pick the best risk-adjusted setup across the WHOLE liquid universe — majors (BTC/ETH) and alts on equal footing. "
     "Don't anchor only on the biggest % movers (that skews to high-beta alts), and don't force a major either; majors "
     "just shouldn't be overlooked when they offer the cleaner trend, especially in a choppy tape.\n"
@@ -1367,9 +1588,27 @@ def run_trading_agent(
     "- If a position has no TP or SL: set them immediately via set_spot_position_protection or set_futures_position_protection.\n"
     "- Protection is monotonic after entry: a replacement SL may preserve or improve protection but must never widen "
     "the existing loss. Place and confirm the new stop before retiring the old one.\n"
-    "- Existing exposure is not grandfathered past thesis failure: if fresh 15m AND 1h biases both oppose the position, "
-    "treat that as a confirmed intraday reversal even when 4h/1D still lag. Reassess for a reduce-only close or a "
-    "structurally tighter stop; never keep or add merely because the daily trend still agrees.\n"
+    # 2026-09-25: this bullet used to say "if fresh 15m AND 1h biases both oppose the position, treat that
+    # as a confirmed intraday reversal" without saying fresh COMPARED WITH WHAT, and the position view
+    # had no entry record, so it fired on the entry premise of counter-intraday playbooks. Measured on
+    # 31 fires since 08-10: 27 were already true at the fill (DASH and KCS were funding_carry longs
+    # entered with 15m/1h bearish, closed on that same condition). Closing at the fire returned -2.06R
+    # vs -1.94R holding under protection (chop +2.07R, rally -2.19R) — but that replay reproduced only
+    # 2 of the 27 non-agent trades it rests on, so it is NOT a validated "zero edge"; the 4-5 genuine
+    # post-entry flips weakly favoured closing (~+1R). Hence: keep the rule, define "fresh" as changed
+    # since entry against entryThesis, and let exitDiscipline (now split by counterAtEntry/htfAligned)
+    # settle it. These numbers stay here, not in the prompt, so no one-regime constant reaches the model.
+    "- Existing exposure is not grandfathered past thesis failure. Each futures position carries 'entryThesis': "
+    "the playbook, the 15m/1h/4h/1D biases recorded when you entered (entryBias), the planned stop and target, "
+    "currentR and one noise band in R (noiseBandR). A fresh reversal means CHANGED SINCE ENTRY: compare the current "
+    "15m and 1h biases with entryThesis.entryBias. When both have turned against the position since entry, treat it "
+    "as a confirmed intraday reversal even if 4h/1D still lag, and reassess for a reduce-only close or a structurally "
+    "tighter stop. An opposition that was already present at entry is the condition you entered into, not new "
+    "evidence by itself. Before a reduce-only close, name what has changed since entry: the structure or your stated "
+    "invalidation broke, a flow or open-interest shift, how many noise bands price now sits from the stop, or for "
+    "funding_carry the sign or size of funding (entryThesis.fundingRateAtEntry vs fundingRateNow). Check "
+    "edgeReport.exitDiscipline for your own measured record at closing early. Never keep or add merely because the "
+    "daily trend still agrees.\n"
     "- Revise an SL or TP only to a defensible structural level; do not mechanically squeeze a bracket to make a metric pass.\n"
     "- The code-driven protection loop runs every poll and may move a stop to breakeven or close a position at the "
     "hard unrealized-loss equity cap. Never re-open or weaken protection to override that safety action.\n"
@@ -1524,8 +1763,9 @@ def run_trading_agent(
     "inside a range — either one is admitted past the daily/1h gates on your call alone. This is NOT a "
     "free pass to relabel a trend-continuation trade: the trade is scored under whatever family you "
     "declare, so a mislabeled entry just poisons that family's scoreboard and gets it stood aside. A newly "
-    "declared playbook trades at reduced 'explore' size until it has ~20 scored signals, then sizes up to "
-    "full risk only if it is actually paying. If you correctly spot a breakout or range fade against the "
+    "declared playbook trades at reduced 'explore' size until it has ~20 scored signals, then sizes up "
+    "toward full risk only as clearly as it is actually paying; longs and shorts of a playbook are judged "
+    "separately once each side has its own ~20. If you correctly spot a breakout or range fade against the "
     "higher-timeframe trend, you MUST declare it — otherwise the gate rejects a setup you correctly saw.\n\n"
 
     "**How to pick entry_price (REQUIRED for limit order tools):**\n"
@@ -1542,32 +1782,48 @@ def run_trading_agent(
     "    * Recent swing low or VAL (Value Area Low)\n"
     "    * VWAP retest from above after a breakout\n"
     "    * Fibonacci retracement of the recent rally: 38.2%, 50%, or 61.8% pullback levels\n"
-    "- **Entry distance**: target levels within 0.5–1.5 × ATR of current price. Farther than 1.5 ATR rarely fills in normal conditions.\n"
-    "- **Execution adaptation (fill rate is a first-class signal)**: read performanceSummary.limitFillRate. A passive "
-    "limit that never fills captures ZERO edge — an unfilled winner is a real loss of opportunity. If fill rate is low, "
-    "do NOT respond by standing aside; respond by executing closer to price: prefer the NEAREST valid structural "
-    "confluence, and place a MARKETABLE entry that crosses to fill immediately. The atomic bracket still attaches, so a "
-    "marketable fill is fully protected. TP/SL, daily/regime alignment, and RR must remain valid — but capturing the "
-    "move beats a perfect unfilled level.\n"
-    "- **What makes a cross safe is NOT conviction — it is the bracket surviving the worse entry.** This was measured "
-    "on real paths: replaying 82 expired limits, waiting LONGER fills more but those extra fills lose (-0.37R mean at "
-    "4h) — resting longer just buys adverse selection. The same 82 plans taken at the live price returned +13.05R over "
-    "80 trades (+0.163R mean, 65% win). Filtering those crossings by confidence >= 0.80 gave +0.050R; filtering by "
-    "'still clears the RR floor after crossing' gave +0.388R. So there is NO confidence bar on crossing — the binding "
-    "test is the post-cost RR gate, which the code already runs on the crossed price and which will reject you if the "
-    "trade no longer clears its floor. Try the cross and let that gate answer; do not pre-refuse yourself.\n"
-    "- **This applies to EVERY playbook, not just continuation.** A range_edge or fade_extreme entry resting above/below "
-    "price at the level is exactly the passive limit that fills ~18% of the time, and it is the most common way a "
-    "correct read produces no trade at all. If price is already at your level and the bracket still clears RR from "
-    "here, cross.\n"
+    # Entry distance and crossing, 2026-09-25. This block used to carry a fixed band ("0.5-1.5 x ATR ...
+    # farther than 1.5 rarely fills") and the Jul-30 replay figures (82 limits, +13.05R, -0.37R at 4h,
+    # +0.050R vs +0.388R, "try the cross and let that gate answer"). Measured Sep 20-24 the band sat in the
+    # 8-33% fill zone, and on a new 124-limit sample the RR-filter and TTL sub-claims did not reproduce
+    # (the crossing direction held, but only for rally longs). Any replacement figure would be one more
+    # frozen one-regime number, so the text states the mechanism and points at the live, self-updating
+    # table (edge.execution_map); the history lives in the tools.py marketable-entry comment.
+    "- **Entry distance — read edgeReport.executionMap, not a rule of thumb.** It is YOUR OWN recent limit entries "
+    "bucketed by how far each rested from the live price at the call, in 15m ATRs (distance = |limit - price| / "
+    "entryMap.atr15m; 'marketable' = crossed): how many you placed, how many filled within the lease, how fast, and "
+    "the realized R of the fills. Resting farther buys paper RR at the cost of fill probability — and a far limit "
+    "fills only after price has first moved against your call — so compare FILL-ADJUSTED expectancy (fillAdjustedR "
+    "= fill rate x realized R of fills at that distance; an unfilled limit earns zero), never planned RR. Marketable is "
+    "its own bucket: crossing is not automatically better, read its row like any other. A value spelled "
+    "'insufficient' has too few samples to mean anything yet, and the table pools both sides over whatever regime its "
+    "window covers. executionMap.counterfactual scores every call at every depth (gross, before trade management) "
+    "for the depths you have not been using.\n"
+    "- **Execution adaptation (fill rate is a first-class signal)**: a passive limit that never fills captures ZERO "
+    "edge — an unfilled winner is a real loss of opportunity. If your limits are not filling, do NOT respond by "
+    "standing aside; respond by choosing the distance whose fillAdjustedR is best — often the NEAREST valid "
+    "structural confluence, sometimes a marketable entry that crosses to fill immediately. The atomic bracket "
+    "attaches either way, so a marketable fill is fully protected. TP/SL, daily/regime alignment, and RR must remain "
+    "valid.\n"
+    "- **The post-cost RR gate is a fee guard, not a quality filter.** It runs at the price you actually pay (the "
+    "crossed price for a marketable entry) and rejects a bracket whose reward no longer covers its costs and risk. A "
+    "pass does NOT mean the trade is good: exits come mostly from the trailing stop rather than the TP, so extra paper "
+    "RR above the floor is not evidence of a better trade. Do not push the entry away (or the TP out) just to clear "
+    "it. There is no confidence bar on crossing; whether to cross or rest follows executionMap.\n"
+    "- **This applies to EVERY playbook, not just continuation.** A range_edge or fade_extreme entry resting away "
+    "from price at the level is the same passive limit, and an unfilled one is the most common way a correct read "
+    "produces no trade at all. If price is already at your level and the bracket still clears RR from here, crossing "
+    "is an option — check its bucket.\n"
     "- **Volume check**: the target level is stronger when it coincides with a prior high-volume node (POC or VAH/VAL from volume profile).\n"
     "- **Rejection confirmation**: for shorts, prefer entry at resistance only when you also see bearish RSI divergence or RSI > 65. "
     "For longs, prefer pullback entries when RSI < 40 or bullish divergence is present.\n"
-    "- If current price is at/through your level: place a marketable limit that crosses up to the code's marketable band "
-    "to secure the fill — the bracket attaches, so it is protected, and the post-cost RR gate is what decides whether "
-    "the worse entry is still worth taking. Pure market entry tools remain close/emergency-only.\n"
-    "- A fresh breakout impulse is best traded on its first confirmed retest/pullback; but if the trend is strong and a "
-    "clean pullback is not offered, a bracketed marketable entry is preferable to missing the move entirely.\n"
+    "- If current price is at/through your level: a marketable limit that crosses up to the code's marketable band "
+    "secures the fill — the bracket attaches, so it is protected, and the post-cost RR gate checks that the worse "
+    "entry still covers its costs (a fee guard, not a verdict on the trade). Pure market entry tools remain "
+    "close/emergency-only.\n"
+    "- A fresh breakout impulse is best traded on its first confirmed retest/pullback; if the trend is strong and a "
+    "clean pullback is not offered, a bracketed marketable entry is an option — check its executionMap bucket. "
+    "Missing a move earns 0R, and a negative marketable row means crossing does worse than that.\n"
     "- Do not cross farther than the setup can carry: the cross is paid out of your reward, so a wide cross on a thin "
     "target fails the RR gate by construction. Crossing is right when you are AT the level; chasing a level that has "
     "already run is a different, worse trade.\n\n"
@@ -1581,8 +1837,8 @@ def run_trading_agent(
     "- Map the likely pullback/retest zone from real structure: 15m VWAP (`vwap15m`), band-mid (`bbMid15m`), the prior "
     "breakout shelf / swing that should now act as support (long) or resistance (short), a 38–62% fib of the last "
     "impulse, and any high-volume node (POC/VAL/VAH). Estimate the pullback DEPTH from ATR.\n"
-    "- THEN pick execution: (a) at/before value with room to target → take it now, marketable if conviction is high, "
-    "to secure the fill; (b) stretched but a strong trend you want → REST a limit at the anticipated pullback/retest "
+    "- THEN pick execution: (a) at/before value with room to target → take it now, resting or marketable per "
+    "executionMap; (b) stretched but a strong trend you want → REST a limit at the anticipated pullback/retest "
     "and let price come to you (this both avoids chasing AND captures the next leg — the highest-EV move after a "
     "vertical spike); (c) no good arrival price and no room to target → skip and rotate.\n"
     "- Ask yourself: 'If I get filled here, where is price most likely to go FIRST — toward my target, or back to the "
@@ -1593,7 +1849,8 @@ def run_trading_agent(
     "arrives. On a confirmed strong-trend leader that keeps running without retracing — you see repeated `entryExpiries` "
     "on it, and/or price sustains 1-2 ATR beyond the level without a deep pullback — 'wait for the pullback' has become "
     "'miss the whole move'. Resolve it the way desks do: SCALE IN. Take a REDUCED-SIZE (e.g. ~40-60%) bracketed "
-    "marketable CONTINUATION entry now so you participate, then add the remainder on a shallow flag/consolidation "
+    "CONTINUATION entry near price now so you participate — crossing only if executionMap's marketable row "
+    "supports it — then add the remainder on a shallow flag/consolidation "
     "pullback if one appears. Do NOT re-place the same never-filling pullback limit run after run — either take the "
     "reduced continuation or explicitly stand down and rotate to a leader that IS offering a clean entry. Keep this "
     "gated to an intact trend (daily+intraday aligned); a weakening/rolling-over trend gets no continuation chase.\n\n"
@@ -1656,7 +1913,9 @@ def run_trading_agent(
     "not permission: projected same-symbol exposure and whole-lifecycle stop risk can impose a lower limit.\n"
     f"- Max trades per symbol per day: {cfg.trading.max_trades_per_symbol_per_day}. If reached, decline new trades for that symbol.\n"
     f"- Futures entry leverage is HARD CAPPED at {cfg.trading.max_entry_leverage}x by the system. Do NOT request higher leverage to meet profit thresholds — if a trade doesn't work at {cfg.trading.max_entry_leverage}x, skip it.\n"
-    f"- Only place a trade if your confidence >= {snapshot.min_confidence}.\n"
+    f"- Only place a trade if your confidence >= {snapshot.min_confidence} — the base floor. Code raises it per "
+    "symbol while that symbol's daily regime is hostile; analyze_market_context reports the floor it will "
+    "actually enforce as summary.entryGate.minConfidence. State the confidence you hold, not the one that clears it.\n"
     "- Keep at least 10% of total USDT untouched as reserve.\n"
     f"- Minimum {cfg.trading.min_trade_interval_minutes:.0f} minutes between trades on the same symbol (enforced by system).\n\n"
 
@@ -1834,7 +2093,11 @@ def run_trading_agent(
       "- THEN scan the whole market every run: call scan_futures_market (the ONLY tool that sees all ~500 "
       "perps, not just named ones) to find what is actually moving. The current 2-3 coins are almost never the "
       "only opportunity — even in a bad tape, some liquid coin is trending. Scan 'momentum' and, in a bearish "
-      "BTC daily, 'losers'/'short'; then deep-validate the top few with analyze_market_context + fetch_orderbook.\n"
+      "BTC daily, 'losers'/'short'; then deep-validate the top few with analyze_market_context + fetch_futures_orderbook "
+      "(the perp book you would trade; fetch_orderbook is the SPOT book). Names under the scan's excluded "
+      "have no spot pair, so this bot can never add or trade them — do not research them. A row carrying "
+      "quarantined or lastAnalysisFailure will fail validation again until its remainingHours / retryInHours "
+      "have passed — move on to the next candidate.\n"
       "- Do NOT stay anchored to BTC/ETH/SOL out of habit. If the scan surfaces a more liquid, cleaner setup "
       "(strong trend, catalyst, good structure) that clears the bars, ADD it for the Trading Agent to evaluate.\n"
       "- You OWN the active coin list. It is a watchlist, not a claim that every name is immediately enterable. Maintain "
@@ -1954,6 +2217,22 @@ def run_trading_agent(
   user_state_obj["fees"] = fees
   user_state_obj["triggers"] = triggers
   user_state_obj["performanceSummary"] = memory.performance_summary()
+  # Each open futures position carries the trade's own entry record (entryThesis), so "fresh" in STEP 1b
+  # can mean CHANGED SINCE ENTRY. `funding_clock` is the poll loop's live per-contract clock (cache
+  # only: the loop refreshes it outside order_lock), so a carry's settlement time here is the one
+  # ProtectionManager holds for.
+  try:
+    _attach_entry_theses(user_state_obj, memory, time.time(), funding_clock=funding_clock)
+  except Exception as exc:
+    logger.warning("ENTRY THESIS: not attached this run (%s)", exc)
+  # The CURRENT market state as plain numbers — no per-state record, no rule, no size factor (see
+  # _market_state_for_prompt for why). Absent when the poll loop has no fresh reading.
+  try:
+    _ms_block = _market_state_for_prompt(market_state() if callable(market_state) else None, time.time())
+    if _ms_block:
+      user_state_obj["marketState"] = _ms_block
+  except Exception as exc:
+    logger.warning("MARKET STATE: not shown this run (%s)", exc)
   # Adaptive edge posture — the CODE-ENFORCED risk stance derived from rolling realized results.
   # Surfaced so the agent proposes trades that will pass the gates instead of burning turns on
   # rejections, and so it explains the posture in its narrative.
@@ -2015,14 +2294,26 @@ def run_trading_agent(
       # mfeReachedRate buckets are the share of trades that ever reached each R milestone.
       # Does the DIRECTION CALL predict, measured from the market price at signal time? Independent of
       # fills and exits. If verdict is "no edge", the problem is setup selection, not trade management.
-      "signalEdge": _edge_now.get("signal_edge", {"verdict": "insufficient data"}),
+      # Each side row (by_family_side) carries standAside + stake, and each pooled row stakeBySide /
+      # standAsideBySide, from the SAME functions the order path calls with the order's side, so the
+      # model sees a zero stake BEFORE it proposes — on 2026-09-24 it learned it from nine refusals in
+      # ~3h while this block still read 'edge'. A pooled row is standAside only when BOTH sides are.
+      "signalEdge": annotate_family_stakes(
+        _edge_now.get("signal_edge", {"verdict": "insufficient data"}),
+        explore_factor=cfg.edge.explore_unproven_family_factor,
+        stand_aside_enabled=cfg.edge.stand_aside_no_edge_family,
+      ),
       # Scheduled high-impact macro releases. phase='before' means code is declining NEW entries
       # right now (open positions unaffected); phase='after' is when a 'macro_event' setup applies.
       # calendarAgeHours None/large = the calendar is stale, so no blackout is in force.
       "macroEvents": _macro_state,
       # Your OWN record at overriding your own brackets. deltaR is positive when your closes helped.
       # Measured, not enforced — you still decide; this is the scoreboard for that decision.
-      "exitDiscipline": _edge_now.get("exit_discipline", {"verdict": "insufficient data"}),
+      "exitDiscipline": _exit_discipline_for_prompt(
+        _edge_now.get("exit_discipline", {"verdict": "insufficient data"})),
+      # Fill rate and realized R by resting distance (ATR15), the per-distance view of
+      # performanceSummary.limitFillRate (same records; totals equal it). A mirror, never a gate.
+      "executionMap": _edge_now.get("execution_map", {"note": "unavailable this run"}),
       "targetReachability": {
         "medianMfeR": (_edge_now.get("entry_quality") or {}).get("median_mfe_r"),
         "mfeReachedRate": (_edge_now.get("entry_quality") or {}).get("mfe_reached_rate", {}),
@@ -2050,8 +2341,9 @@ def run_trading_agent(
         "the nearest reachable structural target (VWAP, POC, prior swing, band mid) and the true invalidation naturally "
         "clear edgeReport.baseRr after costs. Otherwise skip; never lower TP or move SL inside invalidation solely to pass the floor. "
         "ENTRY-QUALITY LEARNING: if entryQuality.avgMaeR is high (say > ~0.5R) or avgEntryExtensionAtr is high, your "
-        "recent entries were CHASING — price kept dipping back to a better price after you filled. Respond by resting "
-        "limits at the pullback/retest anchors in entryMap rather than filling at the current stretched price. "
+        "recent entries were CHASING — price kept dipping back to a better price after you filled. Consider resting at "
+        "the pullback/retest anchors in entryMap rather than filling at the current stretched price — but a deeper rest "
+        "only helps on the fills it gets, so check executionMap's fillAdjustedR at that distance before going deeper. "
         "TARGET REACHABILITY — READ THIS CAREFULLY, IT IS EASY TO MISREAD: targetReachability shows how far price "
         "typically travels in your favour. Across every recorded lifecycle the bracket take-profit has been hit "
         "essentially NEVER — profit comes from the TRAILING STOP and the exit stack, not from price reaching the TP. "
@@ -2065,18 +2357,22 @@ def run_trading_agent(
         "15m ATRs is widened before sizing (position size shrinks to hold dollar risk constant). Place invalidation "
         "outside the noise band yourself and this never has to fire. "
         "FUNDING CARRY — the one MECHANICAL edge available to you: analyze_market_context reports "
-        "futures.fundingSetup whenever the 8h funding rate is extreme enough that the carry alone "
-        "covers the round-trip cost within a couple of settlements. Taking the side that RECEIVES "
+        "futures.fundingSetup whenever the funding rate is extreme enough that the carry alone "
+        "covers the round-trip cost within a couple of settlements. fundingRate is PER SETTLEMENT, and "
+        "each contract settles on its own clock (futures.fundingIntervalHours: 1h, 4h or 8h — KuCoin "
+        "shortens it when funding is extreme), so compare carries on the 8h equivalent fundingSetup "
+        "prints, never on the raw rate. Taking the side that RECEIVES "
         "funding does not require your direction call to be right — the transfer happens whichever way "
         "price moves — and an extreme rate also marks crowded positioning on the opposite side, which "
-        "is the side most prone to unwinding. Every technical playbook you have tried so far measures "
-        "no edge; this one is paid by the exchange's own mechanics rather than by prediction. Declare "
+        "is the side most prone to unwinding. Every other playbook pays only if the direction call is "
+        "right (signalEdge.by_family shows how each is doing); this one is paid by the exchange's own "
+        "mechanics rather than by prediction. Declare "
         "setup_family='funding_carry'. Be precise about WHY it pays: measured over the first four such "
         "trades, three resolved at their bracket before any settlement and collected zero funding — "
         "including the best winner, +1.81R closed at target in 90min. So the evidence so far is for "
         "the POSITIONING half (an extreme rate marks a crowded book prone to unwinding), not for the "
-        "transfer. The carry is a bonus that only accrues if the position survives a settlement, "
-        "accrues. It is scored in signalEdge.by_family like everything else, so it proves itself. "
+        "transfer. The carry is a bonus that accrues only if the position is still open at a "
+        "settlement. It is scored in signalEdge.by_family like everything else, so it proves itself. "
         "SCHEDULED MACRO EVENTS — macroEvents.upcoming lists high-impact releases (CPI, FOMC, NFP) "
         "with minutes until each. This is the one news input that does not require you to be fast: "
         "the dates are published a year ahead, so you are never racing a headline. Two uses. (1) Code "
@@ -2090,33 +2386,59 @@ def run_trading_agent(
         "hypothesis the scoreboard will settle, not as a known edge. If macroEvents.calendarAgeHours "
         "is null or large the calendar is stale and no blackout is in force; the Research Agent "
         "refreshes it with log_macro_calendar. "
+        # History (kept here, never in the prompt): an earlier prompt claim that early closes cost
+        # ~2.2R came from a KuCoin column-order bug; corrected, that sample was +0.84R vs the bracket.
+        # On 2026-09-24 the 5 attributed agent closes read -6.23R vs the bracket and about -3.44R vs
+        # the replayed stack (n=5, one rally). These numbers stay here, not in the prompt — the live
+        # exitDiscipline block is the only measurement the model reads.
         "EARLY CLOSES ARE MEASURED, NOT PRESUMED — CHECK exitDiscipline. When you close a position "
-        "before its stop or target is reached, the code later scores that close against what the "
-        "bracket would have returned, using live prices. It is symmetric: deltaR is positive when "
-        "your closes helped. Let that measurement, not a rule of thumb, decide how readily you close. "
-        "(An earlier claim here that your early closes had cost several R was based on a data-parsing "
-        "error and has been withdrawn; re-measured correctly, over that sample your closes slightly "
-        "BEAT leaving the brackets alone, which is too small a sample to prove either way.) "
+        "before its stop or target is reached, the code later replays what the SYSTEM would have done "
+        "had you left the position to it — the exchange bracket plus the code's own breakeven/trailing "
+        "stop and carry hold — on the contract's 1-minute bars, and scores your close against that "
+        "(stackR). The bare bracket is kept alongside (bracketR) but is not the benchmark: the trail "
+        "can exit well before a distant target, and it can also lock a run that later reverses to the "
+        "stop, so the bracket alone misstates what holding was worth in either direction. Closes "
+        "with only a bare-bracket result (recorded before this replay existed, or whose replay could "
+        "not be done) are shown under legacyBracketScored/legacyDeltaR and stackUnavailable and are NOT "
+        "counted in the verdict. It is symmetric: deltaR is positive when your closes helped. "
+        "byCounterAtEntry and byHtfAligned split the same record by whether 15m and 1h already opposed "
+        "the position at entry and whether 4h/1D agreed with it, with n shown before any verdict. Let "
+        "that measurement, not a rule of thumb, decide how readily you close. "
         "ACT ON THE SCOREBOARD: signalEdge measures whether your DIRECTION CALLS predict, separately "
-        "per playbook, against the cost each must clear. When a family reads 'no edge' over a real "
-        "sample, that is not a suggestion to try harder at it — its forward return is measurably "
-        "failing to pay costs, so more of the same loses money no matter how well the trade is "
-        "managed. Its risk is already cut automatically in proportion to the shortfall. The productive "
-        "response is to spend your turns hunting a DIFFERENT playbook: analyze_market_context now "
-        "reports entryMap.fadeSetup whenever 15m RSI is at an extreme, which is a ready-made "
-        "fade_extreme candidate. A family marked 'insufficient data' is not worse than one marked "
-        "'no edge' — it is the one still capable of surprising you, and it keeps full risk precisely "
-        "so it can earn its verdict. Taking those trades is how the bot finds what works. "
+        "per playbook and per side (by_family_side), against the cost each must clear. Every row "
+        "carries t_stat (net divided by its own standard error). Code judges every entry on its SIDE, "
+        "so the stake an entry would get right now is per side: each by_family_side row carries "
+        "standAside and stake for that side, and each pooled by_family row carries stakeBySide and "
+        "standAsideBySide for both sides. A side marked standAside is at zero stake and code will "
+        "refuse an entry on it however good the setup looks; a family is refused outright only when "
+        "standAside is true on BOTH sides (the pooled row's standAside) — the pooled figures are "
+        "context, not a verdict on either side. stakeReason "
+        "says which of two different things put it there: 'no edge' means its calls measurably fail to "
+        "pay their costs, so more of the same loses money no matter how well the trade is managed; "
+        "'unproven' means its net is positive but still inside its own noise (t below 1) — not a losing "
+        "playbook, just not yet distinguishable from nothing. A refused proposal is still scored — the "
+        "call is recorded before the stand-aside check — and that is the ONLY way a stood-aside family "
+        "or side can re-open: nothing else adds to its record. So do not force it, but when you see a "
+        "genuine, honestly-labelled setup in a stood-aside family or side, proposing it costs nothing "
+        "and feeds its verdict; otherwise spend your turns on the open families and sides: "
+        "analyze_market_context reports entryMap.fadeSetup whenever 15m RSI is at an "
+        "extreme, which is a ready-made fade_extreme candidate. A bet is judged on its SIDE once that "
+        "side has its own sample (judgedOn 'own'). A side still thin on its own is judged on the pooled "
+        "family (judgedOn 'pooled'): it can be stood aside or shrunk on the pooled record, but it is "
+        "never sized UP by it — it is capped at the reduced explore size. A "
+        "family marked 'insufficient data' is not worse than one marked 'no edge' — it is the one still "
+        "capable of surprising you, and it trades at a reduced explore size while it earns its verdict. "
+        "Taking those trades is how the bot finds what works. "
         "SETUP FAMILIES — HOW THE BOT LEARNS WHAT WORKS: every entry must declare setup_family "
         "(continuation / fade_extreme / breakout / range_edge). signalEdge.by_family scores each "
         "playbook on its own measured forward return versus costs, and risk flows toward whichever is "
         "currently paying. Nothing here declares trend-following or fading to be the right answer — "
         "that is the market's call and it changes. Two consequences for you: (1) label honestly, "
         "because a mislabelled trade corrupts the scoreboard that decides where risk goes; (2) if one "
-        "family reads 'no edge' over a real sample, stop feeding it and try a different playbook "
+        "family reads 'no edge' over a real sample, stop forcing it and try a different playbook "
         "rather than trying harder at the one that is measurably not working. A family with "
-        "'insufficient data' is not a bad family — it is an untested one, and it keeps full risk "
-        "precisely so it can earn the evidence that judges it. "
+        "'insufficient data' is not a bad family — it is an untested one, and it trades at a reduced "
+        "explore size while it earns the evidence that judges it. "
         "DIRECTIONAL HONESTY: compare perDirection long vs short. If one direction has taken most of your entries and "
         "carries the losses, that is the tape telling you the bias is yours, not the market's — the fix is to require "
         "the same evidence for a long as for a short, and to stand aside when neither side offers it."
@@ -2143,6 +2465,24 @@ def run_trading_agent(
           "'tradable' reading is an invitation to look, not a signal to take."
         ),
       )
+    # CONFIDENCE — present only for models with a real sample (n >= min_samples); an n=5 correlation
+    # in the prompt is an invitation to read tea leaves. Same pattern as takerFlow: the legend travels
+    # inside the block, and nothing in the code acts on it.
+    _conf_rows = confidence_edge_for_prompt(_edge_now.get("confidence_edge"), model=cfg.azure.deployment)
+    if _conf_rows:
+      user_state_obj["edgeReport"]["confidenceEdge"] = {
+        "byModel": _conf_rows,
+        "note": (
+          "Whether YOUR stated confidence ranks your own direction calls (this model only). withinDay is the "
+          "rank correlation of the confidence you stated with what price did next at the playbook's "
+          "own horizon, taken among calls made on the same day, so a whole calm or trending stretch "
+          "cannot fake it; pooled is the naive version, shown for contrast. verdict 'not demonstrated' "
+          "means no measurable ordering yet — not proof there is none. confidence.p10..p90 is the "
+          "range you have been stating. NOTHING in the code acts on this; it is the evidence any "
+          "future use of your confidence number would need, and it is only honest if the number you "
+          "state is the one you hold."
+        ),
+      }
   except Exception as _edge_exc:
     logger.debug("Edge report unavailable: %s", _edge_exc)
 
@@ -2296,37 +2636,8 @@ def run_trading_agent(
 
   decisions: list[str] = []
 
-  def _summarize(output: Any) -> str | None:
-    if not isinstance(output, dict):
-      return None
-    if output.get("skipped"):
-      return f"decline: {output.get('reason','unspecified')} (conf={output.get('confidence')})"
-    if output.get("cancelled"):
-      return f"cancelled order: {output.get('orderId') or output.get('symbol') or 'unknown'}"
-    if output.get("paper") and output.get("orderRequest"):
-      req = output.get("orderRequest", {})
-      rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
-      suffix = f" rationale={rationale}" if rationale else ""
-      return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')} (pnl=n/a){suffix}"
-    if output.get("orderId") or output.get("orderRequest"):
-      side = output.get("side") or output.get("orderRequest", {}).get("side")
-      sym = output.get("symbol") or output.get("orderRequest", {}).get("symbol")
-      rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
-      suffix = f" rationale={rationale}" if rationale else ""
-      return f"live order: {side} {sym} (orderId={output.get('orderId')}) (pnl=n/a){suffix}"
-    if output.get("transfer"):
-      t = output.get("transfer", {})
-      return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"
-    if output.get("rejected"):
-      sym = output.get("symbol") or output.get("requested") or output.get("futuresSymbol")
-      return f"rejected: {output.get('reason','unspecified')}" + (f" [{sym}]" if sym else "")
-    if output.get("error"):
-      sym = output.get("symbol") or output.get("requested") or output.get("futuresSymbol")
-      return f"error: {output.get('error')}" + (f" [{sym}]" if sym else "")
-    return None
-
   for out in tool_outputs:
-    summary = _summarize(out)
+    summary = _summarize_tool_output(out)
     if summary:
       decisions.append(summary)
 

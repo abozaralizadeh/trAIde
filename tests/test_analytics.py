@@ -513,3 +513,104 @@ class TestFlowReadingMaxAge:
         written moments ago; assuming the default interval only risks keeping a slightly old one."""
         for bad in (None, 0, -5, "", "nonsense", object()):
             assert flow_reading_max_age_sec(bad) == 600.0
+
+
+# ── Evidence-derived retry for a failed candle check (2026-09-25) ─────────────────────────────────────
+
+from src.analytics import candle_quality_retry_after, market_state, qualified_perp_row  # noqa: E402
+
+
+def _hourly_rows(starts, price=100.0):
+    return [[str(t), str(price), str(price), str(price + 1), str(price - 1), "10", "1000"] for t in starts]
+
+
+def test_validate_reports_the_bar_before_the_newest_gap():
+    # Bars at 0..4h, a gap, 8h..9h, another gap, 12h..: the newest gap follows the 9h bar.
+    starts = [h * 3600 for h in (0, 1, 2, 3, 4, 8, 9, 12, 13, 14)]
+    report = validate_candle_data(candles_to_dataframe(_hourly_rows(starts)), "1hour", as_of=15 * 3600)
+    assert report["gap_count"] == 2
+    assert report["latest_gap_start"] == 9 * 3600
+    assert report["latest_invalid_start"] is None
+
+
+def test_retry_after_is_when_the_gap_leaves_the_window():
+    quality = {"latest_gap_start": 9 * 3600}
+    # A 50-bar window: the gap disappears once the 9h bar falls off the start, i.e. at 9h + 50h.
+    assert candle_quality_retry_after(quality, "1hour", window_sec=50 * 3600, now=15 * 3600 + 5) == 59 * 3600
+
+
+def test_retry_after_is_never_before_the_next_bar_close():
+    # Stale / no-closed-candle failures carry no bar to age out: the next close is the earliest change.
+    assert candle_quality_retry_after({}, "15min", window_sec=50 * 900, now=1000) == 1800
+    # An old gap already outside the window cannot pull the retry into the past.
+    assert candle_quality_retry_after({"latest_gap_start": 0}, "1hour", window_sec=3600, now=7300) == 10800
+
+
+def test_retry_after_takes_the_latest_of_gap_and_bad_row():
+    q = {"latest_gap_start": 3600, "latest_invalid_start": 7200}
+    assert candle_quality_retry_after(q, "1hour", window_sec=36000, now=0) == 7200 + 36000
+
+
+# ── The market-state block (2026-09-25) ────────────────────────────────────────────────────────────────
+
+_MS_NOW = 2_000_000_000
+
+
+def _perp(sym, chg, turnover=10_000_000, age_days=30, status="Open", asset="CRYPTO"):
+    return {"symbol": sym, "priceChgPct": chg, "turnoverOf24h": turnover, "status": status,
+            "firstOpenDate": (_MS_NOW - age_days * 86400) * 1000, "assetClass": asset}
+
+
+def _ms_universe():
+    return [
+        _perp("XBTUSDTM", -0.012, 900_000_000),
+        _perp("ETHUSDTM", 0.02),
+        _perp("SOLUSDTM", -0.05),
+        _perp("DOGEUSDTM", -0.08),
+        _perp("WIFUSDTM", 0.01),
+        _perp("THINUSDTM", 0.30, turnover=100_000),       # below the liquidity floor
+        _perp("FRESHUSDTM", 0.40, age_days=2),            # too new
+        _perp("DEADUSDTM", 0.50, status="Paused"),        # not open
+        _perp("TSLAUSDTM", 0.03, asset="STOCK"),          # another market's session
+        {"symbol": "ETH-USDT", "priceChgPct": 0.9, "turnoverOf24h": 9e9},  # not a perp
+    ]
+
+
+def test_qualified_perp_row_is_the_screeners_filter():
+    row = qualified_perp_row(_perp("ETHUSDTM", 0.02), min_turnover=5e6, min_age_days=7, now=_MS_NOW)
+    assert row["futuresSymbol"] == "ETHUSDTM" and row["chgPct"] == pytest.approx(2.0)
+    assert row["assetClass"] == "CRYPTO" and row["ageDays"] == pytest.approx(30.0)
+    for bad in (_perp("THINUSDTM", 0.3, turnover=1), _perp("FRESHUSDTM", 0.3, age_days=1),
+                _perp("DEADUSDTM", 0.3, status="Paused"), {"symbol": "ETH-USDT"}, None):
+        assert qualified_perp_row(bad, min_turnover=5e6, min_age_days=7, now=_MS_NOW) is None
+
+
+def test_market_state_breadth_and_median_over_the_qualified_crypto_universe():
+    out = market_state(_ms_universe(), _MS_NOW, min_turnover=5e6, min_age_days=7)
+    # Counted: XBT -1.2, ETH +2, SOL -5, DOGE -8, WIF +1 -> 2 of 5 up; median -1.2.
+    assert out["universe"] == 5
+    assert out["breadth24"] == pytest.approx(0.4)
+    assert out["basketMedian24h"] == pytest.approx(-1.2)
+    assert out["btc24h"] == pytest.approx(-1.2)
+    assert out["asOf"] == _MS_NOW
+    assert "btc72h" not in out and "btcDailyAdx" not in out     # no candles given -> omitted, not faked
+
+
+def test_market_state_btc_72h_and_daily_adx_from_candles():
+    import math as _m
+    hourly = [[_MS_NOW - (100 - i) * 3600, 100 + i, 100 + i, 101 + i, 99 + i, 1, 1] for i in range(100)]
+    daily = []
+    for i in range(60):
+        t = (_MS_NOW // 86400 - 60 + i) * 86400
+        c = 100 + 5 * _m.sin(i / 5.0) + i
+        daily.append([t, c - 1, c, c + 2, c - 2, 1, 1])
+    out = market_state(_ms_universe(), _MS_NOW, min_turnover=5e6, min_age_days=7,
+                       btc_hourly_candles=hourly, btc_daily_candles=daily)
+    # The newest CLOSED hourly bar is i=99 (it closes exactly at now; close 199); 72h earlier is i=27.
+    assert out["btc72h"] == pytest.approx((199 / 127 - 1) * 100, abs=1e-3)
+    assert out["btcDailyAdx"] > 0 and out["btcDailyBias"] in ("bullish", "bearish", "neutral")
+
+
+def test_market_state_with_nothing_qualified_reports_no_breadth():
+    out = market_state([_perp("THINUSDTM", 0.3, turnover=1)], _MS_NOW, min_turnover=5e6, min_age_days=7)
+    assert out["universe"] == 0 and "breadth24" not in out and "basketMedian24h" not in out

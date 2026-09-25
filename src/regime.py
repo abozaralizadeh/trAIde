@@ -420,16 +420,76 @@ def scale_target_to_widened_stop(side: str, entry, take_profit, widen_factor):
   return take_profit
 
 
-def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.0):
+def _funding_interval_label(interval_hours) -> str | None:
+  """'1h' / '4h' / '8h' for a known positive interval, else None (the clock is unknown)."""
+  try:
+    hours = float(interval_hours)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(hours) or hours <= 0:
+    return None
+  return f"{hours:g}h"
+
+
+def funding_rate_label(rate, interval_hours=None) -> str:
+  """Say what a funding rate IS: a rate PER SETTLEMENT on this contract's own clock.
+
+  KuCoin quotes every contract's current rate per payment, and the payment interval is per contract —
+  on 2026-09-24, 428 of 690 contracts settled every 4h, 257 every 8h and 3 every hour, and KuCoin
+  shortens a contract's interval when its funding turns extreme (ONE-USDT 8h->1h on 09-17, G-USDT on
+  09-20). Until 2026-09-25 every rate was printed as '%/8h', so ONE's HOURLY -0.196% read as if it
+  were paid three times a day instead of twenty-four: the model's own data understated a 1h carry ~8x.
+  The 8h-equivalent is printed next to the real per-settlement rate so carries on different clocks
+  compare on one basis. With the clock unknown it says 'per settlement' and claims no interval.
+  """
+  try:
+    r = float(rate)
+  except (TypeError, ValueError):
+    return "funding rate unknown"
+  label = _funding_interval_label(interval_hours)
+  if label is None:
+    return f"{r * 100:+.4f}% per settlement"
+  if abs(float(interval_hours) - 8.0) < 1e-9:
+    return f"{r * 100:+.4f}% per 8h settlement"
+  per_8h = r * 8.0 / float(interval_hours)
+  return f"{r * 100:+.4f}% per {label} settlement (~{per_8h * 100:+.4f}% per 8h equivalent)"
+
+
+def funding_clock_from_rate(funding_rate_payload) -> tuple[float, float] | None:
+  """``(next_settlement_ts, interval_sec)`` in epoch SECONDS from KuCoin's current-funding payload.
+
+  ``/api/v1/funding-rate/{symbol}/current`` returns ``fundingTime`` (the NEXT settlement, ms) and
+  ``granularity`` (the payment interval, ms) — e.g. ONEUSDTM on 2026-09-24: granularity 3600000,
+  fundingTime 18:00 UTC; TRUSTUSDTM: 14400000 on an offset 03/07/11/15/19/23 UTC grid. None when
+  either is missing or not a positive finite number, so callers fall back rather than guess.
+  """
+  if not isinstance(funding_rate_payload, dict):
+    return None
+  try:
+    next_ts = float(funding_rate_payload.get("fundingTime")) / 1000.0
+    interval = float(funding_rate_payload.get("granularity")) / 1000.0
+  except (TypeError, ValueError):
+    return None
+  if not (math.isfinite(next_ts) and math.isfinite(interval)) or next_ts <= 0 or interval <= 0:
+    return None
+  return next_ts, interval
+
+
+def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.0, interval_hours=None):
   """Flag a FUNDING-CARRY opportunity: take the side that is PAID to hold.
 
   Every other playbook here is a prediction — it needs the direction call to be right. Funding carry is
   the one edge in perpetuals that is *mechanical*: the exchange transfers value between longs and shorts
-  every 8h regardless of which way price goes. Positive funding means longs pay shorts, so the SHORT
-  side is paid; negative funding means the LONG side is paid. It is also the best-documented crypto
-  edge in the literature — delta-neutral funding carry is reported at Sharpe ~2-6, against the ambiguous
-  "momentum, reversal, or both" picture for intraday technical signals, which is the regime this bot has
-  been fishing in while measuring no edge across 178 probes.
+  at every settlement regardless of which way price goes. Positive funding means longs pay shorts, so
+  the SHORT side is paid; negative funding means the LONG side is paid. It is also the best-documented
+  crypto edge in the literature — delta-neutral funding carry is reported at Sharpe ~2-6, against the
+  ambiguous "momentum, reversal, or both" picture for intraday technical signals, which is the regime
+  this bot has been fishing in while measuring no edge across 178 probes.
+
+  Settlements are NOT on one clock: KuCoin quotes the interval per contract (1h, 4h or 8h, shortened
+  when funding is extreme), and ``funding_rate`` is the rate per settlement on that clock.
+  ``interval_hours`` is the contract's own interval (from the exchange's ``granularity``); the text
+  prints the real per-settlement rate plus an 8h equivalent, and None means the clock is unknown.
 
   A directional (non-hedged) version is not the pure arbitrage: price risk remains. But it stacks two
   independent effects that point the same way — you are paid to hold, AND an extreme funding rate marks
@@ -438,7 +498,9 @@ def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.
   The threshold is derived, never hardcoded: it fires when one funding payment covers at least
   ``1/payments_to_cover`` of the measured round-trip cost, i.e. the carry alone pays for the trade within
   ``payments_to_cover`` settlements. That keeps it tied to the bot's own measured friction — as execution
-  costs fall the bar falls with them, with nothing to re-tune.
+  costs fall the bar falls with them, with nothing to re-tune. It stays PER PAYMENT on purpose (2026-09-25):
+  normalising it to 8h would admit every 1h contract at an eighth of today's rate, which widens the carry
+  universe — an opportunity change, not a wording fix.
 
   Returns ``None`` when funding is not extreme enough to matter, else the side that receives it.
   """
@@ -454,16 +516,28 @@ def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.
     return None
   side = "sell" if rate > 0 else "buy"
   payer = "longs pay shorts" if rate > 0 else "shorts pay longs"
+  payments = cost / abs(rate)
+  label = funding_rate_label(rate, interval_hours)
+  interval = _funding_interval_label(interval_hours)
+  hours = payments * float(interval_hours) if interval is not None else None
+  clock = (
+    f" — about {hours:.1f}h on this contract's {interval} settlement clock" if hours is not None
+    else " (this contract's settlement interval is unknown)"
+  )
   return {
     "side": side,
     "fundingRate": rate,
+    "fundingIntervalHours": float(interval_hours) if interval is not None else None,
     "thresholdRate": threshold,
-    "coversCostInPayments": round(cost / abs(rate), 2),
-    "reason": f"funding {rate * 100:+.4f}%/8h ({payer})",
+    "coversCostInPayments": round(payments, 2),
+    "hoursToCoverCost": round(hours, 2) if hours is not None else None,
+    "reason": f"funding {label} ({payer})",
     "note": (
-      f"FUNDING CARRY AVAILABLE — funding is {rate * 100:+.4f}% per 8h, so {payer}: a {side.upper()} is "
+      f"FUNDING CARRY AVAILABLE — funding is {label}, so {payer}: a {side.upper()} is "
       f"PAID to hold, and the carry alone covers the round-trip cost in about "
-      f"{cost / abs(rate):.1f} funding payment(s). This is the one playbook that does not require the "
+      f"{payments:.1f} funding payment(s){clock}. Contracts settle on their OWN clock (1h, 4h or 8h, "
+      "shortened when funding is extreme), so compare carries on the 8h equivalent, not the raw rate. "
+      "This is the one playbook that does not require the "
       "direction call to be right — the transfer happens whichever way price moves — and an extreme rate "
       "also marks crowded positioning on the opposite side. Declare setup_family='funding_carry' to take "
       "it. MEASURED 2026-09-15: 3 of the first 4 such trades resolved at their bracket BEFORE any "
@@ -477,11 +551,13 @@ def funding_carry_setup(funding_rate, cost_pct, *, payments_to_cover: float = 2.
 
 
 def next_funding_settlement(now_ts, *, interval_hours: float = 8.0) -> float | None:
-  """Epoch seconds of the next funding settlement strictly after ``now_ts``.
+  """Epoch seconds of the next point strictly after ``now_ts`` on an epoch-aligned UTC grid.
 
-  Perpetual funding settles on a fixed UTC grid (KuCoin: every 8h at 00:00/08:00/16:00), so the
-  deadline is *derived from the clock*, not tuned. ``interval_hours`` stays a parameter only because
-  a contract may quote a different cadence; nothing here needs hand-maintenance.
+  This is the FALLBACK clock, used only when the contract's own is unknown. It is not KuCoin's
+  schedule: KuCoin quotes the interval per contract (on 2026-09-24, 428 of 690 contracts settled every
+  4h, 257 every 8h, 3 every 1h), some grids are offset from the epoch (TRUSTUSDTM settles at
+  03/07/11/15/19/23 UTC), and KuCoin shortens a contract's interval when funding turns extreme. The
+  exchange-anchored clock is :func:`first_settlement_after`.
   """
   try:
     now = float(now_ts)
@@ -493,18 +569,126 @@ def next_funding_settlement(now_ts, *, interval_hours: float = 8.0) -> float | N
   return (math.floor(now / step) + 1.0) * step
 
 
-def carry_hold_deadline(entry_context, now_ts, *, interval_hours: float = 8.0) -> float | None:
+def first_settlement_after(fill_ts, next_settlement_ts, interval_sec) -> float | None:
+  """The first settlement strictly after ``fill_ts`` on the contract's own clock.
+
+  The exchange tells us one point on its grid (``next_settlement_ts``, KuCoin ``fundingTime``) and the
+  step (``interval_sec``, KuCoin ``granularity``); every settlement is ``next + k*interval`` for some
+  integer k. k may be NEGATIVE — the stamp can be older than the fill (read at analysis, filled later)
+  or newer (re-read while the position is held) — so this walks the grid either way instead of
+  assuming the stamp is ahead. That also covers offset grids such as TRUSTUSDTM's 03/07/11 UTC,
+  which no epoch-aligned grid reproduces. Invariant: ``fill < result <= fill + interval``.
+
+  All arguments are epoch SECONDS. None when any input is missing, non-finite or non-positive.
+  """
+  try:
+    fill = float(fill_ts)
+    nxt = float(next_settlement_ts)
+    step = float(interval_sec)
+  except (TypeError, ValueError):
+    return None
+  if not all(math.isfinite(v) for v in (fill, nxt, step)) or fill <= 0 or nxt <= 0 or step <= 0:
+    return None
+  k = math.floor((nxt - fill) / step)
+  settle = nxt - k * step
+  if settle <= fill:
+    settle += step
+  return settle
+
+
+def first_settlement_in_history(history, fill_ts) -> tuple[bool, float | None]:
+  """``(usable, first)`` from a KuCoin funding-rate HISTORY: the first settlement strictly after the fill.
+
+  ``usable`` is False when the payload is not a list (unknown — the caller falls back to the clocks);
+  ``first`` is None when the history is usable but holds no settlement after the fill yet. Timepoints
+  are milliseconds (``timepoint`` or ``timePoint``); returns epoch SECONDS. Never raises.
+  """
+  if not isinstance(history, (list, tuple)):
+    return False, None
+  try:
+    fill = float(fill_ts)
+  except (TypeError, ValueError):
+    return False, None
+  if not math.isfinite(fill) or fill <= 0:
+    return False, None
+  first = None
+  for item in history:
+    if not isinstance(item, dict):
+      continue
+    raw = item.get("timepoint") if item.get("timepoint") is not None else item.get("timePoint")
+    try:
+      ts = float(raw)
+    except (TypeError, ValueError):
+      continue
+    if not math.isfinite(ts) or ts <= 0:
+      continue
+    if ts > 1e12:
+      ts /= 1000.0
+    if ts > fill and (first is None or ts < first):
+      first = ts
+  return True, first
+
+
+def _entry_funding_clock(entry_context) -> tuple[float, float] | None:
+  """The contract's clock stamped on the entry (``entryContext.funding``) at order placement."""
+  funding = entry_context.get("funding") if isinstance(entry_context, dict) else None
+  if not isinstance(funding, dict):
+    return None
+  nxt, step = funding.get("nextSettlementTs"), funding.get("intervalSec")
+  if nxt is None or step is None:
+    return None
+  return nxt, step
+
+
+def _pos_finite(value) -> float | None:
+  try:
+    out = float(value)
+  except (TypeError, ValueError):
+    return None
+  return out if math.isfinite(out) and out > 0 else None
+
+
+def carry_hold_deadline(
+  entry_context, now_ts, *, next_settlement_ts=None, interval_sec=None, interval_hours: float = 8.0,
+  first_paid_ts=None, unpaid_as_of_ts=None,
+) -> float | None:
   """When a funding-carry position may start being managed for profit, or None if it is not one.
 
-  A carry trade earns from the 8h transfer, so it only pays if it is still open when the transfer
+  A carry trade earns from the funding transfer, so it only pays if it is still open when the transfer
   happens. Every other exit mechanic here is tuned for trades that live minutes — the measured median
-  hold is 13 minutes against a 480-minute settlement cycle — so without this the carry playbook can
-  never actually collect, and degrades into a directional punt whose edge we have measured at zero.
+  hold is 13 minutes against a settlement cycle of 60 to 480 minutes — so without this the carry
+  playbook can never actually collect, and degrades into a directional punt whose edge we have
+  measured at zero.
 
   This is deliberately NOT an opportunity decision: the model still chooses whether to take the trade
   and where the bracket goes. It only says that *the code's own* early profit-taking must not fire
   before the trade's thesis has had its one scheduled chance to pay. The exchange-side stop is
   untouched throughout, so the loss cap is exactly the one the model set.
+
+  WHICH settlement, on WHOSE clock (2026-09-25). Until then this always used an epoch 8h grid, but
+  KuCoin settles most contracts every 4h and extreme-funding ones every hour — and extreme funding is
+  exactly the carry universe (15 of the first 18 carry trades were on 1h/4h contracts). The hold ran
+  up to 7h past the payment it was waiting for, with breakeven, trail and early-cut all off. Sources,
+  in order: the live exchange clock passed in (``next_settlement_ts`` + ``interval_sec``, seconds), then
+  the clock stamped on the entry (``entry_context['funding']``), then the old 8h epoch grid. The result
+  can be LATER than the 8h grid would give on an offset grid (TRUST fill 23:30 -> 03:00, not 00:00);
+  that is the contract's real settlement, so it is right.
+
+  WHEN THE INTERVAL CHANGED AFTER THE FILL (2026-09-25 review). Walking the LIVE grid back to the fill
+  assumes the contract settled on today's grid ever since — false exactly when KuCoin shortens the
+  interval because funding turned extreme, which is the carry universe. A carry filled 09:30 on an 8h
+  clock (next 16:00) whose contract switches to 1h at 11:00 read a 10:00 "settlement" that never
+  happened, the hold lifted at 11:05, and the trail could close it before the first real payment at
+  12:00; the reverse (4h->8h) re-engaged a hold after the carry had already collected. So:
+
+  * ``first_paid_ts`` — the first settlement after the fill in the exchange's own funding HISTORY
+    (``first_settlement_in_history``, fetched by the poll loop's funding clock) — is exact and wins.
+  * ``unpaid_as_of_ts`` — that history was read at this time and held no settlement after the fill —
+    means the live ``next_settlement_ts`` (a real future settlement) is the first one.
+  * Without history: if the live interval differs from the one stamped at entry by more than 1s, the
+    grid changed after the fill, so the deadline is the EARLIER of the stamped clock's first settlement
+    and the live next settlement (if after the fill) — never a walk of the new grid into the past.
+  * Otherwise (same interval, or no stamp) the live grid is walked back to the fill as before.
 
   Returns the settlement epoch, clamped to the entry's own cycle so a position cannot be held open
   indefinitely by re-deriving a fresh deadline every poll.
@@ -523,7 +707,31 @@ def carry_hold_deadline(entry_context, now_ts, *, interval_hours: float = 8.0) -
     return None
   # Anchor on the ENTRY, not on "now": the deadline is the first settlement after the fill, so a
   # position that has already carried through it becomes normally managed instead of rolling forward.
-  deadline = next_funding_settlement(opened_f, interval_hours=interval_hours)
+  deadline = None
+  stamped = _entry_funding_clock(entry_context)
+  live_next = _pos_finite(next_settlement_ts)
+  live_step = _pos_finite(interval_sec)
+  paid = _pos_finite(first_paid_ts)
+  unpaid_asof = _pos_finite(unpaid_as_of_ts)
+  if paid is not None and paid > opened_f:
+    deadline = paid                                   # the exchange's own record: exact
+  elif unpaid_asof is not None and live_next is not None and live_next > max(opened_f, unpaid_asof):
+    deadline = live_next                              # nothing paid since the fill; next one is real
+  if deadline is None and live_next is not None and live_step is not None:
+    stamped_step = _pos_finite(stamped[1]) if stamped is not None else None
+    if stamped_step is not None and abs(live_step - stamped_step) > 1.0:
+      # The interval changed after the fill: the live grid says nothing about the past.
+      cands = [first_settlement_after(opened_f, stamped[0], stamped[1])]
+      if live_next > opened_f:
+        cands.append(live_next)
+      cands = [c for c in cands if c is not None]
+      deadline = min(cands) if cands else None
+    else:
+      deadline = first_settlement_after(opened_f, live_next, live_step)
+  if deadline is None and stamped is not None:
+    deadline = first_settlement_after(opened_f, stamped[0], stamped[1])
+  if deadline is None:
+    deadline = next_funding_settlement(opened_f, interval_hours=interval_hours)
   if deadline is None:
     return None
   try:
@@ -731,8 +939,8 @@ def verify_declared_setup(setup_family, *, side=None, funding_setup=None, macro_
     if paid_side and declared_side and paid_side != declared_side:
       return (
         f"declared 'funding_carry' on a {declared_side.upper()} but funding is "
-        f"{float(funding_setup.get('fundingRate') or 0.0) * 100:+.4f}%/8h, so it is the "
-        f"{paid_side.upper()} side that is PAID — this entry would pay the carry, not receive it"
+        f"{funding_rate_label(funding_setup.get('fundingRate') or 0.0, funding_setup.get('fundingIntervalHours'))}, "
+        f"so it is the {paid_side.upper()} side that is PAID — this entry would pay the carry, not receive it"
       )
     return None
 
@@ -864,9 +1072,10 @@ def allow_declared_setup(
   and a hardcoded trend gate deciding it is exactly the kind of veto this codebase avoids. Survival is
   still fully code-governed, just DOWNSTREAM of the gate rather than at it: the probe is recorded at the
   call, ``family_explore_factor`` sizes an unproven playbook down to exploration-size, ``family_size_factor``
-  shrinks it if it measures a shortfall, and ``family_stand_aside`` skips it outright once it settles to
-  "no edge" over a real sample. So a declared breakout that turns out not to pay still logs its evidence
-  and is then sized to a quarter, and eventually to zero — by MEASUREMENT, not by a pre-trade trend veto.
+  shrinks it if it measures a shortfall, and ``family_stand_aside`` puts it at zero stake while, over a
+  real sample, its net return is not above its own standard error (t = net/SE < 1 — "no edge", or a
+  positive net still inside its noise). So a declared breakout that turns out not to pay still logs its
+  evidence and is then sized down, and to zero — by MEASUREMENT, not by a pre-trade trend veto.
   This widens what may be PROPOSED, never what may be RISKED.
 
   No market-condition test is attached on purpose. A regime filter (e.g. "only range_edge in a ranging
@@ -926,8 +1135,9 @@ def allow_mechanical_setup(
   are deliberately excluded — a breakout long at RSI 83 *is* the continuation bet anti-FOMO is for.
 
   Survival stays downstream and unchanged: the probe is recorded, ``family_explore_factor`` sizes an
-  unproven playbook to exploration-size, and ``family_stand_aside`` drops it to zero once it measures
-  no edge. This widens what may be PROPOSED, never what may be RISKED.
+  unproven playbook to exploration-size, and ``family_stand_aside`` drops it to zero while its measured
+  net is not above its own standard error (t < 1). This widens what may be PROPOSED, never what may be
+  RISKED.
   """
   if not allow_declared_setup(setup_family=setup_family, cfg=cfg):
     return False

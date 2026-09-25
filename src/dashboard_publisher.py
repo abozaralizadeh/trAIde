@@ -27,6 +27,10 @@ from typing import Any, Dict, List, Optional
 
 from .analytics import flow_reading_max_age_sec
 from .edge import (
+  annotate_family_stakes,
+  probe_taker_fee,
+  confidence_edge_stats,
+  gate_scoreboard,
   exit_discipline_stats,
   family_scoring_horizons,
   safe_family_horizons,
@@ -341,7 +345,9 @@ class DashboardPublisher:
       memory.recent_fills(limit=100), prior,
       min_samples=int(getattr(cfg.trading, "slippage_autotune_min_samples", 8)),
     )
-    return {"slippage": slip, "cost": 2.0 * (0.0006 + float(slip.get("value") or 0.0))}
+    # The taker is the recorded futures fee (edge.probe_taker_fee), the same one the Supervisor, the
+    # gate scoreboard and the Trading Agent's edge state charge — one basis, no second constant.
+    return {"slippage": slip, "cost": 2.0 * (probe_taker_fee(memory) + float(slip.get("value") or 0.0))}
 
   def _build_strategy_edge(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
     """Does the direction call predict, and which playbook is currently paying?
@@ -361,9 +367,16 @@ class DashboardPublisher:
       slip, cost = basis["slippage"], basis["cost"]
       # Same window the entry gates use, so the dashboard verdict cannot disagree with the bot's.
       # Same per-family horizons the entry gate uses, so the published verdict matches the bot's.
-      stats = signal_edge_stats(
-        memory.signal_probes(limit=0), cost_pct=cost,
-        family_horizons=safe_family_horizons(memory),
+      probes = memory.signal_probes(limit=0)
+      horizons = safe_family_horizons(memory)
+      stats = signal_edge_stats(probes, cost_pct=cost, family_horizons=horizons)
+      explore = float(getattr(getattr(cfg, "edge", None), "explore_unproven_family_factor", 0.4) or 0.0)
+      # The same standAside / stake marks the agent reads (edge.annotate_family_stakes), so the panel
+      # cannot show a family as 'edge' while the order path holds it at zero stake. Stakes are
+      # multipliers on the configured risk — unitless, no money figure.
+      board = annotate_family_stakes(
+        stats, explore_factor=explore,
+        stand_aside_enabled=bool(getattr(getattr(cfg, "edge", None), "stand_aside_no_edge_family", True)),
       )
       out = {
         "verdict": stats.get("verdict", "insufficient data"),
@@ -371,7 +384,10 @@ class DashboardPublisher:
         "costPct": _round(cost * 100, 4),
         "bestHorizon": stats.get("best_horizon"),
         "byHorizon": stats.get("by_horizon") or {},
-        "byFamily": stats.get("by_family") or {},
+        "byFamily": board.get("by_family") or {},
+        # Each playbook split by side, at the family's own horizon. The stake path judges a side on
+        # its own row once it has a real sample, so the panel shows which side is actually carrying it.
+        "byFamilySide": board.get("by_family_side") or {},
         "slippagePctPerSide": _round(float(slip.get("value") or 0.0) * 100, 4),
         "slippageSource": slip.get("source"),
       }
@@ -381,6 +397,28 @@ class DashboardPublisher:
         fam: _round(family_size_factor(stats, fam), 3)
         for fam in (out["byFamily"] or {})
       }
+      # ...and the stake an entry on each side would actually get (0 when stood aside; else the worse
+      # of the measured and explore factors) — familyRiskFactor alone reads 1.0 for a stood-aside 'edge'
+      # row. Per side, because the order path always judges the order's side: a pooled scalar is a
+      # number no entry receives (2026-09-25 review).
+      out["familyStake"] = {
+        fam: dict(row.get("stakeBySide") or {})
+        for fam, row in (out["byFamily"] or {}).items() if isinstance(row, dict)
+      }
+      # Does each model's stated confidence rank its own calls? Report-only; rank correlations,
+      # percentiles of stated confidence and counts — nothing about the account.
+      out["confidenceEdge"] = confidence_edge_stats(probes, cost_pct=cost, family_horizons=horizons)
+      # What each directional gate BLOCKS vs what it ALLOWS (edge.gate_scoreboard) — report-only, never in
+      # the trading prompt. Percent returns, SEs, t, day/row counts and verdicts only: nothing about the
+      # account. Its own try, so a store without gate probes costs this panel and nothing else.
+      try:
+        if callable(getattr(memory, "gate_probes", None)):
+          out["gateScoreboard"] = gate_scoreboard(
+            memory.gate_probes(), cost_pct=cost, family_horizons=horizons,
+            state_days=memory.gate_state_days(), admitted_probes=probes,
+          )
+      except Exception as exc:
+        logger.warning("strategyEdge.gateScoreboard unavailable: %s", exc)
     except Exception as exc:  # pragma: no cover - defensive; publishing must never break the loop
       logger.debug("strategyEdge unavailable: %s", exc)
     return out
@@ -523,16 +561,33 @@ class DashboardPublisher:
         "n": int(stats.get("n") or 0),
         "takenR": stats.get("takenR"),
         "bracketR": stats.get("bracketR"),
+        # Since 2026-09-25 deltaR is taken minus benchmarkR: the live exit stack replayed on 1m futures
+        # bars (stackR) — the only comparator in n and the verdict. Bracket-only closes
+        # (legacyBracketScored / legacyDeltaR) and given-up replays (stackUnavailable) are shown for
+        # audit and excluded from exitDiscipline. R and counts only — no $.
+        "benchmarkR": stats.get("benchmarkR"),
+        "stackR": stats.get("stackR"),
+        "stackScored": stats.get("stackScored"),
+        "legacyBracketScored": stats.get("legacyBracketScored"),
+        "legacyDeltaR": stats.get("legacyDeltaR"),
+        "stackPending": stats.get("stackPending"),
+        "stackUnavailable": stats.get("stackUnavailable"),
         "deltaR": stats.get("deltaR"),
         "deltaRPerTrade": stats.get("deltaRPerTrade"),
         "beatBracket": stats.get("beatBracket"),
+        "beatBenchmark": stats.get("beatBenchmark"),
         "byFamily": stats.get("byFamily") or {},
+        "byCounterAtEntry": stats.get("byCounterAtEntry") or {},
+        "byHtfAligned": stats.get("byHtfAligned") or {},
         # Exits made by the code (trailing stop / profit-lock), scored against the same bracket but
         # NOT counted in the model's verdict above — they were not the model's decision.
         "otherExits": stats.get("otherExits") or {},
         # The trail's record split by the entry's own regime — negative in a trend, expected positive
         # in chop. A regime-adaptive trail is only justified once both rows exist.
         "trailByRegime": stats.get("trailByRegime") or {},
+        # ...and by the market the entry was taken in (breadth24 terciles, with the BTC daily ADX
+        # terciles nested as byBtcDailyAdx — the chop marker; R and counts only).
+        "trailByMarketState": stats.get("trailByMarketState") or {},
       }
     except Exception as exc:  # pragma: no cover - defensive
       logger.debug("exitDiscipline unavailable: %s", exc)

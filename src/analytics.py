@@ -99,6 +99,8 @@ def validate_candle_data(
   gap_count = 0
   max_gap_seconds = 0.0
   latest_close_seconds: float | None = None
+  latest_gap_start: float | None = None
+  latest_invalid_start: float | None = None
 
   if df.empty:
     errors.append("no candles")
@@ -114,9 +116,16 @@ def validate_candle_data(
       differences = valid_starts.drop_duplicates().diff().dropna()
       if not differences.empty:
         max_gap_seconds = float(differences.max())
-        gap_count = int((differences > interval_seconds * max_gap_intervals).sum())
+        gapped = differences > interval_seconds * max_gap_intervals
+        gap_count = int(gapped.sum())
         if gap_count:
           errors.append(f"{gap_count} candle gap(s)")
+          # The start of the last bar BEFORE the newest gap. A gap never heals — it has to age out of
+          # the analysis window, which happens once that bar falls off the window's start (see
+          # candle_quality_retry_after). ``differences`` is indexed by the bar AFTER each gap.
+          unique_starts = valid_starts.drop_duplicates().reset_index(drop=True)
+          after = [i for i, flag in enumerate(gapped.tolist(), start=1) if flag]
+          latest_gap_start = float(unique_starts.iloc[after[-1] - 1])
 
       closed_starts = valid_starts[valid_starts + interval_seconds <= now_seconds]
       if closed_starts.empty:
@@ -143,6 +152,9 @@ def validate_candle_data(
     invalid_ohlc_rows = df.index[~valid].tolist()
     if invalid_ohlc_rows:
       errors.append(f"invalid OHLC in {len(invalid_ohlc_rows)} row(s)")
+      bad_starts = starts[~valid].dropna()
+      if not bad_starts.empty:
+        latest_invalid_start = float(bad_starts.max())
 
   return {
     "valid": not errors,
@@ -154,7 +166,189 @@ def validate_candle_data(
     "max_gap_seconds": max_gap_seconds,
     "invalid_ohlc_rows": invalid_ohlc_rows,
     "latest_close_time": latest_close_seconds,
+    "latest_gap_start": latest_gap_start,
+    "latest_invalid_start": latest_invalid_start,
   }
+
+
+def candle_quality_retry_after(
+  quality: Dict[str, Any],
+  interval: str,
+  *,
+  window_sec: float,
+  now: float,
+) -> float:
+  """Earliest time a FAILED candle validation can pass again, derived from the failure's own evidence.
+
+  Replaces a hand-set "retry in ~2h" (the adversarial review of 2026-09-24 called that a magic number):
+  - a gap or a malformed row never heals, it ages out — the check passes once the bar before the newest
+    gap (or the newest bad row) has fallen off the start of the analysis window, i.e. at that bar's
+    start + ``window_sec`` (the window the analysis actually requested). TAKE's 1h gap count stepped
+    down 6 -> 5 exactly this way on 09-24;
+  - anything else (stale, no closed candle, duplicate timestamp) can at best change at the next bar
+    close, which is also the floor for every case.
+  The result only predicts a refusal the unchanged gate would issue anyway; nothing is blocked by it.
+  """
+  step = float(INTERVAL_SECONDS[interval])
+  now_s = _as_epoch_seconds(now)
+  candidates = [(math.floor(now_s / step) + 1.0) * step]
+  for key in ("latest_gap_start", "latest_invalid_start"):
+    try:
+      start = float(quality.get(key))
+    except (TypeError, ValueError):
+      continue
+    if math.isfinite(start):
+      candidates.append(start + float(window_sec))
+  return max(candidates)
+
+
+def qualified_perp_row(
+  contract: Any,
+  *,
+  min_turnover: float,
+  min_age_days: float,
+  now: float,
+) -> Dict[str, Any] | None:
+  """The screener's own universe test for ONE contract: an open USDT perp that clears the 24h-turnover
+  floor and the listing-age bar, or None.
+
+  Shared by agent._screen_contracts and :func:`market_state` so the basket the market state is measured
+  over IS the screener's liquidity- and age-qualified universe — never a hand-picked coin list, and never
+  a second copy of the filter that could drift from the first. Returns the parsed fields both need
+  (``chgPct`` is the 24h change in percent, None when the exchange omits it).
+  """
+  if not isinstance(contract, dict):
+    return None
+  sym = str(contract.get("symbol") or "").strip().upper()
+  if not sym.endswith("USDTM"):
+    return None
+  if str(contract.get("status") or "Open").lower() != "open":
+    return None
+  try:
+    turnover = float(contract.get("turnoverOf24h") or 0.0)
+  except (TypeError, ValueError):
+    turnover = 0.0
+  if not math.isfinite(turnover):
+    turnover = 0.0
+  if min_turnover > 0 and turnover < min_turnover:
+    return None
+  age_days = None
+  try:
+    first_open = float(contract.get("firstOpenDate") or 0.0)
+  except (TypeError, ValueError):
+    first_open = 0.0
+  if first_open and math.isfinite(first_open):
+    first_open_s = first_open / 1000.0 if first_open > 1e12 else first_open
+    age_days = (now - first_open_s) / 86400.0
+    if min_age_days > 0 and age_days < min_age_days:
+      return None
+  try:
+    chg = float(contract.get("priceChgPct"))
+    chg_pct = chg * 100.0 if math.isfinite(chg) else None
+  except (TypeError, ValueError):
+    chg_pct = None
+  return {
+    "futuresSymbol": sym,
+    "turnover": turnover,
+    "ageDays": age_days,
+    "chgPct": chg_pct,
+    "assetClass": str(contract.get("assetClass") or "").strip().upper() or None,
+  }
+
+
+def _median(values: List[float]) -> float | None:
+  vals = sorted(values)
+  n = len(vals)
+  if not n:
+    return None
+  return vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def market_state(
+  contracts: Any,
+  now: float,
+  *,
+  min_turnover: float,
+  min_age_days: float,
+  btc_daily_candles: Sequence[Sequence[Any]] | None = None,
+  btc_hourly_candles: Sequence[Sequence[Any]] | None = None,
+) -> Dict[str, Any]:
+  """A small, raw MARKET-level reading: recorded on entries and probes so verdicts can later be split
+  by the market they happened in. Pure; the caller fetches and caches (main._MarketStateClock, hourly).
+
+  Why (2026-09-25): the stored per-symbol regime tag read 'trending/strong' on 164 of 188 closes and the
+  BTC daily bias 'bullish' on 186 of 188, so no stored tag could tell the Sep 17-22 rally from the August
+  chop — and the trail's adaptive decision, waiting for a chop row keyed on that tag, could never get
+  one. These are continuous values, not a verdict and not a gate:
+
+  - ``breadth24`` — share of the liquid, mature CRYPTO perps (the screener's own universe, see
+    :func:`qualified_perp_row`) that are up over 24h; ``universe`` is how many were counted;
+  - ``basketMedian24h`` — their median 24h change, in percent;
+  - ``btc24h`` (XBTUSDTM's own 24h change from the same payload), ``btc72h`` (from ``btc_hourly_candles``),
+    and BTC's daily ADX next to its daily bias (from ``btc_daily_candles``). ADX is the chop marker the
+    bias lacks: BTC's daily ADX sat at 10-21 through the Jul 22-Aug 12 range while the bias read bullish.
+
+  Stock, metal and commodity perps (``assetClass`` other than CRYPTO) are left out of the basket: they
+  follow another market's session, not the crypto tape. Candles are in this module's column order
+  ``[ts, open, close, high, low, volume, turnover]`` and must already be validated by the caller.
+
+  Deliberately NOT here: an EMA-50 breadth over a hand-picked basket (the finding's first form). Both
+  adversarial reviews showed breadth24 from the payload the screener already fetches separates the same
+  episodes at zero extra calls, without a coin list or an EMA constant. The rally-only reading
+  "breadth predicts R" is not shown to the model either — this is recording only.
+  """
+  out: Dict[str, Any] = {"asOf": int(now)}
+  changes: List[float] = []
+  btc_row = None
+  for contract in contracts or []:
+    row = qualified_perp_row(contract, min_turnover=min_turnover, min_age_days=min_age_days, now=now)
+    if row is None:
+      continue
+    if row["futuresSymbol"] == "XBTUSDTM":
+      btc_row = row
+    if row["assetClass"] not in (None, "CRYPTO"):
+      continue
+    if row["chgPct"] is not None:
+      changes.append(float(row["chgPct"]))
+  out["universe"] = len(changes)
+  if changes:
+    out["breadth24"] = round(sum(1 for c in changes if c > 0) / len(changes), 4)
+    out["basketMedian24h"] = round(float(_median(changes)), 3)
+  if btc_row is None:
+    for contract in contracts or []:
+      if isinstance(contract, dict) and str(contract.get("symbol") or "").upper() == "XBTUSDTM":
+        try:
+          btc_row = {"chgPct": float(contract.get("priceChgPct")) * 100.0}
+        except (TypeError, ValueError):
+          btc_row = None
+        break
+  if btc_row is not None and btc_row.get("chgPct") is not None and math.isfinite(btc_row["chgPct"]):
+    out["btc24h"] = round(float(btc_row["chgPct"]), 3)
+  if btc_hourly_candles:
+    try:
+      hourly = candles_to_dataframe(btc_hourly_candles, "1hour", as_of=now, closed_only=True)
+      if not hourly.empty:
+        last = float(hourly["close"].iloc[-1])
+        target = float(hourly["time"].iloc[-1]) - 72 * 3600
+        past = hourly.loc[hourly["time"] <= target]
+        if not past.empty and float(past["close"].iloc[-1]) > 0:
+          out["btc72h"] = round((last / float(past["close"].iloc[-1]) - 1.0) * 100.0, 3)
+    except Exception:
+      pass
+  if btc_daily_candles:
+    try:
+      daily = candles_to_dataframe(btc_daily_candles, "1day", as_of=now, closed_only=True)
+      if not daily.empty:
+        snap = summarize_interval(daily, "1day")
+        adx = snap.get("adx")
+        if adx is not None and math.isfinite(float(adx)):
+          out["btcDailyAdx"] = round(float(adx), 2)
+        bias = str(snap.get("trend_bias") or "").lower()
+        if bias in ("bullish", "bearish", "neutral"):
+          out["btcDailyBias"] = bias
+    except Exception:
+      pass
+  return out
 
 
 def candles_to_dataframe(

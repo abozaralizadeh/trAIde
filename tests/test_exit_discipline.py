@@ -19,8 +19,13 @@ def _store(tmp_path) -> MemoryStore:
 
 
 def _probe(taken, bracket, family="fade_extreme", closed_by="agent"):
-  return {"realizedR": taken, "setupFamily": family, "closedBy": closed_by,
-          "outcome": {"resolved": "take_profit", "bracketR": bracket}}
+  """A resolved exit probe. An AGENT row carries a replayed stack equal to its bracket, because since
+  2026-09-25 only stack-scored agent closes count toward the verdict (bracket-only rows are audit)."""
+  row = {"realizedR": taken, "setupFamily": family, "closedBy": closed_by,
+         "outcome": {"resolved": "take_profit", "bracketR": bracket}}
+  if closed_by == "agent":
+    row["stack"] = {"stackR": bracket, "resolvedBy": "take_profit", "source": "test"}
+  return row
 
 
 # --- the scorecard -------------------------------------------------------------------------------
@@ -79,7 +84,10 @@ def test_settle_resolves_against_the_bracket_both_ways(tmp_path):
   m2.record_exit_probe("X-USDT", "long", 100.0, 90.0, 130.0, 101.0, realized_r=0.1)
   assert m2.settle_exit_probes({"X-USDT": 89.0}) == 1
   assert m2.exit_probes()[0]["outcome"] == {"resolved": "stop", "bracketR": -1.0,
-                                            "resolvedTs": m2.exit_probes()[0]["outcome"]["resolvedTs"]}
+                                            "resolvedTs": m2.exit_probes()[0]["outcome"]["resolvedTs"],
+                                            # the market that resolved it, so the one-off re-resolve of
+                                            # spot-settled rows never touches it (re-run safe)
+                                            "priceSource": "futures_mark"}
 
 
 def test_unresolved_probes_are_marked_to_market_after_expiry(tmp_path):
@@ -220,3 +228,215 @@ def test_trail_record_is_split_by_regime_and_only_for_the_trail():
   assert tbr["trending/strong"]["n"] == 4 and tbr["trending/strong"]["deltaR"] == pytest.approx(4 * (0.3 - 1.8))
   assert tbr["ranging/weak"]["n"] == 3 and tbr["ranging/weak"]["deltaR"] == pytest.approx(3 * (0.2 + 1.0))
   assert out["otherExits"]["protection"]["n"] == 8     # the untagged one still counts as a trail exit
+
+
+# --- the benchmark is the live exit STACK, not the bare bracket (2026-09-25) ----------------------
+# The system never leaves a position on its bare bracket: breakeven, the noise-band trail and the carry
+# hold manage it every poll. On the 5 attributed agent closes at the time the bracket read -6.23R and the
+# replayed stack about -3.5R (DASH/INJ: trail exits near +0.3..0.5R before a TP reached hours later).
+
+def _stack_probe(taken, bracket, stack=None, *, family="funding_carry", closed_by="agent", inputs=True,
+                 counter=None, htf=None, resolved="take_profit"):
+  row = {"realizedR": taken, "setupFamily": family, "closedBy": closed_by,
+         "outcome": {"resolved": resolved, "bracketR": bracket}, "counterAtEntry": counter,
+         "htfAligned": htf}
+  if inputs:
+    row.update({"fillTs": 1_790_000_000, "initRiskPx": 0.5})
+  if stack is not None:
+    row["stack"] = {"stackR": stack, "resolvedBy": "trail_close", "resolvedTs": 1_790_030_000,
+                    "source": "live_1m_replay"}
+  return row
+
+
+def test_agent_closes_are_scored_against_stackR_and_bracket_only_rows_are_audit():
+  rows = [_stack_probe(0.09, 1.70, 0.50), _stack_probe(-0.25, 1.87, 0.33),   # DASH / INJ shape
+          _stack_probe(-0.2, -1.0, inputs=False)]                            # recorded before the replay
+  out = exit_discipline_stats(rows)
+  assert out["n"] == 2                                                       # ONE comparator in the verdict
+  assert out["stackScored"] == 2 and out["legacyBracketScored"] == 1
+  assert out["benchmarkR"] == pytest.approx(0.50 + 0.33)
+  assert out["stackR"] == pytest.approx(0.83)
+  assert out["bracketR"] == pytest.approx(1.70 + 1.87)                       # kept for audit only
+  assert out["deltaR"] == pytest.approx((0.09 - 0.25) - (0.50 + 0.33))
+  assert out["legacyDeltaR"] == pytest.approx(0.8)                           # audit, not in deltaR
+  assert out["stackVsBracket"] == {"n": 2, "deltaR": pytest.approx((0.50 + 0.33) - (1.70 + 1.87))}
+  assert out["beatBenchmark"] == 0 and out["beatBracket"] == 0
+
+
+def test_the_verdict_follows_the_stack_not_the_bracket():
+  """Eight closes that each gave up a distant TP the trail would never have reached: on the bracket
+  that reads 'closes destroy value', against the system that would actually have run it is level —
+  and bracket-only rows give NO verdict at all rather than the bracket's."""
+  rows = [_stack_probe(0.30, 1.80, 0.31)] * 8
+  assert exit_discipline_stats(rows)["verdict"] == "neutral"
+  legacy = exit_discipline_stats([_stack_probe(0.30, 1.80, inputs=False)] * 8)
+  assert legacy["verdict"] == "insufficient data" and legacy["n"] == 0 and legacy["legacyBracketScored"] == 8
+
+
+def test_legacy_bracket_rows_never_unlock_or_steer_the_first_verdict():
+  """C3 review: 5 legacy rows + 3 stack rows read n=8 and 'closes destroy value' (-0.575R/trade) while
+  the 3 stack rows alone were +0.017R/trade — two benchmarks blended into one verdict."""
+  legacy = [_stack_probe(t, b, inputs=False) for t, b in
+            ((0.09, 1.70), (-0.25, 1.87), (0.38, 1.88), (0.54, -1.0), (-0.8, 1.2))]
+  stacked = [_stack_probe(0.2, 0.5, 0.18), _stack_probe(-0.1, -1.0, -0.15), _stack_probe(0.3, 0.9, 0.3)]
+  out = exit_discipline_stats(legacy + stacked)
+  assert out["n"] == 3 and out["verdict"] == "insufficient data"
+  assert out["deltaRPerTrade"] == pytest.approx(((0.2 - 0.1 + 0.3) - (0.18 - 0.15 + 0.3)) / 3, abs=1e-4)
+  assert out["legacyBracketScored"] == 5 and "not counted" in out["note"]
+
+
+def test_a_row_awaiting_its_replay_is_left_out_not_scored_on_the_bracket():
+  """Blending benchmarks mid-flight would flip the verdict as rows mature; the row waits instead."""
+  out = exit_discipline_stats([_stack_probe(0.1, 1.8), _stack_probe(0.1, 1.8, 0.2)])
+  assert out["n"] == 1 and out["stackPending"] == 1
+  gave_up = _stack_probe(0.1, 1.8)
+  gave_up["stack"] = {"stackR": None, "resolvedBy": "unavailable"}
+  out = exit_discipline_stats([gave_up])
+  assert out["n"] == 0 and out["stackUnavailable"] == 1 and out["stackPending"] == 0
+  assert out["legacyBracketScored"] == 0
+  # Five given-up replays next to three stack rows: still n == 3, never a bracket-driven verdict.
+  out = exit_discipline_stats([dict(gave_up) for _ in range(5)] + [_stack_probe(0.1, 1.8, 0.2)] * 3)
+  assert out["n"] == 3 and out["stackUnavailable"] == 5 and out["verdict"] == "insufficient data"
+
+
+def test_a_stack_scored_row_counts_even_when_the_bracket_went_unmeasured():
+  row = _stack_probe(0.2, None, 0.4, resolved="unmeasured")
+  out = exit_discipline_stats([row])
+  assert out["n"] == 1 and out["deltaR"] == pytest.approx(-0.2) and out["stackVsBracket"]["n"] == 0
+
+
+def test_other_exits_stay_on_the_bracket_split_by_how_the_bracket_resolved():
+  """For the trail's own exits the question IS trail-vs-bracket; against the stack a trail exit would
+  score ~0 by construction and the evidence a regime-adaptive trail waits for would vanish."""
+  rows = ([_stack_probe(0.3, 1.8, 0.3, closed_by="protection")] * 3
+          + [_stack_probe(0.1, -1.0, closed_by="protection", resolved="stop")] * 2
+          + [_stack_probe(0.2, 0.5, closed_by="protection", resolved="expired")])
+  other = exit_discipline_stats(rows)["otherExits"]["protection"]
+  assert other["n"] == 6
+  assert other["deltaR"] == pytest.approx(3 * (0.3 - 1.8) + 2 * (0.1 + 1.0) + (0.2 - 0.5))
+  assert other["byResolution"]["take_profit"] == {"n": 3, "deltaR": pytest.approx(-4.5)}
+  assert other["byResolution"]["stop"] == {"n": 2, "deltaR": pytest.approx(2.2)}
+  assert other["byResolution"]["expired"]["n"] == 1
+
+
+def test_closes_are_split_by_the_entrys_own_bias_with_n_before_any_verdict():
+  """Premise-opposition closes (15m AND 1h already against the side at entry) lost on DASH/KCS and
+  helped on G/XMR — n=5 in one rally. The split lets the model's own record decide, shown with n."""
+  rows = [_stack_probe(0.09, 1.7, 0.5, counter=True, htf=True),
+          _stack_probe(0.38, 1.88, 1.88, counter=True, htf=True),
+          _stack_probe(0.54, -1.0, -1.0, family="funding_carry", counter=True, htf=False),
+          _stack_probe(-0.25, 1.87, 0.33, family="continuation", counter=False, htf=True),
+          _stack_probe(-0.8, -1.0, -1.0, family="continuation")]
+  out = exit_discipline_stats(rows)
+  assert out["verdict"] == "insufficient data"
+  assert out["byFamily"]["funding_carry"]["n"] == 3 and out["byFamily"]["continuation"]["n"] == 2
+  assert out["byCounterAtEntry"]["true"]["n"] == 3
+  assert out["byCounterAtEntry"]["true"]["deltaR"] == pytest.approx((0.09 - 0.5) + (0.38 - 1.88) + (0.54 + 1.0))
+  assert out["byCounterAtEntry"]["false"]["n"] == 1
+  assert out["byCounterAtEntry"]["untagged"]["n"] == 1
+  assert out["byHtfAligned"]["true"]["n"] == 3 and out["byHtfAligned"]["false"]["n"] == 1
+
+
+def test_exit_probe_records_the_stack_inputs_and_entry_bias_tags(tmp_path):
+  m = MemoryStore(str(tmp_path / "m.json"))
+  m.record_exit_probe("KCS-USDT", "long", 13.8, 13.62, 14.14, 13.87, realized_r=0.38, closed_by="agent",
+                      setup_family="funding_carry", fill_ts=1_790_244_000, init_risk_px=0.18,
+                      noise_band_r=0.378, hold_until_ts=1_790_265_600,
+                      entry_bias={"15m": "bearish", "1h": "bearish", "4h": "bullish", "1D": "bullish"},
+                      counter_at_entry=True, htf_aligned=True)
+  m.record_exit_probe("X-USDT", "long", 100, 90, 130, 105, realized_r=0.5, closed_by="agent",
+                      fill_ts="junk", init_risk_px=float("nan"), counter_at_entry="yes")
+  kcs, x = m.exit_probes()
+  assert kcs["fillTs"] == 1_790_244_000 and kcs["initRiskPx"] == pytest.approx(0.18)
+  assert kcs["noiseBandR"] == pytest.approx(0.378) and kcs["holdUntilTs"] == 1_790_265_600
+  assert kcs["entryBias"]["15m"] == "bearish" and kcs["counterAtEntry"] is True and kcs["htfAligned"] is True
+  assert x["fillTs"] is None and x["initRiskPx"] is None and x["counterAtEntry"] is None
+
+
+def test_the_stack_result_is_stored_once_on_the_matching_probe(tmp_path):
+  m = MemoryStore(str(tmp_path / "m.json"))
+  m.record_exit_probe("DASH-USDT", "long", 55.0, 54.4, 56.0, 55.05, realized_r=0.09, closed_by="agent",
+                      fill_ts=1_790_202_000, init_risk_px=0.6)
+  ts = m.exit_probes()[0]["ts"]
+  assert m.set_exit_probe_stack("DASHUSDTM", ts + 1, 0.5, "trail_close", 1, "x") is False   # wrong ts
+  assert m.set_exit_probe_stack("DASHUSDTM", ts, 0.5, "trail_close", 1_790_220_960, "live_1m_replay",
+                                pre_close_exit_suppressed=False) is True
+  assert m.set_exit_probe_stack("DASH-USDT", ts, 9.9, "take_profit", 2, "again") is False    # written once
+  stack = m.exit_probes()[0]["stack"]
+  assert stack["stackR"] == pytest.approx(0.5) and stack["resolvedBy"] == "trail_close"
+  assert stack["source"] == "live_1m_replay" and stack["preCloseExitSuppressed"] is False
+  assert exit_discipline_stats(m.exit_probes())["stackScored"] == 1
+
+
+# --- the trail's record split by MARKET state (2026-09-25) ------------------------------------------
+# The per-symbol regime tag read 'trending/strong' on every tagged trail exit, so trailByRegime's chop
+# row could never fill. The entry's breadth24 (share of liquid perps up over 24h) can.
+
+def _ms_probe(taken, bracket, breadth, who="protection"):
+  row = {"realizedR": taken, "setupFamily": "continuation", "closedBy": who,
+         "regime": {"market_regime": "trending", "strength": "strong"},
+         "outcome": {"resolved": "take_profit", "bracketR": bracket}}
+  if breadth is not None:
+    row["marketState"] = {"breadth24": breadth}
+  return row
+
+
+def test_trail_record_is_split_by_rolling_breadth_terciles_with_n():
+  rows = ([_ms_probe(0.2, -1.0, b) for b in (0.05, 0.10, 0.15)]        # low breadth: trail saved 1.2R each
+          + [_ms_probe(0.3, 0.5, b) for b in (0.40, 0.50, 0.55)]
+          + [_ms_probe(0.3, 1.8, b) for b in (0.90, 1.00)]             # high breadth: trail left 1.5R each
+          + [_ms_probe(0.1, 1.0, None)]                                 # legacy row: untagged, still counted
+          + [_ms_probe(0.9, 0.1, 0.95, who="agent")]                   # the model's close: not the trail
+          + [_ms_probe(0.5, 1.8, 0.99, who=None)])                     # pre-attribution row: not the trail
+  out = exit_discipline_stats(rows)
+  tbm = out["trailByMarketState"]
+  # Cuts are the retained probes' OWN terciles (nearest rank over all 10 tagged rows, the agent's and the
+  # unattributed close included in the distribution), not fixed edges.
+  assert tbm["cuts"] == [0.4, 0.9]
+  b = tbm["buckets"]
+  assert b["low"]["n"] == 4 and b["low"]["deltaR"] == pytest.approx(3 * 1.2 - 0.2)   # 0.05..0.15 + 0.40
+  assert b["mid"]["n"] == 3 and b["mid"]["deltaR"] == pytest.approx(2 * -0.2 - 1.5)  # 0.50, 0.55, 0.90
+  assert b["high"]["n"] == 1 and b["high"]["deltaR"] == pytest.approx(-1.5)         # 1.00
+  assert b["untagged"]["n"] == 1
+  assert sum(v["n"] for v in b.values()) == out["otherExits"]["protection"]["n"]
+  # trailByRegime is unchanged (every row still reads trending/strong).
+  assert list(out["trailByRegime"]) == ["trending/strong"]
+
+
+def test_the_trail_record_is_also_split_by_btc_daily_adx_so_a_chop_row_can_fill():
+  """C6 review: breadth is DIRECTION. An August-style high-breadth chop (BTC daily ADX 10-21) spreads
+  across every breadth tercile, so the adaptive-trail decision's chop row could never fill. The entry's
+  BTC daily ADX (stamped on every probe) separates it; nested so the prompt filter still drops it."""
+  def p(taken, bracket, breadth, adx):
+    row = _ms_probe(taken, bracket, breadth)
+    row["marketState"]["btcDailyAdx"] = adx
+    return row
+  chop = [p(0.2, -1.0, b, a) for b, a in zip((0.5, 0.6, 0.7, 0.8, 0.85, 0.55), (10, 12, 14, 16, 18, 21))]
+  rally = [p(0.3, 1.8, b, a) for b, a in zip((0.65, 0.7, 0.8, 0.9, 0.75, 0.85), (30, 32, 34, 36, 38, 40))]
+  mid = [p(0.1, 0.1, b, a) for b, a in zip((0.6, 0.7, 0.8, 0.9, 0.6, 0.75), (22, 24, 25, 26, 27, 28))]
+  out = exit_discipline_stats(chop + rally + mid)["trailByMarketState"]
+  by_breadth = out["buckets"]
+  assert all(k in by_breadth for k in ("low", "mid", "high"))
+  adx = out["byBtcDailyAdx"]
+  assert adx["cuts"] == [21, 28]
+  assert adx["buckets"]["low"] == {"n": 6, "deltaR": pytest.approx(6 * 1.2)}     # the chop cohort, alone
+  assert adx["buckets"]["high"] == {"n": 6, "deltaR": pytest.approx(6 * -1.5)}   # the rally cohort, alone
+  assert adx["buckets"]["mid"]["n"] == 6
+  from src.agent import _exit_discipline_for_prompt
+  assert "trailByMarketState" not in _exit_discipline_for_prompt(exit_discipline_stats(chop + rally))
+
+
+def test_too_few_tagged_rows_have_no_cuts():
+  out = exit_discipline_stats([_ms_probe(0.2, -1.0, 0.3), _ms_probe(0.2, -1.0, None)])
+  assert out["trailByMarketState"]["cuts"] is None
+  assert out["trailByMarketState"]["buckets"] == {"untagged": {"n": 2, "deltaR": pytest.approx(2.4)}}
+
+
+def test_main_stamps_the_entry_and_exit_market_state_on_the_exit_probe():
+  """Wiring: the recorder gets the ENTRY's stamp (what the split keys on) and the loop's reading."""
+  import inspect
+  import src.main as main_mod
+  src = inspect.getsource(main_mod.trading_loop)
+  call = src[src.index("memory.record_exit_probe("):src.index("except Exception as exc:\n          logger.warning(\"EXIT PROBE")]
+  assert 'market_state=_ctx.get("marketState")' in call
+  assert "market_state_at_exit=_market_state.current()" in call

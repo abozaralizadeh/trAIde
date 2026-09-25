@@ -90,20 +90,21 @@ class TradingConfig:
   # the risk budget / concentration / heat caps, which can veto). 0 = off (pure risk-budget sizing).
   min_entry_notional_usd: float = 0.0
   # Marketable entries (fill-rate fix): passive-only limits resting >=min_entry_deviation away were
-  # only ~21% filled — in a trend the price never comes back, so the bot systematically missed the
-  # winners and only filled when the move failed. A high-conviction entry may now cross up to this
-  # fraction of price to fill immediately; the atomic bracket still attaches, so it is never naked.
-  # 0 disables (pure passive-limit behavior).
-  # Jul 30 2026, measured on real paths: only 3 of 80 expired plans fitted the old 0.15% band while the
-  # median cross needed is 0.82%, so the band blocked almost every fill it was meant to enable. Raised
-  # to 1% as an OUTER SANITY BOUND — the binding test is now the post-cost RR gate evaluated at the
-  # crossed price (see the marketable-entry block in tools.py), which is both principled and already
-  # implemented. Extending the entry TTL instead is NOT the answer: the same replay shows later fills
-  # lose (-0.37R mean at a 4h TTL) because a limit that fills late only fills when price came to it.
+  # only ~21% filled — an unfilled limit captures nothing. An entry may cross up to this fraction of
+  # price to fill immediately; the atomic bracket still attaches, so it is never naked. 0 disables
+  # (pure passive-limit behavior). This is an OUTER SANITY BOUND, not an edge claim: the post-cost RR
+  # gate still runs at the crossed price, and it is a fee/payoff guard, not a quality filter.
+  # Jul 30 2026: only 3 of 80 expired plans fitted the old 0.15% band against a median needed cross of
+  # 0.82%, which is why the band was raised to 1%. That replay also claimed later fills lose (-0.37R at a
+  # 4h TTL) and that "clears the RR floor after crossing" was a +0.388R filter — both NOT REPRODUCED on a
+  # new 124-limit sample (Sep 20-24, correct futures columns): the direction of crossing held, the
+  # RR-filter and TTL sub-claims did not (see the marketable-entry comment in tools.py). Whether to
+  # cross is now read from the bot's own live execution map (edge.execution_map), not from these figures.
   marketable_entry_max_dev_pct: float = 0.01
-  # 0 = no extra confidence bar beyond the global min_confidence. Confidence turned out to be a weak
-  # filter for crossings (+0.050R mean at conf>=0.80) versus the RR-after-cross test (+0.388R), so the
-  # old 0.75 bar mostly rejected profitable fills. Set >0 to re-impose a conviction floor.
+  # 0 = no extra confidence bar beyond the global min_confidence. Jul 30 2026: confidence >= 0.80 measured
+  # as a weak crossing filter (+0.050R) and the old 0.75 bar mostly rejected fills — the comparison
+  # figure it was set against (+0.388R for RR-after-cross) did not reproduce on the Sep 20-24 sample, and
+  # neither filter has measured selection value there. Set >0 to re-impose a conviction floor.
   marketable_entry_min_confidence: float = 0.0
   # Noise floor on stop distance (Jul 2026 — the single biggest measured loss driver). Across the 27
   # closed futures lifecycles of 20-27 Jul the median stop sat at 1.4x the 15m ATR (~0.7x the 1h ATR,
@@ -197,12 +198,16 @@ class EdgeConfig:
   streak_size_factor: float = 0.5  # entry-size multiplier while on a losing streak
   direction_min_trades: int = 5    # evidence required before long/short-specific adaptation
   negative_expectancy_size_factor: float = 0.5  # explore smaller on a losing direction; auto-restores
-  stand_aside_no_edge_family: bool = True  # skip entries whose PLAYBOOK measures "no edge" over a real
-                                           # sample (mean forward return fails to clear cost) instead of
-                                           # staking floor-size fee-dust on it. Kelly-zero for a
-                                           # non-positive-edge bet; probes still record at call time so
-                                           # the family auto-restores when its edge returns. See
-                                           # edge.family_stand_aside. Master escape hatch if it over-fires.
+  stand_aside_no_edge_family: bool = True  # zero stake on a PLAYBOOK (judged per side once that side
+                                           # has its own sample) whose measured net-of-cost return is not
+                                           # above its own standard error over a real sample: t = net/SE
+                                           # < 1, which covers "no edge" (net <= 0) and a positive net
+                                           # still inside its noise. t = 1 is the zero point of
+                                           # uncertainty-shrunk Kelly; the bar is stateless (recomputed
+                                           # every run, can flip near the line — the explore floor bounds
+                                           # that step). Probes still record at call time, so it re-opens
+                                           # on its own once net clears one SE. See
+                                           # edge.family_stake_status. Master escape hatch if it over-fires.
   taker_flow_enabled: bool = True  # sample KuCoin's public taker tape each poll and stamp the
                                    # aggressor balance onto every direction call, so
                                    # edge.taker_flow_edge_stats can measure whether order flow
@@ -217,9 +222,11 @@ class EdgeConfig:
                                            # the market price at signal time, so a family's evidence is
                                            # independent of our size — we can measure a new playbook while
                                            # risking little on it. Keeps exploring newly-reachable
-                                           # playbooks (breakout/range_edge) cheap on a small account;
-                                           # lifts to full measured sizing the instant it clears 20
-                                           # probes. See edge.family_explore_factor.
+                                           # playbooks (breakout/range_edge) cheap on a small account.
+                                           # Once scored, size ramps from this floor at t=1 to full at
+                                           # t=2; a SIDE still thin on its own stays at this floor
+                                           # whatever the pooled family earned. See
+                                           # edge.family_explore_factor.
 
 
 @dataclass

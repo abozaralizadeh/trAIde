@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import threading
 import time
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
@@ -26,6 +27,7 @@ from agents.tool import function_tool
 from pydantic import BaseModel, ConfigDict
 from .analytics import (
   INTERVAL_SECONDS,
+  candle_quality_retry_after,
   candles_to_dataframe,
   compute_indicators,
   flow_reading_max_age_sec,
@@ -40,6 +42,7 @@ from .regime import (
   allow_mechanical_setup,
   verify_declared_setup,
   funding_carry_setup,
+  funding_clock_from_rate,
   macro_event_entry_block,
   macro_event_window,
   allow_fade_extreme,
@@ -69,16 +72,22 @@ from .regime import (
 )
 from .edge import (
   SETUP_FAMILIES,
+  describe_stake_row,
+  distance_bucket,
   family_explore_factor,
   family_size_factor,
-  family_stand_aside,
+  family_stake_status,
   open_families,
+  passive_distance_atr,
 )
+from .memory import SCORED_GATES, sanitize_market_state
 from .utils import normalize_symbol as _normalize_symbol
 from .agent import (
+  NOT_TRADEABLE_HERE,
   logger,
   _aggregate_account_totals,
   _base_currency,
+  _bot_can_trade,
   _build_compact_account_state,
   _resolve_allowed_spot_symbol,
   _screen_contracts,
@@ -86,6 +95,66 @@ from .agent import (
   _to_futures_symbol,
   _truncate_to_increment,
 )
+
+
+class _SpotSymbolCache:
+  """The exchange's live, trading-enabled SPOT symbol set, cached ~1h across agent runs. Thread-safe.
+
+  Execution in this bot is spot-anchored (see agent._bot_can_trade), so this one list decides what the
+  screener may offer and what add_coin may accept — the same check in both places, so the discovery
+  layer and the execution layer cannot drift apart. The /api/v2/symbols payload is ~0.7MB, hence the
+  cache lives at module level rather than per run (an agent run builds its tools afresh). The cache is
+  tied to the client object it was filled from, so a different client (another process, a test fake)
+  never reads someone else's list. ``get`` returns None when the list is unavailable: every caller
+  fails OPEN on None — a lookup outage must never blind the screener or block add_coin (the
+  probe-starvation class of failure).
+  """
+
+  TTL_SEC = 3600
+  # After a failed fetch, wait this long before asking again. The screener asks once per row, so without
+  # it one outage would turn a single scan into a burst of failing calls and warnings.
+  RETRY_SEC = 300
+
+  def __init__(self) -> None:
+    self._lock = threading.Lock()
+    self._client: Any = None
+    self._ts = 0.0
+    self._symbols: set[str] | None = None
+    self._failed: tuple[Any, float] | None = None     # (client, when) of the last failed fetch
+
+  def get(self, client: Any, *, now: float | None = None) -> set[str] | None:
+    current = time.time() if now is None else float(now)
+    with self._lock:
+      if self._client is client and self._symbols is not None and current - self._ts < self.TTL_SEC:
+        return self._symbols
+      stale = self._symbols if self._client is client else None
+      if self._failed is not None and self._failed[0] is client and current - self._failed[1] < self.RETRY_SEC:
+        return stale
+    fetch = getattr(client, "list_symbols", None)
+    if not callable(fetch):
+      return stale
+    try:
+      rows = fetch() or []
+      symbols = {
+        str(r.get("symbol") or "").strip().upper()
+        for r in rows
+        if isinstance(r, dict) and r.get("enableTrading") is True
+      }
+      symbols.discard("")
+      if not symbols:
+        raise ValueError("empty symbol list")
+    except Exception as exc:
+      logger.warning("SPOT SYMBOLS unavailable (%s) — screener tradeability and add_coin's spot check "
+                     "fail open for the next %ds", exc, self.RETRY_SEC)
+      with self._lock:
+        self._failed = (client, current)
+      return stale
+    with self._lock:
+      self._client, self._ts, self._symbols, self._failed = client, current, symbols, None
+    return symbols
+
+
+_SPOT_SYMBOLS = _SpotSymbolCache()
 
 
 def normalize_futures_side(side: str) -> str | None:
@@ -234,6 +303,407 @@ def normalize_orderbook(ob: Any, depth: int, symbol: str) -> Dict[str, Any]:
   return {"symbol": symbol, "depth": depth, "orderbook": book}
 
 
+def entry_funding_stamp(gate: Any) -> Dict[str, Any]:
+  """``entryContext['funding']``: the rate and the contract's own settlement clock at the call.
+
+  Analysis and order placement are separate tool calls, so the clock read by analyze_market_context
+  travels via the gate state. Stamped on EVERY futures entry (not only carry) so replays can tell
+  which settlement a trade was open across, and so ``regime.carry_hold_deadline`` has the contract's
+  real grid as a fallback when the live clock cannot be read. Values are None when unknown; epoch and
+  interval are in SECONDS.
+  """
+  g = gate if isinstance(gate, dict) else {}
+
+  def _num(value: Any) -> float | None:
+    try:
+      out = float(value)
+    except (TypeError, ValueError):
+      return None
+    return out if math.isfinite(out) else None
+
+  return {
+    "rate": _num(g.get("funding_rate")),
+    "intervalSec": _num(g.get("funding_interval_sec")),
+    "nextSettlementTs": _num(g.get("funding_next_ts")),
+  }
+
+
+def live_entry_price_sourced(kucoin: Any, kucoin_futures: Any, symbol: str) -> tuple[float | None, str | None]:
+  """The live price a new entry is judged against, and WHICH market it came from.
+
+  New exposure is futures-only: size/deviation/brackets must use the same market that will fill.
+  Spot/perp basis can be material around squeezes and listings, so spot is fallback only.
+
+  The source travels with the price onto the signal probe (``priceSource``) because the probe's
+  forward return must be settled from the same market as its base: a futures base settled on the spot
+  ticker scores the basis as prediction (ONE-USDT, 2026-09-20: spot ~0.0050 vs mark ~0.0038 made a
+  +25% "5-minute return" out of a +2.5% move). Returns ``(price, "futures_mark" | "spot")`` or
+  ``(None, None)``.
+  """
+  if kucoin_futures:
+    futures_symbol = _to_futures_symbol(symbol)
+    if futures_symbol:
+      try:
+        mark = _to_float((kucoin_futures.get_mark_price(futures_symbol) or {}).get("value"))
+        if mark > 0:
+          return mark, "futures_mark"
+      except Exception as exc:
+        logger.warning("Futures mark refresh failed for %s entry; falling back to spot: %s", symbol, exc)
+  try:
+    price = float(kucoin.get_ticker(symbol).price)
+    return (price, "spot") if price > 0 else (None, None)
+  except Exception as exc:
+    logger.warning("Live ticker refresh failed for %s entry: %s", symbol, exc)
+    return None, None
+
+
+def _fmt_pct(value: Any, spec: str) -> str:
+  try:
+    return format(float(value), spec)
+  except (TypeError, ValueError):
+    return "n/a"
+
+
+def stand_aside_message(status: Dict[str, Any], open_fams: Dict[str, Any] | None = None) -> Dict[str, str]:
+  """The refusal the model reads and the STAND ASIDE log line, built from ``edge.family_stake_status``.
+
+  Truthful by construction: the 'NO EDGE … coin-flip minus fees' wording is used ONLY when the judging
+  row's net is at or below zero. A positive net that is merely inside its own noise is told as exactly
+  that, with its SE and t — on 2026-09-24 nine refusals at net +0.41..+0.54% (t≈0.7-0.9) told the model
+  the calls 'don't clear their round-trip cost', and it repeated that in its own decline. The row that
+  judged the bet is always named (a side too thin to judge on its own falls back to the pooled family).
+  """
+  st = status if isinstance(status, dict) else {}
+  judged = str(st.get("judgedOn") or st.get("family") or "other")
+  n = int(st.get("n") or 0)
+  net = st.get("netPct")
+  se = st.get("sePct")
+  t = st.get("tStat")
+  row_desc = describe_stake_row(st)
+  if st.get("reason") == "no edge":
+    reason = (
+      f"Stand aside: '{judged}' playbook measures NO EDGE over {n} signals "
+      f"(net_of_cost {_fmt_pct(net, '+.3f')}% — its direction calls don't clear their round-trip cost, "
+      f"so this is a coin-flip minus fees). Evidence row: {row_desc}."
+    )
+  else:
+    reason = (
+      f"Stand aside: '{judged}' measured net {_fmt_pct(net, '+.3f')}% over {n} signals is inside its own "
+      f"noise (SE {_fmt_pct(se, '.3f')}%, t={_fmt_pct(t, '.2f')}<1) — positive, but not yet "
+      f"distinguishable from nothing, so the stake stays zero until net clears one SE. "
+      f"Evidence row: {row_desc}."
+    )
+
+  def _fmt(rows: List[Dict[str, Any]]) -> str:
+    out = []
+    for r in rows or []:
+      name = f"{r.get('family')} {r['side']} side only" if r.get("side") else str(r.get("family"))
+      net_r = r.get("netOfCostPct")
+      out.append(f"{name} (n={r.get('n')}, {net_r:+.3f}%)" if net_r is not None else f"{name} (n={r.get('n')})")
+    return ", ".join(out)
+
+  where: List[str] = []
+  fams = open_fams if isinstance(open_fams, dict) else {}
+  if fams.get("paying"):
+    where.append(f"Currently paying: {_fmt(fams['paying'])}.")
+  if fams.get("unproven"):
+    where.append(f"Open but unproven (still gathering evidence): {_fmt(fams['unproven'])}.")
+  if not where:
+    where.append("No playbook currently measures an edge — standing down is a valid answer.")
+  # The order path judges the SIDE, so when a side was refused the other side of the same playbook may
+  # be listed above as open — "the same playbook will be refused" would then contradict that list.
+  _fam = str(st.get("family") or "other")
+  _side = st.get("side")
+  _again = (f"Re-proposing this side of the playbook ({_fam} {_side}s) will be refused again while its "
+            f"measurement stands" if _side else "Re-proposing the same playbook will be refused again")
+  hint = (
+    "This is bet-sizing on measured edge, not a directional veto — it re-opens automatically once "
+    "net exceeds its own SE (t≥1), recomputed every run from your calls (this refused call is still "
+    "recorded as evidence). " + " ".join(where) +
+    f" {_again}; take one of the above only if the "
+    "setup is genuinely there, otherwise stand down until the regime turns. Label honestly: declaring "
+    "this same setup as a different playbook to get past the refusal does not change the trade, and it "
+    "corrupts the scoreboard that sizes every future trade."
+  )
+  log = (
+    f"{row_desc}: verdict={st.get('verdict')}, net_of_cost={_fmt_pct(net, '+.3f')}%, "
+    f"SE={_fmt_pct(se, '.3f')}%, t={_fmt_pct(t, '.2f')}; zero stake ({st.get('reason')})"
+  )
+  return {"reason": reason, "hint": hint, "log": log}
+
+
+def entry_gate_summary(base_min: Any, daily_bias: Any, daily_exhausted: Any, regime_cfg: Any) -> Dict[str, Any]:
+  """What analyze_market_context tells the model about the confidence floor for THIS symbol.
+
+  Honest display, not a new rule: ``minConfidence`` is exactly ``regime.effective_min_confidence`` on
+  the same inputs the entry path uses. Never raises — on bad input it reports the base floor only.
+  """
+  try:
+    base = float(base_min)
+  except (TypeError, ValueError):
+    base = None
+  try:
+    eff = float(effective_min_confidence(base, str(daily_bias or "neutral"), bool(daily_exhausted), regime_cfg))
+  except Exception:
+    eff = base
+  raised = bool(eff is not None and base is not None and eff > base + 1e-12)
+  return {
+    "minConfidence": eff,
+    "baseMinConfidence": base,
+    "raisedByRegime": raised,
+    "note": (
+      "The confidence floor code enforces for an entry on this symbol now"
+      + (" — raised above the base because this symbol's daily regime is hostile. " if raised else ". ")
+      + "State the confidence you actually hold: every call's stated confidence is recorded per model "
+        "and scored against what price did next, so inflating it to clear a floor corrupts the one "
+        "measurement that can ever show whether your confidence means anything."
+    ),
+  }
+
+
+def _bias_opposes(bias: Any, side: str) -> bool:
+  b = str(bias or "").strip().lower()
+  return (b == "bearish" and side == "buy") or (b == "bullish" and side == "sell")
+
+
+def directional_gates_against(
+  gate: Any,
+  side: Any,
+  *,
+  correlation_blocks: bool = False,
+  move_24h_extreme: bool = False,
+  benched: bool = False,
+) -> List[str]:
+  """Every directional gate ``place_futures_limit_order`` would refuse a PLAIN call on ``side`` with, now.
+
+  Plain = no hatch: no declared/mechanical/fade playbook and no confidence-dependent allowance (trend
+  short, reversal, deadlock break, relative strength) — the gate's own condition, which is what the
+  model reads and self-censors on. Same conditions, same order as the order path (anti_fomo,
+  daily_opposing, h1_align, tf_conflict, correlation, move_24h, bench); tests pin the first element to
+  the ``gate`` the order path actually returns. The symbol-level inputs (BTC correlation veto for an
+  alt long, the 24h move cap, the bench) are passed in, computed by the same closures the order path
+  calls. Recording only — nothing here gates anything. Unknown side -> []. Never raises.
+  """
+  try:
+    s = normalize_futures_side(side) if side else None
+  except Exception:
+    s = None
+  if s is None or not isinstance(gate, dict):
+    return []
+  out: List[str] = []
+  daily_bias = gate.get("daily_bias", "neutral")
+  daily_bias_raw = gate.get("daily_bias_raw", daily_bias)
+  exhausted = bool(gate.get("daily_exhausted", False))
+  if exhausted and daily_bias_raw in ("bullish", "bearish"):
+    if (daily_bias_raw == "bullish" and s == "buy") or (daily_bias_raw == "bearish" and s == "sell"):
+      out.append("anti_fomo")
+  if daily_bias != "neutral" and not exhausted and _bias_opposes(daily_bias, s):
+    out.append("daily_opposing")
+  if _bias_opposes(gate.get("intraday_bias_1h", "neutral"), s):
+    out.append("h1_align")
+  bias_15m = gate.get("intraday_bias_15m", "neutral")
+  if gate.get("timeframe_conflict", False) and bias_15m != "neutral" and _bias_opposes(bias_15m, s):
+    out.append("tf_conflict")
+  if correlation_blocks and s == "buy":
+    out.append("correlation")
+  if move_24h_extreme:
+    out.append("move_24h")
+  if benched:
+    out.append("bench")
+  return out
+
+
+# Order in which the futures limit entry turns a notional into contracts; each cap can only shrink.
+SIZING_CONTRACT_STAGES = ("raw", "lotFloor", "riskCap", "heatCap", "concentrationCap")
+
+
+def _sizing_breakdown_unsafe(
+  *,
+  equity_usd: Any,
+  eff_risk_frac: Any,
+  vol_scale: Any,
+  soft: Any,
+  quality: Any,
+  quality_floor: Any,
+  family_measured: Any,
+  family_explore: Any,
+  family_judged_on: Any,
+  atr_scale: Any,
+  risk_scale: Any,
+  conc_scale: Any,
+  contract_stages: Dict[str, Any],
+  lot_floored: Any,
+  planned_max_loss_usd: Any,
+  gross_risk_usd: Any = None,
+) -> Dict[str, Any]:
+  def _num(name: str, value: Any) -> float:
+    out = float(value)          # None / junk raises -> the caller records no breakdown
+    if not math.isfinite(out):
+      raise ValueError(f"{name} is not finite")
+    return out
+
+  equity = _num("equityUsd", equity_usd)
+  if equity <= 0:
+    raise ValueError("equityUsd must be positive")
+  eff = _num("effRiskFrac", eff_risk_frac)
+  atr = _num("atrScale", atr_scale)
+  soft_vals = [_num("soft", f) for f in (soft or []) if f is not None]
+  quality_val = _num("quality", quality)
+  # The unfloored worst soft factor, so an audit can see when size_quality_floor lifted it.
+  quality_raw = combined_size_factor(soft_vals, floor=0.0)
+  stages = {name: round(_num(name, contract_stages[name]), 6) for name in SIZING_CONTRACT_STAGES}
+  planned_loss = _num("plannedMaxLossUsd", planned_max_loss_usd)
+  out: Dict[str, Any] = {
+    # Equity is the snapshot the order was SIZED on, i.e. at placement — not at fill. A limit that
+    # fills later is still attributed to the budget that sized it, which is what an audit needs.
+    "equityUsd": round(equity, 4),
+    "effRiskFrac": round(eff, 8),
+    "volScale": round(_num("volScale", vol_scale), 4),
+    "soft": [round(v, 4) for v in soft_vals],
+    "qualityRaw": round(quality_raw, 4),
+    "quality": round(quality_val, 4),
+    "qualityFloor": round(_num("qualityFloor", quality_floor), 4),
+    "qualityFloorClamped": bool(quality_val > quality_raw + 1e-9),
+    # Both family legs, not only their minimum — the min is what sized the trade, but which leg bound
+    # (measured shortfall vs explore) is the question every sizing post-mortem has had to reverse-engineer.
+    "familyMeasured": round(_num("familyMeasured", family_measured), 4),
+    "familyExplore": round(_num("familyExplore", family_explore), 4),
+    "familyJudgedOn": (describe_stake_row(family_judged_on) if isinstance(family_judged_on, dict)
+                       else str(family_judged_on or "")),
+    "atrScale": round(atr, 4),
+    "riskScale": round(_num("riskScale", risk_scale), 4),
+    "concScale": round(_num("concScale", conc_scale), 4),
+    # Contracts after each stage. `contracts` is overwritten in place by every cap, so without this a
+    # lot rounded DOWN on a high-priced contract (ETH/BCH ~0.53x of target) is indistinguishable from
+    # a heat or concentration cap.
+    "contractsByStage": stages,
+    "lotFloored": bool(lot_floored),
+    # Unitless, so they compare across equity levels and sizing eras: the fraction of equity the size
+    # factors aimed to risk, and the fraction the placed bracket actually risks (net of costs, as
+    # plannedMaxLossUsd is).
+    "riskFracTarget": round(eff * atr, 8),
+    "riskFracActual": round(planned_loss / equity, 8),
+  }
+  if gross_risk_usd is not None:
+    out["grossRiskFracActual"] = round(_num("grossRiskUsd", gross_risk_usd) / equity, 8)
+  return out
+
+
+def sizing_breakdown(**kwargs: Any) -> Dict[str, Any] | None:
+  """``entryContext['sizing']``: how a futures entry was sized, from the values the code actually used.
+
+  Every close carries the sizing OUTCOME (notionalUsd, plannedMaxLossUsd) but not its inputs, so a
+  sizing audit had to back equity out of today's balance minus cumulative PnL and rebuild the factor
+  stack from logs that rotate in ~2 days (verified 2026-09-25: only 109 SIZE FACTORS lines survive).
+  This keeps them with the trade. Dollar fields live only in the local, git-ignored memory file —
+  the dashboard publisher is whitelist-based and never serialises entryContext wholesale.
+
+  ORDER-PATH TELEMETRY, so it is total by construction: any failure (a missing input, a NaN, a bug in
+  here) logs a WARNING and returns None — it can never refuse, resize or delay the order. The probe
+  starvation of 2026-09-04 (a NameError in entry-path telemetry froze every edge verdict for 2.6 days)
+  is why this is a separate wrapper rather than a try inside the order path.
+  """
+  try:
+    return _sizing_breakdown_unsafe(**kwargs)
+  except Exception as exc:
+    logger.warning("SIZING TELEMETRY LOST: entry sizing breakdown not recorded (%s) — the order is "
+                   "unaffected, but this trade's sizing cannot be audited exactly", exc)
+    return None
+
+
+def probe_execution_stamp(
+  side: Any,
+  market_price: Any,
+  entry_price: Any,
+  stop_loss: Any,
+  take_profit: Any,
+  *,
+  fee_rate: Any,
+  slippage_rate: Any,
+  atr_pct: Any,
+  lease_min: Any,
+) -> Dict[str, Any]:
+  """Keyword arguments for ``memory.record_signal_probe`` describing the call's PLANNED execution.
+
+  The 15m ATR (percent), the planned bracket, the order lease, and ``crossed_net_rr`` — the post-cost
+  net RR the SAME bracket would have if crossed at the live price, priced exactly as the RR gate prices
+  it (same fee and slippage). Recorded only, never acted on: it is what `edge.execution_map` needs to
+  score every call at every resting depth, and to show, at zero stake, how calls the 1.5 floor would
+  refuse at market actually move (``crossBand``). That evidence previously existed only as a rally-only
+  replay (+17R over 40 sub-floor crosses, ~23 independent, 23 of them on one day).
+
+  ORDER-PATH TELEMETRY, total by construction: any failure logs a WARNING and returns {} — the probe is
+  still recorded without these fields and the order is untouched.
+  """
+  try:
+    crossed = net_reward_risk_ratio(
+      side, float(market_price), float(take_profit), float(stop_loss),
+      fee_rate=float(fee_rate or 0.0), slippage_rate=float(slippage_rate or 0.0),
+    )
+    return {
+      "atr15_pct": atr_pct,
+      "planned_entry": entry_price,
+      "planned_stop": stop_loss,
+      "planned_tp": take_profit,
+      "crossed_net_rr": crossed,
+      "lease_min": lease_min,
+    }
+  except Exception as exc:
+    logger.warning("EXECUTION STAMP LOST: probe recorded without its planned-execution fields (%s)", exc)
+    return {}
+
+
+def execution_bucket_note(
+  execution_map: Any,
+  side: Any,
+  entry_price: Any,
+  market_price: Any,
+  atr_pct: Any,
+  *,
+  crossed_net_rr: Any = None,
+  rr_floor: Any = None,
+) -> str:
+  """One or two sentences placing THIS limit in the bot's own execution map, for the placement response.
+
+  e.g. "Execution map: this limit rests 1.31 ATR15 from price (1-2); your last 72 limits there filled 8%
+  within the lease (6/72); fills there averaged -0.03R (n=14, SE 0.21)." plus, for a resting limit, what
+  the bracket would net if crossed now. It reads the same table the model sees as edgeReport.executionMap
+  — a mirror of its own record, never a rule. Total: any failure logs a WARNING and returns ''.
+  """
+  try:
+    parts = []
+    d = passive_distance_atr(side, entry_price, market_price, atr_pct)
+    label = distance_bucket(d)
+    if label is not None:
+      row = ((execution_map or {}).get("byDistance") or {}).get(label) or {}
+      where = ("crosses the live price (marketable)" if label == "marketable"
+               else f"rests {d:.2f} ATR15 from price ({label})")
+      text = f"Execution map: this limit {where}; "
+      placed, filled = int(row.get("placed") or 0), int(row.get("filled") or 0)
+      rate = row.get("fillRate")
+      if placed and isinstance(rate, (int, float)):
+        text += f"your last {placed} limits there filled {rate:.0%} within the lease ({filled}/{placed})"
+      elif placed:
+        text += f"your last {placed} limits there filled {filled}/{placed} (too few to call a rate)"
+      else:
+        text += "no recent limits of yours at this distance"
+      fills = row.get("fills") or {}
+      mean_r, se_r, n_f = fills.get("meanR"), fills.get("seR"), int(fills.get("n") or 0)
+      if isinstance(mean_r, (int, float)):
+        text += f"; fills there averaged {mean_r:+.2f}R (n={n_f}, SE {float(se_r or 0.0):.2f})"
+      elif n_f:
+        text += f"; fills there: n={n_f}, too few to average"
+      parts.append(text + ".")
+      rr = crossed_net_rr
+      if label != "marketable" and isinstance(rr, (int, float)) and isinstance(rr_floor, (int, float)):
+        parts.append(f"Crossed at the live price this bracket would net RR {float(rr):.2f} "
+                     f"(floor {float(rr_floor):.2f}).")
+    return " ".join(parts)
+  except Exception as exc:
+    logger.warning("EXECUTION MAP NOTE lost for this placement (%s) — the order is unaffected", exc)
+    return ""
+
+
 def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   """Instantiate all agent tools bound to the given per-run context. Returns a namespace of tools."""
   cfg = ctx.cfg
@@ -248,6 +718,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   _futures_margin_mode = ctx._futures_margin_mode
   _apply_cross_leverage = ctx._apply_cross_leverage
   _btc_daily_bias = ctx._btc_daily_bias
+  # Cache-only, non-fetching view of the run's BTC daily bias (agent._btc_daily_bias_peek), for telemetry
+  # that must never fill the cache the correlation veto and the RS size factor decide on. None = unknown.
+  _btc_bias_peek = getattr(ctx, "_btc_daily_bias_peek", None) or (lambda: None)
   _edge_state = ctx._edge_state
   _fee_adjusted_breakeven = ctx._fee_adjusted_breakeven
   _get_contract_spec = ctx._get_contract_spec
@@ -257,6 +730,27 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   _stop_distance_ok = ctx._stop_distance_ok
   safety_state = getattr(ctx, "safety_state", None)
   entry_token = getattr(ctx, "entry_token", None)
+  # Zero-arg callable returning the poll loop's hourly market-state block (main._MarketStateClock.current)
+  # or None. Cache only — reading it never makes a network call, so stamping it on the order path is free.
+  _market_state_source = getattr(ctx, "market_state", None)
+
+  def _market_state_now() -> Dict[str, Any] | None:
+    """The current market-state block, sanitized, or None. Total: recording must never touch a trade."""
+    if not callable(_market_state_source):
+      return None
+    try:
+      return sanitize_market_state(_market_state_source())
+    except Exception as exc:
+      logger.warning("MARKET STATE: unreadable for this stamp (%s) — row recorded without it", exc)
+      return None
+
+  def _tradeable_by_bot(symbol: str) -> bool | None:
+    """Can this bot's execution layer add and trade ``symbol``? None = spot list unavailable (fail open).
+
+    The ONE reachability check shared by add_coin and scan_futures_market (agent._bot_can_trade over the
+    cached live spot list), so the screener can never offer what add_coin would refuse.
+    """
+    return _bot_can_trade(symbol, _SPOT_SYMBOLS.get(kucoin))
 
   def _authority_error() -> str | None:
     if safety_state is None:
@@ -431,23 +925,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     return round_price_to_tick(value, tick_size)
 
   def _live_entry_price(symbol: str) -> float | None:
-    # New exposure is futures-only: size/deviation/brackets must use the same market that will fill.
-    # Spot/perp basis can be material around squeezes and listings, so spot is fallback only.
-    if kucoin_futures:
-      futures_symbol = _to_futures_symbol(symbol)
-      if futures_symbol:
-        try:
-          mark = _to_float((kucoin_futures.get_mark_price(futures_symbol) or {}).get("value"))
-          if mark > 0:
-            return mark
-        except Exception as exc:
-          logger.warning("Futures mark refresh failed for %s entry; falling back to spot: %s", symbol, exc)
-    try:
-      price = float(kucoin.get_ticker(symbol).price)
-      return price if price > 0 else None
-    except Exception as exc:
-      logger.warning("Live ticker refresh failed for %s entry: %s", symbol, exc)
-      return None
+    return live_entry_price_sourced(kucoin, kucoin_futures, symbol)[0]
 
   _flow_cache: Dict[str, Dict[str, Any]] = {}
 
@@ -585,6 +1063,101 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return None
     cap = float(cfg.trading.max_24h_volatility_pct or 0.0)
     return move if cap > 0 and abs(move) > cap else None
+
+  # ── Gate scoreboard telemetry (2026-09-25). Recording only: nothing below can refuse, alter or delay
+  # a trading decision, and every failure is a WARNING, never an exception (an entry-path NameError once
+  # froze every edge verdict for 2.6 days). Kept out of the trading prompt entirely — see edge.gate_scoreboard.
+
+  def _gates_against_now(symbol: str) -> Dict[str, List[str]]:
+    """``{'long': [...], 'short': [...]}``: every directional gate a PLAIN call on each side would hit now,
+    through the same closures the order path calls (bench, 24h cap, BTC correlation veto)."""
+    gate = _gate_for(symbol)
+    try:
+      benched = float((_edge_state().get("bench") or {}).get(symbol, 0) or 0) > time.time()
+    except Exception as exc:
+      logger.warning("GATE STATE: bench unreadable for %s (%s) — recorded as not benched", symbol, exc)
+      benched = False
+    move = _extreme_24h_move(symbol) is not None
+    out: Dict[str, List[str]] = {}
+    for side, order_side in (("long", "buy"), ("short", "sell")):
+      corr = False
+      if order_side == "buy":
+        try:
+          # PEEK, never `_btc_daily_bias()`: that call caches its first answer for the whole run (and
+          # before BTC is analysed it is a raw forming-bar fetch), so calling it from here decided which
+          # bias the LIVE correlation veto and RS size factor would use later in the run (2026-09-25
+          # review). Unknown this run -> recorded as not blocked by correlation.
+          _btc_now = _btc_bias_peek()
+          if _btc_now is not None:
+            corr = bool(block_alt_long_in_btc_downtrend(
+              symbol=symbol,
+              side=order_side,
+              btc_daily_bias=_btc_now,
+              local_daily_bias=gate.get("daily_bias_raw", gate.get("daily_bias", "neutral")),
+              bias_4h=gate.get("intraday_bias_4h", "neutral"),
+              bias_1h=gate.get("intraday_bias_1h", "neutral"),
+              bias_15m=gate.get("intraday_bias_15m", "neutral"),
+              strength=gate.get("strength", "weak"),
+              daily_exhausted=bool(gate.get("daily_exhausted", False)),
+              confidence=None,   # no RS hatch: a plain call
+              cfg=cfg.regime,
+            ))
+        except Exception as exc:
+          logger.warning("GATE STATE: correlation veto unreadable for %s (%s)", symbol, exc)
+      out[side] = directional_gates_against(
+        gate, order_side, correlation_blocks=corr, move_24h_extreme=move, benched=benched,
+      )
+    return out
+
+  def _record_gate_state(symbol: str, result: Dict[str, Any]) -> None:
+    """One gate-state probe per side for this analysis: what the gates would do to a call on each side,
+    whether or not the model proposes anything — the self-censored footprint the hard refusals miss.
+    Base = this analysis's futures mark (the market that settles it). Deduped per symbol/side in memory."""
+    try:
+      gate = _gate_for(symbol)
+      if not gate or not gate.get("data_quality_ok", False):
+        return      # the entry path refuses every call on bad data; its biases are not a gate state
+      if not _to_futures_symbol(symbol):
+        return      # no perp, no futures entry path — nothing a gate could refuse
+      mark = _to_float(((result or {}).get("futures") or {}).get("markPrice"))
+      if not mark or mark <= 0:
+        logger.warning("GATE STATE PROBE skipped: no futures mark for %s this analysis", symbol)
+        return
+      memory.record_gate_state_probes(
+        symbol, mark, _gates_against_now(symbol), price_source="futures_mark",
+        regime=gate, market_state=_market_state_now(),
+      )
+    except Exception as exc:
+      logger.warning("GATE STATE PROBE LOST: %s not recorded (%s)", symbol, exc)
+
+  def _record_gate_refusal(result: Any, symbol: Any, side: Any, setup_family: Any, confidence: Any) -> None:
+    """Record a HARD refusal by a scored gate as a gate probe (memory.record_gate_probe).
+
+    Reads the refusal, never changes it. Base = the live price now (futures mark, spot only as a labelled
+    fallback — the same helper the signal probe uses), so the refused call is scored exactly like an
+    admitted one. Only ``SCORED_GATES`` record; a structural refusal says nothing about the call.
+    """
+    try:
+      if not (isinstance(result, dict) and result.get("rejected") is True):
+        return
+      gate = result.get("gate")
+      if gate not in SCORED_GATES:
+        return
+      spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
+      side_lower = _normalize_futures_side(side)
+      if not spot_symbol or side_lower is None:
+        return
+      price, source = live_entry_price_sourced(kucoin, kucoin_futures, spot_symbol)
+      if price is None:
+        logger.warning("GATE PROBE LOST: %s %s refusal by %s — no live price", spot_symbol, side_lower, gate)
+        return
+      memory.record_gate_probe(
+        spot_symbol, side_lower, price, gate,
+        setup_family=setup_family, price_source=source, model=cfg.azure.deployment,
+        confidence=confidence, regime=_gate_for(spot_symbol), market_state=_market_state_now(),
+      )
+    except Exception as exc:
+      logger.warning("GATE PROBE LOST: %s %s refusal not recorded (%s)", symbol, side, exc)
 
   def _quarantine_symbol(symbol: str, reason: str) -> None:
     """Remove a persistently unsafe candidate from the next run's active universe."""
@@ -1957,6 +2530,28 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"error": str(exc), "symbol": symbol}
     return normalize_orderbook(ob, depth_safe, symbol)
 
+  def _retry_fields(failures: Dict[str, tuple[str, float]]) -> Dict[str, Any]:
+    """{retryAfter, retryInHours} for the latest-clearing failure, or {} when there is none."""
+    if not failures:
+      return {}
+    retry = max(float(r) for _, r in failures.values())
+    return {"retryAfter": int(retry), "retryInHours": round(max(0.0, retry - time.time()) / 3600.0, 1)}
+
+  def _record_analysis_failure(symbol: str, failures: Dict[str, tuple[str, float]]) -> None:
+    """Persist a data-quality refusal with its evidence-derived retry time. Total: never raises."""
+    try:
+      reason = "; ".join(f"{iv}: {why}" for iv, (why, _) in failures.items())
+      retry = max(float(r) for _, r in failures.values())
+      memory.record_analysis_failure(symbol, reason=reason, retry_after=retry)
+    except Exception as exc:
+      logger.warning("ANALYSIS FAILURE not recorded for %s (%s) — the scan will not flag it", symbol, exc)
+
+  def _clear_analysis_failure(symbol: str) -> None:
+    try:
+      memory.clear_analysis_failure(symbol)
+    except Exception as exc:
+      logger.warning("ANALYSIS FAILURE not cleared for %s (%s) — the scan may flag it until expiry", symbol, exc)
+
   @function_tool
   async def analyze_market_context(
     symbol: str,
@@ -1979,6 +2574,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     snapshots: list[Dict[str, Any]] = []
     analysis_errors: Dict[str, str] = {}
+    # Data-quality failures with the time each one's evidence can first age out (interval -> (reason,
+    # retryAfter)), persisted so scan_futures_market can flag the row before the model re-analyses it.
+    quality_failures: Dict[str, tuple[str, float]] = {}
     end_at = int(time.time())
     futures_granularity = {"1min": 1, "5min": 5, "15min": 15, "1hour": 60, "4hour": 240, "1day": 1440}
     context_futures_symbol = _to_futures_symbol(symbol) if cfg.kucoin_futures.enabled and kucoin_futures else None
@@ -2022,17 +2620,25 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if not candles:
         candles = kucoin.get_candles(symbol, interval=iv, start_at=start_at, end_at=end_at)
       if not candles:
+        quality_failures[iv] = ("no candles returned", candle_quality_retry_after(
+          {}, iv, window_sec=points * interval_sec, now=end_at))
         if iv in ("4hour", "1day"):
           analysis_errors[iv] = "no candles returned"
           continue
-        return {"error": "No candles returned", "interval": iv}
+        _record_analysis_failure(symbol, quality_failures)
+        return {"error": "No candles returned", "interval": iv,
+                **_retry_fields(quality_failures)}
       try:
         raw_df = candles_to_dataframe(candles)
         quality = validate_candle_data(raw_df, iv, as_of=end_at)
         if not quality.get("valid"):
           analysis_errors[iv] = "; ".join(quality.get("errors") or ["invalid candle data"])
+          quality_failures[iv] = (analysis_errors[iv], candle_quality_retry_after(
+            quality, iv, window_sec=points * interval_sec, now=end_at))
           if iv in ("15min", "1hour"):
-            return {"error": analysis_errors[iv], "interval": iv, "dataQuality": quality}
+            _record_analysis_failure(symbol, quality_failures)
+            return {"error": analysis_errors[iv], "interval": iv, "dataQuality": quality,
+                    **_retry_fields(quality_failures)}
           continue
         df = candles_to_dataframe(candles, interval=iv, as_of=end_at, closed_only=True)
         snapshot = summarize_interval(df, iv)
@@ -2111,6 +2717,15 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "data_quality_ok": data_quality_ok,
       "analysis_errors": analysis_errors,
     }
+    # The confidence floor the order path will ENFORCE for this symbol right now — computed from the
+    # same gate fields place_futures_limit_order reads. The prompt and snapshot only ever showed the
+    # base 0.65 while code enforced 0.75 in a hostile daily regime, so the model learned the real floor
+    # from a rejection (14 such on 09-23/24, 5 of them simply restated +0.03..+0.06 and accepted).
+    summary["entryGate"] = entry_gate_summary(
+      cfg.trading.min_confidence,
+      _daily_gate_state[symbol]["daily_bias"], _daily_gate_state[symbol]["daily_exhausted"],
+      cfg.regime,
+    )
 
     # Entry-planning map (decision-support, NOT a gate): how far current price sits beyond the 15m VWAP
     # anchor in each direction (in ATR units) plus the nearest pullback/retest anchors, so the agent can
@@ -2144,8 +2759,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "symbol": symbol,
       "snapshots": snapshots,
       "summary": summary,
-      "dataQuality": {"ok": data_quality_ok, "errors": analysis_errors},
+      "dataQuality": {"ok": data_quality_ok, "errors": analysis_errors, **_retry_fields(quality_failures)},
     }
+    # Remember a 4h/1D data-quality failure (the entry gate refuses on it) or clear an old one now that
+    # the data is clean. The ATR breach is not recorded here: _quarantine_symbol already owns it.
+    if quality_failures:
+      _record_analysis_failure(symbol, quality_failures)
+    elif data_quality_ok:
+      _clear_analysis_failure(symbol)
 
     if cfg.kucoin_futures.enabled and kucoin_futures:
       fsym = _to_futures_symbol(symbol)
@@ -2157,19 +2778,33 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           current_funding_rate = fr.get("value")
           futures_data["fundingRate"] = current_funding_rate
           futures_data["predictedRate"] = fr.get("predictedValue")
+          # The contract's OWN settlement clock. fundingRate is per settlement, and KuCoin settles each
+          # contract on its own interval (1h/4h/8h, shortened when funding is extreme), so a rate
+          # without its interval is unreadable: until 2026-09-25 it was labelled '%/8h' everywhere
+          # and ONE's hourly rate read ~8x smaller than it was.
+          _funding_clock = funding_clock_from_rate(fr)
+          futures_data["fundingIntervalHours"] = (
+            round(_funding_clock[1] / 3600.0, 4) if _funding_clock else None
+          )
           # A live FUNDING-CARRY opportunity, when the rate is extreme enough to matter against the
           # bot's own measured round-trip cost. Every other playbook needs the direction call to be
-          # right; this one is paid mechanically every 8h whichever way price moves, and is the
-          # best-documented edge in perpetuals. Threshold is derived from measured cost, not tuned.
+          # right; this one is paid mechanically at every settlement whichever way price moves, and is
+          # the best-documented edge in perpetuals. Threshold is derived from measured cost, not tuned.
           _rt_cost = 2.0 * (
             (_to_float(fees.get("futures_taker")) or 0.0006) + _slippage_rate()
           )
-          futures_data["fundingSetup"] = funding_carry_setup(current_funding_rate, _rt_cost)
+          futures_data["fundingSetup"] = funding_carry_setup(
+            current_funding_rate, _rt_cost, interval_hours=futures_data["fundingIntervalHours"],
+          )
           # Keep it on the gate too: a declared 'funding_carry' entry is verified against this, so the
           # label cannot admit a trade whose mechanism is absent (see regime.verify_declared_setup).
+          # The clock rides along so the entry can stamp it (analysis and order placement are separate
+          # tool calls) and the carry hold / replays know which settlement the trade was opened for.
           if symbol in _daily_gate_state:
             _daily_gate_state[symbol]["funding_setup"] = futures_data["fundingSetup"]
             _daily_gate_state[symbol]["funding_rate"] = current_funding_rate
+            _daily_gate_state[symbol]["funding_interval_sec"] = _funding_clock[1] if _funding_clock else None
+            _daily_gate_state[symbol]["funding_next_ts"] = _funding_clock[0] if _funding_clock else None
         except Exception:
           pass
         current_oi = None
@@ -2250,6 +2885,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         if futures_data.keys() - {"symbol"}:
           result["futures"] = futures_data
 
+    # Gate scoreboard: record which directional gates a call on each side would face right now (report-
+    # only; never read by any gate or shown to the model). After the futures block, which supplies the
+    # mark it is based on and the 24h move the move cap reads. Total.
+    if cfg.kucoin_futures.enabled and kucoin_futures:
+      _record_gate_state(symbol, result)
     return result
 
   @function_tool
@@ -3336,8 +3976,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "transferUsed": transfer_used,
     }
 
-  @function_tool
-  async def place_futures_limit_order(
+  async def _place_futures_limit_order_impl(
     symbol: str,
     side: str,
     notional_usd: float,
@@ -3350,33 +3989,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     stop_loss_price: float | None = None,
     setup_family: str | None = None,
   ) -> Dict[str, Any]:
-    """Place a futures limit entry order at a technically derived target price.
-    Use for new entries where you want to wait for price to reach a key level
-    (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
+    """Body of the place_futures_limit_order tool (whose docstring is the model-facing one).
 
-    ALWAYS pass `setup_family` — which PLAYBOOK this trade belongs to. One of:
-      "funding_carry" — taking the side that is PAID by the 8h funding transfer (analyze_market_context
-                        reports futures.fundingSetup when the rate is extreme enough to matter). This
-                        is the ONLY playbook that does not need the direction call to be right: the
-                        transfer happens whichever way price moves, and an extreme rate also marks
-                        crowded positioning on the other side. Hold across at least one settlement.
-                        Because its payoff is not the trend continuing, it (and "macro_event") is also
-                        the only way past the daily-exhaustion gate — but only when fundingSetup is
-                        actually present and pays the side you are entering.
-      "continuation"  — trading with an established trend (timeframes agree, you expect it to persist)
-      "fade_extreme"  — fading a stretched move back toward value (oversold bounce, overbought fade)
-      "breakout"      — entering on a break of a range/level, expecting expansion
-      "range_edge"    — buying support / selling resistance inside a defined range
-      "other"         — none of the above
-    Each family keeps its OWN measured forward-return score (edgeReport.signalEdge.by_family), and
-    risk flows toward whichever is currently paying its costs. This is how the bot learns which
-    approach works in the current market without anyone hand-picking one — so label honestly. A
-    mislabelled trade corrupts the scoreboard that decides where your risk goes.
-    Rejects if entry_price is too close to current price; wait for a genuine limit level instead
-    of chasing. Futures market orders are reserved for closes and emergencies.
-    ALWAYS pass take_profit_price AND stop_loss_price: they are attached to the order and arm
-    automatically the instant it fills (KuCoin st-orders), so the position is never left unprotected
-    in the gap before your next run. Decide the best entry, TP and SL together, up front."""
+    Every refusal returned BEFORE the signal probe carries a ``gate`` code: one of memory.SCORED_GATES
+    (a rule that judged THIS call — the tool wrapper records it as a gate probe) or of
+    memory.STRUCTURAL_REFUSALS (records nothing). A source test enforces it for every such return,
+    so a new gate cannot be added without saying which kind it is.
+    """
     spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not spot_symbol:
       spot_symbol = _repair_allowed_symbol(symbol)
@@ -3391,6 +4010,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if existing_pending:
         return {
           "rejected": True,
+          "gate": "pending_entry",
           "reason": f"Pending entry already exists for {spot_symbol}; cancel or let it fill/expire before another entry",
           "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
           "hint": "Only one resting entry per symbol is allowed; stacking GTC orders can multiply exposure when they fill together.",
@@ -3398,6 +4018,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if take_profit_price is None or stop_loss_price is None:
       return {
         "rejected": True,
+        "gate": "bracket_missing",
         "reason": "Futures limit entries require both take-profit and stop-loss prices",
         "hint": "Define the atomic bracket before placing the entry so risk is bounded from the instant it fills.",
       }
@@ -3405,12 +4026,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       take_profit_price = float(take_profit_price)
       stop_loss_price = float(stop_loss_price)
     except (TypeError, ValueError):
-      return {"rejected": True, "reason": "Take-profit and stop-loss must be valid positive prices"}
+      return {"rejected": True, "gate": "bracket_invalid", "reason": "Take-profit and stop-loss must be valid positive prices"}
     if take_profit_price <= 0 or stop_loss_price <= 0:
-      return {"rejected": True, "reason": "Take-profit and stop-loss must be positive"}
+      return {"rejected": True, "gate": "bracket_invalid", "reason": "Take-profit and stop-loss must be positive"}
     if not cfg.trading.atomic_bracket_enabled and not snapshot.paper_trading:
       return {
         "rejected": True,
+        "gate": "atomic_bracket_disabled",
         "reason": "Live futures entries require ATOMIC_BRACKET_ENABLED=true",
         "hint": "The bot will not submit an entry that can fill without exchange-attached TP and SL.",
       }
@@ -3426,10 +4048,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
     context_error = _entry_context_error(spot_symbol, confidence)
     if context_error:
-      return {"rejected": True, "reason": context_error, "hint": "Analyze this symbol immediately before submitting an entry."}
+      return {"rejected": True, "gate": "entry_context", "reason": context_error, "hint": "Analyze this symbol immediately before submitting an entry."}
     live_entry_book = _refresh_live_futures_truth()
     if live_entry_book.get("error"):
-      return {"rejected": True, "reason": live_entry_book["error"]}
+      return {"rejected": True, "gate": "live_book", "reason": live_entry_book["error"]}
     initial_entry_fingerprint = live_entry_book.get("fingerprint")
     initial_entry_equity = float(live_entry_book.get("futuresEquity") or 0.0)
     if _pre_futures_symbol_fl:
@@ -3437,6 +4059,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if existing_pending:
         return {
           "rejected": True,
+          "gate": "pending_entry",
           "reason": f"Live pending entry already exists for {spot_symbol}",
           "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
         }
@@ -3452,11 +4075,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       ):
         return {
           "rejected": True,
+          "gate": "no_chase",
           "reason": f"No-chase: proposed {side_lower} entry {entry_price_val:.8g} is worse than recent profitable exit {float(win['exitPrice']):.8g}",
         }
 
     if snapshot.trading_restricted:
-      return {"rejected": True, "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
+      return {"rejected": True, "gate": "restricted", "reason": f"Trading restricted (close-only mode): {snapshot.restriction_reason}", "hint": "Only reduce_only/close operations are allowed during circuit breaker activation."}
 
     if cfg.trading.post_loss_cooldown_minutes > 0:
       last_loss_ts = memory.last_loss_time(spot_symbol)
@@ -3464,7 +4088,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         elapsed_min = (int(time.time()) - last_loss_ts) / 60
         if elapsed_min < cfg.trading.post_loss_cooldown_minutes:
           remaining = int(cfg.trading.post_loss_cooldown_minutes - elapsed_min)
-          return {"rejected": True, "reason": f"Post-loss cooldown active for {spot_symbol} ({remaining}min remaining)", "hint": "Try a different symbol or wait."}
+          return {"rejected": True, "gate": "post_loss_cooldown", "reason": f"Post-loss cooldown active for {spot_symbol} ({remaining}min remaining)", "hint": "Try a different symbol or wait."}
 
     if cfg.trading.min_trade_interval_minutes > 0:
       last_trade_ts = memory.last_trade_time(spot_symbol)
@@ -3472,8 +4096,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         elapsed_min = (int(time.time()) - last_trade_ts) / 60
         if elapsed_min < cfg.trading.min_trade_interval_minutes:
           remaining = int(cfg.trading.min_trade_interval_minutes - elapsed_min)
-          return {"rejected": True, "reason": f"Trade interval cooldown for {spot_symbol} ({remaining}min remaining)"}
+          return {"rejected": True, "gate": "trade_interval", "reason": f"Trade interval cooldown for {spot_symbol} ({remaining}min remaining)"}
 
+    # Which gates this call FACED and which hatch let it through (gate scoreboard, report-only). Stamped
+    # on the signal probe below; inert for every family verdict. 09-22..24: 28 hatch admissions were
+    # probed but untagged, so neither the gates nor their hatches could be scored.
+    _gates_passed_fl: List[Dict[str, str]] = []
     if spot_symbol in _daily_gate_state:
       gate = _daily_gate_state[spot_symbol]
       daily_bias = gate.get("daily_bias", "neutral")
@@ -3491,19 +4119,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("TREND-SHORT ALLOWED: futures limit %s %s — exhausted-bearish daily but 1h/15m confirm downtrend resumption (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+            _gates_passed_fl.append({"gate": "anti_fomo", "hatch": "trend_short"})
           elif allow_mechanical_setup(setup_family=setup_family, cfg=cfg.regime):
             # Anti-FOMO refuses a bet that the trend runs further. A carry or a post-release trade is
             # not that bet, so the mechanism — not the RSI — decides. Verification is mandatory here.
             _mech_bad = _declared_setup_error(setup_family, side_lower, gate)
             if _mech_bad:
               logger.warning("MECHANICAL SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _mech_bad)
-              return {"rejected": True, "reason": f"Declared setup does not match reality: {_mech_bad}",
+              # The exhaustion gate refused this call: its hatch was declared but the mechanism is absent.
+              return {"rejected": True, "gate": "anti_fomo", "reason": f"Declared setup does not match reality: {_mech_bad}",
                       "hint": "Only a playbook whose payoff is mechanical rather than directional may pass the daily-exhaustion gate, and it must actually have its mechanism present."}
             logger.info("MECHANICAL SETUP ALLOWED: futures limit %s %s past the daily-exhaustion gate — declared %r earns its payoff from a verified mechanism, not from the %s trend continuing (explore-sized until it earns a verdict)",
                         side_lower, spot_symbol, str(setup_family or "").strip().lower(), daily_bias_raw)
+            _gates_passed_fl.append({"gate": "anti_fomo", "hatch": "mechanical"})
           else:
             logger.warning("ANTI-FOMO BLOCK: futures limit %s %s rejected — daily %s exhausted", side_lower, spot_symbol, daily_bias_raw)
-            return {"rejected": True, "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback, trade counter-trend, or — if this trade's payoff does not depend on the trend continuing — declare the mechanical playbook it really is ('funding_carry' with funding that clears the threshold, 'macro_event' just after a scheduled release)."}
+            return {"rejected": True, "gate": "anti_fomo", "reason": f"Daily exhaustion: {daily_bias_raw} trend overextended — no continuation entry", "hint": "Daily RSI is at an extreme. Wait for the pullback, trade counter-trend, or — if this trade's payoff does not depend on the trend continuing — declare the mechanical playbook it really is ('funding_carry' with funding that clears the threshold, 'macro_event' just after a scheduled release)."}
       if daily_bias != "neutral" and not daily_exhausted:
         opposing = (daily_bias == "bearish" and side_lower == "buy") or (daily_bias == "bullish" and side_lower == "sell")
         if opposing:
@@ -3513,28 +4144,35 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("REVERSAL LONG ALLOWED: futures limit %s %s — bearish daily but 1h/15m confirm a turn (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+            _gates_passed_fl.append({"gate": "daily_opposing", "hatch": "reversal_long"})
           elif allow_reversal_short(
             daily_bias=daily_bias, side=side_lower,
             bias_1h=gate.get("intraday_bias_1h", "neutral"), bias_15m=gate.get("intraday_bias_15m", "neutral"),
             confidence=confidence, cfg=cfg.regime,
           ):
             logger.info("REVERSAL SHORT ALLOWED: futures limit %s %s — bullish daily but 1h/15m confirm a roll-over (conf=%.2f)", side_lower, spot_symbol, confidence or 0.0)
+            _gates_passed_fl.append({"gate": "daily_opposing", "hatch": "reversal_short"})
           elif allow_fade_extreme(
             side=side_lower, setup_family=setup_family,
             rsi=gate.get("intraday_rsi_15m"), cfg=cfg.regime,
           ):
             logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the daily gate — 15m RSI %.1f is at an extreme against the entry (family scoring decides its risk)",
                         side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
+            _gates_passed_fl.append({"gate": "daily_opposing", "hatch": "fade"})
           elif allow_declared_setup(setup_family=setup_family, cfg=cfg.regime):
             _decl_bad = _declared_setup_error(setup_family, side_lower, gate)
             if _decl_bad:
               logger.warning("DECLARED SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _decl_bad)
-              return {"rejected": True, "reason": f"Declared setup does not match reality: {_decl_bad}",
+              return {"rejected": True, "gate": "daily_opposing", "reason": f"Declared setup does not match reality: {_decl_bad}",
                       "hint": "A mechanical playbook must actually have its mechanism present. Re-declare the setup_family this trade really is and it will face that family's normal gates."}
             logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the daily gate — declared playbook %r (family scoring decides its risk — see SIZE FACTORS)",
                         side_lower, spot_symbol, str(setup_family or "").strip().lower())
+            _gates_passed_fl.append({"gate": "daily_opposing", "hatch": "declared"})
           else:
-            return {"rejected": True, "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), declare setup_family='fade_extreme' at a genuine RSI extreme, declare a deliberate 'breakout'/'range_edge' playbook, or switch symbol."}
+            # Logged since 2026-09-25: this was the one directional refusal with neither a log line nor a
+            # probe, so the 09-22..24 count of 8 hard refusals was a lower bound.
+            logger.warning("DAILY GATE BLOCK: futures limit %s %s rejected — 1D trend is %s", side_lower, spot_symbol, daily_bias)
+            return {"rejected": True, "gate": "daily_opposing", "reason": f"Daily gate: 1D trend is {daily_bias} — {side_lower} entry blocked", "hint": "Trade with the daily trend, take a confirmed reversal (1h+15m turned against the daily, high confidence), declare setup_family='fade_extreme' at a genuine RSI extreme, declare a deliberate 'breakout'/'range_edge' playbook, or switch symbol."}
       intraday_bias_1h_fl = gate.get("intraday_bias_1h", "neutral")
       intraday_1h_opposes_fl = (
         (intraday_bias_1h_fl == "bearish" and side_lower == "buy") or
@@ -3547,6 +4185,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           confidence=confidence, cfg=cfg.regime,
         ):
           logger.info("DEADLOCK BREAK: futures limit %s %s — daily-aligned entry allowed past stalling 1h counter-bounce (daily=%s, 1h=%s, conf=%.2f)", side_lower, spot_symbol, daily_bias, intraday_bias_1h_fl, confidence or 0.0)
+          _gates_passed_fl.append({"gate": "h1_align", "hatch": "deadlock"})
         elif allow_fade_extreme(
           side=side_lower, setup_family=setup_family,
           rsi=gate.get("intraday_rsi_15m"), cfg=cfg.regime,
@@ -3555,6 +4194,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           # alignment here is what made the playbook unreachable.
           logger.info("FADE-EXTREME ALLOWED: futures limit %s %s past the 1h gate — 15m RSI %.1f at an extreme",
                       side_lower, spot_symbol, float(gate.get("intraday_rsi_15m") or 0.0))
+          _gates_passed_fl.append({"gate": "h1_align", "hatch": "fade"})
         elif allow_declared_setup(setup_family=setup_family, cfg=cfg.regime):
           # A breakout/range_edge often has the 1h against it too (a range fade at the top, a breakout
           # of a level the 1h hasn't caught up to). Admit the declared playbook; risk is governed
@@ -3564,13 +4204,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           _decl_bad = _declared_setup_error(setup_family, side_lower, gate)
           if _decl_bad:
             logger.warning("DECLARED SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _decl_bad)
-            return {"rejected": True, "reason": f"Declared setup does not match reality: {_decl_bad}",
+            return {"rejected": True, "gate": "h1_align", "reason": f"Declared setup does not match reality: {_decl_bad}",
                     "hint": "A mechanical playbook must actually have its mechanism present. Re-declare the setup_family this trade really is and it will face that family's normal gates."}
           logger.info("DECLARED SETUP ALLOWED: futures limit %s %s past the 1h gate — declared playbook %r (family scoring decides its risk — see SIZE FACTORS)",
                       side_lower, spot_symbol, str(setup_family or "").strip().lower())
+          _gates_passed_fl.append({"gate": "h1_align", "hatch": "declared"})
         else:
           logger.warning("1H ALIGN BLOCK: futures limit %s %s rejected — 1h bias %s opposes %s", side_lower, spot_symbol, intraday_bias_1h_fl, side_lower)
-          return {"rejected": True, "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. Wait for 1h alignment, declare setup_family='fade_extreme' at a genuine RSI extreme, or declare a deliberate 'breakout'/'range_edge' playbook."}
+          return {"rejected": True, "gate": "h1_align", "reason": f"1h trend is {intraday_bias_1h_fl} — {side_lower} entry blocked", "hint": "1h timeframe opposes this direction. Wait for 1h alignment, declare setup_family='fade_extreme' at a genuine RSI extreme, or declare a deliberate 'breakout'/'range_edge' playbook."}
       tf_conflict_fl = gate.get("timeframe_conflict", False)
       intraday_bias_15m_fl = gate.get("intraday_bias_15m", "neutral")
       if tf_conflict_fl and intraday_bias_15m_fl != "neutral":
@@ -3589,23 +4230,28 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           _mech_bad = _declared_setup_error(setup_family, side_lower, gate)
           if _mech_bad:
             logger.warning("MECHANICAL SETUP REJECTED: futures limit %s %s — %s", side_lower, spot_symbol, _mech_bad)
-            return {"rejected": True, "reason": f"Declared setup does not match reality: {_mech_bad}",
+            return {"rejected": True, "gate": "tf_conflict", "reason": f"Declared setup does not match reality: {_mech_bad}",
                     "hint": "Only a playbook whose payoff is mechanical rather than directional may pass the timeframe-conflict gate, and it must actually have its mechanism present."}
           logger.info("MECHANICAL SETUP ALLOWED: futures limit %s %s past the timeframe-conflict gate — declared %r is paid by a verified mechanism, not by the 15m bias agreeing (explore-sized until it earns a verdict)",
                       side_lower, spot_symbol, str(setup_family or "").strip().lower())
+          _gates_passed_fl.append({"gate": "tf_conflict", "hatch": "mechanical"})
         elif intraday_opposes_fl:
           logger.warning("TF CONFLICT BLOCK: futures limit %s %s rejected — daily/intraday split, 15m %s opposes %s", side_lower, spot_symbol, intraday_bias_15m_fl, side_lower)
-          return {"rejected": True, "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, pick a different symbol, or — if this trade's payoff does not depend on the 15m direction — declare the mechanical playbook it really is ('funding_carry' with funding that clears the threshold and pays your side, 'macro_event' just after a scheduled release)."}
+          return {"rejected": True, "gate": "tf_conflict", "reason": f"Timeframe conflict: 15m {intraday_bias_15m_fl} opposes proposed {side_lower}", "hint": "Wait for 15m to align with the higher-TF bias, pick a different symbol, or — if this trade's payoff does not depend on the 15m direction — declare the mechanical playbook it really is ('funding_carry' with funding that clears the threshold and pays your side, 'macro_event' just after a scheduled release)."}
 
     # Correlation gate: block alt LONGs while BTC's daily regime is bearish (the RE-USDT failure mode).
     if _alt_long_is_blocked(spot_symbol, side_lower, confidence):
       logger.warning("CORRELATION GATE BLOCK: futures limit long %s rejected — BTC daily regime is bearish", spot_symbol)
-      return {"rejected": True, "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
+      return {"rejected": True, "gate": "correlation", "reason": f"Correlation gate: BTC daily regime is bearish — long on alt {spot_symbol} blocked", "hint": "Alts are high-beta to BTC; do NOT long an altcoin while BTC's daily trend is down. Trade a trend-aligned short, wait for BTC's daily to turn, or trade a major instead."}
 
     _move_24h_fl = _extreme_24h_move(spot_symbol)
     if _move_24h_fl is not None:
+      # Logged since 2026-09-25 (it refused silently before, like the opposing-daily branch).
+      logger.warning("24H MOVE BLOCK: futures limit %s %s rejected — 24h move %+.2f%% beyond the %.1f%% cap",
+                     side_lower, spot_symbol, _move_24h_fl, cfg.trading.max_24h_volatility_pct)
       return {
         "rejected": True,
+        "gate": "move_24h",
         "reason": f"24h move {_move_24h_fl:+.2f}% exceeds {cfg.trading.max_24h_volatility_pct:.1f}% safety cap",
         "hint": "The move is already extreme. Rotate to the next screened liquid contract instead of chasing it.",
       }
@@ -3615,7 +4261,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if _bench_until_fl > int(time.time()):
       _bench_hours_fl = (_bench_until_fl - int(time.time())) / 3600.0
       logger.warning("SYMBOL BENCH BLOCK: futures limit %s %s rejected — repeated recent losses, benched %.1fh more", side_lower, spot_symbol, _bench_hours_fl)
-      return {"rejected": True, "reason": f"Symbol benched: {spot_symbol} lost repeatedly in its recent closes — no entries for {_bench_hours_fl:.1f}h more", "symbol": spot_symbol, "hint": "This symbol keeps stopping out; the setup that looks compliant is not working in the current tape. Trade a different symbol or stand aside — the bench lifts automatically."}
+      return {"rejected": True, "gate": "bench", "reason": f"Symbol benched: {spot_symbol} lost repeatedly in its recent closes — no entries for {_bench_hours_fl:.1f}h more", "symbol": spot_symbol, "hint": "This symbol keeps stopping out; the setup that looks compliant is not working in the current tape. Trade a different symbol or stand aside — the bench lifts automatically."}
 
     # Volatility scale (hard risk adjustment, linear — not squared; see the market path for why).
     _vol_scale_fl = 1.0
@@ -3626,7 +4272,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         hard_limit = cfg.trading.max_atr_pct_for_entry * 1.5
         if daily_atr_pct > hard_limit:
           _quarantine_symbol(spot_symbol, f"daily ATR {daily_atr_pct:.2f}% exceeds {hard_limit:.2f}% hard limit")
-          return {"rejected": True, "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
+          return {"rejected": True, "gate": "vol_limit", "reason": f"Extreme volatility: ATR={daily_atr_pct:.2f}% > {hard_limit:.1f}% hard limit"}
         _vol_scale_fl = max(0.50, cfg.trading.max_atr_pct_for_entry / daily_atr_pct)
         logger.info("VOLATILITY SOFT GATE: futures limit %s ATR=%.2f%% — scaling position to %.0f%%", spot_symbol, daily_atr_pct, _vol_scale_fl * 100)
 
@@ -3634,20 +4280,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # Confidence floor (a hard gate, not a size factor).
     _eff_min_fl = effective_min_confidence(cfg.trading.min_confidence, _g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)
     if confidence is not None and confidence < _eff_min_fl:
-      return {"rejected": True, "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fl:.2f}"}
+      # The regime-raised floor refused 14 calls on 09-23/24 — more than every directional gate combined.
+      return {"rejected": True, "gate": "confidence_floor", "reason": f"Confidence {confidence:.2f} below regime-adjusted minimum {_eff_min_fl:.2f}"}
 
     # Soft size factors combine by their WORST single signal (regime.combined_size_factor), not a product.
     _soft_fl = [regime_size_factor(_g_fl.get("daily_bias", "neutral"), _g_fl.get("daily_exhausted", False), cfg.regime)]
     if _relative_strength_exception(spot_symbol, side_lower, confidence):
       _soft_fl.append(cfg.regime.relative_strength_size_factor)
       logger.info("RELATIVE-STRENGTH LONG: futures limit %s allowed against bearish BTC", spot_symbol)
+      _gates_passed_fl.append({"gate": "correlation", "hatch": "relative_strength"})
     if confidence is not None:
       _soft_fl.append(conviction_size_factor(confidence, _eff_min_fl, cfg.regime))
     _soft_fl.append(_edge_state()["size_factor"])                    # loss-streak
     _soft_fl.append(_expectancy_entry_factor(spot_symbol, side_lower))  # direction/symbol expectancy
     # Per-SETUP-FAMILY measured edge: capital follows whichever playbook currently pays its costs.
-    # Nothing here decides that trend-following or fading is "right" — each family keeps its own score
-    # and an unproven one is left at full risk so it can earn the evidence that judges it.
+    # Nothing here decides that trend-following or fading is "right" — each family keeps its own score,
+    # and an unproven one trades at the explore size while it earns the evidence that judges it.
     _family_fl = str(setup_family or "").strip().lower() or None
     if _family_fl and _family_fl not in SETUP_FAMILIES:
       logger.warning("SETUP FAMILY: futures limit %s unknown family %r — scoring it as 'other'", spot_symbol, _family_fl)
@@ -3672,15 +4320,22 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # A family still earning its verdict (< 20 probes) trades at explore-size, NOT full risk: probes
     # record from the market price at call time, so the family's evidence accrues at the same rate no
     # matter how little we stake — cheap to learn a newly-reachable playbook (breakout/range_edge) on a
-    # small account, then full measured sizing the instant it is scored. Combined with the measured
-    # factor by the WORSE of the two (never the product), the same rule the soft stack uses.
-    _family_scale_fl = min(
-      family_size_factor(_edge_state().get("signal_edge") or {}, _family_fl or "other"),
-      family_explore_factor(
-        _edge_state().get("signal_edge") or {}, _family_fl or "other",
-        explore_factor=cfg.edge.explore_unproven_family_factor,
-      ),
+    # small account, then a size that ramps with the evidence (explore floor at t=1 -> full at t=2).
+    # Combined with the measured factor by the WORSE of the two (never the product), the same rule the
+    # soft stack uses.
+    # The bet is on a SIDE of the playbook, so it is judged on that side's own record once the side has
+    # a real sample; a side still thin on its own falls back to the pooled family for the stand-aside
+    # and the no-edge shrink but is capped at the explore floor (edge.family_evidence_row). 2026-09-24:
+    # continuation SHORTS (n=9, -0.18%) were sized 0.52-0.79 on the LONGS' record (n=40, +1.24%).
+    _side_fl = "long" if side_lower == "buy" else "short"
+    _signal_edge_fl = _edge_state().get("signal_edge") or {}
+    _family_measured_fl = family_size_factor(_signal_edge_fl, _family_fl or "other", side=_side_fl)
+    _family_explore_fl = family_explore_factor(
+      _signal_edge_fl, _family_fl or "other",
+      explore_factor=cfg.edge.explore_unproven_family_factor, side=_side_fl,
     )
+    _family_scale_fl = min(_family_measured_fl, _family_explore_fl)
+    _stake_fl = family_stake_status(_signal_edge_fl, _family_fl or "other", side=_side_fl)
     # Combined with the soft stack by taking the WORSE of the two, never their product — the same rule
     # `combined_size_factor` already applies within the stack, and for the same reason. Multiplying
     # them re-created exactly the compounding that rule exists to prevent: measured live on 2026-08-11,
@@ -3689,22 +4344,23 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # 12.5 hours. Taking the minimum still lets the evidence-based factor dominate whenever it is the
     # more cautious of the two (0.25 here), without stacking two independent cautions into fee-dust.
     _atr_scale_fl = _vol_scale_fl * min(_quality_fl, _family_scale_fl)
-    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f family=%.2f(%s) → worst=%.2f (soft=%s floor=%.2f) → %.0f%%",
+    logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f family=%.2f(%s: measured=%.2f explore=%.2f, %s) → worst=%.2f (soft=%s floor=%.2f) → %.0f%%",
                 spot_symbol, _vol_scale_fl, _quality_fl, _family_scale_fl, _family_fl or "other",
+                _family_measured_fl, _family_explore_fl, describe_stake_row(_stake_fl),
                 min(_quality_fl, _family_scale_fl), [round(f, 2) for f in _soft_fl],
                 cfg.trading.size_quality_floor, _atr_scale_fl * 100)
 
     trades_today = memory.trades_today(spot_symbol)
     if trades_today >= cfg.trading.max_trades_per_symbol_per_day:
-      return {"rejected": True, "reason": "Daily trade cap reached"}
+      return {"rejected": True, "gate": "trade_cap", "reason": "Daily trade cap reached"}
 
     if cfg.trading.sentiment_filter_enabled:
       latest_sent = memory.latest_sentiment(symbol)
       day_key = int(time.time() // 86400)
       if not latest_sent or latest_sent.get("day") != day_key:
-        return {"rejected": True, "reason": "Sentiment missing for today"}
+        return {"rejected": True, "gate": "sentiment", "reason": "Sentiment missing for today"}
       if latest_sent.get("score", 0) < cfg.trading.sentiment_min_score:
-        return {"rejected": True, "reason": "Sentiment below threshold", "score": latest_sent.get("score")}
+        return {"rejected": True, "gate": "sentiment", "reason": "Sentiment below threshold", "score": latest_sent.get("score")}
 
     futures_symbol = _to_futures_symbol(spot_symbol)
     if not futures_symbol:
@@ -3721,9 +4377,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         _age_days = (time.time() - _first_open_s) / 86400.0
         if _age_days < cfg.trading.min_futures_listing_age_days:
           logger.warning("NEW-LISTING BLOCK: %s rejected — contract age %.1fd < %.1fd minimum", futures_symbol, _age_days, cfg.trading.min_futures_listing_age_days)
-          return {"rejected": True, "reason": f"New-listing guard: {futures_symbol} is {_age_days:.1f}d old (< {cfg.trading.min_futures_listing_age_days:.0f}d minimum)", "hint": "Freshly-listed perps are thin and ultra-volatile (this is how RE-USDT blew up). Wait for a real price history, or trade an established contract."}
+          return {"rejected": True, "gate": "new_listing", "reason": f"New-listing guard: {futures_symbol} is {_age_days:.1f}d old (< {cfg.trading.min_futures_listing_age_days:.0f}d minimum)", "hint": "Freshly-listed perps are thin and ultra-volatile (this is how RE-USDT blew up). Wait for a real price history, or trade an established contract."}
 
-    current_price = _live_entry_price(spot_symbol)
+    current_price, _price_source = live_entry_price_sourced(kucoin, kucoin_futures, spot_symbol)
     if current_price is None:
       return {"error": "Unable to fetch current live price for deviation check"}
 
@@ -3732,10 +4388,40 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # too small to clear the contract minimum is still evidence about whether the model predicts —
     # and measuring only placed orders coupled the evidence supply to the very risk factor the
     # evidence governs, which deadlocked live on 2026-08-10 (see memory.record_signal_probe).
+    # Planned execution for the execution map's counterfactual and crossBand (edge.execution_map):
+    # ATR15, bracket, lease, and the net RR this bracket would have if CROSSED at the live price —
+    # priced with the same fee/slippage the RR gate uses below. Recorded only; total by construction.
+    try:
+      _xm_stamp_fl = probe_execution_stamp(
+        side_lower, current_price, entry_price_val, stop_loss_price, take_profit_price,
+        fee_rate=_to_float(contract.get("takerFeeRate")) or fees.get("futures_taker", 0.0006),
+        slippage_rate=_slippage_rate(),
+        atr_pct=_g_fl.get("intraday_atr_pct"),
+        lease_min=cfg.trading.entry_limit_expiry_minutes,
+      )
+    except Exception as _xm_stamp_exc:
+      logger.warning("EXECUTION STAMP LOST: %s %s probe recorded without its planned-execution fields (%s)",
+                     spot_symbol, side_lower, _xm_stamp_exc)
+      _xm_stamp_fl = {}
+    # The market this call was made in (breadth24, basket median, BTC 24h/72h, BTC daily ADX + bias):
+    # read from the poll loop's hourly cache, never fetched here. Recorded on the probe and the entry so
+    # verdicts can later be split by market state; nothing on this path reads it back.
+    _market_state_fl = _market_state_now()
     try:
       memory.record_signal_probe(
         spot_symbol, side_lower, current_price, setup_family,
         taker_flow=_taker_flow_reading(spot_symbol),
+        market_state=_market_state_fl,
+        # Settlement reads the same market as the base (memory._probe_price_source).
+        price_source=_price_source,
+        # Which model made the call, how sure it said it was, and the floor it had to clear — so
+        # edge.confidence_edge_stats can measure, per model, whether stated confidence ranks calls.
+        model=cfg.azure.deployment,
+        confidence=confidence,
+        min_confidence=_eff_min_fl,
+        # Gates this call faced and the hatch that admitted it ([] = faced none). Report-only.
+        gates_passed=_gates_passed_fl,
+        **_xm_stamp_fl,
       )
     except Exception as _probe_exc:
       # WARNING, not debug: the probe is the evidence supply for every edge verdict, and a verdict
@@ -3745,52 +4431,28 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       logger.warning("SIGNAL PROBE LOST: %s %s not recorded (%s) — edge verdicts will go stale",
                      spot_symbol, side_lower, _probe_exc)
 
-    # STAND ASIDE on a measured-no-edge playbook. The probe above is already recorded, so declining the
-    # trade does NOT starve the family's evidence — it keeps scoring from the call and re-opens on its
-    # own the moment its forward return clears cost. A signal whose mean move does not beat its round
-    # trip has non-positive expectancy; the growth-optimal (Kelly) stake on that is zero, i.e. skip.
-    # This is bet-sizing (survival), not a directional veto (opportunity): it acts only on the bot's own
-    # measurement of its own direction calls, and auto-restores. See edge.family_stand_aside.
-    if cfg.edge.stand_aside_no_edge_family and family_stand_aside(
-      _edge_state().get("signal_edge") or {}, _family_fl or "other"
-    ):
-      _signal_edge = _edge_state().get("signal_edge") or {}
-      _fam_row = (_signal_edge.get("by_family") or {}).get(_family_fl or "other") or {}
-      _fam_n = _fam_row.get("n")
-      _fam_net = float(_fam_row.get("net_of_cost_pct") or 0.0)
-      logger.warning(
-        "STAND ASIDE: futures limit %s %s — family %r measures NO EDGE (n=%s, net_of_cost=%+.3f%%); skipping entry",
-        spot_symbol, side_lower, _family_fl or "other", _fam_n, _fam_net,
-      )
+    # STAND ASIDE: zero stake on a playbook whose measured net is not above its own noise. The probe
+    # above is already recorded, so declining the trade does NOT starve the family's evidence — it keeps
+    # scoring from the call and re-opens on its own once its net clears one standard error (t >= 1),
+    # the zero point of uncertainty-shrunk Kelly. That bar is stateless and recomputed every run, and it
+    # judges the SIDE being entered once that side has its own sample (edge.family_stake_status). This
+    # is bet-sizing (survival), not a directional veto (opportunity): it acts only on the bot's own
+    # measurement of its own direction calls, and auto-restores. The refusal says WHICH of the two
+    # reasons fired — 'no edge' (net <= 0) or 'unproven' (0 < net < SE) — because on 2026-09-24 all nine
+    # refusals were the second kind but said 'NO EDGE … coin-flip minus fees', and the model repeated it.
+    if cfg.edge.stand_aside_no_edge_family and _stake_fl["standAside"]:
       # Name where the edge actually is, from the live scoreboard. A refusal that does not say where
       # to go just gets the same family re-proposed next poll — which is what live did on 2026-09-07,
       # 21 continuation stand-asides in six hours while range_edge sat unblocked at a measured +0.72%.
-      _open = open_families(_signal_edge)
-      _fmt = lambda rows: ", ".join(
-        f"{r['family']} (n={r['n']}, {r['netOfCostPct']:+.3f}%)" if r["netOfCostPct"] is not None
-        else f"{r['family']} (n={r['n']})" for r in rows
-      )
-      _where = []
-      if _open["paying"]:
-        _where.append(f"Currently paying: {_fmt(_open['paying'])}.")
-      if _open["unproven"]:
-        _where.append(f"Open but unproven (still gathering evidence): {_fmt(_open['unproven'])}.")
-      if not _where:
-        _where.append("No playbook currently measures an edge — standing down is a valid answer.")
+      _open = open_families(_signal_edge_fl)
+      _refusal = stand_aside_message(_stake_fl, _open)
+      logger.warning("STAND ASIDE: futures limit %s %s — %s; skipping entry",
+                     spot_symbol, side_lower, _refusal["log"])
       return {
         "rejected": True,
-        "reason": (
-          f"Stand aside: '{_family_fl or 'other'}' playbook measures NO EDGE over {_fam_n} signals "
-          f"(net_of_cost {_fam_net:+.3f}% — its direction calls don't clear their round-trip cost, "
-          f"so this is a coin-flip minus fees)."
-        ),
+        "reason": _refusal["reason"],
         "openFamilies": _open,
-        "hint": (
-          "This is bet-sizing on measured edge, not a directional veto — it re-opens automatically once "
-          "this playbook's forward return beats cost. " + " ".join(_where) +
-          " Re-proposing the same playbook will be refused again; take one of the above only if the "
-          "setup is genuinely there, otherwise stand down until the regime turns."
-        ),
+        "hint": _refusal["hint"],
       }
 
     # Noise floor on the bracket, applied BEFORE tick rounding, the RR gate and sizing, so the whole
@@ -3807,21 +4469,23 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       take_profit_price = _round_price_to_tick(float(take_profit_price), tick_size)
       stop_loss_price = _round_price_to_tick(float(stop_loss_price), tick_size)
 
-    # Marketable-entry allowance (fill-rate fix): a passive limit resting away from price filled only
-    # ~18% of the time — in a trend the price never comes back, so the bot missed the winners and only
-    # filled when the move failed (adverse selection). Confirmed on real paths: replaying the 82
-    # expired limits, *extending* the TTL fills more but those extra fills LOSE (-0.37R mean at 4h) —
-    # waiting longer just buys more adverse selection. Crossing to fill immediately is the opposite:
-    # the same 82 plans taken at the live price return +13.05R over 80 trades (+0.163R mean, 65% win).
+    # Marketable-entry allowance (fill-rate fix): a passive limit resting away from price fills far less
+    # often than one near it, and an unfilled limit captures nothing. An entry may therefore cross the
+    # live price by up to `marketable_entry_max_dev_pct` (an outer sanity bound, not a tuned edge); the
+    # atomic TP/SL bracket still attaches, so a fill is never naked, and the post-cost RR gate below
+    # still runs on the price actually paid. That gate is a FEE/PAYOFF GUARD, not a quality filter.
     #
-    # What makes a cross safe is NOT conviction — it is whether the bracket still has edge from the
-    # worse entry. Measured: filtering those crossings by confidence >= 0.80 yields +0.050R mean;
-    # filtering by "still clears the RR floor after crossing" yields +0.388R. So the confidence bar was
-    # a crude proxy that mostly blocked good fills (only 3 of 80 plans fit the old 0.15% band, while
-    # the median cross needed is 0.82%). The binding test is now the POST-COST RR GATE that already
-    # runs below on this same `entry_price_val` — pay up for a fill exactly as long as the trade still
-    # clears its structural floor from the price you actually pay. `marketable_entry_max_dev_pct` stays
-    # only as an outer sanity bound, and the atomic TP/SL bracket still attaches, so a fill is never naked.
+    # History, honestly labelled. Jul 30 2026: a replay of 82 expired limits reported crossing at +13.05R
+    # over 80 (+0.163R), waiting longer at -0.37R at 4h, and "still clears the RR floor after crossing" as
+    # a +0.388R filter vs +0.050R for confidence >= 0.80 — all on 1m futures paths read in the WRONG column
+    # order. NOT REPRODUCED on a new 124-limit sample (Sep 20-24, correct columns, replay within ~0.2R MAE
+    # of real outcomes): the direction of crossing held (+0.216R/placement), but the RR-filter and TTL
+    # sub-claims did not — gate passes +0.16R (n=13) vs blocked +0.22R; extra fills after the lease were
+    # positive at every horizon to 240m, not negative. And the crossing gain itself is one-regime: rally
+    # longs +0.317R (n=83), shorts +0.012R (n=41), fading below zero by Sep 24, and the live model's
+    # crosses averaged -0.03R. None of these figures belongs in the prompt; the model reads its own live
+    # fill rate and realized R by resting distance (edge.execution_map) instead. The 15-minute TTL is left
+    # alone: a longer lease measured positive only for rally longs, which is not a reason to retune it.
     _marketable_ok = cfg.trading.marketable_entry_max_dev_pct > 0 and (
       cfg.trading.marketable_entry_min_confidence <= 0
       or (confidence is not None and confidence >= cfg.trading.marketable_entry_min_confidence)
@@ -3910,6 +4574,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     lot = max(1, lot_size)
     _min_notional_fl = lot * multiplier * entry_price_val
     contracts, _min_lot_floored = entry_contracts_at_least_one_lot(contracts_raw, lot)
+    # Contracts after each sizing stage (entryContext['sizing']): `contracts` is overwritten by every
+    # cap below, so without this a lot rounded DOWN is indistinguishable from a heat/concentration cap.
+    _contract_stages_fl: Dict[str, Any] = {"raw": contracts_raw, "lotFloor": contracts}
     if _min_lot_floored:
       logger.info(
         "MIN LOT FLOOR: futures limit %s sized budget %.2f buys less than one lot (%.2f) — "
@@ -3920,6 +4587,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       contracts, lot, multiplier, entry_price_val, float(stop_loss_price),
       existing_risk_usd=existing_risk_usd,
     )
+    _contract_stages_fl["riskCap"] = contracts
     if contracts < lot:
       return {
         "rejected": True,
@@ -3928,6 +4596,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "minNotionalUsd": _min_notional_fl,
       }
     contracts = _heat_capped_contracts(contracts, lot, multiplier, entry_price_val, float(stop_loss_price))
+    _contract_stages_fl["heatCap"] = contracts
     if contracts < lot:
       return {
         "rejected": True,
@@ -3938,6 +4607,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     contracts = _concentration_capped_contracts(
       contracts, lot, multiplier, entry_price_val, existing_notional_usd,
     )
+    _contract_stages_fl["concentrationCap"] = contracts
     if contracts < lot:
       return {"rejected": True, "reason": "Contract minimum exceeds remaining same-symbol concentration budget"}
     actual_notional = contracts * multiplier * entry_price_val
@@ -3972,7 +4642,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "reason": f"Net reward:risk {(_net_rr_fl or 0.0):.2f} after costs below minimum {_req_rr_fl:.2f}",
           "rr": _rr_fl, "netRr": _net_rr_fl, "minRr": _req_rr_fl,
           "entryPrice": entry_price_val, "takeProfit": take_profit_price, "stopLoss": stop_loss_price,
-          "hint": "Use the true structural target and invalidation, then skip the setup if their post-cost payoff is insufficient; do not distort the stop to pass the gate.",
+          "hint": "Use the true structural target and invalidation, then skip the setup if their post-cost payoff is insufficient; do not distort the stop to pass the gate, and do not push the entry farther away to pass it either — distance bought for paper RR costs fills (see edgeReport.executionMap).",
         }
 
     base_units = contracts * multiplier
@@ -4019,6 +4689,29 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "plannedNetRr": _planned_net_rr,
       "plannedMaxLossUsd": _planned_max_loss,
       "confidence": confidence,
+      # The regime-adjusted confidence floor this call had to clear (edge.confidence_edge_stats).
+      "minConfidence": _eff_min_fl,
+      # HOW this trade was sized, from the values the code used (equity at placement, every factor and
+      # every contract stage). Total by construction: a failure is a WARNING and None, never a refusal.
+      # Local memory only — the dashboard publisher is whitelist-based and never publishes it.
+      "sizing": sizing_breakdown(
+        equity_usd=snapshot.total_usdt,
+        eff_risk_frac=_effective_risk_fraction(),
+        vol_scale=_vol_scale_fl,
+        soft=_soft_fl,
+        quality=_quality_fl,
+        quality_floor=cfg.trading.size_quality_floor,
+        family_measured=_family_measured_fl,
+        family_explore=_family_explore_fl,
+        family_judged_on=_stake_fl,
+        atr_scale=_atr_scale_fl,
+        risk_scale=_risk_scale_fl,
+        conc_scale=_conc_scale,
+        contract_stages=_contract_stages_fl,
+        lot_floored=_min_lot_floored,
+        planned_max_loss_usd=_planned_max_loss,
+        gross_risk_usd=base_units * abs(entry_price_val - float(stop_loss_price)),
+      ),
       # How stretched the entry was vs the 15m VWAP (ATR units) — stamped so the post-trade entry-quality
       # review can tell a well-timed pullback entry from a late chase, with no hard gate at entry time.
       "entryExtensionAtr": overextension_atr(
@@ -4027,12 +4720,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       # The LIVE price when the call was made — not the limit price. Signal edge must be measured from
       # here or the resting discount is scored as prediction (see edge.signal_edge_stats).
       "marketPriceAtSignal": current_price,
+      # ...and the market it was read from, so settle_signal_probes (which walks placed trades too)
+      # settles this row on the SAME market — never the perp/spot basis scored as a return.
+      "priceSource": _price_source,
       # Which playbook this trade belongs to, so signal edge can be scored per family.
       "setupFamily": _family_fl,
+      # The funding rate and the contract's OWN settlement clock at the call, so the carry hold and
+      # replays know which settlement this trade was opened for (KuCoin: 1h/4h/8h per contract).
+      "funding": entry_funding_stamp(_g_fl),
       # Who was hitting the tape when the call was made. Stamped here as well as on the standalone
       # probe because settle_signal_probes also walks placed trades, and edge.taker_flow_edge_stats
       # can only ask "does flow agreement predict?" of calls that carry a reading.
       "takerFlow": _taker_flow_reading(spot_symbol),
+      # The MARKET this entry was taken in (see analytics.market_state) — carried to the exit probe so
+      # the trail's record can be split by market state (edge.exit_discipline_stats.trailByMarketState).
+      "marketState": _market_state_fl,
       # Stop geometry actually used, so post-trade review can tell a noise-floored stop from the
       # model's original and judge whether the floor is set where it needs to be.
       "stopAtrMult": (
@@ -4066,6 +4768,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
          if _use_bracket else
          "On next run: check open positions — if filled, place bracket TP/SL with place_futures_stop_order.")
     )
+    # Where this limit sits in the bot's own execution map (fill rate and realized R by resting distance).
+    # A mirror of its record, never a rule — and total: a failure only drops the sentence.
+    try:
+      _xm_note_fl = execution_bucket_note(
+        _edge_state().get("execution_map"), side_lower, entry_price_val, current_price,
+        _g_fl.get("intraday_atr_pct"),
+        crossed_net_rr=_xm_stamp_fl.get("crossed_net_rr"), rr_floor=cfg.trading.min_futures_rr,
+      )
+      if _xm_note_fl:
+        note = f"{note} {_xm_note_fl}"
+    except Exception as _xm_exc:
+      logger.warning("EXECUTION MAP NOTE lost for %s (%s) — the order is unaffected", spot_symbol, _xm_exc)
 
     def _submit(oq: KucoinFuturesOrderRequest) -> Dict[str, Any]:
       """Place only an exchange-atomic entry bracket; never fall back to naked exposure."""
@@ -4239,6 +4953,69 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     res["pendingProtection"] = pending_protection
     res["note"] = note
     return res
+
+  @function_tool
+  async def place_futures_limit_order(
+    symbol: str,
+    side: str,
+    notional_usd: float,
+    entry_price: float,
+    leverage: float = 1.0,
+    size_override: float | None = None,
+    confidence: float | None = None,
+    rationale: str | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    setup_family: str | None = None,
+  ) -> Dict[str, Any]:
+    """Place a futures limit entry order at a technically derived target price.
+    Use for new entries where you want to wait for price to reach a key level
+    (EMA resistance/support, Bollinger Band, swing high/low, VWAP) before entering.
+
+    ALWAYS pass `setup_family` — which PLAYBOOK this trade belongs to. One of:
+      "funding_carry" — taking the side that is PAID by the funding transfer at each settlement, on the
+                        contract's own clock (futures.fundingIntervalHours: 1h, 4h or 8h). analyze_market_context
+                        reports futures.fundingSetup when the rate is extreme enough to matter. This
+                        is the ONLY playbook that does not need the direction call to be right: the
+                        transfer happens whichever way price moves, and an extreme rate also marks
+                        crowded positioning on the other side. Hold across at least one settlement.
+                        Because its payoff is not the trend continuing, it (and "macro_event") is also
+                        the only way past the daily-exhaustion gate — but only when fundingSetup is
+                        actually present and pays the side you are entering.
+      "continuation"  — trading with an established trend (timeframes agree, you expect it to persist)
+      "fade_extreme"  — fading a stretched move back toward value (oversold bounce, overbought fade)
+      "breakout"      — entering on a break of a range/level, expecting expansion
+      "range_edge"    — buying support / selling resistance inside a defined range
+      "other"         — none of the above
+    Each family keeps its OWN measured forward-return score (edgeReport.signalEdge.by_family), and
+    risk flows toward whichever is currently paying its costs. This is how the bot learns which
+    approach works in the current market without anyone hand-picking one — so label honestly. A
+    mislabelled trade corrupts the scoreboard that decides where your risk goes.
+    May rest away from price, or cross the live price by up to the marketable band
+    (MARKETABLE_ENTRY_MAX_DEV_PCT) to fill now. The post-cost RR gate still runs on the price
+    actually paid; choose between resting and crossing from edgeReport.executionMap.
+    Futures market orders are reserved for closes and emergencies.
+    ALWAYS pass take_profit_price AND stop_loss_price: they are attached to the order and arm
+    automatically the instant it fills (KuCoin st-orders), so the position is never left unprotected
+    in the gap before your next run. Decide the best entry, TP and SL together, up front."""
+    result = await _place_futures_limit_order_impl(
+      symbol=symbol,
+      side=side,
+      notional_usd=notional_usd,
+      entry_price=entry_price,
+      leverage=leverage,
+      size_override=size_override,
+      confidence=confidence,
+      rationale=rationale,
+      take_profit_price=take_profit_price,
+      stop_loss_price=stop_loss_price,
+      setup_family=setup_family,
+    )
+    # Gate scoreboard (2026-09-25): a refusal by a gate that judged the call used to leave no evidence
+    # at all — the gates return before the signal probe. Record it (report-only, its own bucket) and
+    # hand back the refusal exactly as the body returned it. Total: _record_gate_refusal never raises.
+    _record_gate_refusal(result, symbol, side, setup_family, confidence)
+    return result
 
   async def _place_futures_stop_order_impl(
     symbol: str,
@@ -4432,14 +5209,31 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   @function_tool
   async def list_futures_stop_orders(status: str = "active", symbol: str | None = None) -> Dict[str, Any]:
-    """List futures stop orders; status: active/done."""
+    """List futures stop orders; status: active/done. symbol may be 'DASH-USDT' or 'DASHUSDTM'."""
     if not cfg.kucoin_futures.enabled or not kucoin_futures:
       return {"error": "Futures disabled in config"}
+    # The exchange takes only the contract name ('DASHUSDTM'); the model speaks 'DASH-USDT'. Sending
+    # the raw symbol failed with '100003 Contract parameter invalid' on EVERY filtered check — 9 times
+    # in two days, each in the run that had just closed, entered or tightened that symbol. So the call
+    # is made UNFILTERED (the same single API call) and filtered here on the resolved contract. The
+    # resolver maps coins outside the universe through the live contract list too, so leftover stops
+    # on a coin the bot has since removed can still be listed.
+    target = None
+    if symbol:
+      target, err = _resolve_futures_symbol(symbol)
+      if err or not target:
+        return {"error": err or f"Cannot map '{symbol}' to a futures contract", "status": status,
+                "requested": symbol}
     try:
-      orders = kucoin_futures.list_stop_orders(status=status, symbol=symbol)
-      return {"orders": orders, "status": status, "symbol": symbol}
+      orders = kucoin_futures.list_stop_orders(status=status)
     except Exception as exc:
-      return {"error": str(exc), "status": status, "symbol": symbol}
+      return {"error": str(exc), "status": status, "symbol": target, "requested": symbol}
+    if target:
+      orders = [
+        o for o in (orders or [])
+        if isinstance(o, dict) and str(o.get("symbol") or "").strip().upper() == target
+      ]
+    return {"orders": orders, "status": status, "symbol": target, "requested": symbol}
 
   @function_tool
   async def list_futures_positions(status: str | None = None) -> Dict[str, Any]:
@@ -4533,6 +5327,17 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if not spot:
       spot = _repair_allowed_symbol(symbol)
     if not spot:
+      # Outside the universe: map 'X-USDT' -> 'XUSDTM' and accept it when the exchange lists that
+      # contract (fail open if the list is unavailable, like the '*USDTM' branch above). This serves the
+      # READ-ONLY data tools only — every order tool resolves through the allowed spot symbols and still
+      # refuses a coin outside the universe. Before 2026-09-25 a spot-listed coin the bot had not added
+      # yet (KCS, BCH, SPX...) failed here as 'Unknown symbol' 14 times in two days, minutes before the
+      # bot traded one of them.
+      fallback = _to_futures_symbol(_normalize_symbol(symbol))
+      if fallback:
+        active = _active_contract_symbols()
+        if active is None or fallback in active:
+          return fallback, None
       return None, f"Unknown symbol '{symbol}'"
     fsym = _to_futures_symbol(spot)
     return fsym, None if fsym else f"Cannot map '{symbol}' to futures"
@@ -4596,7 +5401,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     the same code-level quality bars the entry gates enforce (a 24h-turnover liquidity floor and the
     minimum listing age), so every result is liquid and mature enough to consider — no fresh micro-caps.
     Use it every research run: scan, then validate the best candidates with analyze_market_context /
-    fetch_orderbook before add_coin.
+    fetch_futures_orderbook before add_coin.
+
+    Contracts this bot cannot trade (no live spot pair — execution here is spot-anchored) are left out
+    of `results` and named in `excluded`. A row with `quarantined` (remainingHours) or
+    `lastAnalysisFailure` (retryAfter / retryInHours) will fail validation again until then — skip it.
 
     Args:
       top_n: how many to return (max 40).
@@ -4619,7 +5428,30 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       side=side,
       top_n=top_n,
       max_abs_change_pct=cfg.trading.max_24h_volatility_pct,
+      # The SAME reachability check add_coin applies (fail open: None keeps the row).
+      tradeable=_tradeable_by_bot,
     )
+    # What the bot already knows about each row, at zero extra API calls: the adaptive ATR quarantine
+    # (add_coin refuses these until it expires) and the last data-quality failure of
+    # analyze_market_context with its evidence-derived retry time. Rows are ANNOTATED, never dropped —
+    # the unchanged gates decide. Live 09-23/24: ONE, 4, POWER and MUBARAK were re-analysed while
+    # quarantined, and TAKE's 1h candle gaps were hit ~1.4 times per run for ~6 hours.
+    try:
+      _quarantined = {q.get("symbol"): q for q in memory.get_quarantined_coins()}
+      _failures = memory.analysis_failures()
+      _now_scan = time.time()
+      for _row in screened.get("results") or []:
+        _q = _quarantined.get(_row.get("symbol"))
+        if _q:
+          _row["quarantined"] = True
+          _row["remainingHours"] = _q.get("remainingHours")
+        _f = _failures.get(_row.get("symbol"))
+        if _f:
+          _row["lastAnalysisFailure"] = _f.get("reason")
+          _row["retryAfter"] = _f.get("retryAfter")
+          _row["retryInHours"] = round(max(0.0, float(_f.get("retryAfter") or 0) - _now_scan) / 3600.0, 1)
+    except Exception as exc:
+      logger.warning("SCAN ANNOTATION: quarantine/data-quality flags unavailable this scan (%s)", exc)
     screened.update({
       "minTurnoverUsd": cfg.trading.screener_min_turnover_usd_24h,
       "minAgeDays": cfg.trading.min_futures_listing_age_days,
@@ -4628,8 +5460,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "side": side,
       "note": (
         "Results cleared the liquidity + listing-age bars. Validate a candidate with "
-        "analyze_market_context/fetch_orderbook before add_coin. Entry gates (daily/1h/RR/correlation) "
-        "still apply at trade time — in a bearish BTC daily, alt LONGs stay blocked, so prefer shorts or majors."
+        "analyze_market_context/fetch_futures_orderbook before add_coin. Entry gates (daily/1h/RR/correlation) "
+        "still apply at trade time — in a bearish BTC daily, alt LONGs stay blocked, so prefer shorts or majors. "
+        "'excluded' names contracts this bot cannot add or trade (no spot pair); do not research them. "
+        "A row marked quarantined or lastAnalysisFailure will fail validation again before its "
+        "remainingHours / retryInHours — pick another."
       ),
     })
     return screened
@@ -5268,10 +6103,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   @function_tool
   async def list_coins() -> Dict[str, Any]:
-    """List active coins plus automatic risk quarantines that must not be re-researched yet."""
+    """List active coins plus automatic risk quarantines and data-quality failures not worth re-researching yet."""
     return {
       "coins": memory.get_coins(default=list(allowed_symbols)),
       "quarantined": memory.get_quarantined_coins(),
+      # analyze_market_context's own refusals (candle gaps, stale/invalid bars), each with the time the
+      # failure's evidence can first age out. Informational: analysis is never blocked by it.
+      "analysisFailures": memory.analysis_failures(),
     }
 
   @function_tool
@@ -5293,6 +6131,15 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         ),
         "quarantine": quarantine,
         "hint": "Do not re-analyze this candidate until retryAfter; scan another liquid contract.",
+      }
+    # Same reachability check as scan_futures_market's `excluded` (shared helper; fails open on None).
+    # A perp-only contract (FHE, TAKE, 1000BONK, stock perps) used to fail below as 'not found on
+    # KuCoin', which read like a typo and was retried; this says what is actually true.
+    if _tradeable_by_bot(norm) is False:
+      return {
+        "rejected": True,
+        "reason": f"Cannot add {norm}: {NOT_TRADEABLE_HERE} (execution is spot-anchored)",
+        "hint": "Pick a candidate from scan_futures_market's results; its excluded list names these.",
       }
     try:
       kucoin.get_ticker(norm)

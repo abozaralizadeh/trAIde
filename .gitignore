@@ -186,6 +186,8 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 .agent_memory.json
+# Backups/temp files of the memory file (e.g. scripts/resettle_probes_futures.py --apply) hold live trading data.
+.agent_memory.json.*
 .env.local
 .claude
 .env.backup

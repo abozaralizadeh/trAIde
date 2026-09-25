@@ -127,13 +127,14 @@ def test_invalid_flat_backoff_max_multiplier():
 
 
 def test_marketable_entry_defaults_let_the_rr_gate_be_the_binding_test():
-    """Crossing to fill is gated by post-cost RR, not by a conviction bar or a tiny fixed band.
+    """Crossing to fill is bounded by a wide sanity band and the post-cost RR gate, not a conviction bar.
 
-    Measured on real 1m paths over the 82 expired limits (Jul 30 2026): only 3 of 80 plans fitted the
-    old 0.15% band while the median cross needed is 0.82%, so the band blocked nearly every fill it
-    existed to enable. Filtering crossings by confidence >= 0.80 returns +0.050R mean; filtering by
-    "still clears the RR floor from the crossed price" returns +0.388R. Confidence was a weak proxy for
-    the thing that actually matters, so the band is now only an outer bound and the RR gate decides.
+    Jul 30 2026: only 3 of 80 expired plans fitted the old 0.15% band while the median cross needed is
+    0.82%, so the band blocked nearly every fill it existed to enable — hence 1% as an outer bound. The
+    same replay's filter figures (+0.050R for confidence >= 0.80 vs +0.388R for "still clears the RR
+    floor from the crossed price") were NOT reproduced on a new 124-limit sample (Sep 20-24, correct
+    futures columns): neither filter showed selection value there. The RR gate is a fee/payoff guard,
+    not a quality filter; whether to cross is read from the live execution map (edge.execution_map).
     """
     from src.config import TradingConfig
     defaults = TradingConfig.__dataclass_fields__
@@ -141,13 +142,14 @@ def test_marketable_entry_defaults_let_the_rr_gate_be_the_binding_test():
     assert defaults["marketable_entry_min_confidence"].default == 0.0
 
 
-def test_entry_ttl_stays_short_because_late_fills_are_adverse():
-    """The TTL must NOT be lengthened to chase fill rate.
+def test_entry_ttl_is_not_retuned_on_a_one_regime_lease_replay():
+    """The entry lease stays short; it must not be retuned either way on a single-regime replay.
 
-    Replaying the same expired limits at longer TTLs fills more orders but those extra fills lose:
-    -0.79R mean at 30min, -0.30R at 60min, -0.39R at 120min, -0.37R at 240min. A resting limit that
-    fills late only fills because price came to it — i.e. the move went against the thesis. The short
-    TTL is doing real work; throughput has to come from crossing, not from waiting.
+    This test used to claim late fills are adverse (a Jul-30 replay: -0.79R at 30min ... -0.37R at
+    240min, on futures candles read in the wrong column order). That did NOT reproduce on a new 124-limit
+    sample (Sep 20-24, correct columns): extra fills after the lease were positive at every horizon to
+    240m — but only for rally longs (240m shorts -0.16R). Neither result is a reason to move the TTL, so
+    the shipped loader default stays where it was.
     """
     # Assert the SHIPPED loader default, not the local fixture (which sets its own value).
     from src.config import load_config
@@ -178,3 +180,16 @@ def test_declared_setups_reach_the_book_by_default():
     assert "range_edge" in cfg.regime.declarable_setup_families
     # Unproven playbooks explore cheap rather than at full risk.
     assert 0.0 < cfg.edge.explore_unproven_family_factor <= 1.0
+
+
+def test_the_suite_runs_on_dummy_credentials_never_the_real_ones():
+  """T9 (2026-09-25 review): harnesses call load_config(), which needs the six required variables — so a
+  checkout without .env failed 68 tests, and on the dev machine every test cfg carried the real keys.
+  conftest forces dummies before any src import; load_dotenv never overrides a set variable."""
+  import os
+  from src.config import load_config
+  from tests.conftest import TEST_REQUIRED_ENV
+  for key, value in TEST_REQUIRED_ENV.items():
+    assert os.environ[key] == value, key
+  cfg = load_config()
+  assert cfg.kucoin.api_key == "test" and cfg.azure.endpoint == "https://test.invalid"

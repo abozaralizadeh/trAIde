@@ -519,7 +519,8 @@ def test_live_extremes_map_from_snapshot():
     from src.main import _live_extremes_map  # lazy: pulls heavy deps only when this test runs
     snap = SimpleNamespace(futures_positions=[
         {"symbol": "ETHUSDTM", "currentQty": 5, "unrealisedPnl": 3.2},
-        {"symbol": "XBTUSDTM", "currentQty": -2, "unrealisedPnl": -1.0},
+        {"symbol": "XBTUSDTM", "currentQty": -2, "unrealisedPnl": -1.0, "positionSide": "BOTH",
+         "openingTime": 1790252000000, "markPrice": 99.0, "avgEntryPrice": 100.0},
         {"symbol": "SOLUSDTM", "currentQty": 0, "unrealisedPnl": 0.0},  # flat -> skipped
     ])
     out = _live_extremes_map(snap)
@@ -529,8 +530,18 @@ def test_live_extremes_map_from_snapshot():
         "unrealizedPnl": 3.2,
         "positionOpenTime": None,
         "positionSide": "long",
+        # 2026-09-25: the raw inputs of the PRICE-space trail peak (memory.update_position_extremes).
+        "lifecycleOpenTime": None,
+        "markPrice": None,
+        "avgEntryPrice": None,
     }
     assert out["BTC-USDT"]["netSize"] == -2.0
+    # Side is qty-derived even when KuCoin says BOTH; the peak's open time uses ProtectionManager's
+    # key order (openingTime is read there, and not by the older positionOpenTime field).
+    assert out["BTC-USDT"]["positionSide"] == "short"
+    assert out["BTC-USDT"]["lifecycleOpenTime"] == 1790252000000
+    assert out["BTC-USDT"]["positionOpenTime"] is None
+    assert (out["BTC-USDT"]["markPrice"], out["BTC-USDT"]["avgEntryPrice"]) == (99.0, 100.0)
 
 
 # ── Reversal short: catch a confirmed roll-over against a lagging bullish daily ───
@@ -1166,3 +1177,219 @@ class TestEveryDirectionalGateHasAMechanicalHatch:
       assert "_declared_setup_error" in window, (
         "an allow_mechanical_setup branch opens without calling _declared_setup_error"
       )
+
+
+# ── Carry hold on the contract's OWN funding clock (2026-09-25) ────────────────────────────────
+
+
+def _utc(day, hh, mm=0):
+  import datetime as _dt
+  return _dt.datetime(2026, 9, day, hh, mm, tzinfo=_dt.UTC).timestamp()
+
+
+class TestCarryHoldOnTheContractsOwnFundingClock:
+  """The hold was meant to last until 'the first settlement after the FILL', but always used an epoch
+  8h grid. KuCoin settles 428 of 690 contracts every 4h and a few extreme-funding ones every hour —
+  and extreme funding IS the carry universe: 15 of the first 18 carry trades were on 1h/4h contracts.
+  ONE-USDT 09-21 00:24 (1h clock) held its trail off until 08:00 instead of 01:00 and stopped out at
+  -1.29R at 02:23; the 1m replay with the real clock gives about -0.05R. Every case below fails on the
+  8h grid."""
+
+  H = 3600.0
+
+  def _ctx(self, fill, **funding):
+    ctx = {"setupFamily": "funding_carry", "fillTs": fill}
+    if funding:
+      ctx["funding"] = funding
+    return ctx
+
+  def test_one_hour_contract_holds_to_the_next_hour_not_the_8h_grid(self):
+    from src.regime import carry_hold_deadline
+    fill = _utc(21, 0, 24)
+    got = carry_hold_deadline(self._ctx(fill), fill + 60,
+                              next_settlement_ts=_utc(21, 1), interval_sec=self.H)
+    assert got == _utc(21, 1)
+    assert carry_hold_deadline(self._ctx(fill), fill + 60) == _utc(21, 8)   # the old 8h answer
+
+  def test_four_hour_contract(self):
+    from src.regime import carry_hold_deadline
+    fill = _utc(22, 1, 10)
+    got = carry_hold_deadline(self._ctx(fill), fill + 60,
+                              next_settlement_ts=_utc(22, 4), interval_sec=4 * self.H)
+    assert got == _utc(22, 4)
+
+  def test_offset_grid_is_walked_both_ways_and_may_be_later_than_the_8h_grid(self):
+    """TRUSTUSDTM settles at 03/07/11/15/19/23 UTC — no epoch grid reproduces it. A fill at 23:30
+    belongs to the 03:00 settlement, which is LATER than the 8h grid's 00:00 and is still right, so
+    'never later than the 8h grid' is deliberately NOT an invariant."""
+    from src.regime import carry_hold_deadline
+    nxt = _utc(24, 7)
+    early = _utc(24, 3, 30)
+    assert carry_hold_deadline(self._ctx(early), early + 60,
+                               next_settlement_ts=nxt, interval_sec=4 * self.H) == _utc(24, 7)
+    late = _utc(23, 23, 30)
+    got = carry_hold_deadline(self._ctx(late), late + 60, next_settlement_ts=nxt, interval_sec=4 * self.H)
+    assert got == _utc(24, 3)
+    assert got > carry_hold_deadline(self._ctx(late), late + 60)          # 8h grid said 00:00
+
+  def test_exchange_stamp_older_or_newer_than_the_fill(self):
+    """The stamp is read at analysis (before a limit fills) or while holding (hours later): k in
+    next + k*interval must be allowed to go negative as well as positive."""
+    from src.regime import first_settlement_after
+    fill = _utc(24, 5, 0)
+    older = _utc(24, 3)            # a settlement already past at the fill
+    newer = _utc(25, 11)           # read the next day while still holding
+    assert first_settlement_after(fill, older, 4 * self.H) == _utc(24, 7)
+    assert first_settlement_after(fill, newer, 4 * self.H) == _utc(24, 7)
+    # A fill exactly ON a settlement belongs to the NEXT one: 'strictly after'.
+    assert first_settlement_after(_utc(24, 7), older, 4 * self.H) == _utc(24, 11)
+
+  def test_randomized_invariant_fill_lt_deadline_le_fill_plus_interval_on_the_grid(self):
+    import random
+    from src.regime import first_settlement_after
+    rng = random.Random(20260925)
+    for _ in range(2000):
+      interval = rng.choice([3600.0, 4 * 3600.0, 8 * 3600.0, 2 * 3600.0])
+      nxt = 1_790_000_000 + rng.randrange(0, 86400)
+      fill = nxt + rng.uniform(-5 * 86400, 5 * 86400)
+      d = first_settlement_after(fill, nxt, interval)
+      assert fill < d <= fill + interval
+      k = (d - nxt) / interval
+      assert abs(k - round(k)) < 1e-9, "the deadline must be an exchange settlement time"
+
+  def test_missing_clock_is_exactly_the_old_8h_result(self):
+    from src.regime import carry_hold_deadline, next_funding_settlement
+    fill = _utc(21, 0, 24)
+    ctx = self._ctx(fill)
+    expected = next_funding_settlement(fill)
+    assert carry_hold_deadline(ctx, fill + 60) == expected
+    for nxt, step in ((None, 3600), (_utc(21, 1), None), ("junk", 3600), (_utc(21, 1), 0), (_utc(21, 1), -3600)):
+      assert carry_hold_deadline(ctx, fill + 60, next_settlement_ts=nxt, interval_sec=step) == expected
+
+  def test_the_clock_stamped_on_the_entry_is_the_fallback_before_the_8h_grid(self):
+    from src.regime import carry_hold_deadline
+    fill = _utc(21, 0, 24)
+    ctx = self._ctx(fill, rate=-0.00196, intervalSec=self.H, nextSettlementTs=_utc(20, 23))
+    assert carry_hold_deadline(ctx, fill + 60) == _utc(21, 1)
+    # A live clock on the SAME interval outranks the stamp (a fresher read of the same grid).
+    assert carry_hold_deadline(ctx, fill + 60, next_settlement_ts=_utc(21, 3),
+                               interval_sec=self.H) == _utc(21, 1)
+    # A live clock on a DIFFERENT interval says the grid changed after the fill, so it is never walked
+    # back into the past: without the exchange's history the earlier of the stamped clock's first
+    # settlement and the live next one is the deadline (01:00, not 04:00 — 2026-09-25 review) ...
+    assert carry_hold_deadline(ctx, fill + 60, next_settlement_ts=_utc(21, 4),
+                               interval_sec=4 * self.H) == _utc(21, 1)
+    # ...and with the history in hand, "nothing paid since the fill" keeps the real 04:00.
+    assert carry_hold_deadline(ctx, fill + 60, next_settlement_ts=_utc(21, 4), interval_sec=4 * self.H,
+                               unpaid_as_of_ts=fill + 30) == _utc(21, 4)
+
+  def test_an_interval_shortened_mid_hold_never_invents_a_past_settlement(self):
+    """W2: fill 09:30 on an 8h clock (next 16:00); KuCoin switches the contract to 1h at 11:00. The live
+    grid (12:00/1h) walked back to the fill gave 10:00 — a settlement that never happened — so at 11:05
+    the hold was already over and the trail could close the carry before its first real payment."""
+    from src.regime import carry_hold_deadline
+    fill = _utc(21, 9, 30)
+    ctx = self._ctx(fill, rate=-0.002, intervalSec=8 * self.H, nextSettlementTs=_utc(21, 16))
+    live = dict(next_settlement_ts=_utc(21, 12), interval_sec=self.H)
+    assert carry_hold_deadline(ctx, _utc(21, 11, 5), **live) == _utc(21, 12)            # not None
+    assert carry_hold_deadline(ctx, _utc(21, 11, 5), unpaid_as_of_ts=_utc(21, 11), **live) == _utc(21, 12)
+    assert carry_hold_deadline(ctx, _utc(21, 12, 1), **live) is None                  # paid at 12:00
+
+  def test_an_interval_lengthened_after_the_payment_never_re_engages_the_hold(self):
+    """The reverse: fill 09:30 on a 4h clock (next 12:00), switched to 8h at the 12:00 boundary after the
+    payment (new grid next 16:00). The walk-back re-held the collected carry to 16:00."""
+    from src.regime import carry_hold_deadline
+    fill = _utc(21, 9, 30)
+    ctx = self._ctx(fill, rate=-0.002, intervalSec=4 * self.H, nextSettlementTs=_utc(21, 12))
+    live = dict(next_settlement_ts=_utc(21, 16), interval_sec=8 * self.H)
+    assert carry_hold_deadline(ctx, _utc(21, 12, 1), first_paid_ts=_utc(21, 12), **live) is None
+    assert carry_hold_deadline(ctx, _utc(21, 12, 1), **live) is None                  # heuristic too
+    assert carry_hold_deadline(ctx, _utc(21, 11, 50), first_paid_ts=None, **live) == _utc(21, 12)
+
+  def test_the_exchange_history_is_exact_and_parsed_in_seconds(self):
+    from src.regime import carry_hold_deadline, first_settlement_in_history
+    fill = _utc(21, 9, 30)
+    hist = [{"symbol": "ONEUSDTM", "fundingRate": -0.002, "timepoint": int(_utc(21, 9) * 1000)},
+            {"symbol": "ONEUSDTM", "fundingRate": -0.002, "timePoint": int(_utc(21, 11) * 1000)},
+            {"symbol": "ONEUSDTM", "fundingRate": -0.002, "timepoint": int(_utc(21, 10) * 1000)}]
+    assert first_settlement_in_history(hist, fill) == (True, _utc(21, 10))
+    assert first_settlement_in_history(hist[:1], fill) == (True, None)
+    assert first_settlement_in_history({"dataList": []}, fill) == (False, None)
+    assert first_settlement_in_history(None, fill) == (False, None)
+    ctx = self._ctx(fill, rate=-0.002, intervalSec=8 * self.H, nextSettlementTs=_utc(21, 16))
+    assert carry_hold_deadline(ctx, _utc(21, 9, 50), first_paid_ts=_utc(21, 10)) == _utc(21, 10)
+
+  def test_hold_ends_once_the_settlement_has_passed(self):
+    from src.regime import carry_hold_deadline
+    fill = _utc(21, 0, 24)
+    kw = dict(next_settlement_ts=_utc(21, 1), interval_sec=self.H)
+    assert carry_hold_deadline(self._ctx(fill), _utc(21, 0, 59), **kw) == _utc(21, 1)
+    assert carry_hold_deadline(self._ctx(fill), _utc(21, 1), **kw) is None
+    assert carry_hold_deadline(self._ctx(fill), _utc(21, 3), **kw) is None       # never rolls forward
+    assert carry_hold_deadline({"setupFamily": "continuation", "fillTs": fill}, fill, **kw) is None
+
+  def test_funding_clock_parses_the_real_kucoin_payload(self):
+    """Captured 2026-09-24 from /api/v1/funding-rate/ONEUSDTM/current and TRUSTUSDTM."""
+    from src.regime import funding_clock_from_rate
+    one = {"symbol": ".ONEUSDTMFPI8H", "granularity": 3600000, "timePoint": 1790269200000,
+           "value": -0.001963, "fundingTime": 1790272800000}
+    trust = {"symbol": ".TRUSTUSDTMFPI8H", "granularity": 14400000, "timePoint": 1790262000000,
+             "value": 5.0e-5, "fundingTime": 1790276400000}
+    assert funding_clock_from_rate(one) == (1790272800.0, 3600.0)
+    assert funding_clock_from_rate(trust) == (1790276400.0, 14400.0)      # 19:00 UTC, offset grid
+    for junk in (None, {}, {"granularity": 3600000}, {"fundingTime": 1, "granularity": 0},
+                 {"fundingTime": "x", "granularity": 3600000}):
+      assert funding_clock_from_rate(junk) is None
+
+
+class TestFundingRateIsLabelledPerSettlement:
+  """ONE-USDT's -0.196% is paid EVERY HOUR; printed as '%/8h' it read ~8x smaller than the carry the
+  model was being offered, and a 1h contract could not be compared with a 4h one."""
+
+  def test_one_hour_contract_names_its_interval_and_never_prints_per_8h(self):
+    out = funding_carry_setup(-0.00196, 0.0014, interval_hours=1.0)
+    assert "per 1h settlement" in out["reason"]
+    assert "/8h" not in out["reason"] and "/8h" not in out["note"]
+    assert "per 1h settlement" in out["note"]
+    # The 8h equivalent is shown so contracts on different clocks compare on one basis.
+    assert "-1.5680% per 8h equivalent" in out["reason"]
+    assert out["fundingIntervalHours"] == 1.0
+    # ...and how long the carry takes to cover the round trip on THIS clock: 0.14/0.196 payments.
+    assert out["hoursToCoverCost"] == pytest.approx(0.0014 / 0.00196, abs=0.01)
+    assert "1h settlement clock" in out["note"]
+
+  def test_threshold_stays_per_payment(self):
+    """Normalising the trigger to 8h would admit every 1h contract at an eighth of today's rate —
+    an opportunity change, not a wording fix. Same rate, same verdict, whatever the clock."""
+    for hours in (None, 1.0, 4.0, 8.0):
+      assert funding_carry_setup(0.0006, 0.0014, interval_hours=hours) is None
+      assert funding_carry_setup(0.0007, 0.0014, interval_hours=hours) is not None
+
+  def test_unknown_clock_claims_no_interval(self):
+    out = funding_carry_setup(0.0020, 0.0014)
+    assert "per settlement" in out["reason"]
+    assert "8h" not in out["reason"]
+    assert out["fundingIntervalHours"] is None and out["hoursToCoverCost"] is None
+
+  def test_an_8h_contract_reads_naturally(self):
+    out = funding_carry_setup(0.0020, 0.0014, interval_hours=8.0)
+    assert "+0.2000% per 8h settlement" in out["reason"]
+    assert "equivalent" not in out["reason"]
+
+  def test_the_wrong_side_refusal_quotes_the_real_clock(self):
+    setup = funding_carry_setup(-0.00196, 0.0014, interval_hours=1.0)
+    msg = verify_declared_setup("funding_carry", side="sell", funding_setup=setup)
+    assert msg and "per 1h settlement" in msg and "/8h" not in msg
+
+  def test_the_model_facing_text_no_longer_calls_every_rate_8h(self):
+    """agent.py prompt and the limit-entry tool description are what the MODEL reads."""
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1] / "src"
+    agent_src = (root / "agent.py").read_text()
+    assert "the 8h funding rate" not in agent_src
+    assert "fundingIntervalHours" in agent_src
+    # The garbled 'survives a settlement, accrues.' sentence is gone.
+    assert "survives a settlement, \"\n        \"accrues." not in agent_src
+    assert "accrues only if the position is still open at a" in agent_src
+    tools_src = (root / "tools.py").read_text()
+    assert "PAID by the 8h funding transfer" not in tools_src

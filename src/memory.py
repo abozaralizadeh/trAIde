@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -42,7 +42,14 @@ MAX_SIGNAL_PROBES = 400
 # Losing the evidence for a verdict must never be equivalent to never having had it.
 MAX_PROBES_PER_FAMILY = 150
 MAX_EXIT_PROBES = 200
+# How long an exit probe waits for its bracket to resolve before it is marked to market. Shared by the
+# settle step and by the poll loop's "which symbols need a price" query, so both agree on a probe's life.
+EXIT_PROBE_EXPIRE_HOURS = 8.0
+EXIT_PROBE_PRICE_SOURCE = "futures_mark"   # stamped on every live exit-probe resolution since 2026-09-25
 MAX_MACRO_EVENTS = 60
+# analyze_market_context data-quality refusals kept for the screener, one per symbol. Each expires on
+# its own evidence-derived retryAfter; the cap only bounds the file if the bot analyses a whole universe.
+MAX_ANALYSIS_FAILURES = 200
 MAX_AGENT_SCHEDULER_SYMBOLS = 100
 # Forward-return measurement points, in minutes. 60/240 are the horizons the live entry gates score
 # against; 5/15 were added 2026-09-04 to test whether anything predicts at the short horizons where
@@ -50,6 +57,61 @@ MAX_AGENT_SCHEDULER_SYMBOLS = 100
 # only measures: `edge.signal_edge_stats` keeps its verdict and its per-family sizing anchored to the
 # original horizons, so nothing the bot DOES changes until the evidence says it should.
 SIGNAL_PROBE_HORIZONS_MIN: tuple[int, ...] = (5, 15, 60, 240)
+# ── Gate probes: what each directional gate blocks (2026-09-25) ──────────────────────────────────────
+# The directional/timing gates in the futures limit path returned BEFORE the signal probe, so a refused
+# call left no evidence and nothing scored any gate live: 09-22..24 had 8 hard directional refusals,
+# 0 probes (the opposing-daily branch did not even log), against 23 of 23 probed NET RR / STAND ASIDE
+# refusals. The gates' real footprint is the model's self-censorship (97 of 131 declines cited daily
+# exhaustion), which only a MODEL-INDEPENDENT reading of the gate state can see. Both land in their
+# own ``gate_probes`` bucket, NEVER in ``signal_probes()`` — a refused or never-proposed call must not
+# move a family verdict or evict continuation evidence (already at its 150 cap). Report-only.
+#
+# Gate codes, in the order place_futures_limit_order checks them. ``DIRECTIONAL_GATES`` are the ones a
+# gate-STATE row can evaluate without a call (no confidence, no family); ``SCORED_GATES`` adds the
+# refusals that still judge THIS call (volatility hard limit, confidence floor, no-chase, the two
+# cooldowns). Every other pre-probe refusal carries a ``STRUCTURAL_REFUSALS`` code (malformed request,
+# stale analysis, circuit breaker, caps) and records nothing — it says nothing about the call.
+DIRECTIONAL_GATES: tuple[str, ...] = (
+  "anti_fomo", "daily_opposing", "h1_align", "tf_conflict", "correlation", "move_24h", "bench",
+)
+SCORED_GATES: tuple[str, ...] = DIRECTIONAL_GATES + (
+  "vol_limit", "confidence_floor", "no_chase", "post_loss_cooldown", "trade_interval",
+)
+STRUCTURAL_REFUSALS: tuple[str, ...] = (
+  "pending_entry", "bracket_missing", "bracket_invalid", "atomic_bracket_disabled", "entry_context",
+  "live_book", "restricted", "trade_cap", "sentiment", "new_listing",
+)
+# Hard-refusal rows are kept per gate, mirroring MAX_PROBES_PER_FAMILY: a loud gate (the exhaustion
+# gate in a rally) must not evict a quiet one's history. Retained by count, never by clock.
+MAX_GATE_PROBES_PER_GATE = MAX_PROBES_PER_FAMILY
+# A gate-STATE row per (symbol, side) at most once per this many minutes — the WIDEST settled horizon,
+# so no two stored rows of one symbol/side overlap at any horizon they are scored at. That is what lets
+# settled state rows be folded into per-day totals (``gate_state_days``) exactly, with no second de-overlap
+# rule: `edge._probe_observations` over the rows being folded is the only one.
+GATE_STATE_WINDOW_MIN = max(SIGNAL_PROBE_HORIZONS_MIN)
+# Why fold at all: state rows arrive at ~6x the hard-refusal rate (every analysed symbol, both sides),
+# and resolving a ~0.17%/call gate effect needs MONTHS of day-level data. Raw rows at that rate would
+# add ~1 MB a month to a file rewritten every poll, and a per-gate row cap would hold only the last few
+# days — a one-regime scoreboard by construction. So a fully settled state row is folded into its UTC
+# day's per-side, per-horizon sums (total, and per gate) and dropped. Day cells are kept by COUNT (four
+# months), each as ONE compact JSON string: the store is written with indent=2, which would otherwise
+# spread a day's ~60 numbers over ~120 lines (~2.5 KB/day instead of ~0.9 KB).
+MAX_GATE_STATE_DAYS = 120
+# Backstop only: unsettled state rows normally fold ~4.8h after they are recorded.
+MAX_GATE_STATE_UNFOLDED = 600
+
+
+# Bot-placed limit entries carry this clientOid prefix. ONE predicate (`is_limit_entry_record`) defines
+# "a limit placement" for both `performanceSummary.limitFillRate` and `edge.execution_map`, so the
+# aggregate rate and the per-distance table are computed from the same records and cannot disagree.
+LIMIT_ENTRY_CLIENT_OID_PREFIX = "traide-entry-"
+
+
+def is_limit_entry_record(trade: Any) -> bool:
+  """True for a trade row the bot placed as a tagged limit entry (filled or not)."""
+  return isinstance(trade, dict) and str(trade.get("clientOid") or "").startswith(LIMIT_ENTRY_CLIENT_OID_PREFIX)
+
+
 _ATR_QUARANTINE_RE = re.compile(
   r"daily ATR\s+([0-9]+(?:\.[0-9]+)?)%\s+exceeds\s+([0-9]+(?:\.[0-9]+)?)%",
   re.IGNORECASE,
@@ -89,6 +151,51 @@ def _sanitize_taker_flow(value: Any) -> Optional[Dict[str, Any]]:
   # A reading with no buy share carries no information; storing the husk would only make probes look
   # flow-stamped to the analysis when they are not.
   return out if "buyShare" in out else None
+
+
+_MARKET_STATE_BIASES = ("bullish", "bearish", "neutral")
+
+
+def sanitize_market_state(value: Any) -> Optional[Dict[str, Any]]:
+  """Whitelist an analytics.market_state block down to its raw numbers, or None.
+
+  Shared by every place that stamps it (entryContext, signal probes, exit probes) so all three carry the
+  same shape. A value out of its domain is DROPPED, not clamped — a parsing bug should show up as missing
+  evidence, never as a plausible number that quietly biases a split (the same rule as taker flow).
+  """
+  raw = value if isinstance(value, dict) else None
+  if not raw:
+    return None
+  out: Dict[str, Any] = {}
+
+  def _num(key: str) -> Optional[float]:
+    try:
+      val = float(raw.get(key))
+    except (TypeError, ValueError):
+      return None
+    return val if math.isfinite(val) else None
+
+  as_of = _num("asOf")
+  if as_of is not None and as_of > 0:
+    out["asOf"] = int(as_of)
+  universe = _num("universe")
+  if universe is not None and universe >= 0:
+    out["universe"] = int(universe)
+  breadth = _num("breadth24")
+  if breadth is not None and 0.0 <= breadth <= 1.0:
+    out["breadth24"] = round(breadth, 4)
+  for key in ("basketMedian24h", "btc24h", "btc72h"):
+    val = _num(key)
+    if val is not None:
+      out[key] = round(val, 3)
+  adx = _num("btcDailyAdx")
+  if adx is not None and adx >= 0:
+    out["btcDailyAdx"] = round(adx, 2)
+  bias = str(raw.get("btcDailyBias") or "").strip().lower()
+  if bias in _MARKET_STATE_BIASES:
+    out["btcDailyBias"] = bias
+  # A block with no reading at all (only a timestamp) carries no information.
+  return out if set(out) - {"asOf", "universe"} else None
 
 
 def _sanitize_agent_scheduler(value: Any) -> Dict[str, Any]:
@@ -195,6 +302,225 @@ def _probe_settle_tolerance_sec(horizon_min: float) -> float:
   return max(120.0, 0.2 * max(0.0, float(horizon_min)) * 60.0)
 
 
+def _probe_price_source(ctx: Dict[str, Any]) -> str:
+  """Which market a signal probe's base price came from — and so which one must settle it.
+
+  A forward return is only a return when both ends are read from the SAME market. The base has come
+  from the futures mark since 2026-07-19 (`tools._live_entry_price`), but settlement read the SPOT
+  ticker, so on a coin where the perp traded away from spot the gap was scored as prediction. It
+  landed almost entirely on `funding_carry`, which is chosen exactly when that gap is widest: ONE-USDT
+  on 2026-09-20 had spot ~0.0050 against a futures mark ~0.0038, and eight ONE long probes each
+  recorded a ~+7.5% 60m return that the contract never made — enough to lift the family from t=0.97
+  (stood aside) to t=2.02 (full size) in a day.
+
+  Rows stamped ``spot`` (the entry path fell back to the spot ticker) settle on spot. EVERYTHING else
+  settles on futures, including legacy rows with no stamp, because their base has been the futures
+  mark since 07-19 and every retained probe is newer than that.
+  """
+  src = str(ctx.get("priceSource") or "").strip().lower() if isinstance(ctx, dict) else ""
+  return "spot" if src == "spot" else "futures"
+
+
+def _price_from(book: Any, symbol: Any) -> Optional[float]:
+  """A positive finite price for ``symbol`` from a price map (plain numbers or ticker objects), or None."""
+  if not book:
+    return None
+  try:
+    px = book.get(symbol)
+  except Exception:
+    return None
+  px = getattr(px, "price", px)
+  try:
+    px = float(px)
+  except (TypeError, ValueError):
+    return None
+  return px if math.isfinite(px) and px > 0 else None
+
+
+def funding_received_from_history(history: Any, side: Any, t0: float, t1: float) -> Optional[float]:
+  """Funding a position on ``side`` would have RECEIVED over the window (t0, t1], as a fraction of notional.
+
+  KuCoin's convention: a positive ``fundingRate`` means longs pay shorts. So at every settlement whose
+  ``timepoint`` falls inside the window a long receives ``-rate`` and a short ``+rate``; the result is
+  their sum, signed from the position's side (positive = the position was paid). A position opened at
+  the settlement instant does not receive it, hence the open left edge.
+
+  Why a probe needs this at all: `funding_carry` is a bet on the TRANSFER, not only on price. A
+  price-only forward return scores a carry call as if the payment never happened, which understates a
+  real carry edge by roughly ``rate x horizon / interval`` — small at 60m, but the honest number
+  either way, and it must never be what keeps a phantom alive (that was the spot/futures basis).
+
+  Returns 0.0 when no settlement fell inside the window and None when the history is unusable, so a
+  caller can tell "nothing was paid" from "cannot know". Duplicate timepoints count once. Never raises.
+  """
+  s = str(side or "").strip().lower()
+  if s in ("long", "buy"):
+    sign = -1.0
+  elif s in ("short", "sell"):
+    sign = 1.0
+  else:
+    return None
+  if not isinstance(history, (list, tuple)):
+    return None
+  try:
+    lo, hi = float(t0), float(t1)
+  except (TypeError, ValueError):
+    return None
+  by_ts: Dict[float, float] = {}
+  for item in history:
+    if not isinstance(item, dict):
+      continue
+    try:
+      rate = float(item.get("fundingRate"))
+      ts = float(item.get("timepoint") if item.get("timepoint") is not None else item.get("timePoint"))
+    except (TypeError, ValueError):
+      continue
+    if not (math.isfinite(rate) and math.isfinite(ts)):
+      continue
+    if ts > 1e12:          # KuCoin reports milliseconds
+      ts /= 1000.0
+    if lo < ts <= hi:
+      by_ts[ts] = rate
+  return sign * sum(by_ts.values())
+
+
+def _signal_stamps_due(
+  row: Any,
+  prices: Optional[Dict[str, Any]],
+  spot_prices: Optional[Dict[str, Any]],
+  horizons_min: tuple,
+  now: int,
+) -> list:
+  """The ``(key, horizon, value)`` stamps a signal-probe row is due this poll, without writing them.
+
+  ``value`` is a price (read from the row's OWN market, see `_probe_price_source`) or None for a
+  horizon that is past its settle tolerance and so recorded as missed. A due horizon whose market has
+  no price yet is simply absent: it is retried next poll until the tolerance writes it off. Pure, so
+  the settle step can plan (and fetch funding) outside the store lock and apply under it.
+  """
+  if not isinstance(row, dict):
+    return []
+  ctx = row.get("entryContext")
+  if not isinstance(ctx, dict) or not ctx.get("marketPriceAtSignal"):
+    return []
+  probe = ctx.get("signalProbe") if isinstance(ctx.get("signalProbe"), dict) else {}
+  ts0 = int(row.get("ts") or 0)
+  book = spot_prices if _probe_price_source(ctx) == "spot" else prices
+  px: Any = False    # not looked up yet — most rows have nothing due, so skip the lookup for them
+  out = []
+  for horizon in horizons_min:
+    key = f"m{int(horizon)}"
+    due_at = ts0 + int(horizon) * 60
+    if key in probe or now < due_at:
+      continue
+    if now - due_at > _probe_settle_tolerance_sec(horizon):
+      out.append((key, int(horizon), None))
+      continue
+    if px is False:
+      px = _price_from(book, row.get("symbol"))
+    if px is None:
+      continue
+    out.append((key, int(horizon), px))
+  return out
+
+
+def _lease_settle_tolerance_sec(lease_min: float) -> float:
+  """How long after its lease a probe's lease extremes may still be fetched before they are written off.
+
+  Unlike a forward PRICE (which is only that horizon's return if read on time — see
+  `_probe_settle_tolerance_sec`), a lease low/high comes from historical 1m bars and is exact whenever
+  it is fetched. The window therefore only bounds retries: one lease length (at least the price-stamp
+  tolerance) covers a routine restart or deploy without re-asking for a dead symbol forever.
+  """
+  return max(_probe_settle_tolerance_sec(lease_min), max(0.0, float(lease_min)) * 60.0)
+
+
+def _funding_backfill_window_sec(horizon_min: float) -> float:
+  """How long after a horizon an UNKNOWN funding credit (``f{h}`` None) may still be backfilled.
+
+  Funding history is exact and permanent, like a lease's 1m bars, so a late fetch is not back-stamping
+  the way a late price would be; the window only bounds retries so a dead symbol is not asked forever
+  (the same rule as ``_lease_settle_tolerance_sec``).
+  """
+  return _lease_settle_tolerance_sec(horizon_min)
+
+
+def _credit_backfills_due(row: Any, now: int, horizons_min: tuple) -> list:
+  """``(horizon, t_end)`` for every horizon whose price is stamped but whose funding credit is UNKNOWN
+  (``f{h}`` present and None) and still inside ``_funding_backfill_window_sec``. ``t_end`` is the time
+  the price was observed (``t{h}``, stamped with the unknown credit), else the horizon itself — never
+  ``now``, or a late backfill would credit settlements after the horizon. Pure; never raises."""
+  try:
+    ctx = row.get("entryContext") if isinstance(row, dict) else None
+    probe = ctx.get("signalProbe") if isinstance(ctx, dict) else None
+    if not isinstance(probe, dict):
+      return []
+    ts0 = int(row.get("ts") or 0)
+    out = []
+    for horizon in horizons_min:
+      h = int(horizon)
+      fk = f"f{h}"
+      if fk not in probe or probe.get(fk) is not None:
+        continue
+      try:
+        px = float(probe.get(f"m{h}"))
+      except (TypeError, ValueError):
+        continue
+      if not (math.isfinite(px) and px > 0):
+        continue
+      due_at = ts0 + h * 60
+      if now - due_at > _funding_backfill_window_sec(h):
+        continue
+      try:
+        t_end = float(probe.get(f"t{h}")) if probe.get(f"t{h}") is not None else float(due_at)
+      except (TypeError, ValueError):
+        t_end = float(due_at)
+      out.append((h, t_end))
+    return out
+  except Exception:
+    return []
+
+
+def _lease_window(row: Any) -> Optional[tuple]:
+  """``(t0, t1)`` — the call's order lease in epoch seconds — for a probe that carries ``leaseMin``."""
+  if not isinstance(row, dict):
+    return None
+  ctx = row.get("entryContext")
+  if not isinstance(ctx, dict):
+    return None
+  try:
+    lease_min = float(ctx.get("leaseMin"))
+    t0 = float(row.get("ts"))
+  except (TypeError, ValueError):
+    return None
+  if not (math.isfinite(lease_min) and lease_min > 0 and math.isfinite(t0) and t0 > 0):
+    return None
+  return t0, t0 + lease_min * 60.0
+
+
+def _lease_stamp_due(row: Any, now: float) -> Optional[str]:
+  """``'fetch'`` when a probe's lease extremes are due, ``'missed'`` past the tolerance, else None.
+
+  Due once the lease has elapsed AND the last 1m bar inside it has closed (``t1 + 60``), so the high/low
+  is final. Rows already stamped (even with None) are never touched again: a measurement that was
+  missed is recorded as missed, never back-filled later. Only rows that stamped ``leaseMin`` at the
+  call qualify — probes recorded before 2026-09-25 carry no ATR either and could not be scored.
+  """
+  window = _lease_window(row)
+  if window is None:
+    return None
+  ctx = row["entryContext"]
+  if "leaseLow" in ctx or "leaseHigh" in ctx:
+    return None
+  due_at = window[1] + 60.0
+  if now < due_at:
+    return None
+  lease_min = (window[1] - window[0]) / 60.0
+  if now - due_at > _lease_settle_tolerance_sec(lease_min):
+    return "missed"
+  return "fetch"
+
+
 def _adaptive_quarantine_seconds(reason: str) -> int:
   """Back off unsafe candidates in proportion to how far their volatility exceeded the gate."""
   text = str(reason or "")
@@ -244,6 +570,130 @@ def _trim_probes_per_family(probes: Any) -> list:
     for row in bucket[-MAX_PROBES_PER_FAMILY:]:
       keep_ids.add(id(row))
   return [r for r in rows if id(r) in keep_ids]
+
+
+def _gate_probe_kind(row: Any) -> Optional[str]:
+  ctx = row.get("entryContext") if isinstance(row, dict) else None
+  kind = ctx.get("gateProbe") if isinstance(ctx, dict) else None
+  return kind if kind in ("state", "refusal") else None
+
+
+def _trim_gate_probes(rows: Any) -> list:
+  """Bound the ``gate_probes`` bucket, preserving chronological order. Never raises.
+
+  Refusal rows keep the newest ``MAX_GATE_PROBES_PER_GATE`` PER GATE (the per-family rule, for the
+  same reason). State rows are transient — folded into ``gate_state_days`` once settled — so they get
+  one backstop count cap that only bites if folding never runs. Rows of unknown kind are dropped.
+  """
+  kept = [r for r in (rows or []) if isinstance(r, dict) and _gate_probe_kind(r)]
+  keep_ids: set[int] = set()
+  buckets: Dict[str, list] = {}
+  states: list = []
+  for row in kept:
+    if _gate_probe_kind(row) == "state":
+      states.append(row)
+    else:
+      buckets.setdefault(str(row["entryContext"].get("gate") or "?"), []).append(row)
+  for bucket in buckets.values():
+    for row in bucket[-MAX_GATE_PROBES_PER_GATE:]:
+      keep_ids.add(id(row))
+  for row in states[-MAX_GATE_STATE_UNFOLDED:]:
+    keep_ids.add(id(row))
+  return [r for r in kept if id(r) in keep_ids]
+
+
+def _decode_gate_day(cell: Any) -> Optional[Dict[str, Any]]:
+  """One stored day cell -> ``{side: {horizon: [n, s, {gate: [n, s]}]}}``, or None when unreadable."""
+  try:
+    val = json.loads(cell) if isinstance(cell, str) else cell
+  except (TypeError, ValueError):
+    return None
+  return val if isinstance(val, dict) else None
+
+
+def _encode_gate_day(cell: Dict[str, Any]) -> str:
+  return json.dumps(cell, separators=(",", ":"), sort_keys=True)
+
+
+def _trim_gate_state_days(days: Any) -> Dict[str, Any]:
+  """The newest ``MAX_GATE_STATE_DAYS`` readable day cells (keys: UTC day numbers as strings)."""
+  if not isinstance(days, dict):
+    return {}
+  valid = []
+  for key, cell in days.items():
+    try:
+      day = int(key)
+    except (TypeError, ValueError):
+      continue
+    if _decode_gate_day(cell) is not None:
+      valid.append((day, str(key), cell if isinstance(cell, str) else _encode_gate_day(cell)))
+  valid.sort()
+  return {key: cell for _, key, cell in valid[-MAX_GATE_STATE_DAYS:]}
+
+
+def _gate_regime_stamp(regime: Any) -> Optional[Dict[str, Any]]:
+  """The gate-state fields a gate probe keeps: biases and flags only (whitelisted, no prices)."""
+  raw = regime if isinstance(regime, dict) else None
+  if not raw:
+    return None
+  out: Dict[str, Any] = {}
+  for key in ("daily_bias", "daily_bias_raw", "intraday_bias_4h", "intraday_bias_1h", "intraday_bias_15m"):
+    val = str(raw.get(key) or "").strip().lower()
+    if val in ("bullish", "bearish", "neutral"):
+      out[key] = val
+  for key in ("daily_exhausted", "timeframe_conflict"):
+    if key in raw:
+      out[key] = bool(raw.get(key))
+  return out or None
+
+
+# Keys an exchange position may carry its opening time under, in the order ProtectionManager's own
+# `_position_signature` reads them. The restart peak must be keyed on the SAME identity the in-process
+# manager resets on, so this order is shared rather than re-derived (tests assert they agree).
+POSITION_OPEN_TIME_KEYS = ("openingTimestamp", "openingTime", "openTime", "createdAt")
+
+
+def position_open_time(pos: Any) -> Any:
+  """The raw opening time of a live exchange position (first present key), or None."""
+  if not isinstance(pos, dict):
+    return None
+  for key in POSITION_OPEN_TIME_KEYS:
+    value = pos.get(key)
+    if value not in (None, ""):
+      return value
+  return None
+
+
+def peak_fe_key(open_time: Any, qty: Any, avg_entry: Any) -> Optional[str]:
+  """Lifecycle identity of a persisted price-space peak: (openTime, side, |qty|, avgEntry).
+
+  This is exactly the identity ``ProtectionManager._position_signature`` resets its in-process peak
+  on: a same-side close/reopen, an add-on, a partial reduction or a flip each start a new excursion
+  baseline there, because keeping a prior peak against a changed size or average entry "can
+  immediately produce a false give-back". The persisted peak must reset on the same events, or a
+  restart would hand back a peak the in-process manager had deliberately thrown away.
+
+  Why a separate key from ``lifecycleKey`` (openTime:side): that one deliberately SURVIVES add-ons and
+  partial reductions, because close records and MFE stats want the whole lifecycle's USD peak. The
+  peak the trail uses must not. Side comes from the SIGN of qty, never from KuCoin's ``positionSide``
+  (BOTH in one-way mode, LONG/SHORT in hedge mode) — reading that raw field is why the Sep 22 restart
+  seed never matched a single stored key. Returns a string (JSON-stable), or None when unkeyable.
+  """
+  try:
+    q = float(qty)
+    a = float(avg_entry)
+  except (TypeError, ValueError):
+    return None
+  if not (math.isfinite(q) and math.isfinite(a)) or q == 0 or a <= 0:
+    return None
+  opened: Any = None
+  if open_time not in (None, ""):
+    try:
+      opened = int(float(open_time))
+    except (TypeError, ValueError):
+      opened = str(open_time)
+  side = "long" if q > 0 else "short"
+  return f"{opened}|{side}|{abs(q)!r}|{a!r}"
 
 
 class MemoryStore:
@@ -496,6 +946,13 @@ class MemoryStore:
     # Signal probes are learning data (every direction call, placed or not): retained by COUNT only,
     # never by clock — see record_signal_probe for why tying evidence to anything else deadlocks.
     data["signal_probes"] = _trim_probes_per_family(data.get("signal_probes") or [])
+    # Gate probes (report-only, never part of signal_probes()): count-capped per gate, never by clock;
+    # the folded state days by count of days. Only touched once a store has them, so an older file is
+    # not rewritten just to add empty keys.
+    if "gate_probes" in data:
+      data["gate_probes"] = _trim_gate_probes(data.get("gate_probes"))
+    if "gate_state_days" in data:
+      data["gate_state_days"] = _trim_gate_state_days(data.get("gate_state_days"))
     # The macro calendar is forward-looking: drop anything more than a day past, cap the rest. A stale
     # or empty calendar must degrade to "no events known" (ordinary trading), never to a stuck blackout.
     data["macro_events"] = [
@@ -503,6 +960,13 @@ class MemoryStore:
       if isinstance(e, dict) and (e.get("ts") or 0) >= now - 86400
     ][-MAX_MACRO_EVENTS:]
     data["agent_closes"] = [m for m in (data.get("agent_closes") or []) if isinstance(m, dict)][-200:]
+    # Data-quality failures expire on their own evidence-derived retryAfter.
+    if "analysis_failures" in data:
+      _af = data.get("analysis_failures")
+      data["analysis_failures"] = {
+        k: v for k, v in (_af.items() if isinstance(_af, dict) else [])
+        if isinstance(v, dict) and (v.get("retryAfter") or 0) > now
+      }
     # Exit probes are learning data too (was the discretionary close better than the bracket?):
     # count-capped, never clock-pruned, for the same reason signal probes are not.
     _xp = data.get("exit_probes") or []
@@ -756,6 +1220,69 @@ class MemoryStore:
           "remainingHours": round((retry_after - current) / 3600.0, 1),
         })
       return sorted(quarantined, key=lambda item: item["retryAfter"])
+
+  def record_analysis_failure(self, symbol: str, *, reason: str, retry_after: Any, now: Any = None) -> None:
+    """Remember that analyze_market_context refused ``symbol`` on data quality, until ``retry_after``.
+
+    Kept in its own key, NOT the coins list: that list is capped at 50 and the model's own remove_coin
+    overwrites an entry, which is how an ATR quarantine could be erased. One row per symbol (the latest
+    refusal); ``retry_after`` comes from the failure's own evidence (analytics.candle_quality_retry_after),
+    never a hand-set TTL. Informational only — nothing is blocked by it; the scan and list_coins show it.
+    """
+    sym = _normalize_symbol(symbol)
+    try:
+      retry = float(retry_after)
+    except (TypeError, ValueError):
+      return
+    current = int(time.time() if now is None else float(now))
+    if not sym or not math.isfinite(retry) or retry <= current:
+      return
+    with self._lock:
+      data = self._prune(self._read())
+      failures = data.get("analysis_failures") if isinstance(data.get("analysis_failures"), dict) else {}
+      failures[sym] = {"reason": str(reason or "")[:300], "ts": current, "retryAfter": int(math.ceil(retry))}
+      if len(failures) > MAX_ANALYSIS_FAILURES:
+        keep = sorted(failures.items(), key=lambda kv: kv[1].get("ts") or 0)[-MAX_ANALYSIS_FAILURES:]
+        failures = dict(keep)
+      data["analysis_failures"] = failures
+      self._write(data)
+
+  def clear_analysis_failure(self, symbol: str) -> bool:
+    """Drop ``symbol``'s recorded data-quality failure (a later analysis came back clean)."""
+    sym = _normalize_symbol(symbol)
+    with self._lock:
+      data = self._read()
+      failures = data.get("analysis_failures")
+      if not isinstance(failures, dict) or sym not in failures:
+        return False
+      failures.pop(sym, None)
+      data["analysis_failures"] = failures
+      self._write(data)
+      return True
+
+  def analysis_failures(self, now: Any = None) -> Dict[str, Dict[str, Any]]:
+    """Active data-quality failures {symbol: {reason, ts, retryAfter, remainingHours}}; expired ones omitted."""
+    current = float(time.time() if now is None else now)
+    with self._lock:
+      data = self._read()
+    out: Dict[str, Dict[str, Any]] = {}
+    failures = data.get("analysis_failures")
+    for sym, row in (failures.items() if isinstance(failures, dict) else []):
+      if not isinstance(row, dict):
+        continue
+      try:
+        retry = float(row.get("retryAfter"))
+      except (TypeError, ValueError):
+        continue
+      if retry <= current:
+        continue
+      out[sym] = {
+        "reason": row.get("reason"),
+        "ts": row.get("ts"),
+        "retryAfter": int(retry),
+        "remainingHours": round((retry - current) / 3600.0, 1),
+      }
+    return out
 
   def has_coins(self) -> bool:
     with self._lock:
@@ -1120,7 +1647,21 @@ class MemoryStore:
     return positions
 
   def update_position_extremes(self, positions: Dict[str, Dict[str, Any]]) -> None:
-    """Update peak/trough unrealized PnL for open positions. Call each poll round."""
+    """Update peak/trough unrealized PnL for open positions. Call each poll round.
+
+    Two peaks are kept, on purpose on two different identities:
+
+    * ``peakPnl`` / ``troughPnl`` (USD) on ``lifecycleKey`` = openTime:side — the whole lifecycle's
+      extremes, which close records and MFE stats read. Unchanged.
+    * ``peakFePx`` (PRICE units: max over polls of (mark - avgEntry) x +1 long / -1 short) on
+      ``peakFeKey`` = :func:`peak_fe_key` — the peak the trail uses, reset on every event that resets
+      ProtectionManager's own peak (add-on, partial reduction, flip), so a restart can hand the
+      in-process manager back exactly what it would have held. Stored in price because the USD peak
+      divided by contracts is price x contract MULTIPLIER (10x on H/WIF/ONDO, 520,000x on PEPE), which
+      the Sep 22 seed did and which would have market-closed multiplier>1 winners had its key ever
+      matched. Needs ``markPrice``, ``avgEntryPrice`` and ``lifecycleOpenTime`` on the row
+      (``main._live_extremes_map``); rows without them keep the USD fields only.
+    """
     with self._lock:
       data = self._read()
       extremes = data.get("position_extremes", {})
@@ -1135,12 +1676,13 @@ class MemoryStore:
         ext = extremes.get(sym)
         lifecycle_key = f"{pos.get('positionOpenTime') or ''}:{pos.get('positionSide') or ('long' if net > 0 else 'short')}"
         if ext is None or ext.get("lifecycleKey") != lifecycle_key:
-          extremes[sym] = {
+          ext = {
             "peakPnl": upnl, "troughPnl": upnl, "peakTs": now, "troughTs": now,
             "openTs": now, "lifecycleKey": lifecycle_key,
             "positionOpenTime": pos.get("positionOpenTime"),
             "positionSide": pos.get("positionSide") or ("long" if net > 0 else "short"),
           }
+          extremes[sym] = ext
         else:
           if upnl > (ext.get("peakPnl") or float("-inf")):
             ext["peakPnl"] = upnl
@@ -1148,11 +1690,37 @@ class MemoryStore:
           if upnl < (ext.get("troughPnl") or float("inf")):
             ext["troughPnl"] = upnl
             ext["troughTs"] = now
+        self._update_peak_fe(ext, pos, net, now)
       for sym in list(extremes.keys()):
         if sym not in active_symbols:
           del extremes[sym]
       data["position_extremes"] = extremes
       self._write(data)
+
+  @staticmethod
+  def _update_peak_fe(ext: Dict[str, Any], pos: Dict[str, Any], net: Any, now: int) -> None:
+    """Advance (or reset) the price-space peak on ``ext`` in place. Never raises."""
+    try:
+      key = peak_fe_key(pos.get("lifecycleOpenTime"), net, pos.get("avgEntryPrice"))
+      mark = float(pos.get("markPrice"))
+      avg = float(pos.get("avgEntryPrice"))
+    except (TypeError, ValueError):
+      return
+    if key is None or not math.isfinite(mark) or mark <= 0:
+      return
+    fe = (mark - avg) if float(net) > 0 else (avg - mark)
+    if ext.get("peakFeKey") != key:
+      ext["peakFeKey"] = key
+      ext["peakFePx"] = fe
+      ext["peakFeTs"] = now
+      return
+    try:
+      prev = float(ext.get("peakFePx"))
+    except (TypeError, ValueError):
+      prev = float("-inf")
+    if not math.isfinite(prev) or fe > prev:
+      ext["peakFePx"] = fe
+      ext["peakFeTs"] = now
 
   def get_position_extremes(self, symbol: str | None = None) -> Dict[str, Any]:
     """Get peak/trough PnL extremes for open positions (or a specific symbol)."""
@@ -1306,6 +1874,18 @@ class MemoryStore:
     market_price: Any,
     setup_family: Optional[str] = None,
     taker_flow: Optional[Dict[str, Any]] = None,
+    price_source: Optional[str] = None,
+    model: Optional[str] = None,
+    confidence: Any = None,
+    min_confidence: Any = None,
+    atr15_pct: Any = None,
+    planned_entry: Any = None,
+    planned_stop: Any = None,
+    planned_tp: Any = None,
+    crossed_net_rr: Any = None,
+    lease_min: Any = None,
+    market_state: Optional[Dict[str, Any]] = None,
+    gates_passed: Any = None,
   ) -> None:
     """Record a DIRECTION CALL for edge measurement, whether or not it becomes an order.
 
@@ -1327,6 +1907,34 @@ class MemoryStore:
     `edge.taker_flow_edge_stats` can later answer whether flow agreeing with the direction separated
     the calls that worked from the ones that did not, on this venue at these horizons. Nothing reads
     it at entry time.
+
+    ``price_source`` names the market ``market_price`` was read from (``futures_mark``, or ``spot``
+    when the entry path had to fall back to the spot ticker). Settlement reads the SAME market, so the
+    perp/spot basis can never be scored as a return — see `_probe_price_source`.
+
+    ``model`` (the Azure deployment that made the call), ``confidence`` (what it stated) and
+    ``min_confidence`` (the regime-adjusted floor the call had to clear) are stamped so
+    `edge.confidence_edge_stats` can ask, per model, whether stated confidence ranks the calls at all.
+    Seven absolute confidence thresholds shape entries and none of that was measurable before
+    2026-09-25, because no probe said which model spoke or how sure it claimed to be. Recorded only;
+    nothing at entry reads them. An unusable value is dropped rather than stored as a fake number.
+
+    The execution stamps make `edge.execution_map`'s counterfactual possible — every call scored at
+    every resting depth, not only at the depth the model happened to use: ``atr15_pct`` (the 15m ATR in
+    percent, the depth unit), the planned bracket (``planned_entry`` / ``planned_stop`` / ``planned_tp``
+    — the stop distance is the call's own R), ``crossed_net_rr`` (post-cost net RR of that bracket if
+    CROSSED at ``market_price``) and ``lease_min`` (the order lease, so settlement can stamp the lease
+    low/high from 1m futures bars). All recorded only — the RR gate still decides on its own inputs.
+
+    ``market_state`` (analytics.market_state via ``sanitize_market_state``: breadth24, basket median,
+    BTC 24h/72h, BTC daily ADX + bias) lets `edge.signal_edge_stats` split the verdict by the market the
+    call was made in. No stored tag could do that before 2026-09-25. Recorded only.
+
+    ``gates_passed`` (a list of ``{'gate', 'hatch'}``; ``[]`` = the call faced no directional gate) says
+    which gates this admitted call met and which hatch let it through, so `edge.gate_scoreboard` can
+    score the hatches against calls that never faced the gate. Stored as ``gatesPassed`` only when
+    given (so legacy rows stay distinguishable from 'faced none'); unknown gates are dropped. Inert for
+    every family verdict.
     """
     try:
       px = float(market_price)
@@ -1338,22 +1946,279 @@ class MemoryStore:
     position_side = "long" if s in ("buy", "long") else ("short" if s in ("sell", "short") else None)
     if not position_side:
       return
+    ctx: Dict[str, Any] = {
+      "positionSide": position_side,
+      "marketPriceAtSignal": px,
+      "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
+      "takerFlow": _sanitize_taker_flow(taker_flow),
+      "signalProbe": {},
+    }
+    source = str(price_source or "").strip().lower()[:40]
+    if source:
+      ctx["priceSource"] = source
+    model_name = str(model or "").strip()[:80]
+    if model_name:
+      ctx["model"] = model_name
+    for key, value in (("confidence", confidence), ("minConfidence", min_confidence)):
+      try:
+        val = float(value)
+      except (TypeError, ValueError):
+        continue
+      if math.isfinite(val):
+        ctx[key] = val
+    # Prices, the ATR and the lease must be positive; a crossed net RR of 0 is real (costs ate the reward).
+    for key, value, allow_zero in (
+      ("atr15Pct", atr15_pct, False), ("plannedEntry", planned_entry, False),
+      ("plannedStop", planned_stop, False), ("plannedTp", planned_tp, False),
+      ("crossedNetRr", crossed_net_rr, True), ("leaseMin", lease_min, False),
+    ):
+      try:
+        val = float(value)
+      except (TypeError, ValueError):
+        continue
+      if math.isfinite(val) and (val > 0 or (allow_zero and val == 0)):
+        ctx[key] = val
+    state = sanitize_market_state(market_state)
+    if state:
+      ctx["marketState"] = state
+    if isinstance(gates_passed, (list, tuple)):
+      ctx["gatesPassed"] = [
+        {"gate": str(item.get("gate")), "hatch": str(item.get("hatch") or "")[:24]}
+        for item in gates_passed
+        if isinstance(item, dict) and item.get("gate") in SCORED_GATES
+      ]
     row = {
       "symbol": _normalize_symbol(symbol),
       "ts": int(time.time()),
-      "entryContext": {
-        "positionSide": position_side,
-        "marketPriceAtSignal": px,
-        "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
-        "takerFlow": _sanitize_taker_flow(taker_flow),
-        "signalProbe": {},
-      },
+      "entryContext": ctx,
     }
     with self._lock:
       data = self._read()
       data.setdefault("signal_probes", []).append(row)
       data["signal_probes"] = _trim_probes_per_family(data["signal_probes"])
       self._write(data)
+
+  @staticmethod
+  def _gate_probe_row(symbol: Any, side: Any, market_price: Any, *, kind: str, gates: list,
+                      price_source: Any = None, regime: Any = None, market_state: Any = None,
+                      now: Any = None) -> Optional[Dict[str, Any]]:
+    """One gate-probe row in the signal-probe shape (so settlement and `edge` read it unchanged), or None."""
+    try:
+      px = float(market_price)
+    except (TypeError, ValueError):
+      return None
+    if not (math.isfinite(px) and px > 0):
+      return None
+    s = str(side or "").strip().lower()
+    position_side = "long" if s in ("buy", "long") else ("short" if s in ("sell", "short") else None)
+    sym = _normalize_symbol(symbol) if symbol else ""
+    if not position_side or not sym:
+      return None
+    ctx: Dict[str, Any] = {
+      "positionSide": position_side,
+      "marketPriceAtSignal": px,
+      "gateProbe": kind,
+      "gates": [g for g in gates if g in SCORED_GATES],
+      "signalProbe": {},
+    }
+    source = str(price_source or "").strip().lower()[:40]
+    if source:
+      ctx["priceSource"] = source
+    stamp = _gate_regime_stamp(regime)
+    if stamp:
+      ctx["regime"] = stamp
+    state = sanitize_market_state(market_state)
+    if state:
+      ctx["marketState"] = state
+    try:
+      ts = int(float(now)) if now is not None else int(time.time())
+    except (TypeError, ValueError):
+      ts = int(time.time())
+    return {"symbol": sym, "ts": ts, "entryContext": ctx}
+
+  def record_gate_probe(
+    self,
+    symbol: str,
+    side: str,
+    market_price: Any,
+    gate: str,
+    *,
+    setup_family: Optional[str] = None,
+    price_source: Optional[str] = None,
+    model: Optional[str] = None,
+    confidence: Any = None,
+    regime: Optional[Dict[str, Any]] = None,
+    market_state: Optional[Dict[str, Any]] = None,
+  ) -> bool:
+    """Record a direction call a gate HARD-REFUSED, for the gate scoreboard only. Returns True if stored.
+
+    Same shape as a signal probe (base = the market price when the refusal was returned, settled on the
+    same market at the same horizons, funding credited) but in its own ``gate_probes`` bucket, which
+    ``signal_probes()`` never reads: a refused call must not move a family verdict. ``gate`` must be one
+    of ``SCORED_GATES``. ``setup_family`` is what the model declared (the scoreboard scores the call at
+    that family's horizon); ``regime`` the gate fields the refusal was decided on. Never raises.
+    """
+    try:
+      if gate not in SCORED_GATES:
+        return False
+      row = self._gate_probe_row(symbol, side, market_price, kind="refusal", gates=[gate],
+                                 price_source=price_source, regime=regime, market_state=market_state)
+      if row is None:
+        return False
+      ctx = row["entryContext"]
+      ctx["gate"] = gate
+      ctx["setupFamily"] = (str(setup_family).strip().lower() or None) if setup_family else None
+      model_name = str(model or "").strip()[:80]
+      if model_name:
+        ctx["model"] = model_name
+      try:
+        conf = float(confidence)
+        if math.isfinite(conf):
+          ctx["confidence"] = conf
+      except (TypeError, ValueError):
+        pass
+      with self._lock:
+        data = self._read()
+        data["gate_probes"] = _trim_gate_probes(list(data.get("gate_probes") or []) + [row])
+        self._write(data)
+      return True
+    except Exception as exc:
+      logger.warning("GATE PROBE LOST: %s %s refusal by %s not stored (%s)", symbol, side, gate, exc)
+      return False
+
+  def record_gate_state_probes(
+    self,
+    symbol: str,
+    market_price: Any,
+    gates_by_side: Dict[str, Any],
+    *,
+    price_source: Optional[str] = None,
+    regime: Optional[Dict[str, Any]] = None,
+    market_state: Optional[Dict[str, Any]] = None,
+    now: Any = None,
+  ) -> int:
+    """Record what the directional gates would do to a call on each side RIGHT NOW. Returns rows stored.
+
+    ``gates_by_side`` is ``{'long': [...], 'short': [...]}`` — every gate that would refuse a plain call
+    on that side (an empty list is a real row: the allowed complement the blocked rows are compared
+    with). Model-independent: written when analyze_market_context computes the gate state, whether or
+    not anything is proposed, so it sees what the model self-censors — the footprint the hard refusals
+    miss. One row per (symbol, side) per ``GATE_STATE_WINDOW_MIN``: a side that already has a row inside
+    that window is skipped, which keeps every stored row non-overlapping at every settled horizon. Both
+    sides share ONE write. Never raises.
+    """
+    try:
+      t = int(float(now)) if now is not None else int(time.time())
+      sym = _normalize_symbol(symbol) if symbol else ""
+      rows = []
+      for side in ("long", "short"):
+        gates = gates_by_side.get(side) if isinstance(gates_by_side, dict) else None
+        if not isinstance(gates, (list, tuple)):
+          continue
+        row = self._gate_probe_row(sym, side, market_price, kind="state", gates=list(gates),
+                                   price_source=price_source, regime=regime, market_state=market_state, now=t)
+        if row is not None:
+          rows.append(row)
+      if not rows:
+        return 0
+      window = int(GATE_STATE_WINDOW_MIN) * 60
+      with self._lock:
+        data = self._read()
+        existing = list(data.get("gate_probes") or [])
+        recent = {
+          r["entryContext"].get("positionSide")
+          for r in existing
+          if _gate_probe_kind(r) == "state" and r.get("symbol") == sym
+          and 0 <= t - int(r.get("ts") or 0) < window
+        }
+        fresh = [r for r in rows if r["entryContext"]["positionSide"] not in recent]
+        if not fresh:
+          return 0
+        data["gate_probes"] = _trim_gate_probes(existing + fresh)
+        self._write(data)
+      return len(fresh)
+    except Exception as exc:
+      logger.warning("GATE STATE PROBE LOST: %s not stored (%s)", symbol, exc)
+      return 0
+
+  def gate_probes(self) -> list[Dict[str, Any]]:
+    """Every retained gate-probe row (refusal and unfolded state), oldest first, as deep copies."""
+    with self._lock:
+      data = self._read()
+    rows = [copy.deepcopy(r) for r in (data.get("gate_probes") or []) if _gate_probe_kind(r)]
+    rows.sort(key=lambda r: int(r.get("ts") or 0))
+    return rows
+
+  def gate_state_days(self) -> Dict[str, Any]:
+    """The folded gate-state day cells, decoded: ``{day: {side: {horizon: [n, s, {gate: [n, s]}]}}}``.
+
+    ``day`` is the UTC day number (epoch seconds // 86400) as a string, ``s`` the SUM of the signed
+    forward returns (fractions, funding included) of the day's rows at that horizon, ``n`` their count;
+    the per-gate pair is the same over the rows that gate would have refused. Unreadable cells are
+    skipped. See `fold_settled_gate_states`.
+    """
+    with self._lock:
+      data = self._read()
+    out: Dict[str, Any] = {}
+    for key, cell in (data.get("gate_state_days") or {}).items() if isinstance(data.get("gate_state_days"), dict) else []:
+      decoded = _decode_gate_day(cell)
+      if decoded is not None:
+        out[str(key)] = decoded
+    return out
+
+  def fold_settled_gate_states(
+    self,
+    cells_fn: Callable[[list], Any],
+    horizons_min: tuple = SIGNAL_PROBE_HORIZONS_MIN,
+  ) -> int:
+    """Fold every FULLY settled gate-state row into ``gate_state_days`` and drop it. Returns rows folded.
+
+    Fully settled = every horizon in ``horizons_min`` is stamped (a price, or None once written off), so
+    a folded row can never receive a later stamp. ``cells_fn`` is `edge.gate_state_cells`, injected by
+    the poll loop so the return arithmetic and the de-overlap live only in `edge` (memory never imports
+    the scorer); it returns ``{day: {side: {horizon: [n, s, {gate: [n, s]}]}}}`` increments, which are
+    ADDED to the stored cells. Rows and cells change in one locked write, so a row is counted exactly
+    once. What is given up: a folded row cannot be re-settled later (as the Sep 25 spot->futures fix
+    re-settled signal probes); the rows it came from are settled on the futures mark from day one.
+    Never raises.
+    """
+    try:
+      keys = [f"m{int(h)}" for h in horizons_min]
+      with self._lock:
+        data = self._read()
+        rows = list(data.get("gate_probes") or [])
+        done = []
+        for r in rows:
+          if _gate_probe_kind(r) != "state":
+            continue
+          probe = r["entryContext"].get("signalProbe")
+          if isinstance(probe, dict) and all(k in probe for k in keys):
+            done.append(r)
+        if not done:
+          return 0
+        increments = cells_fn(copy.deepcopy(done)) or {}
+        stored = data.get("gate_state_days") if isinstance(data.get("gate_state_days"), dict) else {}
+        days = dict(stored)
+        for day, sides in increments.items():
+          day_cell = _decode_gate_day(days.get(str(day))) or {}
+          for side, horizons in (sides or {}).items():
+            side_cell = day_cell.setdefault(str(side), {})
+            for horizon, inc in (horizons or {}).items():
+              n0, s0, g0 = (side_cell.get(str(horizon)) or [0, 0.0, {}])[:3]
+              gates = dict(g0 or {})
+              for gate, (gn, gs) in (inc[2] or {}).items():
+                prev = gates.get(gate) or [0, 0.0]
+                gates[gate] = [int(prev[0]) + int(gn), round(float(prev[1]) + float(gs), 7)]
+              side_cell[str(horizon)] = [int(n0) + int(inc[0]), round(float(s0) + float(inc[1]), 7), gates]
+          days[str(day)] = _encode_gate_day(day_cell)
+        done_ids = {id(r) for r in done}
+        data["gate_probes"] = [r for r in rows if id(r) not in done_ids]
+        data["gate_state_days"] = _trim_gate_state_days(days)
+        self._write(data)
+      return len(done)
+    except Exception as exc:
+      logger.warning("GATE STATE FOLD failed (%s) — settled state rows wait for the next poll", exc)
+      return 0
 
   def record_macro_events(self, events: Any) -> int:
     """Replace the scheduled-macro calendar with ``events``; returns how many were stored.
@@ -1474,12 +2339,37 @@ class MemoryStore:
     setup_family: Optional[str] = None,
     closed_by: Optional[str] = None,
     regime: Optional[Dict[str, Any]] = None,
+    *,
+    fill_ts: Any = None,
+    init_risk_px: Any = None,
+    noise_band_r: Any = None,
+    hold_until_ts: Any = None,
+    entry_bias: Optional[Dict[str, Any]] = None,
+    counter_at_entry: Optional[bool] = None,
+    htf_aligned: Optional[bool] = None,
+    market_state: Optional[Dict[str, Any]] = None,
+    market_state_at_exit: Optional[Dict[str, Any]] = None,
   ) -> None:
     """Record an EARLY close so it can later be scored against the bracket it overrode.
 
     ``closed_by`` is "agent" when the model closed it and "protection" when the code's trailing stop
     or profit-lock did. Both land between the original stop and target, so both are worth scoring —
     but against different questions, and only the first is the model's decision.
+
+    Stack-replay inputs (2026-09-25): ``fill_ts``, ``init_risk_px`` (|entry - ORIGINAL stop|),
+    ``noise_band_r`` (1/stopAtrMult) and ``hold_until_ts`` (the carry hold's first settlement after the
+    fill) let main.py replay what the live exit stack — bracket + breakeven/trail + carry hold — would
+    have done had the model not closed, which is the benchmark an AGENT close is scored against
+    (``set_exit_probe_stack``); the bare bracket stays on the row for audit and for the trail's own
+    record — an agent close without a stack result is never scored on it (edge.exit_discipline_stats). ``entry_bias`` {15m, 1h, 4h, 1D}, ``counter_at_entry`` (15m AND 1h both opposed the side
+    at entry) and ``htf_aligned`` (4h AND 1D both agreed) let the scoreboard split the model's closes
+    by whether the opposition it closed on already existed when it entered — the case that lost on
+    DASH/KCS and helped on G/XMR, n=5, so the record decides, not a rule.
+
+    ``market_state`` is the ENTRY's market-state stamp (entryContext.marketState) and
+    ``market_state_at_exit`` the poll loop's reading at the close. The per-symbol ``regime`` tag read
+    'trending/strong' on every tagged trail exit, so the trail's chop row could never fill; the trail's
+    record is now also split by the entry's breadth24 tercile (trailByMarketState). Recorded only.
 
     The bot measures whether its entries predict (``signal_probes``) but never measured whether its
     *exits* helped — and the exits turned out to be the dominant behaviour: over the 2026-09-02 window
@@ -1535,6 +2425,25 @@ class MemoryStore:
       } if isinstance(regime, dict) else None,
       "outcome": {},
     }
+
+    def _pos_num(value: Any) -> Optional[float]:
+      try:
+        out = float(value)
+      except (TypeError, ValueError):
+        return None
+      return out if math.isfinite(out) and out > 0 else None
+
+    row["fillTs"] = _pos_num(fill_ts)
+    row["initRiskPx"] = _pos_num(init_risk_px)
+    row["noiseBandR"] = _pos_num(noise_band_r)
+    row["holdUntilTs"] = _pos_num(hold_until_ts)
+    row["entryBias"] = {
+      k: str(entry_bias.get(k)).lower() for k in ("15m", "1h", "4h", "1D") if entry_bias.get(k)
+    } if isinstance(entry_bias, dict) else None
+    row["counterAtEntry"] = counter_at_entry if isinstance(counter_at_entry, bool) else None
+    row["htfAligned"] = htf_aligned if isinstance(htf_aligned, bool) else None
+    row["marketState"] = sanitize_market_state(market_state)
+    row["marketStateAtExit"] = sanitize_market_state(market_state_at_exit)
     with self._lock:
       data = self._read()
       data.setdefault("exit_probes", []).append(row)
@@ -1542,17 +2451,90 @@ class MemoryStore:
         data["exit_probes"] = data["exit_probes"][-MAX_EXIT_PROBES:]
       self._write(data)
 
-  def settle_exit_probes(self, prices: Dict[str, Any], expire_hours: float = 8.0) -> int:
+  def set_exit_probe_stack(
+    self,
+    symbol: str,
+    ts: Any,
+    stack_r: Any,
+    resolved_by: Any,
+    resolved_ts: Any,
+    source: Any,
+    *,
+    pre_close_exit_suppressed: Optional[bool] = None,
+  ) -> bool:
+    """Store the live-exit-stack replay result on the exit probe ``(symbol, ts)``. Storage only.
+
+    The replay itself (protection.replay_protection_stack over 1m futures bars) runs in main.py: this
+    module must not import protection or kucoin. ``stack_r`` None with ``resolved_by`` "unavailable"
+    records that the replay could not be done — the scoreboard then falls back to the bracket for
+    that row and counts it as such. Writes once: a row that already has a stack result is left alone.
+    Returns True when a row was updated. Never raises.
+    """
+    try:
+      sym = _normalize_symbol(symbol)
+      key_ts = int(float(ts))
+    except (TypeError, ValueError):
+      return False
+    try:
+      value = float(stack_r) if stack_r is not None else None
+    except (TypeError, ValueError):
+      value = None
+    if value is not None and not math.isfinite(value):
+      value = None
+    try:
+      when = float(resolved_ts) if resolved_ts is not None else None
+    except (TypeError, ValueError):
+      when = None
+    try:
+      with self._lock:
+        data = self._read()
+        for row in data.get("exit_probes") or []:
+          if not isinstance(row, dict) or row.get("symbol") != sym or row.get("stack"):
+            continue
+          try:
+            if int(float(row.get("ts"))) != key_ts:
+              continue
+          except (TypeError, ValueError):
+            continue
+          row["stack"] = {
+            "stackR": value,
+            "resolvedBy": str(resolved_by) if resolved_by else None,
+            "resolvedTs": when,
+            "source": str(source) if source else None,
+            "scoredTs": int(time.time()),
+          }
+          if isinstance(pre_close_exit_suppressed, bool):
+            row["stack"]["preCloseExitSuppressed"] = pre_close_exit_suppressed
+          self._write(data)
+          return True
+    except Exception as exc:
+      logger.warning("EXIT PROBE stack store failed for %s @ %s (%s)", symbol, ts, exc)
+    return False
+
+  def settle_exit_probes(self, prices: Dict[str, Any], expire_hours: float = EXIT_PROBE_EXPIRE_HOURS) -> int:
     """Resolve each recorded discretionary close against what its bracket would have done.
 
-    Uses the per-poll ticker snapshot, so resolution is at poll resolution (a level crossed and
-    retraced between two polls is missed) — which biases the comparison CONSERVATIVELY toward the
-    discretionary close, since a missed touch is a bracket outcome not credited. Unresolved probes are
-    marked to market at ``expire_hours`` so a trade that simply drifted still contributes. Never raises.
+    ``prices`` must be the FUTURES MARK map: the brackets being replayed trigger on the mark
+    (stopPriceType MP), so the spot ticker is the wrong market. Until 2026-09-25 this read spot, and
+    on a coin with a wide perp/spot basis that invented bracket outcomes — ONE-USDT protection exits
+    were stored at -4.70R against -0.60R replayed on futures bars (a 09-21 probe stored as a TP one
+    minute later had in fact been stopped out on the contract).
+
+    Resolution is at poll resolution: a level crossed and retraced between two polls is missed, which
+    UNDER-credits brackets and so flatters discretionary and protection closes. A 1m replay put that
+    bias at the larger part of the stored-vs-replayed gap (-13.32R vs -16.88R over 84 probes), and a
+    per-poll mark does not remove it — treat `exitDiscipline` numbers as poll-resolution.
+
+    Unresolved probes are marked to market at ``expire_hours`` so a trade that simply drifted still
+    contributes. **A probe with no price by ``expire_hours`` + its settle tolerance is recorded as
+    ``unmeasured`` (``bracketR`` None), never resolved late**: the check used to be "any price, any
+    time", and an XMR probe from 2026-09-12 was resolved seven days later, when the ticker reappeared,
+    as if a week-later touch were the bracket's outcome. Never raises; one bad row cannot stop the rest.
     """
-    if not prices:
-      return 0
+    prices = prices or {}
     now = int(time.time())
+    expire_sec = int(float(expire_hours) * 3600)
+    stale_after = expire_sec + _probe_settle_tolerance_sec(float(expire_hours) * 60.0)
     settled = 0
     with self._lock:
       data = self._read()
@@ -1562,38 +2544,122 @@ class MemoryStore:
         outcome = row.get("outcome")
         if not isinstance(outcome, dict) or outcome.get("resolved"):
           continue
-        px = prices.get(row.get("symbol"))
-        px = getattr(px, "price", px)
         try:
-          px = float(px)
-        except (TypeError, ValueError):
-          continue
-        if px <= 0:
-          continue
-        try:
-          e = float(row["entryPrice"]); sl = float(row["stopPrice"]); tp = float(row["takeProfitPrice"])
-        except (TypeError, ValueError, KeyError):
-          continue
-        risk = abs(e - sl)
-        if risk <= 0:
-          continue
-        long_side = row.get("positionSide") == "long"
-        hit_tp = px >= tp if long_side else px <= tp
-        hit_sl = px <= sl if long_side else px >= sl
-        if hit_tp:
-          outcome.update({"resolved": "take_profit", "bracketR": abs(tp - e) / risk})
-        elif hit_sl:
-          outcome.update({"resolved": "stop", "bracketR": -1.0})
-        elif now >= int(row.get("ts") or now) + int(expire_hours * 3600):
-          mark = (px - e) / risk if long_side else (e - px) / risk
-          outcome.update({"resolved": "expired", "bracketR": mark})
-        else:
-          continue
-        outcome["resolvedTs"] = now
-        settled += 1
+          ts0 = int(row.get("ts") or now)
+          if now - ts0 > stale_after:
+            # Its measurable life is over with no in-window price: honestly unknown. A later price
+            # says nothing about which leg the bracket would have hit first.
+            outcome.update({"resolved": "unmeasured", "bracketR": None, "resolvedTs": now,
+                            "priceSource": EXIT_PROBE_PRICE_SOURCE})
+            settled += 1
+            continue
+          px = _price_from(prices, row.get("symbol"))
+          if px is None:
+            continue
+          try:
+            e = float(row["entryPrice"]); sl = float(row["stopPrice"]); tp = float(row["takeProfitPrice"])
+          except (TypeError, ValueError, KeyError):
+            continue
+          risk = abs(e - sl)
+          if risk <= 0:
+            continue
+          long_side = row.get("positionSide") == "long"
+          hit_tp = px >= tp if long_side else px <= tp
+          hit_sl = px <= sl if long_side else px >= sl
+          if hit_tp:
+            outcome.update({"resolved": "take_profit", "bracketR": abs(tp - e) / risk})
+          elif hit_sl:
+            outcome.update({"resolved": "stop", "bracketR": -1.0})
+          elif now >= ts0 + expire_sec:
+            mark = (px - e) / risk if long_side else (e - px) / risk
+            outcome.update({"resolved": "expired", "bracketR": mark})
+          else:
+            continue
+          outcome["resolvedTs"] = now
+          # Which market resolved it: the futures mark. Outcomes WITHOUT this stamp were resolved on the
+          # spot ticker before 2026-09-25 (ONE-USDT protection exits: -4.70R stored vs -0.60R on
+          # futures) and are the ones scripts/resettle_probes_futures.py re-resolves — re-run safe.
+          outcome["priceSource"] = EXIT_PROBE_PRICE_SOURCE
+          settled += 1
+        except Exception as exc:
+          logger.warning("EXIT PROBE settle failed for %s (%s) — other probes unaffected",
+                         row.get("symbol"), exc)
       if settled:
         self._write(data)
     return settled
+
+  def symbols_due_for_settlement(
+    self,
+    now: Optional[float] = None,
+    horizons_min: tuple = SIGNAL_PROBE_HORIZONS_MIN,
+    expire_hours: float = EXIT_PROBE_EXPIRE_HOURS,
+  ) -> set:
+    """Symbols that need a FUTURES MARK this poll for some probe to settle (``settlement_cutoffs``' keys)."""
+    return set(self.settlement_cutoffs(now, horizons_min=horizons_min, expire_hours=expire_hours))
+
+  def settlement_cutoffs(
+    self,
+    now: Optional[float] = None,
+    horizons_min: tuple = SIGNAL_PROBE_HORIZONS_MIN,
+    expire_hours: float = EXIT_PROBE_EXPIRE_HOURS,
+  ) -> Dict[str, float]:
+    """``{symbol: cutoff_ts}`` for every symbol that needs a FUTURES MARK this poll for some probe to settle.
+
+    That is: a futures-based signal probe with a horizon due now and still inside its settle tolerance,
+    or an exit probe that is unresolved and still inside its measurable life. The poll loop fetches a
+    mark for exactly these, so settlement costs a handful of small public calls rather than one
+    1.4 MB ``/contracts/active`` pull every minute. Spot-based probes are left out — they settle from
+    the spot snapshot the loop already holds. ``cutoff_ts`` is the EARLIEST moment one of that symbol's
+    due rows is written off as unmeasured, so the loop can spend a limited per-poll I/O budget on the
+    measurements that would otherwise be lost first (signal/gate horizons before 8h exit probes) and
+    cap a failing symbol's backoff at its remaining tolerance (2026-09-25 review). Never raises.
+    """
+    t = int(time.time()) if now is None else int(now)
+    stale_after = int(float(expire_hours) * 3600) + _probe_settle_tolerance_sec(float(expire_hours) * 60.0)
+    out: Dict[str, float] = {}
+
+    def _keep(symbol: Any, cutoff: float) -> None:
+      if symbol:
+        out[symbol] = min(float(cutoff), out.get(symbol, float("inf")))
+
+    with self._lock:
+      data = self._read()
+      # Gate probes settle exactly like signal probes (their own bucket, the same horizons and market).
+      for row in (list(data.get("trades") or []) + list(data.get("signal_probes") or [])
+                  + list(data.get("gate_probes") or [])):
+        try:
+          if not isinstance(row, dict):
+            continue
+          ctx = row.get("entryContext")
+          if not isinstance(ctx, dict) or not ctx.get("marketPriceAtSignal"):
+            continue
+          if _probe_price_source(ctx) == "spot":
+            continue
+          probe = ctx.get("signalProbe") if isinstance(ctx.get("signalProbe"), dict) else {}
+          ts0 = int(row.get("ts") or 0)
+          for horizon in horizons_min:
+            due_at = ts0 + int(horizon) * 60
+            if f"m{int(horizon)}" in probe:
+              continue
+            cutoff = due_at + _probe_settle_tolerance_sec(horizon)
+            if due_at <= t <= cutoff:
+              _keep(row.get("symbol"), cutoff)
+              break
+        except Exception:
+          continue
+      for row in data.get("exit_probes") or []:
+        try:
+          if not isinstance(row, dict):
+            continue
+          outcome = row.get("outcome")
+          if not isinstance(outcome, dict) or outcome.get("resolved"):
+            continue
+          ts0 = int(row.get("ts") or t)
+          if t - ts0 <= stale_after:
+            _keep(row.get("symbol"), ts0 + stale_after)
+        except Exception:
+          continue
+    return out
 
   def exit_probes(self, limit: int = 200) -> list[Dict[str, Any]]:
     """Recorded discretionary closes, newest last."""
@@ -1606,6 +2672,10 @@ class MemoryStore:
     self,
     prices: Dict[str, Any],
     horizons_min: tuple = SIGNAL_PROBE_HORIZONS_MIN,
+    *,
+    spot_prices: Optional[Dict[str, Any]] = None,
+    funding_received: Optional[Callable[[str, str, float, float], Any]] = None,
+    lease_extremes: Optional[Callable[[str, float, float], Any]] = None,
   ) -> int:
     """Stamp the forward price on any entry signal whose measurement horizon has elapsed.
 
@@ -1620,8 +2690,31 @@ class MemoryStore:
     edge, and significantly negative in the dominant configuration. Storing the probe makes that
     measurable continuously and in-process, so a future model that genuinely predicts will show it.
 
-    Cheap by construction: it reuses the per-poll ticker snapshot, writes only when a horizon elapses,
-    and never raises. Returns the number of probes settled.
+    **Each row settles from the SAME market its base price came from** (`_probe_price_source`):
+    ``prices`` is the FUTURES MARK map, ``spot_prices`` the spot snapshot for the rare row whose base
+    fell back to spot. There is no cross-market fallback in either direction — a row whose market has
+    no price this poll waits, and the tolerance rule below writes it off if the price never comes.
+    Settling futures-based probes on the spot ticker (the code until 2026-09-25) scored the perp/spot
+    basis as prediction: +1.68% mean / +0.16% median phantom return on `funding_carry` at its 60m
+    horizon, ~0 on every other family, and enough to hold the family at full size on a record of
+    -0.04R over 18 real closes.
+
+    ``funding_received(symbol, side, t0, t1)`` credits the funding the position would have been paid
+    over the window (see `funding_received_from_history`); it is stamped as ``f{h}`` beside ``m{h}``
+    and `edge` adds it to the signed return. It is called OUTSIDE the store lock (it may hit the
+    network). The price stamp never waits on it. **Unknown is kept apart from zero** (2026-09-25
+    review): when a lookup fails, ``f{h}`` is written as None (with ``t{h}``, the time the price was
+    observed) instead of being left absent — absent used to score as zero, and since a stamped horizon
+    is never due again the credit was lost for good (a 1h carry at -0.2%/settlement lost ~0.8% of return
+    per affected probe at 240m, always biasing carry DOWN). A None credit is re-asked on later polls
+    until ``_funding_backfill_window_sec`` and overwritten with the exact history value; past that it
+    stays None ("never known"), which `edge` skips for funding_carry rather than counting as zero.
+    Legacy rows and calls without ``funding_received`` are unchanged (absent = zero).
+
+    Cheap by construction: writes only when a horizon elapses, and never raises — a malformed row is
+    logged at WARNING and skipped, so one bad row cannot starve every other probe of its settlement
+    (a silent probe outage froze every edge verdict for 2.6 days in 2026-09). Returns the number of
+    stamps written.
 
     **A horizon that elapsed long ago is recorded as unmeasurable (``None``), never back-stamped.**
     The check used to be "has the horizon passed?", which silently means "stamp today's price on
@@ -1631,40 +2724,155 @@ class MemoryStore:
     probes with the current price and labelled a multi-day return as a five-minute one. ``None`` is
     the honest record of a measurement that was missed, and `edge` already skips it; writing it once
     also stops the horizon being retried forever.
+
+    ``lease_extremes(symbol, t0, t1)`` returns the ``(low, high)`` the contract traded over a probe's
+    order lease (1m FUTURES bars, column order asserted by the caller) or None when unknown. Once a
+    probe's lease has elapsed it is stamped ``leaseLow`` / ``leaseHigh`` — what `edge.execution_map`
+    needs to say whether a limit at ANY depth would have filled — and a probe whose bars never came
+    within `_lease_settle_tolerance_sec` is stamped None and never back-filled. Only dedicated probe
+    rows that recorded ``leaseMin`` qualify. Fetched outside the lock, like the funding credit.
     """
-    if not prices:
-      return 0
     now = int(time.time())
+
+    def _rows(data: Dict[str, Any]) -> list:
+      # Gate probes (report-only, see record_gate_probe) are stamped by the same rule on the same market;
+      # they live in their own bucket so `signal_probes()` and every family verdict never see them.
+      return (list(data.get("trades") or []) + list(data.get("signal_probes") or [])
+              + list(data.get("gate_probes") or []))
+
+    # Phase 1 (read-only): which price stamps and lease extremes are due, so their network lookups can
+    # run without holding the store lock.
+    credits: Dict[tuple, float] = {}
+    backfills: Dict[tuple, float] = {}
+    leases: Dict[tuple, tuple] = {}
+    if funding_received is not None or lease_extremes is not None:
+      wanted: list[tuple] = []
+      wanted_backfill: list[tuple] = []
+      wanted_leases: list[tuple] = []
+      with self._lock:
+        data = self._read()
+        if funding_received is not None:
+          for row in _rows(data):
+            try:
+              for _key, horizon, px in _signal_stamps_due(row, prices, spot_prices, horizons_min, now):
+                if px is not None:
+                  wanted.append((row.get("symbol"), row["entryContext"].get("positionSide"),
+                                 int(row.get("ts") or 0), int(horizon)))
+              for horizon, t_end in _credit_backfills_due(row, now, horizons_min):
+                wanted_backfill.append((row.get("symbol"), row["entryContext"].get("positionSide"),
+                                        int(row.get("ts") or 0), int(horizon), t_end))
+            except Exception:
+              continue    # phase 3 re-walks the row and logs it
+        if lease_extremes is not None:
+          for row in data.get("signal_probes") or []:
+            try:
+              if _lease_stamp_due(row, now) == "fetch":
+                t0, t1 = _lease_window(row)
+                wanted_leases.append((row.get("symbol"), int(row.get("ts") or 0), t0, t1))
+            except Exception:
+              continue
+      # Phase 2: the funding credit and the lease extremes, outside the lock.
+      for symbol, side, ts0, horizon in wanted:
+        try:
+          value = funding_received(symbol, side, ts0, now)
+          value = float(value) if value is not None else None
+        except Exception as exc:
+          logger.warning("PROBE FUNDING credit unavailable for %s (%s) — f%dm recorded unknown, backfilled later",
+                         symbol, exc, horizon)
+          continue
+        if value is not None and math.isfinite(value):
+          # Keyed by SIDE too: a gate-state reading writes a long and a short row at the same instant,
+          # and their credits have opposite signs.
+          credits[(symbol, side, ts0, horizon)] = value
+      for symbol, side, ts0, horizon, t_end in wanted_backfill:
+        try:
+          value = funding_received(symbol, side, ts0, t_end)
+          value = float(value) if value is not None else None
+        except Exception as exc:
+          logger.warning("PROBE FUNDING backfill unavailable for %s (%s) — f%dm stays unknown for now",
+                         symbol, exc, horizon)
+          continue
+        if value is not None and math.isfinite(value):
+          backfills[(symbol, side, ts0, horizon)] = value
+      for symbol, ts0, t0, t1 in wanted_leases:
+        try:
+          got = lease_extremes(symbol, t0, t1)
+          if got is None:
+            continue
+          low, high = float(got[0]), float(got[1])
+        except Exception as exc:
+          logger.warning("PROBE LEASE extremes unavailable for %s (%s) — retried until its tolerance", symbol, exc)
+          continue
+        if math.isfinite(low) and math.isfinite(high) and 0 < low <= high:
+          leases[(symbol, ts0)] = (low, high)
+
+    # Phase 3: stamp, under the lock, re-reading in case another writer ran in between.
     settled = 0
     with self._lock:
       data = self._read()
-      for row in list(data.get("trades") or []) + list(data.get("signal_probes") or []):
-        if not isinstance(row, dict):
-          continue
-        ctx = row.get("entryContext")
-        if not isinstance(ctx, dict) or not ctx.get("marketPriceAtSignal"):
-          continue
-        probe = ctx.setdefault("signalProbe", {})
-        ts0 = row.get("ts") or 0
-        for horizon in horizons_min:
-          key = f"m{int(horizon)}"
-          due_at = ts0 + int(horizon) * 60
-          if key in probe or now < due_at:
+      for row in _rows(data):
+        try:
+          stamps = _signal_stamps_due(row, prices, spot_prices, horizons_min, now)
+          if not stamps:
             continue
-          if now - due_at > _probe_settle_tolerance_sec(horizon):
-            probe[key] = None
+          ctx = row["entryContext"]
+          if not isinstance(ctx.get("signalProbe"), dict):
+            ctx["signalProbe"] = {}
+          probe = ctx["signalProbe"]
+          ts0 = int(row.get("ts") or 0)
+          for key, horizon, px in stamps:
+            probe[key] = px
             settled += 1
-            continue
-          px = prices.get(row.get("symbol"))
-          px = getattr(px, "price", px)
+            credit = (credits.get((row.get("symbol"), ctx.get("positionSide"), ts0, int(horizon)))
+                      if px is not None else None)
+            if credit is not None:
+              probe[f"f{int(horizon)}"] = credit
+            elif px is not None and funding_received is not None:
+              # Unknown, NOT zero: kept apart on disk and backfilled on a later poll (see docstring).
+              probe[f"f{int(horizon)}"] = None
+              probe[f"t{int(horizon)}"] = now
+        except Exception as exc:
+          logger.warning("SIGNAL PROBE settle failed for %s (%s) — other probes unaffected",
+                         row.get("symbol") if isinstance(row, dict) else "?", exc)
+      if backfills:
+        for row in _rows(data):
           try:
-            px = float(px)
-          except (TypeError, ValueError):
-            continue
-          if px <= 0:
-            continue
-          probe[key] = px
-          settled += 1
+            if not isinstance(row, dict):
+              continue
+            ctx = row.get("entryContext")
+            probe = ctx.get("signalProbe") if isinstance(ctx, dict) else None
+            if not isinstance(probe, dict):
+              continue
+            ts0 = int(row.get("ts") or 0)
+            for horizon in horizons_min:
+              h = int(horizon)
+              value = backfills.get((row.get("symbol"), ctx.get("positionSide"), ts0, h))
+              if value is None or f"f{h}" not in probe or probe.get(f"f{h}") is not None:
+                continue
+              probe[f"f{h}"] = value
+              probe.pop(f"t{h}", None)
+              settled += 1
+          except Exception as exc:
+            logger.warning("PROBE FUNDING backfill stamp failed for %s (%s) — other probes unaffected",
+                           row.get("symbol") if isinstance(row, dict) else "?", exc)
+      if lease_extremes is not None:
+        for row in data.get("signal_probes") or []:
+          try:
+            status = _lease_stamp_due(row, now)
+            if status is None:
+              continue
+            ctx = row["entryContext"]
+            if status == "missed":
+              ctx["leaseLow"] = ctx["leaseHigh"] = None
+              settled += 1
+              continue
+            got = leases.get((row.get("symbol"), int(row.get("ts") or 0)))
+            if got is not None:
+              ctx["leaseLow"], ctx["leaseHigh"] = got
+              settled += 1
+          except Exception as exc:
+            logger.warning("PROBE LEASE stamp failed for %s (%s) — other probes unaffected",
+                           row.get("symbol") if isinstance(row, dict) else "?", exc)
       if settled:
         self._write(data)
     return settled
@@ -1677,6 +2885,9 @@ class MemoryStore:
     per family, so a second truncation at read time can only throw away evidence the writer chose to
     keep. This union also returns MORE rows than ``MAX_SIGNAL_PROBES`` (it folds in legacy
     trades-derived rows), so passing that constant as the limit quietly dropped the oldest of them.
+
+    ``gate_probes`` are deliberately NOT part of this union: a call a gate refused, or a side the model
+    never proposed, is gate-scoreboard evidence only and must never move a family verdict or its stake.
     """
     with self._lock:
       data = self._read()
@@ -1697,6 +2908,17 @@ class MemoryStore:
     out.sort(key=lambda r: int(r.get("ts") or 0))
     lim = int(limit or 0)
     return out if lim <= 0 else out[-lim:]
+
+  def limit_entry_records(self) -> list[Dict[str, Any]]:
+    """Every retained bot-placed limit entry, filled or not, oldest→newest (deep copies).
+
+    Exactly the records ``performanceSummary.limitFillRate`` counts — same prune, same predicate — so
+    `edge.execution_map` built from these reproduces that rate in its ``totals`` by construction.
+    """
+    with self._lock:
+      data = self._prune(self._read())
+      rows = [copy.deepcopy(t) for t in (data.get("trades") or []) if is_limit_entry_record(t)]
+    return rows
 
   def recent_fills(self, limit: int = 100) -> list[Dict[str, Any]]:
     """Recent FILLED entry orders, oldest→newest — the sample the friction estimate calibrates on.
@@ -2148,10 +3370,7 @@ class MemoryStore:
     submissions = [trade for trade in all_trade_records if trade.get("filled") is False]
 
     def _limit_execution_stats(records: list[Dict[str, Any]]) -> Dict[str, Any]:
-      limit_records = [
-        trade for trade in records
-        if str(trade.get("clientOid") or "").startswith("traide-entry-")
-      ]
+      limit_records = [trade for trade in records if is_limit_entry_record(trade)]
       filled_limits = [trade for trade in limit_records if trade.get("filled") is True]
       return {
         "limitOrdersSubmitted": len(limit_records),

@@ -18,3 +18,19 @@ import os
 
 os.environ.setdefault("_TRAIDE_REAL_LOG_FILE", os.environ.get("LOG_FILE", ""))
 os.environ["LOG_FILE"] = ""
+
+# The six variables `config.validate_config` requires, forced to dummies BEFORE any `src` import
+# (2026-09-25 review). Many harnesses call `load_config()`, so on a clean checkout / fresh VM with no
+# `.env` 68 tests failed on 'Missing required configuration', and on the dev machine every test cfg
+# carried the REAL KuCoin/Azure keys. Assigned (not setdefault): `load_dotenv()` never overrides a
+# variable that is already set, so the real secrets never enter the test process. Tests use fakes only;
+# nothing may reach the network with these anyway.
+TEST_REQUIRED_ENV = {
+  "AZURE_OPENAI_ENDPOINT": "https://test.invalid",
+  "AZURE_OPENAI_API_KEY": "test",
+  "KUCOIN_API_KEY": "test",
+  "KUCOIN_API_SECRET": "test",
+  "KUCOIN_API_PASSPHRASE": "test",
+  "COINS": "BTC-USDT",
+}
+os.environ.update(TEST_REQUIRED_ENV)

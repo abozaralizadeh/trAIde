@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -391,6 +392,11 @@ class KucoinClient:
     # API returns list of [time, open, close, high, low, volume, turnover].
     return data
 
+  def list_symbols(self) -> list[Dict[str, Any]]:
+    """Every spot symbol with its trading flags (public /api/v2/symbols; ~0.7MB — callers cache it)."""
+    data = self._request("GET", "/api/v2/symbols")
+    return data if isinstance(data, list) else []
+
   def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
     """Fetch symbol details (baseIncrement, quoteIncrement, baseMinSize, etc.)."""
     data = self._request("GET", "/api/v2/symbols", query={"symbol": symbol})
@@ -640,6 +646,18 @@ class KucoinFuturesClient:
     self.api_passphrase = cfg.kucoin.passphrase.encode("utf-8")
     self.base_url = cfg.kucoin_futures.base_url.rstrip("/")
     self._time_offset_ms = 0
+    self._timeout = 15.0
+
+  def with_timeout(self, seconds: float) -> "KucoinFuturesClient":
+    """A shallow copy whose requests use ``seconds`` as the HTTP timeout (the original keeps 15s).
+
+    For the poll loop's MEASUREMENT reads only (probe marks, funding history, 1m bars, the carry clock):
+    they run on the survival thread, so a hanging public endpoint must cost a few seconds there, not
+    the 15s an order or position call is allowed (2026-09-25 review). Never used for order paths.
+    """
+    clone = copy.copy(self)
+    clone._timeout = max(0.5, float(seconds))
+    return clone
 
   def _timestamp_ms(self) -> int:
     return int(time.time() * 1000 + self._time_offset_ms)
@@ -677,14 +695,15 @@ class KucoinFuturesClient:
     if auth:
       headers.update(self._sign_headers(method, full_path, body))
 
-    response = requests.request(method, url, headers=headers, json=body, timeout=15)
+    timeout = getattr(self, "_timeout", 15.0)
+    response = requests.request(method, url, headers=headers, json=body, timeout=timeout)
     if not response.ok:
       if response.status_code == 400 and "Invalid KC-API-TIMESTAMP" in response.text:
         self._sync_time()
         headers = {"Content-Type": "application/json"}
         if auth:
           headers.update(self._sign_headers(method, full_path, body))
-        response = requests.request(method, url, headers=headers, json=body, timeout=15)
+        response = requests.request(method, url, headers=headers, json=body, timeout=timeout)
       if not response.ok:
         raise RuntimeError(f"Kucoin Futures HTTP {response.status_code}: {response.text}")
 

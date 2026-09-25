@@ -799,13 +799,15 @@ def test_trail_without_a_noise_band_is_unchanged():
 
 def _restart_snap(*, stop_price, mark=108.0):
   """A long from 100 whose live stop sits at `stop_price`. After a breakeven ratchet that stop is
-  ABOVE entry, which is exactly the case the live capture cannot handle on a fresh process."""
+  ABOVE entry, which is exactly the case the live capture cannot handle on a fresh process.
+  ETHUSDTM's real contract multiplier is 0.01 ETH, so USD PnL = move x contracts x 0.01 (the fixture
+  used to imply multiplier 1, which hid that pnl/contracts is not a price)."""
   return SimpleNamespace(
     futures_enabled=True,
     futures_account={"accountEquity": 1000},
     futures_positions=[{
       "symbol": "ETHUSDTM", "currentQty": 5, "avgEntryPrice": 100.0,
-      "markPrice": mark, "unrealisedPnl": (mark - 100.0) * 5,
+      "markPrice": mark, "unrealisedPnl": (mark - 100.0) * 5 * 0.01,
       "openingTimestamp": 1000,
     }],
     futures_stop_orders=[{
@@ -863,13 +865,397 @@ def test_junk_context_values_never_seed_anything():
     assert "ETHUSDTM" not in mgr._init_risk
 
 
-def test_trade_context_seeds_peak_only_for_the_current_lifecycle():
-  """Structural guard on the main.py lookup: a PREVIOUS lifecycle's peak on the same symbol must not
-  be handed to a new position. The lookup keys the recorded extremes on openTime:side."""
-  from pathlib import Path
-  src = Path(__file__).resolve().parents[1].joinpath("src", "main.py").read_text()
-  i = src.find("def _trade_context(")
-  body = src[i:i + 3000]
-  assert 'ext.get("lifecycleKey") == key' in body
-  assert 'key = f"{opened}:{side}"' in body
-  assert '"initRiskPx"' in body and '"peakFePx"' in body
+# --- restart-safe trail peak through the REAL writer, lookup and manager (2026-09-25) -------------
+#
+# The Sep 22 seed never fired: the lookup keyed on KuCoin's raw positionSide ('BOTH') while the writer
+# stored 'long'/'short', and its value was peakPnl/|contracts| = price x contract MULTIPLIER. Its only
+# test grepped source strings, which both bugs passed. Everything below executes the production
+# path — main._live_extremes_map -> MemoryStore.update_position_extremes (writer), then
+# main._make_trade_context_lookup -> position_context.trade_context (reader) inside
+# ProtectionManager.run — on exchange-shaped payloads, in the loop's own order (writer, then manager).
+
+_FSYM = "HUSDTM"
+_OPENED = 1790252000000
+
+
+def _book_snap(*, qty, entry, mark, stop, mult=10.0, opened=_OPENED, side_field="BOTH"):
+  """One live position as KuCoin returns it: positionSide 'BOTH' (one-way mode), USD PnL scaled by the
+  contract multiplier, and its reduce-only loss-side stop."""
+  is_long = qty > 0
+  return SimpleNamespace(
+    futures_enabled=True,
+    futures_account={"accountEquity": 1000},
+    total_usdt=1000,
+    futures_positions=[{
+      "symbol": _FSYM, "currentQty": qty, "avgEntryPrice": entry, "markPrice": mark,
+      "unrealisedPnl": (mark - entry) * qty * mult, "openingTimestamp": opened,
+      "positionSide": side_field,
+    }],
+    futures_stop_orders=[{
+      "symbol": _FSYM, "side": "sell" if is_long else "buy", "stop": "down" if is_long else "up",
+      "stopPrice": stop, "reduceOnly": True,
+    }],
+  )
+
+
+def _record_entry(store, *, side="long", entry=1.0, stop=0.98, opened=_OPENED, atr_mult=2.0):
+  """The filled entry behind the position, so the lookup can restore its 1R anchor after a restart."""
+  store.record_trade(
+    "H-USDT", "buy" if side == "long" else "sell", 5.0, price=entry, venue="futures",
+    entry_context={"positionSide": side, "entryPrice": entry, "stopLossPrice": stop,
+                   "stopAtrMult": atr_mult, "setupFamily": "continuation"},
+  )
+  data = store._read()
+  data["trades"][-1]["fillTs"] = opened // 1000
+  store._write(data)
+
+
+def _live_lookup_mgr(store):
+  from src.main import _make_trade_context_lookup
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True, dry_run=True)
+  return ProtectionManager(cfg, SimpleNamespace(), trade_context_lookup=_make_trade_context_lookup(store, None))
+
+
+def _drive(monkeypatch, store, steps, *, restart_at=None):
+  """Run the loop's order per poll (writer, then manager) over ``steps`` = [(qty, entry, mark)], moving
+  the exchange stop exactly as the manager decides. A restart replaces the manager (empty in-process
+  state) and keeps the memory file, as a real deploy does. Returns (decisions, final manager)."""
+  import src.protection as prot
+  from src.main import _live_extremes_map
+  captured = []
+  real = prot.decide_protection
+
+  def _capture(**kwargs):
+    out = real(**kwargs)
+    captured.append(out)
+    return out
+
+  monkeypatch.setattr(prot, "decide_protection", _capture)
+  mgr = _live_lookup_mgr(store)
+  stop = 0.98
+  decisions = []
+  for i, (qty, entry, mark) in enumerate(steps):
+    if restart_at is not None and i == restart_at:
+      mgr = _live_lookup_mgr(store)
+    snap = _book_snap(qty=qty, entry=entry, mark=mark, stop=stop)
+    store.update_position_extremes(_live_extremes_map(snap))
+    captured.clear()
+    mgr.run(snap)
+    d = dict(captured[-1]) if captured else {"action": "skipped"}
+    decisions.append((d["action"], d.get("stopPrice"), d.get("reason")))
+    if d["action"] == "move_breakeven":
+      stop = float(d["stopPrice"])
+    if d["action"] == "close":
+      break
+  return decisions, mgr
+
+
+# A long from 1.000, stop 0.980 (1R = 0.020), three contracts of multiplier 10. It ratchets, peaks at
+# +1.1R (1.022) with the last +0.2R of lock still unplaced (under the 0.25R min step), then retraces to
+# 1.011 — through the lock the uninterrupted manager computes from the true peak.
+_PATH = [(3, 1.0, m) for m in (1.000, 1.006, 1.012, 1.018, 1.022, 1.016, 1.021, 1.011)]
+_RESTART = 5   # the process restarts after the 1.022 peak
+
+
+def test_restart_plus_seed_gives_the_same_decisions_as_an_uninterrupted_manager(tmp_path, monkeypatch):
+  """The criterion is 'a restart must be invisible'. Without a working seed, the fresh process
+  measures its peak from 1.016 and keeps the position open at 1.011 that the uninterrupted manager
+  closes; with it, every decision — action, stop and reason text (which prints the peak) — matches."""
+  from src.memory import MemoryStore
+  straight_store = MemoryStore(str(tmp_path / "straight.json"))
+  _record_entry(straight_store)
+  straight, _ = _drive(monkeypatch, straight_store, _PATH)
+  restarted_store = MemoryStore(str(tmp_path / "restarted.json"))
+  _record_entry(restarted_store)
+  restarted, mgr = _drive(monkeypatch, restarted_store, _PATH, restart_at=_RESTART)
+  assert straight[-1][0] == "close" and "trailing stop hit" in straight[-1][2], straight
+  assert restarted == straight
+  assert mgr._peak_fe[_FSYM] == pytest.approx(0.022)
+
+
+def test_a_restart_on_a_multiplier_10_contract_seeds_exactly_the_true_price_peak(tmp_path, monkeypatch):
+  """positionSide 'BOTH' still matches, and the seed is the PRICE excursion (0.022), not the old
+  peakPnl/contracts (= 0.022 x multiplier 10 = 0.22), which would have market-closed the winner."""
+  from src.main import _live_extremes_map
+  from src.memory import MemoryStore
+  store = MemoryStore(str(tmp_path / "m.json"))
+  _record_entry(store)
+  _drive(monkeypatch, store, _PATH[:_RESTART])
+  ext = store.get_position_extremes("H-USDT")
+  assert ext["peakFePx"] == pytest.approx(0.022)
+  assert ext["peakPnl"] / 3 == pytest.approx(0.22), "sanity: the old USD/contracts conversion is 10x"
+  fresh = _live_lookup_mgr(store)
+  snap = _book_snap(qty=3, entry=1.0, mark=1.016, stop=1.008)
+  store.update_position_extremes(_live_extremes_map(snap))
+  fresh.run(snap)
+  assert fresh._peak_fe[_FSYM] == pytest.approx(0.022)
+
+
+def test_ordinary_polls_never_inflate_the_peak(tmp_path, monkeypatch):
+  """With no restart, the in-process peak is exactly the running max of (mark - entry) — on every
+  poll, on a multiplier-10 contract — whatever the recorder holds."""
+  from src.memory import MemoryStore
+  store = MemoryStore(str(tmp_path / "m.json"))
+  _record_entry(store)
+  from src.main import _live_extremes_map
+  mgr = _live_lookup_mgr(store)
+  running = float("-inf")
+  for _, _, mark in _PATH[:-1]:
+    snap = _book_snap(qty=3, entry=1.0, mark=mark, stop=0.98)
+    store.update_position_extremes(_live_extremes_map(snap))
+    mgr.run(snap)
+    running = max(running, mark - 1.0)
+    assert mgr._peak_fe[_FSYM] == pytest.approx(running)
+
+
+def test_the_seed_applies_only_on_the_first_sighting_of_a_lifecycle():
+  """Seeding every poll is the channel through which a unit or key bug becomes a market close. A
+  lookup that starts offering a (bogus) larger peak on a LATER poll must be ignored."""
+  offers = iter([{}, {"peakFePx": 50.0}, {"peakFePx": 50.0}])
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5, trail_enabled=True, dry_run=True)
+  mgr = ProtectionManager(cfg, SimpleNamespace(), trade_context_lookup=lambda f, p: next(offers))
+  for _ in range(3):
+    actions = mgr.run(_restart_snap(stop_price=92.0, mark=101.0))
+    assert not any(a.get("action") == "close" for a in actions), actions
+  assert mgr._peak_fe["ETHUSDTM"] == pytest.approx(1.0)
+
+
+def test_a_partial_reduction_does_not_seed_above_the_post_reset_peak(tmp_path, monkeypatch):
+  """WIF 2026-09-23 closed in three chunks. The lifecycleKey (openTime:side) survives a reduction, so
+  a peak keyed only on it — or the USD peak / the SMALLER current size — hands the reset manager a peak
+  it deliberately threw away (a 0.53R true peak re-seeded as 1.06R closed at +0.38R in replay)."""
+  from src.memory import MemoryStore
+  store = MemoryStore(str(tmp_path / "m.json"))
+  _record_entry(store)
+  steps = [(2, 1.0, 1.000), (2, 1.0, 1.018), (1, 1.0, 1.010), (1, 1.0, 1.012)]
+  _, live = _drive(monkeypatch, store, steps)
+  assert live._peak_fe[_FSYM] == pytest.approx(0.012)          # in-process: reset at the reduction
+  assert store.get_position_extremes("H-USDT")["peakFePx"] == pytest.approx(0.012)
+  _, restarted = _drive(monkeypatch, store, steps[-1:])
+  assert restarted._peak_fe[_FSYM] == pytest.approx(0.012), "must not re-seed the pre-reduction 0.018"
+
+
+def test_an_add_on_does_not_re_seed_the_old_peak(tmp_path, monkeypatch):
+  """An add-on moves avgEntry; ProtectionManager resets because 'keeping the prior peak against a
+  changed average entry can immediately produce a false give-back'. The recorder must reset with it."""
+  from src.memory import MemoryStore
+  store = MemoryStore(str(tmp_path / "m.json"))
+  _record_entry(store)
+  steps = [(1, 1.0, 1.000), (1, 1.0, 1.018), (2, 1.009, 1.018), (2, 1.009, 1.016)]
+  _, live = _drive(monkeypatch, store, steps)
+  assert live._peak_fe[_FSYM] == pytest.approx(0.009)
+  _, restarted = _drive(monkeypatch, store, [(2, 1.009, 1.015)])
+  assert restarted._peak_fe[_FSYM] == pytest.approx(0.009)
+
+
+def test_a_flip_does_not_carry_the_old_sides_peak(tmp_path):
+  """Even with the SAME openingTimestamp (the adversarial case), a long's peak must never seed the
+  short that replaces it: side is part of the key, derived from the sign of qty."""
+  from src.memory import MemoryStore
+  from src.main import _live_extremes_map
+  store = MemoryStore(str(tmp_path / "m.json"))
+  mgr = _live_lookup_mgr(store)
+  for mark in (1.000, 1.018):
+    snap = _book_snap(qty=2, entry=1.0, mark=mark, stop=0.98)
+    store.update_position_extremes(_live_extremes_map(snap))
+    mgr.run(snap)
+  flip = SimpleNamespace(**{**vars(_book_snap(qty=-2, entry=1.015, mark=1.013, stop=1.035)),
+                            "futures_stop_orders": [{"symbol": _FSYM, "side": "buy", "stop": "up",
+                                                     "stopPrice": 1.035, "reduceOnly": True}]})
+  store.update_position_extremes(_live_extremes_map(flip))
+  mgr.run(flip)
+  assert mgr._peak_fe[_FSYM] == pytest.approx(0.002)
+  fresh = _live_lookup_mgr(store)
+  fresh.run(flip)
+  assert fresh._peak_fe[_FSYM] == pytest.approx(0.002)
+
+
+def test_reader_and_writer_build_the_key_with_the_same_helper():
+  """One helper, both sides, so the two keys cannot drift apart again (the Sep 22 reader built its own
+  f-string from a different field than the writer)."""
+  import inspect
+  import src.memory as memory_mod
+  import src.position_context as pc
+  writer = inspect.getsource(memory_mod.MemoryStore._update_peak_fe)
+  reader = inspect.getsource(pc.trade_context)
+  assert "peak_fe_key(" in writer and "peak_fe_key(" in reader
+  assert 'get("positionSide")' not in reader, "the reader must derive side from currentQty, never positionSide"
+  assert 'get("peakPnl")' not in reader, "no USD-to-price conversion may come back"
+
+
+@pytest.mark.parametrize("pos", [
+  {"openingTimestamp": _OPENED, "currentQty": 3, "avgEntryPrice": 1.0},
+  {"openingTime": "1790252000000", "currentQty": "-2", "avgEntryPrice": "0.06008"},
+  {"openTime": 1790252000.5, "createdAt": 5, "currentQty": 11, "avgEntryPrice": 0.06},
+  {"createdAt": "2026-09-23T11:52:00Z", "currentQty": -1, "avgEntryPrice": 2.5},
+  {"currentQty": 4, "avgEntryPrice": 3.0},
+])
+def test_peak_key_is_the_same_identity_protection_resets_on(pos):
+  """Same identity as ProtectionManager._position_signature: equal keys iff equal signatures."""
+  from src.memory import peak_fe_key, position_open_time
+  qty = float(pos["currentQty"])
+  sig = ProtectionManager._position_signature(pos, qty > 0, qty, float(pos["avgEntryPrice"]))
+  key = peak_fe_key(position_open_time(pos), pos["currentQty"], pos["avgEntryPrice"])
+  assert key == f"{sig[0]}|{'long' if sig[1] else 'short'}|{abs(sig[2])!r}|{sig[3]!r}"
+  for changed in ({"currentQty": qty * 2}, {"avgEntryPrice": float(pos["avgEntryPrice"]) * 1.01},
+                  {"currentQty": -qty}):
+    other = {**pos, **changed}
+    oq = float(other["currentQty"])
+    assert ProtectionManager._position_signature(other, oq > 0, oq, float(other["avgEntryPrice"])) != sig
+    assert peak_fe_key(position_open_time(other), other["currentQty"], other["avgEntryPrice"]) != key
+
+
+# ── replay_protection_stack: the benchmark an agent close is scored against (2026-09-25) ────────────
+# exitDiscipline used to score the model's early closes against the BARE bracket, which the system never
+# leaves a position on. On the 5 attributed closes at the time: -6.23R vs the bracket, ~-3.5R vs the live
+# stack; all of the gap was DASH and INJ, whose trail would have exited near +0.3..0.5R long before the TP.
+
+from src.protection import replay_protection_stack  # noqa: E402
+
+
+# ── T5: the READER's own peakFeKey check (the Sep 22 fix), exercised without the writer ────────────────
+
+_LONG_POS = {"symbol": _FSYM, "currentQty": 2, "avgEntryPrice": 1.0, "markPrice": 1.018,
+             "openingTimestamp": _OPENED, "positionSide": "BOTH"}
+
+
+@pytest.mark.parametrize("changed", [
+    {"currentQty": -2, "avgEntryPrice": 1.015},   # flip, same openingTimestamp
+    {"currentQty": 3, "avgEntryPrice": 1.009},    # add-on
+    {"currentQty": 1},                            # partial reduction
+    {"openingTimestamp": _OPENED + 60_000},       # close / reopen
+])
+def test_reader_never_returns_a_peak_recorded_under_another_key(tmp_path, changed):
+    """If the extremes write fails on a flip/add-on poll (main only logs a WARNING), the reader alone
+    must refuse the old lifecycle's peak, or the fresh manager seeds it and trail-closes."""
+    from src.memory import MemoryStore
+    from src.main import _live_extremes_map
+    from src.position_context import trade_context
+    store = MemoryStore(str(tmp_path / "m.json"))
+    for mark in (1.000, 1.018):
+        store.update_position_extremes(_live_extremes_map(_book_snap(qty=2, entry=1.0, mark=mark, stop=0.98)))
+    assert trade_context(store, _FSYM, _LONG_POS, 0.0)["peakFePx"] == pytest.approx(0.018)   # exact key
+    assert "peakFePx" not in trade_context(store, _FSYM, {**_LONG_POS, **changed}, 0.0)
+
+_RT = 1_790_000_040          # a minute-aligned fill time (seconds)
+
+
+def _rbar(i, o, h, l, c):
+    """A raw FUTURES kline row for minute ``i`` after the fill: [ts_ms, open, HIGH, LOW, close, vol, turnover]."""
+    return [(_RT + 60 * i) * 1000, o, h, l, c, 10.0, 1.0]
+
+
+# Long 100, stop 98 (1R = 2), target 106 (+3R). Runs to +2R, pulls back through the trail, THEN tags TP.
+_ARM_THEN_PULLBACK = [
+    _rbar(0, 100.0, 100.5, 99.8, 100.4),
+    _rbar(1, 100.4, 102.2, 100.3, 102.0),     # +1R close: the trail arms (band 0.5R) -> stop 101
+    _rbar(2, 102.0, 104.2, 101.9, 104.0),     # +2R close: stop ratchets to 103
+    _rbar(3, 104.0, 104.1, 102.5, 102.8),     # retrace through 103: the trail's stop fills
+    _rbar(4, 102.8, 105.0, 102.6, 104.9),
+    _rbar(5, 104.9, 106.5, 104.8, 106.2),     # the bracket's TP, reached only after the pullback
+]
+
+
+def _replay_path(bars, *, end_min=480, **kw):
+    args = dict(side_long=True, entry=100.0, stop=98.0, take_profit=106.0, cfg=_cfg(),
+                init_risk=2.0, fill_ts=_RT, end_ts=_RT + end_min * 60, noise_band_r=0.5)
+    args.update(kw)
+    return replay_protection_stack(bars, **args)
+
+
+def test_replay_scores_a_trail_exit_below_the_brackets_target():
+    out = _replay_path(_ARM_THEN_PULLBACK)
+    assert out["resolvedBy"] == "trail_stop"
+    assert out["stackR"] == pytest.approx(1.5)                 # stopped at 103, not the +3R target
+    assert out["stackR"] < 3.0
+    assert out["resolvedTs"] == _RT + 4 * 60
+    assert out["preCloseExitSuppressed"] is False
+
+
+def test_replay_a_straight_path_scores_the_target():
+    bars = [_rbar(i, 100.0 + i, 101.0 + i, 100.0 + i, 101.0 + i) for i in range(7)]   # never retraces
+    out = _replay_path(bars)
+    assert out["resolvedBy"] == "take_profit"
+    assert out["stackR"] == pytest.approx(3.0)
+
+
+def test_replay_a_stop_path_scores_minus_one():
+    bars = [_rbar(0, 100.0, 100.1, 99.5, 99.6), _rbar(1, 99.6, 99.7, 98.6, 98.7),
+            _rbar(2, 98.7, 98.8, 97.9, 98.1)]
+    out = _replay_path(bars)
+    assert out["resolvedBy"] == "stop"
+    assert out["stackR"] == pytest.approx(-1.0)
+
+
+def test_replay_carry_hold_keeps_the_trail_off_until_the_settlement():
+    held = _replay_path(_ARM_THEN_PULLBACK, hold_until_ts=_RT + 10 * 60)
+    assert held["resolvedBy"] == "take_profit"                 # no ratchet while held: rides to TP
+    assert held["stackR"] == pytest.approx(3.0)
+    lifted = _replay_path(_ARM_THEN_PULLBACK, hold_until_ts=_RT + 60)   # hold over after the first bar
+    assert lifted["resolvedBy"] == "trail_stop"
+
+
+def test_replay_refuses_a_bar_whose_high_is_below_its_close():
+    """KuCoin FUTURES rows are [ts, o, HIGH, LOW, close]; SPOT is [ts, o, close, high, low]. Mixing them
+    up once reversed a finding, so a row that cannot be futures-ordered must abort the replay."""
+    with pytest.raises(ValueError):
+        _replay_path([_rbar(0, 100.0, 100.5, 99.0, 101.0)])    # high 100.5 < close 101
+    with pytest.raises(ValueError):
+        _replay_path([[_RT * 1000, 100.0, 100.4, 100.6, 99.9]])    # the spot layout read as futures
+
+
+def test_replay_takes_the_stop_when_both_legs_sit_in_one_bar():
+    out = _replay_path([_rbar(0, 100.0, 106.5, 97.5, 101.0)])
+    assert out["resolvedBy"] == "stop" and out["stackR"] == pytest.approx(-1.0)
+
+
+def test_replay_marks_to_market_at_the_horizon():
+    bars = [_rbar(i, 100.2, 100.3, 100.1, 100.2) for i in range(30)]
+    out = _replay_path(bars, end_min=20)
+    assert out["resolvedBy"] == "expired"
+    assert out["stackR"] == pytest.approx(0.1)
+    assert out["resolvedTs"] == _RT + 20 * 60                  # bars past the horizon are ignored
+
+
+def test_replay_never_exits_before_the_known_close_but_keeps_the_state():
+    """The model closed at ``open_until_ts``: the live stack demonstrably had not exited by then, so a
+    replay exit before it is a replay error (1m last price vs the mark) — skipped, with the ratcheted
+    stop carried into the counterfactual."""
+    bars = _ARM_THEN_PULLBACK[:4] + [_rbar(4, 102.8, 103.5, 102.6, 103.2)] + _ARM_THEN_PULLBACK[5:]
+    out = _replay_path(bars, open_until_ts=_RT + 250)
+    assert out["preCloseExitSuppressed"] is True
+    assert out["resolvedBy"] == "trail_stop"
+    assert out["stackR"] == pytest.approx(1.4)                 # opened through the 103 stop at 102.8
+    with pytest.raises(ValueError):
+        _replay_path([], end_min=10)                           # no bars: the caller retries later
+
+
+def test_replay_short_symmetry():
+    bars = [_rbar(0, 100.0, 100.2, 99.6, 99.6), _rbar(1, 99.6, 99.7, 97.9, 98.0),
+            _rbar(2, 98.0, 98.1, 95.9, 96.0), _rbar(3, 96.0, 97.5, 95.9, 97.2)]
+    out = _replay_path(bars, side_long=False, stop=102.0, take_profit=94.0)
+    assert out["resolvedBy"] == "trail_stop"
+    assert out["stackR"] == pytest.approx(1.5)                 # short from 100, trail stop at 97
+    # T7: the same path whose last bar OPENS through the 97 trail stop fills at the worse open.
+    gapped = bars[:3] + [_rbar(3, 97.4, 97.6, 97.1, 97.2)]
+    out = _replay_path(gapped, side_long=False, stop=102.0, take_profit=94.0)
+    assert out["resolvedBy"] == "trail_stop" and out["stackR"] == pytest.approx(1.3)
+
+
+def test_replay_a_short_gapping_through_its_stop_fills_at_the_open():
+    """T7: only the long side of 'a bar that opens through the stop fills at the open' was covered; a
+    short credited the stop price instead of the worse open would flatter the stack benchmark."""
+    out = _replay_path([_rbar(0, 102.6, 103.0, 102.4, 102.8)], side_long=False, stop=102.0, take_profit=94.0)
+    assert out["resolvedBy"] == "stop"
+    assert out["stackR"] == pytest.approx(-1.3)                # filled at 102.6, not the 102 stop
+
+
+def test_replay_releases_the_carry_hold_at_the_settlement_bars_close():
+    """T7: the hold is lifted on the bar whose CLOSE is the settlement (decide_protection holds only while
+    time remains), so the trail ratchets on that bar; one second later it is still held on it."""
+    bars = [_rbar(0, 100.0, 104.2, 99.9, 104.0), _rbar(1, 104.0, 104.1, 102.5, 102.8),
+            _rbar(2, 102.8, 102.9, 102.7, 102.8)]
+    at_close = _replay_path(bars, hold_until_ts=_RT + 60)
+    assert at_close["resolvedBy"] == "trail_stop" and at_close["stackR"] == pytest.approx(1.5)
+    later = _replay_path(bars, hold_until_ts=_RT + 61)
+    assert later["resolvedBy"] == "trail_close" and later["stackR"] == pytest.approx(1.4)

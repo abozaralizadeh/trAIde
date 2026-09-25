@@ -39,7 +39,10 @@ print("STARTED:" + ",".join(started))
 def _run(pretend_pytest: bool, env_extra=None):
   line = 'sys.modules["pytest"] = types.ModuleType("pytest")' if pretend_pytest else ""
   code = textwrap.dedent(_HARNESS).format(pytest_line=line)
-  env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LOG_FILE": ""}
+  # The same dummy required variables conftest forces, so the subprocess never needs (or reads) the
+  # real credentials from `.env` to get past config validation.
+  from tests.conftest import TEST_REQUIRED_ENV
+  env = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), "LOG_FILE": "", **TEST_REQUIRED_ENV}
   env.update(env_extra or {})
   out = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
                        env=env, timeout=120)

@@ -304,6 +304,174 @@ def decide_protection(
   return {"action": "none", "reason": "no protective action needed", "feNow": fe_now}
 
 
+_BAR_SEC = 60.0
+
+
+def _replay_bar(row: Any) -> tuple[float, float, float, float, float]:
+  """``(start_s, open, high, low, close)`` from a 1m FUTURES kline row, or ValueError.
+
+  KuCoin FUTURES rows are ``[ts_ms, open, HIGH, LOW, close, ...]``; SPOT rows are
+  ``[ts, open, close, high, low]``. An offline replay that mixed the two up once reversed a finding (it
+  checked stops against the close instead of the low and missed most stop-outs), so every bar must
+  prove its order: high is the row maximum and low the row minimum, or nothing computed from it is
+  trusted.
+  """
+  try:
+    ts = float(row[0])
+    o, h, l, c = (float(row[1]), float(row[2]), float(row[3]), float(row[4]))
+  except (TypeError, ValueError, IndexError) as exc:
+    raise ValueError(f"unreadable kline row {row!r}: {exc}") from exc
+  if not all(math.isfinite(v) for v in (ts, o, h, l, c)):
+    raise ValueError(f"non-finite kline row {row!r}")
+  if h != max(o, h, l, c) or l != min(o, h, l, c):
+    raise ValueError(
+      f"kline row {row!r}: high/low are not the row extremes — futures rows are "
+      "[ts, open, HIGH, LOW, close]; refusing to replay misread candles"
+    )
+  if ts > 1e12:
+    ts /= 1000.0
+  return ts, o, h, l, c
+
+
+def _replay_close_label(reason: Any) -> str:
+  text = str(reason or "").lower()
+  if text.startswith("trailing stop hit"):
+    return "trail_close"
+  if text.startswith("early invalidation"):
+    return "early_cut"
+  if text.startswith("gave back"):
+    return "giveback_close"
+  return "protection_close"
+
+
+def replay_protection_stack(
+  bars: Any,
+  *,
+  side_long: bool,
+  entry: float,
+  stop: float,
+  take_profit: float,
+  cfg: ProfitProtectionConfig,
+  init_risk: float,
+  fill_ts: float,
+  end_ts: float,
+  noise_band_r: Optional[float] = None,
+  hold_until_ts: Optional[float] = None,
+  open_until_ts: Optional[float] = None,
+) -> Dict[str, Any]:
+  """What the LIVE exit stack would have done with a position the model closed early. Pure function.
+
+  The exit scoreboard (edge.exit_discipline_stats) asks "did the model's close beat leaving the position
+  to the system?". Until 2026-09-25 the answer was the bare exchange bracket — original stop and TP, or
+  an 8h mark — but the system never leaves a position on its bare bracket: breakeven, the noise-band
+  trail and the carry hold (``decide_protection``) manage it every poll. On the 5 attributed agent
+  closes at the time, bracket-only read -6.23R and this replay about -3.5R; all of the gap was two
+  trades (DASH, INJ) whose trail would have exited near +0.3..0.5R long before the TP the bracket
+  credited. The bias is REGIME-SIGNED, not a fixed overstatement: in a trend the trail leaks against
+  the bracket, so bracket-only makes closes look costly; in chop a run that armed the trail and
+  reversed scores -1R on the bracket but ~0R here, so bracket-only flatters closes. Replaying the real
+  stack removes the regime from the benchmark instead of correcting for one sample of it.
+
+  Walks 1m FUTURES ``bars`` ([ts, open, high, low, close, ...], ts in ms or s) whose minute starts at or
+  after ``fill_ts`` and before ``end_ts``, exactly as the live manager sees a position — one mark per
+  poll — with these rules per bar:
+
+  1. The bar's order is checked (high = row max, low = row min) or ValueError: the column-order trap.
+  2. The simulated EXCHANGE legs are checked first against the bar's high/low. When the stop and the
+     target are both inside one bar the stop is taken (conservative: a 1m bar cannot say which came
+     first). A bar that OPENS through the stop fills at the open, the way a stop-market order would.
+  3. The peak is the maximum favourable CLOSE excursion so far (from 0), then ``decide_protection``
+     runs on the bar close with ``cfg`` (pass ProtectionManager's EFFECTIVE cfg — its breakeven_fee_pct
+     is raised to the round-trip cost), the trade's ORIGINAL risk as ``risk_override``, its own noise
+     band and carry hold, the age since fill for the early cut, and ``now_ts`` = the bar's close time
+     (the moment its close price exists). ``move_breakeven`` moves the simulated stop; ``close`` exits
+     at the bar close.
+  4. Still open at ``end_ts``: marked to market at the last bar's close (the same horizon the bracket
+     probe expires on, so the two benchmarks are comparable).
+
+  ``open_until_ts``: the position is KNOWN to have been open until then (the model closed it at that
+  time). An exit the replay would take before it is not taken — the live stack demonstrably did not
+  exit, so the replay has diverged from reality (1m last-trade prices vs the live mark) — but the
+  stop/peak state keeps evolving, so the counterfactual starts from the state the stack would be in
+  at the close. ``preCloseExitSuppressed`` says when that happened.
+
+  Returns GROSS R on the original risk — the same basis as the probe's ``realizedR`` and ``bracketR``
+  — as ``{'stackR', 'resolvedBy', 'resolvedTs', 'preCloseExitSuppressed'}``, ``resolvedBy`` one of
+  take_profit / stop / trail_stop / trail_close / early_cut / giveback_close / protection_close /
+  expired. Known bias: 1m last-trade prices, while the live manager and the MP stops read the mark —
+  median |error| ~0.05R on validation, slightly conservative in sum. Raises ValueError on bad input or
+  when no bar falls inside the window (the caller retries later).
+  """
+  e = float(entry)
+  sl = float(stop)
+  tp = float(take_profit)
+  risk = float(init_risk) if init_risk is not None else abs(e - sl)
+  fill = float(fill_ts)
+  end = float(end_ts)
+  if not all(math.isfinite(v) for v in (e, sl, tp, risk, fill, end)):
+    raise ValueError("non-finite replay input")
+  if e <= 0 or sl <= 0 or tp <= 0 or risk <= 0 or end <= fill:
+    raise ValueError("replay needs a positive entry/stop/target/risk and end_ts after fill_ts")
+  held_until = float(open_until_ts) if open_until_ts is not None else None
+  if held_until is not None and not math.isfinite(held_until):
+    held_until = None
+  original_sl = sl
+  suppressed = False
+
+  def _r(px: float) -> float:
+    return ((px - e) if side_long else (e - px)) / risk
+
+  parsed = sorted((_replay_bar(row) for row in (bars or [])), key=lambda b: b[0])
+  peak_fe = 0.0
+  last_close: Optional[float] = None
+  last_close_ts: Optional[float] = None
+  seen: set = set()
+  for ts, o, h, l, c in parsed:
+    if ts in seen or ts < fill or ts >= end:
+      continue
+    seen.add(ts)
+    t_close = ts + _BAR_SEC
+    may_exit = held_until is None or t_close > held_until
+    if side_long:
+      hit_sl, hit_tp = l <= sl, h >= tp
+      stop_px = min(o, sl)
+    else:
+      hit_sl, hit_tp = h >= sl, l <= tp
+      stop_px = max(o, sl)
+    if hit_sl or hit_tp:
+      if may_exit:
+        if hit_sl:  # both inside one bar -> the stop (conservative)
+          return {
+            "stackR": _r(stop_px), "resolvedBy": "stop" if sl == original_sl else "trail_stop",
+            "resolvedTs": t_close, "preCloseExitSuppressed": suppressed,
+          }
+        return {"stackR": _r(tp), "resolvedBy": "take_profit", "resolvedTs": t_close,
+                "preCloseExitSuppressed": suppressed}
+      suppressed = True
+    fe = (c - e) if side_long else (e - c)
+    peak_fe = max(peak_fe, fe)
+    decision = decide_protection(
+      side_long=side_long, avg_entry=e, mark=c, sl_price=sl, peak_fe=peak_fe, cfg=cfg,
+      opened_min_ago=(t_close - fill) / 60.0, risk_override=risk,
+      hold_until_ts=hold_until_ts, now_ts=t_close, noise_band_r=noise_band_r,
+    )
+    action = decision.get("action")
+    if action == "move_breakeven":
+      new_sl = _to_float(decision.get("stopPrice"))
+      if new_sl is not None and math.isfinite(new_sl) and new_sl > 0:
+        sl = new_sl
+    elif action == "close":
+      if may_exit:
+        return {"stackR": _r(c), "resolvedBy": _replay_close_label(decision.get("reason")),
+                "resolvedTs": t_close, "preCloseExitSuppressed": suppressed}
+      suppressed = True
+    last_close, last_close_ts = c, t_close
+  if last_close is None:
+    raise ValueError("no futures bars inside the replay window")
+  return {"stackR": _r(last_close), "resolvedBy": "expired", "resolvedTs": min(end, float(last_close_ts)),
+          "preCloseExitSuppressed": suppressed}
+
+
 def should_block_chase(
   *,
   close_type: str,
@@ -380,10 +548,12 @@ class ProtectionManager:
     self._emergency_placed_legs: Dict[str, set[str]] = {}
     self._emergency_grace_sec: float = 90.0   # let an atomic/attached bracket appear before we add one
     self._open_since: Dict[str, float] = {}   # futures symbol -> ts first seen open (for early-cut age)
-    # Optional callable(futures_symbol, position) -> {"holdUntilTs": float|None, "noiseBandR": float|None}
-    # describing the trade behind an open position: when its edge is scheduled to accrue (funding
-    # settlement) and how wide its own noise band is. Injected rather than read here so this module
-    # keeps no memory/exchange dependency and stays unit-testable.
+    # Optional callable(futures_symbol, position) -> {"holdUntilTs", "noiseBandR", "initRiskPx",
+    # "peakFePx"} describing the trade behind an open position: when its edge is scheduled to accrue
+    # (funding settlement on the contract's own clock), how wide its own noise band is, and its
+    # original risk and recorded price-space peak for restart safety (position_context.trade_context).
+    # Injected rather than read here so this module keeps no memory/exchange dependency and stays
+    # unit-testable.
     self._trade_context_lookup = trade_context_lookup
 
   # -- public -------------------------------------------------------------------
@@ -449,17 +619,22 @@ class ProtectionManager:
         lifecycle = self._position_signature(pos, side_long, qty, avg_entry)
         # A same-side close/reopen, add-on, or partial reduction is a new excursion baseline. Keeping
         # the prior peak against a changed average entry can immediately produce a false give-back.
-        if self._position_lifecycle.get(fsym) != lifecycle:
+        # First sighting of this lifecycle by THIS process: the only poll on which a recorded peak may
+        # be applied (see the trade-context block below).
+        fresh_lifecycle = self._position_lifecycle.get(fsym) != lifecycle
+        if fresh_lifecycle:
           self._position_lifecycle[fsym] = lifecycle
           self._peak_side[fsym] = side_long
           self._peak_fe.pop(fsym, None)
           self._init_risk.pop(fsym, None)
           self._emergency_placed_legs.pop(fsym, None)
           self._open_since[fsym] = time.time()
-        # Early-cut depends on both observed age and observed MFE. Peak excursion is process-local,
-        # so trusting an exchange age after restart could call a mature retracing winner "never
-        # worked" and close it immediately. Start both clocks together until lifecycle MFE is
-        # persisted atomically in a future schema.
+        # Early-cut depends on both observed age and observed MFE. Trusting an exchange age after a
+        # restart, with the MFE reset, could call a mature retracing winner "never worked" and close it
+        # immediately, so the age clock starts with this process. Since 2026-09-25 the MFE is restored
+        # from the recorded lifecycle peak (below) when its key matches, which makes the shorter age
+        # purely conservative: it can delay an early cut, never add one. Restoring the age as well
+        # would need the lifecycle's first-seen time persisted next to that peak.
         opened_min_ago = (time.time() - self._open_since.setdefault(fsym, time.time())) / 60.0
 
         fe_now = (mark - avg_entry) if side_long else (avg_entry - mark)
@@ -525,8 +700,20 @@ class ProtectionManager:
             _rec_risk = _to_float(_tc.get("initRiskPx"))
             if fsym not in self._init_risk and _rec_risk and _rec_risk > 0:
               self._init_risk[fsym] = _rec_risk
+            # The recorded peak is applied ONLY on the poll this process first sees the lifecycle
+            # signature — after a restart, the first sighting; in steady state, the poll of an add-on /
+            # reduction / flip, where the recorder has just reset to this same poll's excursion, so it
+            # is a no-op. After that this process tracks the same polls the recorder does, so a
+            # per-poll max() adds nothing, and it is the channel through which any future unit/key bug
+            # would become a market close (the Sep 22 seed divided USD by contracts: 10-520,000x on
+            # multiplier>1 contracts, dormant only because its key never matched). The value is
+            # price-space and keyed by the writer on this same (openTime, side, |qty|, avgEntry)
+            # signature, so it can never re-inject a peak the reset above threw away.
             _rec_peak = _to_float(_tc.get("peakFePx"))
-            if _rec_peak and _rec_peak > 0 and _rec_peak > self._peak_fe.get(fsym, 0.0):
+            if (
+              fresh_lifecycle and _rec_peak is not None and math.isfinite(_rec_peak)
+              and _rec_peak > 0 and _rec_peak > peak_fe
+            ):
               self._peak_fe[fsym] = _rec_peak
               peak_fe = _rec_peak
           except Exception:  # a lookup failure must never disable the guards

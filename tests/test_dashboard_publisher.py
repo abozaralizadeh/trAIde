@@ -535,6 +535,8 @@ class TestExitDisciplinePanel:
     data = m._read()
     data["exit_probes"][0]["outcome"] = {"resolved": "take_profit", "bracketR": 1.76,
                                          "resolvedTs": int(time.time())}
+    # Only stack-scored agent closes count (2026-09-25): give the row its replayed stack.
+    data["exit_probes"][0]["stack"] = {"stackR": 1.76, "resolvedBy": "take_profit", "source": "test"}
     m._write(data)
     out = DashboardPublisher(cfg)._build_exit_discipline(m)
     assert out["n"] == 1
@@ -549,9 +551,22 @@ class TestExitDisciplinePanel:
     from src.memory import MemoryStore
     cfg = SimpleNamespace(dashboard=SimpleNamespace(disclosure="normalized"))
     out = DashboardPublisher(cfg)._build_exit_discipline(MemoryStore(str(tmp_path / "m.json")))
+    # 2026-09-25: the benchmark became the replayed live exit stack; the panel carries it, the
+    # legacy-bracket count and the entry-bias splits alongside the old fields (all R / counts, no $).
+    # Also 09-25: the trail's record split by the entry's market state (breadth24 terciles), which on
+    # an empty store has no cuts and no buckets.
     assert out == {"verdict": "insufficient data", "n": 0, "takenR": 0, "bracketR": 0,
-                   "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0, "byFamily": {},
-                   "otherExits": {}, "trailByRegime": {}}
+                   "benchmarkR": 0, "stackR": 0, "stackScored": 0, "legacyBracketScored": 0,
+                   "legacyDeltaR": 0, "stackPending": 0, "stackUnavailable": 0,
+                   "deltaR": 0, "deltaRPerTrade": None, "beatBracket": 0,
+                   "beatBenchmark": 0, "byFamily": {}, "byCounterAtEntry": {}, "byHtfAligned": {},
+                   "otherExits": {}, "trailByRegime": {},
+                   "trailByMarketState": {
+                     "key": "entry breadth24 terciles over the retained exit probes (rolling)",
+                     "cuts": None, "buckets": {},
+                     "byBtcDailyAdx": {
+                       "key": "entry BTC daily ADX terciles over the retained exit probes (rolling)",
+                       "cuts": None, "buckets": {}}}}
 
 
 class TestTakerFlowPanel:
@@ -777,3 +792,127 @@ class TestCorruptCloseSkipsToLastGood:
     rows = [(20680, 84.172806), (20695, 72358594.525117)]
     _, day = self._pub(rows)._prev_day_point(20696)
     assert day == 20680
+
+
+class TestSideSplitAndStakeOnThePanel:
+  """The panel shows the same standAside / stake the order path applies, and the side split."""
+
+  def test_a_stood_aside_edge_family_shows_zero_stake_and_its_sides(self):
+    pub = _publisher()
+    probes = []
+    seq = [0]
+
+    def _p(side, move, sym):
+      seq[0] += 1
+      fwd = 100.0 * (1 + move) if side == "long" else 100.0 * (1 - move)
+      return {"symbol": sym, "ts": 1_000_000 + seq[0] * 240 * 60,
+              "entryContext": {"positionSide": side, "marketPriceAtSignal": 100.0,
+                               "setupFamily": "continuation", "signalProbe": {"m60": fwd}}}
+    # Positive but noisy pooled net (t < 1): verdict 'edge', stake 0.
+    for i in range(24):
+      probes.append(_p("long" if i % 3 else "short", 0.03 if i % 2 else -0.023, f"S{i}-USDT"))
+    out = pub._build_strategy_edge(TestStrategyEdgePanel._memory(probes), TestStrategyEdgePanel._cfg())
+    row = out["byFamily"]["continuation"]
+    assert row["verdict"] == "edge" and row["standAside"] is True
+    # Per side, because the order path always judges the order's side (no pooled scalar published).
+    assert out["familyStake"]["continuation"] == {"long": 0.0, "short": 0.0}
+    assert out["familyRiskFactor"]["continuation"] == 1.0     # the old multiplier alone hid the bench
+    assert set(out["byFamilySide"]["continuation"]) == {"long", "short"}
+    assert out["byFamilySide"]["continuation"]["short"]["judgedOn"] == "pooled"
+    assert "by_model" in out["confidenceEdge"]
+
+
+class TestSizingTelemetryStaysPrivate:
+  """entryContext['sizing'] holds equity and dollar risk in the LOCAL memory file only. The publisher
+  is whitelist-based and never serialises entryContext wholesale — this pins that down end to end."""
+
+  SIZING = {"equityUsd": 73.1234, "effRiskFrac": 0.0075, "volScale": 1.0, "soft": [0.62],
+            "qualityRaw": 0.62, "quality": 0.62, "qualityFloor": 0.5, "qualityFloorClamped": False,
+            "familyMeasured": 1.0, "familyExplore": 0.4, "familyJudgedOn": "judged on pooled x (n=3)",
+            "atrScale": 0.4, "riskScale": 1.0, "concScale": 1.0,
+            "contractsByStage": {"raw": 3.6, "lotFloor": 3, "riskCap": 3, "heatCap": 2, "concentrationCap": 2},
+            "lotFloored": False, "riskFracTarget": 0.003, "riskFracActual": 0.00287,
+            "grossRiskFracActual": 0.00246}
+
+  def test_a_close_with_sizing_publishes_no_equity_sizing_or_dollar_field(self, tmp_path):
+    import json
+    from src.config import load_config
+    from src.memory import MemoryStore
+    cfg = load_config()
+    m = MemoryStore(str(tmp_path / "m.json"))
+    ctx = {"positionSide": "short", "setupFamily": "continuation", "plannedMaxLossUsd": 0.21,
+           "marketPriceAtSignal": 1.0, "entryPrice": 1.01, "model": "gpt-6-luna", "confidence": 0.8,
+           "notionalUsd": 20.2, "sizing": dict(self.SIZING)}
+    m.record_trade("SPX-USDT", "sell", 20.2, price=1.01, size=20, venue="futures", filled=True,
+                   entry_context=ctx)
+    m.log_decision("SPX-USDT", "futures_sell_triggered", 0.8, "TP/SL triggered (CLOSE_SHORT, ROE -5.0%)",
+                   pnl=-0.2, close_type="CLOSE_SHORT", entry_price=1.01, exit_price=1.03,
+                   position_side="short", entry_context=ctx)
+    pub = DashboardPublisher(SimpleNamespace(dashboard=SimpleNamespace(
+      disclosure="normalized", feed_limit=50, index_base=100.0)))
+    snapshot = SimpleNamespace(futures_positions=[], futures_stop_orders=[], futures_pending_orders=[],
+                               spot_pending_orders=[], spot_stop_orders=[], balances=[], spot_accounts=[],
+                               tickers={})
+    payload = pub._build_payload(m, snapshot, {}, cfg)
+    assert payload["closedPositions"], "the close itself must still publish"
+    blob = json.dumps(payload)
+    for leaked in ('"sizing"', "equityUsd", "effRiskFrac", "riskFrac", "contractsByStage",
+                   "plannedMaxLossUsd", "notionalUsd", "73.1234", "$"):
+      assert leaked not in blob, leaked
+
+
+class TestGateScoreboardPanel:
+  """strategyEdge.gateScoreboard: what each directional gate blocks vs allows. Percent returns, SEs,
+  t and counts only — never a price, a balance or a size — and never on the trading prompt."""
+
+  _COUNTS = {"n", "days", "matchedN", "matchedDays", "t", "tstat", "min_samples", "stateHorizonMin",
+             "stateDays", "pendingStateRows", "refusalRows", "calls", "tCritical"}
+
+  def _store(self, tmp_path):
+    from src.edge import gate_state_cells
+    from src.memory import MemoryStore
+    m = MemoryStore(str(tmp_path / "g.json"))
+    m.record_gate_state_probes("A-USDT", 43210.5, {"long": ["h1_align"], "short": []}, price_source="futures_mark")
+    m.record_gate_probe("B-USDT", "buy", 1.23457, "anti_fomo", setup_family="continuation", confidence=0.8)
+    m.record_signal_probe("C-USDT", "buy", 2.71828, "continuation", gates_passed=[])
+    m.record_signal_probe("D-USDT", "buy", 3.14159, "breakout",
+                          gates_passed=[{"gate": "h1_align", "hatch": "declared"}])
+    data = m._read()
+    for row in data["gate_probes"] + data["signal_probes"]:
+      base = row["entryContext"]["marketPriceAtSignal"]
+      row["entryContext"]["signalProbe"] = {f"m{h}": base * 1.01 for h in (5, 15, 60, 240)}
+    m._write(data)
+    m.fold_settled_gate_states(gate_state_cells)
+    return m
+
+  def test_percent_and_counts_only(self, tmp_path):
+    import json
+    pub = _publisher("normalized")
+    out = pub._build_strategy_edge(self._store(tmp_path), TestStrategyEdgePanel._cfg())
+    board = out["gateScoreboard"]
+    assert board["gates"]["h1_align"]["state"]["long"]["blocked"]["n"] == 1
+    assert board["gates"]["anti_fomo"]["refused"]["long"]["blocked"]["n"] == 1
+    assert board["gates"]["h1_align"]["hatched"]["long"]["byHatch"] == [{"hatch": "declared", "calls": 1}]
+
+    def _walk(obj, path=""):
+      if isinstance(obj, dict):
+        for k, v in obj.items():
+          yield from _walk(v, str(k))
+      elif isinstance(obj, list):
+        for v in obj:
+          yield from _walk(v, path)
+      else:
+        yield path, obj
+
+    for key, value in _walk(board):
+      if isinstance(value, (int, float)) and not isinstance(value, bool):
+        assert key.endswith("Pct") or key in self._COUNTS, (key, value)
+    blob = json.dumps(board)
+    for leaked in ("43210", "1.23457", "2.71828", "3.14159", "$", "usd", "equity", "balance", "size", "notional"):
+      assert leaked not in blob.lower(), leaked
+
+  def test_a_store_without_gate_probes_costs_only_this_panel(self):
+    pub = _publisher()
+    probes = [TestStrategyEdgePanel._probe("long", 100.0, 101.0, "continuation") for _ in range(3)]
+    out = pub._build_strategy_edge(TestStrategyEdgePanel._memory(probes), TestStrategyEdgePanel._cfg())
+    assert "gateScoreboard" not in out and out["n"] > 0
