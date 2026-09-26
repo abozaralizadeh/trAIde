@@ -175,6 +175,99 @@ if [[ ! -x "$GUNICORN_BIN" ]]; then
   exit 1
 fi
 
+# ---------------------------------------------------------------------------
+# Probe re-settle (data migration, runs only while there is something to migrate).
+#
+# Until 2026-09-25 the bot scored its own direction calls ("signal probes") and early closes ("exit
+# probes") on the SPOT ticker while their base was the FUTURES mark, so the perp/spot gap was booked as
+# edge (it made funding_carry look proven). New rows settle on futures; the stored ones are re-settled
+# once by scripts/resettle_probes_futures.py, which must run with the bot STOPPED (it rewrites the
+# memory file the bot writes every poll). It was left to a manual step twice and never ran, so the
+# deploy does it: count the rows still needing it; if there are any, stop the service, run the script
+# (it writes its own timestamped backup and refuses to write if the file changes under it), then carry
+# on to the normal start below. Open positions keep their exchange TP/SL brackets while it runs; only
+# the code trail pauses, for a few minutes the first time and seconds after that. A failure never
+# blocks the deploy: the bot starts anyway and the next run retries. SKIP_RESETTLE=1 skips it.
+# ---------------------------------------------------------------------------
+SKIP_RESETTLE="${SKIP_RESETTLE:-0}"
+
+memory_file_path() {
+  local value=""
+  if [[ -f "$PROJECT_ROOT/.env" ]]; then
+    value="$(grep -E '^[[:space:]]*MEMORY_FILE=' "$PROJECT_ROOT/.env" | tail -1 | cut -d= -f2- \
+             | sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^[\"']//" -e "s/[\"']$//")"
+  fi
+  value="${value:-.agent_memory.json}"
+  if [[ "$value" != /* ]]; then
+    value="$WORKDIR/$value"
+  fi
+  echo "$value"
+}
+
+resettle_probes_if_needed() {
+  if [[ "$SKIP_RESETTLE" == "1" ]]; then
+    echo "Probe re-settle: skipped (SKIP_RESETTLE=1)."
+    return 0
+  fi
+  local mem pending
+  mem="$(memory_file_path)"
+  if [[ ! -f "$mem" ]]; then
+    echo "Probe re-settle: no memory file at $mem yet — nothing to migrate."
+    return 0
+  fi
+  # Rows the script would actually migrate, by ITS OWN selection rules (so a finished migration reads 0
+  # and later deploys skip it): signal-probe/trade rows with a base price, a side and no priceSource;
+  # and matured exit probes whose bracket outcome (take_profit/stop/expired) has no priceSource. An
+  # 'unmeasured' outcome is final and not counted. The first run also backfills the stack score on old
+  # agent closes; new closes are scored by the live loop (main._score_exit_probe_stacks).
+  if ! pending="$(run_as_service_user "$VENV_PATH/bin/python" - "$mem" <<'PYEOF'
+import json, sys, time
+try:
+  data = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+  print(0); sys.exit(0)
+now = time.time()
+legacy = 0
+for row in list(data.get("trades") or []) + list(data.get("signal_probes") or []):
+  ctx = row.get("entryContext") if isinstance(row, dict) else None
+  if (isinstance(ctx, dict) and ctx.get("marketPriceAtSignal") and not ctx.get("priceSource")
+      and str(ctx.get("positionSide") or "").lower() in ("long", "short")):
+    legacy += 1
+spot_exits = 0
+for row in data.get("exit_probes") or []:
+  outcome = row.get("outcome") if isinstance(row, dict) else None
+  if not isinstance(outcome, dict) or outcome.get("priceSource"):
+    continue
+  if outcome.get("resolved") not in ("take_profit", "stop", "expired"):
+    continue
+  try:
+    matured = float(row.get("ts")) + 8 * 3600 <= now - 120
+  except (TypeError, ValueError):
+    matured = False
+  spot_exits += 1 if matured else 0
+print(legacy + spot_exits)
+PYEOF
+)"; then
+    echo "WARNING: could not read $mem to check for legacy probes — skipping the re-settle this run." >&2
+    return 0
+  fi
+  if [[ "${pending:-0}" == "0" ]]; then
+    echo "Probe re-settle: nothing to migrate."
+    return 0
+  fi
+  echo "Probe re-settle: $pending row(s) still on the pre-2026-09-25 spot settlement."
+  echo "  Stopping ${SERVICE_NAME} for the re-settle (exchange TP/SL brackets keep protecting open positions) ..."
+  systemctl stop "${SERVICE_NAME}.service" 2>/dev/null || true
+  if (cd "$PROJECT_ROOT" && run_as_service_user env TRAIDE_WSGI_AUTOSTART=0 "$VENV_PATH/bin/python" \
+        -m scripts.resettle_probes_futures --memory "$mem" --apply --bot-stopped); then
+    echo "Probe re-settle: done (a timestamped .bak of the previous memory file sits next to it)."
+  else
+    echo "WARNING: probe re-settle did not complete — the bot starts anyway; the next setup_service.sh run retries it." >&2
+  fi
+}
+
+resettle_probes_if_needed
+
 cat > "$UNIT_PATH" <<EOF
 [Unit]
 Description=trAIde Trading Agent (Gunicorn)

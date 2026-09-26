@@ -92,7 +92,7 @@ from .regime import (
   resolve_gate_deadlock,
   reward_risk_ratio,
 )
-from .utils import normalize_symbol as _normalize_symbol
+from .utils import SPOT_DUST_VALUE_USD, normalize_symbol as _normalize_symbol
 
 
 class _RedactingConsoleExporter(ConsoleSpanExporter):
@@ -473,12 +473,6 @@ def _build_compact_account_state(
     },
   }
   return result
-
-
-# A spot balance worth less than this cannot carry a protective order (it rounds below the exchange's
-# minimum size) and is not exposure worth managing. Shared with main._discover_unlisted_holdings so the
-# two views of "what do we hold" apply ONE dust rule.
-SPOT_DUST_VALUE_USD = 0.50
 
 
 def reconcile_spot_positions(

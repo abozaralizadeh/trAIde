@@ -487,5 +487,8 @@ class TestSpotDustIsNotAPosition:
     import src.agent as agent_mod
     import src.main as main_mod
     assert "reconcile_spot_positions(" in inspect.getsource(agent_mod.run_trading_agent)
+    import src.utils as utils_mod
     sig = inspect.signature(main_mod._discover_unlisted_holdings)
-    assert sig.parameters["min_value_usd"].default == agent_mod.SPOT_DUST_VALUE_USD
+    assert sig.parameters["min_value_usd"].default == utils_mod.SPOT_DUST_VALUE_USD
+    assert inspect.signature(agent_mod.reconcile_spot_positions).parameters["dust_value_usd"].default \
+      == utils_mod.SPOT_DUST_VALUE_USD

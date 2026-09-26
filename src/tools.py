@@ -81,7 +81,7 @@ from .edge import (
   passive_distance_atr,
 )
 from .memory import SCORED_GATES, sanitize_market_state
-from .utils import normalize_symbol as _normalize_symbol
+from .utils import SPOT_DUST_VALUE_USD, normalize_symbol as _normalize_symbol
 from .agent import (
   NOT_TRADEABLE_HERE,
   logger,
@@ -364,7 +364,20 @@ def _fmt_pct(value: Any, spec: str) -> str:
     return "n/a"
 
 
-def stand_aside_message(status: Dict[str, Any], open_fams: Dict[str, Any] | None = None) -> Dict[str, str]:
+def repeat_gap_seconds(family_weights: Dict[str, Dict[int, float]] | None, family: str | None) -> float:
+  """How long a repeat of the same call (symbol, side, family) adds no new evidence: the family's
+  SHORTEST scored horizon, in seconds (the de-overlap keeps one call per symbol per horizon window).
+  0 when the family has no holding-time weights yet — then every call is recorded, as before."""
+  try:
+    weights = (family_weights or {}).get(str(family or "other").strip().lower() or "other") or {}
+    horizons = [int(h) for h, w in weights.items() if w and float(w) > 0 and int(h) > 0]
+    return float(min(horizons) * 60) if horizons else 0.0
+  except Exception:
+    return 0.0
+
+
+def stand_aside_message(status: Dict[str, Any], open_fams: Dict[str, Any] | None = None,
+                        repeat_gap_min: float | None = None) -> Dict[str, str]:
   """The refusal the model reads and the STAND ASIDE log line, built from ``edge.family_stake_status``.
 
   Truthful by construction: the 'NO EDGE … coin-flip minus fees' wording is used ONLY when the judging
@@ -432,6 +445,14 @@ def stand_aside_message(status: Dict[str, Any], open_fams: Dict[str, Any] | None
     "past the refusal does not change the trade, and it corrupts the scoreboard that sizes every future "
     "trade."
   )
+  if repeat_gap_min:
+    # 2026-09-26: the model re-submitted the same benched SOL long every run; say that a repeat adds
+    # nothing, so it stops spending turns on it (the recorder already declined to store it).
+    hint += (
+      f" This exact call ({_fam} {_side or 'call'} on this symbol) was already recorded within the last "
+      f"{repeat_gap_min:.0f} minutes, so this repeat added no new evidence and was not stored; "
+      "resubmitting it before then adds nothing."
+    )
   log = (
     f"{row_desc}: verdict={st.get('verdict')}, net_of_cost={_fmt_pct(net, '+.3f')}%, "
     f"SE={_fmt_pct(se, '.3f')}%, t={_fmt_pct(t, '.2f')}; zero stake ({st.get('reason')})"
@@ -4414,8 +4435,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # read from the poll loop's hourly cache, never fetched here. Recorded on the probe and the entry so
     # verdicts can later be split by market state; nothing on this path reads it back.
     _market_state_fl = _market_state_now()
+    # A repeat of the same call (symbol, side, family) inside the family's shortest scored horizon adds
+    # no observation but costs a retention slot (memory.record_signal_probe, 2026-09-26).
+    _repeat_gap_fl = repeat_gap_seconds(_edge_state().get("family_horizon_weights"), _family_fl)
+    _probe_repeat_fl = False
     try:
-      memory.record_signal_probe(
+      _probe_stored_fl = memory.record_signal_probe(
         spot_symbol, side_lower, current_price, setup_family,
         taker_flow=_taker_flow_reading(spot_symbol),
         market_state=_market_state_fl,
@@ -4428,8 +4453,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         min_confidence=_eff_min_fl,
         # Gates this call faced and the hatch that admitted it ([] = faced none). Report-only.
         gates_passed=_gates_passed_fl,
+        min_gap_sec=_repeat_gap_fl,
         **_xm_stamp_fl,
       )
+      if _probe_stored_fl is False and _repeat_gap_fl > 0:
+        _probe_repeat_fl = True
+        logger.info("SIGNAL PROBE REPEAT: %s %s %s already recorded within %.0fm — not stored again",
+                    spot_symbol, side_lower, _family_fl or "other", _repeat_gap_fl / 60.0)
     except Exception as _probe_exc:
       # WARNING, not debug: the probe is the evidence supply for every edge verdict, and a verdict
       # with no fresh evidence never changes — so silently dropping probes freezes the scoreboard and
@@ -4452,7 +4482,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       # to go just gets the same family re-proposed next poll — which is what live did on 2026-09-07,
       # 21 continuation stand-asides in six hours while range_edge sat unblocked at a measured +0.72%.
       _open = open_families(_signal_edge_fl)
-      _refusal = stand_aside_message(_stake_fl, _open)
+      _refusal = stand_aside_message(_stake_fl, _open,
+                                     repeat_gap_min=(_repeat_gap_fl / 60.0) if _probe_repeat_fl else None)
       logger.warning("STAND ASIDE: futures limit %s %s — %s; skipping entry",
                      spot_symbol, side_lower, _refusal["log"])
       return {
@@ -6214,7 +6245,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "rejected": True,
           "reason": f"Cannot verify {norm} is flat before removal: {exc}",
         }
-    if live_position or pending_order or _spot_position_size(norm) > 0:
+    # Spot DUST does not hold a coin in the universe (utils.SPOT_DUST_VALUE_USD): a ~$0.005 KCS remainder
+    # refused every removal of KCS on 2026-09-25/26. Unknown price -> treated as a real holding.
+    _spot_qty = _spot_position_size(norm)
+    _spot_ticker = (getattr(snapshot, "tickers", None) or {}).get(norm)
+    _spot_px = _to_float(getattr(_spot_ticker, "price", None)) if _spot_ticker is not None else 0.0
+    _spot_live = _spot_qty > 0 and not (_spot_px > 0 and _spot_qty * _spot_px < SPOT_DUST_VALUE_USD)
+    if live_position or pending_order or _spot_live:
       return {
         "rejected": True,
         "reason": f"Cannot remove {norm} while a live position or pending order still requires management",

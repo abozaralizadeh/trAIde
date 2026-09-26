@@ -1811,3 +1811,44 @@ def test_a_direction_call_records_which_gates_it_met_and_the_hatch_that_admitted
   assert by_sym["A-USDT"]["gatesPassed"] == [{"gate": "h1_align", "hatch": "declared"}]
   assert by_sym["B-USDT"]["gatesPassed"] == []          # faced none: a real baseline row
   assert "gatesPassed" not in by_sym["C-USDT"]          # not stamped: never counted as 'faced none'
+
+
+class TestSignalProbeRepeatGap:
+  """record_signal_probe(min_gap_sec=...) skips a repeat of the same (symbol, side, family) call made
+  less than the gap ago — it could never become a new de-overlapped observation, but it would cost a
+  retention slot (2026-09-26)."""
+
+  def _store(self, tmp_path):
+    from src.memory import MemoryStore
+    return MemoryStore(str(tmp_path / "mem.json"))
+
+  def test_a_repeat_inside_the_gap_is_skipped_and_reported(self, tmp_path, monkeypatch):
+    import src.memory as mem_mod
+    m = self._store(tmp_path)
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(mem_mod.time, "time", lambda: clock["t"])
+    assert m.record_signal_probe("SOL-USDT", "buy", 120.8, "continuation", min_gap_sec=3600) is True
+    clock["t"] += 900
+    assert m.record_signal_probe("SOL-USDT", "buy", 120.9, "continuation", min_gap_sec=3600) is False
+    clock["t"] += 2700                                           # exactly one gap after the first
+    assert m.record_signal_probe("SOL-USDT", "buy", 121.0, "continuation", min_gap_sec=3600) is True
+    assert [p["entryContext"]["marketPriceAtSignal"] for p in m.signal_probes(limit=0)] == [120.8, 121.0]
+
+  def test_other_symbols_sides_and_families_are_not_repeats(self, tmp_path, monkeypatch):
+    import src.memory as mem_mod
+    m = self._store(tmp_path)
+    monkeypatch.setattr(mem_mod.time, "time", lambda: 2_000_000.0)
+    assert m.record_signal_probe("SOL-USDT", "buy", 120.8, "continuation", min_gap_sec=3600)
+    assert m.record_signal_probe("SOL-USDT", "sell", 120.8, "continuation", min_gap_sec=3600)
+    assert m.record_signal_probe("SOL-USDT", "buy", 120.8, "breakout", min_gap_sec=3600)
+    assert m.record_signal_probe("ETH-USDT", "buy", 2700.0, "continuation", min_gap_sec=3600)
+    # Count what is STORED (what retention sees); the reader merges rows sharing (symbol, ts).
+    assert len(m._read()["signal_probes"]) == 4
+
+  def test_zero_gap_records_every_call_as_before(self, tmp_path, monkeypatch):
+    import src.memory as mem_mod
+    m = self._store(tmp_path)
+    monkeypatch.setattr(mem_mod.time, "time", lambda: 3_000_000.0)
+    for _ in range(3):
+      assert m.record_signal_probe("SOL-USDT", "buy", 120.8, "continuation") is True
+    assert len(m._read()["signal_probes"]) == 3

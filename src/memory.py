@@ -1886,7 +1886,8 @@ class MemoryStore:
     lease_min: Any = None,
     market_state: Optional[Dict[str, Any]] = None,
     gates_passed: Any = None,
-  ) -> None:
+    min_gap_sec: float = 0.0,
+  ) -> bool:
     """Record a DIRECTION CALL for edge measurement, whether or not it becomes an order.
 
     Signal quality is a property of the call, not of the execution — so a setup that the model
@@ -1935,17 +1936,26 @@ class MemoryStore:
     score the hatches against calls that never faced the gate. Stored as ``gatesPassed`` only when
     given (so legacy rows stay distinguishable from 'faced none'); unknown gates are dropped. Inert for
     every family verdict.
+
+    ``min_gap_sec`` (the caller passes the family's SHORTEST scored horizon) skips a REPEAT: the same
+    symbol, side and family recorded less than that long ago. Such a call cannot become a new
+    observation at any horizon the family is scored on — the de-overlap keeps one call per symbol per
+    horizon window — but it still costs a retention slot, and the family cap keeps the NEWEST rows.
+    2026-09-26: continuation sat at its 150-row cap with only 88 independent rows, and the model, now
+    told to submit setups on a benched side, re-submitted the same SOL long every run; each repeat
+    would have evicted an older independent observation until the verdict "un-learned" itself by
+    forgetting. 0 (the default) records every call. Returns True when the call was stored.
     """
     try:
       px = float(market_price)
     except (TypeError, ValueError):
-      return
+      return False
     if px <= 0:
-      return
+      return False
     s = str(side or "").lower()
     position_side = "long" if s in ("buy", "long") else ("short" if s in ("sell", "short") else None)
     if not position_side:
-      return
+      return False
     ctx: Dict[str, Any] = {
       "positionSide": position_side,
       "marketPriceAtSignal": px,
@@ -1992,11 +2002,28 @@ class MemoryStore:
       "ts": int(time.time()),
       "entryContext": ctx,
     }
+    try:
+      gap = float(min_gap_sec or 0.0)
+    except (TypeError, ValueError):
+      gap = 0.0
     with self._lock:
       data = self._read()
-      data.setdefault("signal_probes", []).append(row)
-      data["signal_probes"] = _trim_probes_per_family(data["signal_probes"])
+      probes = data.setdefault("signal_probes", [])
+      if gap > 0 and math.isfinite(gap):
+        family = _probe_family(row)
+        for prev in reversed(probes):
+          if not isinstance(prev, dict):
+            continue
+          if row["ts"] - int(prev.get("ts") or 0) >= gap:
+            break                      # rows are chronological: nothing older can be within the gap
+          prev_ctx = prev.get("entryContext") if isinstance(prev.get("entryContext"), dict) else {}
+          if (prev.get("symbol") == row["symbol"] and prev_ctx.get("positionSide") == position_side
+              and _probe_family(prev) == family):
+            return False
+      probes.append(row)
+      data["signal_probes"] = _trim_probes_per_family(probes)
       self._write(data)
+    return True
 
   @staticmethod
   def _gate_probe_row(symbol: Any, side: Any, market_price: Any, *, kind: str, gates: list,

@@ -16,7 +16,7 @@ from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
 from .agent import (
   TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client,
-  _to_futures_symbol, SPOT_DUST_VALUE_USD,
+  _to_futures_symbol,
 )
 from .analytics import flow_reading_max_age_sec, market_state, taker_flow_summary
 from .config import load_config
@@ -40,7 +40,7 @@ from .regime import (
 )
 from .safety import TradingSafetyState
 from .telegram import TelegramNotifier
-from .utils import normalize_symbol
+from .utils import SPOT_DUST_VALUE_USD, normalize_symbol
 
 logger = logging.getLogger(__name__)
 

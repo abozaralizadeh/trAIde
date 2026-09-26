@@ -976,7 +976,7 @@ DEPS_ONLY=1 bash setup_service.sh
 
 ### One-off: re-settle stored probes on futures
 
-Probes recorded before the Sep 25 2026 settlement fix were settled on the spot ticker against a futures base (see *Settle on the market that fills* above). Re-settle them once, on the VM, **with the bot stopped** (it rewrites the memory file every poll):
+Probes recorded before the Sep 25 2026 settlement fix were settled on the spot ticker against a futures base (see *Settle on the market that fills* above). **`sudo bash setup_service.sh` does this for you** (since Sep 26 2026, after the manual step was skipped on two deploys): it counts the rows the script would migrate — by the script's own selection rules — and, only when there are some, stops the service, runs the script with `--apply --bot-stopped` as the service user (the script writes its own timestamped backup and refuses to write if the file changes under it), then starts the service as usual. A finished migration counts 0, so later deploys skip the step; a failure never blocks the deploy (the bot starts and the next run retries). The first run takes a few minutes, during which open positions keep their exchange TP/SL brackets but the code trail pauses. `SKIP_RESETTLE=1 sudo bash setup_service.sh` skips it. To run it by hand instead — **with the bot stopped** (it rewrites the memory file every poll):
 
 ```bash
 sudo systemctl stop traide

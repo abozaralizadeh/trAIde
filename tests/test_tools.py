@@ -476,7 +476,7 @@ class TestStandAsideMessageTellsTheTruth:
     src = inspect.getsource(tools.build_tools)
     assert '_stake_fl = family_stake_status(_signal_edge_fl, _family_fl or "other", side=_side_fl)' in src
     assert 'if cfg.edge.stand_aside_no_edge_family and _stake_fl["standAside"]:' in src
-    assert "_refusal = stand_aside_message(_stake_fl, _open)" in src
+    assert "_refusal = stand_aside_message(_stake_fl, _open," in src
     assert "measures NO EDGE (n=%s" not in src          # the old always-'NO EDGE' log line is gone
     for fn in ("family_size_factor(_signal_edge_fl", "family_explore_factor(\n      _signal_edge_fl"):
       assert fn in src
@@ -1314,3 +1314,98 @@ class TestHatchAdmissionsAreStamped:
       assert "_gates_passed_fl.append(" in body[i:i + 500], body[i - 80:i + 80]
     probe_call = src[src.index("memory.record_signal_probe("):]
     assert "gates_passed=_gates_passed_fl" in probe_call[:probe_call.index("\n      )\n")]
+
+
+class TestRepeatCallsDoNotEvictEvidence:
+  """2026-09-26: told to submit setups on a benched side, the model re-submitted the same SOL
+  continuation long every run. Continuation sat at its 150-row retention cap with only 88 independent
+  rows, so each repeat — which the de-overlap would never count — evicted an older independent
+  observation. A repeat inside the family's shortest scored horizon is not stored, and the model is
+  told why."""
+
+  _WEIGHTS = {"continuation": {60: 0.55, 240: 0.45}}
+
+  def test_the_gap_is_the_familys_shortest_scored_horizon(self):
+    from src.tools import repeat_gap_seconds
+    assert repeat_gap_seconds(self._WEIGHTS, "continuation") == 3600.0
+    assert repeat_gap_seconds({"fade_extreme": {5: 0.25, 15: 0.75}}, "fade_extreme") == 300.0
+    assert repeat_gap_seconds(self._WEIGHTS, "breakout") == 0.0        # no weights yet: record all
+    assert repeat_gap_seconds(None, "continuation") == 0.0
+    assert repeat_gap_seconds({"continuation": {60: 0.0, 240: 1.0}}, "continuation") == 14400.0
+
+  def test_a_repeated_benched_call_is_stored_once_and_the_model_is_told(self, tmp_path):
+    tools, memory = _limit_entry_tools(tmp_path, _CONTINUATION_0924,
+                                       edge_extra={"family_horizon_weights": self._WEIGHTS})
+    first = _place(tools)                                   # continuation SHORT: thin -> pooled t<1
+    second = _place(tools, entry_price=1.012)
+    assert first.get("rejected") and second.get("rejected"), (first, second)
+    assert len(memory._read()["signal_probes"]) == 1        # the repeat was not STORED (raw rows)
+    assert "already recorded within the last 60 minutes" not in first["hint"]
+    assert "already recorded within the last 60 minutes" in second["hint"]
+    assert "not stored" in second["hint"]
+
+  def test_a_different_side_or_family_on_the_same_symbol_is_still_a_new_call(self, tmp_path):
+    def _stored(sub):
+      tools, memory = _limit_entry_tools(sub, _CONTINUATION_0924,
+                                         edge_extra={"family_horizon_weights": self._WEIGHTS})
+      return tools, memory
+    (tmp_path / "side").mkdir()
+    tools, memory = _stored(tmp_path / "side")
+    _place(tools)                                                     # continuation short (refused)
+    _place(tools, side="buy", entry_price=0.99, take_profit_price=1.05, stop_loss_price=0.97)
+    assert [(p["entryContext"]["positionSide"], p["entryContext"]["setupFamily"])
+            for p in memory._read()["signal_probes"]] == [("short", "continuation"), ("long", "continuation")]
+    (tmp_path / "family").mkdir()
+    tools, memory = _stored(tmp_path / "family")
+    _place(tools)                                                     # continuation short (refused)
+    _place(tools, setup_family="breakout", entry_price=1.013)
+    assert [(p["entryContext"]["positionSide"], p["entryContext"]["setupFamily"])
+            for p in memory._read()["signal_probes"]] == [("short", "continuation"), ("short", "breakout")]
+
+  def test_without_weights_every_call_is_recorded_as_before(self, tmp_path):
+    tools, memory = _limit_entry_tools(tmp_path, _CONTINUATION_0924)
+    _place(tools)
+    _place(tools, entry_price=1.012)
+    assert len(memory._read()["signal_probes"]) == 2
+
+
+
+def _priced_snapshot(price):
+  """The harness snapshot with SPX-USDT priced (``None`` = no ticker for it)."""
+  return SimpleNamespace(
+    tickers={} if price is None else {"SPX-USDT": SimpleNamespace(price=str(price))},
+    balances=[], paper_trading=True, max_position_usd=1000.0, min_confidence=0.65,
+    max_leverage=5.0, futures_enabled=True, total_usdt=100.0, futures_positions=[],
+    futures_account={"accountEquity": 100.0}, futures_stop_orders=[], futures_pending_orders=[],
+    spot_pending_orders=[], spot_stop_orders=[], trading_restricted=False, restriction_reason="",
+  )
+
+
+class TestRemoveCoinIgnoresSpotDust:
+  """2026-09-25/26: a ~$0.005 KCS spot remainder made remove_coin refuse ('a live position ... still
+  requires management') every time the model tried to drop KCS from the watchlist. Dust follows the
+  one shared rule (utils.SPOT_DUST_VALUE_USD); a real or unpriced holding still blocks removal."""
+
+  def _remove(self, tmp_path, spot_qty, price):
+    import asyncio
+    import json
+    from agents.tool_context import ToolContext
+    tools, _ = _limit_entry_tools(tmp_path, ctx_extra={
+      "_spot_position_size": lambda *a, **k: spot_qty, "snapshot": _priced_snapshot(price)})
+    raw = json.dumps({"symbol": "SPX-USDT", "reason": "done", "exit_plan": "nothing open"})
+    tool = tools.remove_coin
+    return asyncio.run(tool.on_invoke_tool(
+      ToolContext(context=None, tool_name=tool.name, tool_call_id="t1", tool_arguments=raw), raw,
+    ))
+
+  def test_dust_does_not_block_removal(self, tmp_path):
+    out = self._remove(tmp_path, 0.0007, 7.1)                  # ~$0.005
+    assert out.get("removed"), out
+
+  def test_a_real_holding_still_blocks_removal(self, tmp_path):
+    out = self._remove(tmp_path, 40.0, 7.1)                    # ~$284
+    assert out.get("rejected") and "Cannot remove" in out["reason"], out
+
+  def test_an_unpriced_holding_still_blocks_removal(self, tmp_path):
+    out = self._remove(tmp_path, 0.0007, None)                 # cannot judge -> treat as real
+    assert out.get("rejected") and "Cannot remove" in out["reason"], out
