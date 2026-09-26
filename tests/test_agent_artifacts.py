@@ -293,6 +293,10 @@ class TestScoreboardTellsTheTruthBeforeTheModelProposes:
     assert "do not spend a turn proposing it" not in text
     assert "re-opens by itself" not in text
     assert "ONLY way a stood-aside family" in text
+    # 2026-09-26: shown the stake before proposing, the model declined 21 genuine benched-side setups
+    # instead of submitting them, and a decline records nothing — the prompt must ask for the call.
+    assert "SUBMIT it with its true label" in text
+    assert "Declining it instead" in text and "records nothing" in text
     assert "stop feeding it" not in _joined_literals('"SETUP FAMILIES', "DIRECTIONAL HONESTY")
     carry = _joined_literals('"FUNDING CARRY', "SCHEDULED MACRO EVENTS")
     assert "Every technical playbook you have tried so far measures no edge" not in carry
@@ -452,3 +456,36 @@ class TestMarketStateForTheModel:
     text = src[src.index("## COIN-LIST CURATION"):src.index("- Do NOT stay anchored")]
     assert "fetch_futures_orderbook" in text and "excluded" in text
     assert "lastAnalysisFailure" in text and "quarantined" in text
+
+
+class TestSpotDustIsNotAPosition:
+  """2026-09-25/26: a 0.0007 KCS spot remainder (~$0.005) reached the model as a position with unknown
+  avgEntry; the prompt's 'unknown avgEntry -> set protection' rule sent it to place TP/SL on dust
+  (KuCoin rejected both legs) and to re-audit the phantom run after run."""
+
+  def test_dust_is_dropped_and_real_holdings_are_kept(self):
+    from src.agent import reconcile_spot_positions
+    prices = {"KCS-USDT": 7.1, "SOL-USDT": 150.0}
+    totals = {"KCS": {"available": "0.00070778"}, "SOL": {"available": "0.2"}}
+    out = reconcile_spot_positions({}, totals, ["KCS-USDT", "SOL-USDT"], prices)
+    assert "KCS-USDT" not in out                         # ~$0.005: dust
+    assert out["SOL-USDT"]["netSize"] == 0.2              # ~$30: a real holding, still surfaced
+
+  def test_a_tracked_position_sold_down_to_dust_is_dropped(self):
+    from src.agent import reconcile_spot_positions
+    tracked = {"KCS-USDT": {"netSize": 40.0, "avgEntry": 7.0, "cost": 280.0}}
+    out = reconcile_spot_positions(tracked, {"KCS": {"available": "0.0007"}}, ["KCS-USDT"], {"KCS-USDT": 7.1})
+    assert out == {}
+
+  def test_an_unpriced_balance_is_kept_because_it_cannot_be_judged(self):
+    from src.agent import reconcile_spot_positions
+    out = reconcile_spot_positions({}, {"XYZ": {"available": "0.001"}}, ["XYZ-USDT"], {})
+    assert out["XYZ-USDT"]["netSize"] == 0.001
+
+  def test_the_agent_and_the_holdings_discovery_share_one_dust_rule(self):
+    import inspect
+    import src.agent as agent_mod
+    import src.main as main_mod
+    assert "reconcile_spot_positions(" in inspect.getsource(agent_mod.run_trading_agent)
+    sig = inspect.signature(main_mod._discover_unlisted_holdings)
+    assert sig.parameters["min_value_usd"].default == agent_mod.SPOT_DUST_VALUE_USD

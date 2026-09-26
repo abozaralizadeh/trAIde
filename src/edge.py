@@ -821,29 +821,41 @@ def _probe_observations(
     symbol = str(row.get("symbol") or "?")
     ts = int(row.get("ts") or 0)
     for horizon in horizons_min:
-      px = _f(probe.get(f"m{int(horizon)}"))
-      if px is None or px <= 0:
-        continue
-      if _carry_credit_unknown(ctx, probe, horizon):
-        # A carry call is a bet on the transfer: scoring it with an UNKNOWN credit as zero biased the
-        # family down on every exchange hiccup (2026-09-25 review). Skipped (not counted as zero) while
-        # memory backfills it, and for good once its backfill window passed with the credit unknown.
+      signed = _signed_probe_return(ctx, probe, base, side, horizon)
+      if signed is None:
         continue
       key = (symbol, int(horizon))
       if ts - last_seen.get(key, -10**9) < int(horizon) * 60:
         continue
       last_seen[key] = ts
-      ret = (px - base) / base
-      signed = ret if side == "long" else -ret
-      # Funding the position would have been PAID over the same window (already signed for its side
-      # by memory.funding_received_from_history). A carry call is a bet on the transfer as well as on
-      # price, so a price-only return understates it. ABSENT (legacy rows) counts as zero, which is what
-      # every non-carry window crossing no settlement is anyway; an explicit None (a failed lookup since
-      # 2026-09-25) is also zero for non-carry rows, but a carry row with it was skipped above.
-      credit = _f(probe.get(f"f{int(horizon)}"))
-      if credit is not None and math.isfinite(credit):
-        signed += credit
       yield row, ctx, int(horizon), signed
+
+
+def _signed_probe_return(ctx: Dict[str, Any], probe: Dict[str, Any], base: float, side: str,
+                         horizon: int) -> float | None:
+  """One probe's return at one horizon, signed by its side, plus funding credited; None if unusable.
+
+  The single definition shared by the per-horizon and the holding-time-weighted observations.
+  """
+  px = _f(probe.get(f"m{int(horizon)}"))
+  if px is None or px <= 0:
+    return None
+  if _carry_credit_unknown(ctx, probe, horizon):
+    # A carry call is a bet on the transfer: scoring it with an UNKNOWN credit as zero biased the
+    # family down on every exchange hiccup (2026-09-25 review). Skipped (not counted as zero) while
+    # memory backfills it, and for good once its backfill window passed with the credit unknown.
+    return None
+  ret = (px - base) / base
+  signed = ret if side == "long" else -ret
+  # Funding the position would have been PAID over the same window (already signed for its side
+  # by memory.funding_received_from_history). A carry call is a bet on the transfer as well as on
+  # price, so a price-only return understates it. ABSENT (legacy rows) counts as zero, which is what
+  # every non-carry window crossing no settlement is anyway; an explicit None (a failed lookup since
+  # 2026-09-25) is also zero for non-carry rows, but a carry row with it was skipped above.
+  credit = _f(probe.get(f"f{int(horizon)}"))
+  if credit is not None and math.isfinite(credit):
+    signed += credit
+  return signed
 
 
 def family_scoring_horizons(
@@ -870,7 +882,31 @@ def family_scoring_horizons(
   the stand-aside's own ``min_samples`` (20), so the horizon a family is judged at comes from the same
   recent sample size that judges it, rather than from a second, unrelated constant.
   """
-  holds: Dict[str, List[float]] = {}
+  opts = sorted({int(h) for h in available if int(h) > 0})
+  out: Dict[str, int] = {}
+  if not opts:
+    return out
+  for fam, vals in _recent_family_holds(closes, recent=recent, min_trades=min_trades).items():
+    vals = sorted(vals)
+    n = len(vals)
+    median = vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+    out[fam] = _nearest_horizon(median, opts)
+  return out
+
+
+def _nearest_horizon(minutes: float, opts: List[int]) -> int:
+  """The settled horizon nearest a holding time on a LOG scale (the ratio is what matters)."""
+  return min(opts, key=lambda h: abs(math.log(h) - math.log(max(minutes, 1e-9))))
+
+
+def _recent_family_holds(closes, *, recent: int = 20, min_trades: int = 6) -> Dict[str, List[float]]:
+  """Minutes from fill to close of each family's most recent ``recent`` realized closes.
+
+  Families with fewer than ``min_trades`` such closes are omitted (no trustworthy holding time).
+  Shared by :func:`family_scoring_horizons` and :func:`family_horizon_weights` so both read the same
+  holds under the same rules. Never raises.
+  """
+  holds: Dict[str, List[tuple]] = {}
   for row in closes or []:
     if not isinstance(row, dict):
       continue
@@ -887,19 +923,50 @@ def family_scoring_horizons(
     if not fam:
       continue
     holds.setdefault(fam, []).append((closed, minutes))
+  out: Dict[str, List[float]] = {}
+  for fam, dated in holds.items():
+    dated.sort(key=lambda p: p[0])                         # oldest -> newest
+    vals = [m for _, m in dated[-max(1, int(recent)):]]    # this family's most recent closes only
+    if len(vals) >= max(1, int(min_trades)):
+      out[fam] = vals
+  return out
+
+
+def family_horizon_weights(
+  closes,
+  *,
+  available: tuple = (5, 15, 60, 240),
+  min_trades: int = 6,
+  recent: int = 20,
+) -> Dict[str, Dict[int, float]]:
+  """How each family's recent trades were actually held, as weights over the settled probe horizons.
+
+  Each of the family's last ``recent`` realized holds votes for its nearest settled horizon (log
+  scale, as in :func:`family_scoring_horizons`); a horizon's weight is its share of the votes. The
+  family's verdict is then scored on the forward return over the holding times it really uses — a
+  weighted MIX of horizons — instead of the single horizon nearest the median.
+
+  Why (2026-09-25): continuation's median hold sat at 118-141 minutes, straddling 120m, the log
+  midpoint between the 60m and 240m horizons. Snapping the median made the verdict a step function
+  of one close: a +0.39R FET winner banked in 63 minutes moved the median from 125.5 to 118.5, the
+  horizon from 240m to 60m, and continuation longs from +1.1% net to -0.15% — zero stake, during a
+  broad alt rally, on the same calls (declined continuation longs then ran +0.05% at 60m and +1.44%
+  at 240m). And a benched family makes no closes, so the step could not step back: the faster the
+  trail banked winners, the more firmly the winning playbook stayed benched. With weights, one close
+  moves the mix by one twentieth — the verdict is continuous in the data, with no constant added and
+  no regime assumption (a family held mostly at 60m is still scored mostly at 60m).
+  """
   opts = sorted({int(h) for h in available if int(h) > 0})
-  out: Dict[str, int] = {}
+  out: Dict[str, Dict[int, float]] = {}
   if not opts:
     return out
-  for fam, dated in holds.items():
-    dated.sort(key=lambda p: p[0])                       # oldest -> newest
-    vals = [m for _, m in dated[-max(1, int(recent)):]]    # this family's most recent closes only
-    if len(vals) < max(1, int(min_trades)):
-      continue
-    vals.sort()
-    n = len(vals)
-    median = vals[n // 2] if n % 2 else 0.5 * (vals[n // 2 - 1] + vals[n // 2])
-    out[fam] = min(opts, key=lambda h: abs(math.log(h) - math.log(max(median, 1e-9))))
+  for fam, vals in _recent_family_holds(closes, recent=recent, min_trades=min_trades).items():
+    votes: Dict[int, int] = {}
+    for minutes in vals:
+      h = _nearest_horizon(minutes, opts)
+      votes[h] = votes.get(h, 0) + 1
+    total = float(sum(votes.values()))
+    out[fam] = {h: votes[h] / total for h in sorted(votes)}
   return out
 
 
@@ -912,6 +979,15 @@ def safe_family_horizons(memory: Any, **kwargs: Any) -> Dict[str, int]:
   """
   try:
     return family_scoring_horizons(memory.realized_closes(limit=1000), **kwargs)
+  except Exception:
+    return {}
+
+
+def safe_family_horizon_weights(memory: Any, **kwargs: Any) -> Dict[str, Dict[int, float]]:
+  """`family_horizon_weights` over a store's realized closes, or {} if they cannot be read (the
+  verdict then falls back to the snapped horizon, never to a blank report)."""
+  try:
+    return family_horizon_weights(memory.realized_closes(limit=1000), **kwargs)
   except Exception:
     return {}
 
@@ -983,6 +1059,48 @@ def _scored_row(vals: List[float], cost_pct: float, min_samples: int) -> Dict[st
   }
 
 
+def _mixed_row(vals_by_h: Dict[int, List[float]], weights: Dict[int, float], cost_pct: float,
+               min_samples: int) -> Dict[str, Any] | None:
+  """A scoreboard row over a holding-time MIX of horizons, or None if a weighted horizon has no data.
+
+  Each horizon keeps its own de-overlapped sample (exactly what a single-horizon row would use), and
+  the row is their weighted combination: mean and hit rate are the weighted averages, ``n`` is the
+  SMALLEST leg (the evidence is only as deep as its thinnest part), and the standard error is the
+  weighted SUM of the legs' errors — the exact error if the horizons were perfectly correlated and an
+  upper bound otherwise (|cov| <= SE_i x SE_j), so mixing can never make a verdict look surer than
+  its legs. With all the weight on one horizon it is that horizon's row, number for number.
+  """
+  total_w = sum(w for w in weights.values() if w > 0)
+  if total_w <= 0:
+    return None
+  mean = se = hit = 0.0
+  n = None
+  for h, w in weights.items():
+    if w <= 0:
+      continue
+    vals = vals_by_h.get(h) or []
+    if not vals:
+      return None
+    frac = w / total_w
+    mean += frac * (sum(vals) / len(vals))
+    se += frac * _stderr(vals)
+    hit += frac * (sum(1 for v in vals if v > 0) / len(vals))
+    n = len(vals) if n is None else min(n, len(vals))
+  net = mean - cost_pct
+  return {
+    "n": int(n or 0),
+    "mean_pct": round(mean * 100, 4),
+    "hit_rate": round(hit, 3),
+    "stderr_pct": round(se * 100, 4),
+    "net_of_cost_pct": round(net * 100, 4),
+    "t_stat": round(net / se, 3) if se > 0 else None,
+    "verdict": ("insufficient data" if int(n or 0) < max(1, int(min_samples))
+                else ("edge" if mean > cost_pct else "no edge")),
+    "horizonWeights": {f"{h}m": round(w / total_w, 3) for h, w in sorted(weights.items()) if w > 0},
+    "nByHorizon": {f"{h}m": len(vals_by_h.get(h) or []) for h, w in sorted(weights.items()) if w > 0},
+  }
+
+
 def signal_edge_stats(
   probes: List[Dict[str, Any]],
   *,
@@ -993,6 +1111,7 @@ def signal_edge_stats(
   min_samples: int = 20,
   family_horizons: Dict[str, int] | None = None,
   market_state_split: bool = False,
+  family_horizon_weights: Dict[str, Dict[int, float]] | None = None,
 ) -> Dict[str, Any]:
   """Does the agent's DIRECTION CALL predict? The one question that decides profitability.
 
@@ -1034,6 +1153,17 @@ def signal_edge_stats(
   breadth24 stamp (see :func:`breadth_terciles`), each bucket reading 'insufficient data' below
   ``min_samples``. It is there so a later reader can test whether any market state separates the calls
   that paid from the ones that did not — nothing sizes or gates on it.
+
+  ``family_horizon_weights`` (from :func:`family_horizon_weights`) replaces the single snapped horizon
+  for every family it covers: that family's ``by_family`` and ``by_family_side`` rows are scored on the
+  holding-time MIX of horizons, so the verdict no longer jumps when the median hold crosses a log
+  midpoint (2026-09-25: continuation flipped 240m -> 60m on one close and went from +1.1% to -0.15%
+  net). Each weighted horizon keeps its own de-overlapped sample — the one a single-horizon row would
+  use — and the row mixes them (:func:`_mixed_row`: weighted mean, n = thinnest leg, SE = weighted sum,
+  an upper bound), so mixing never shrinks a sample nor overstates certainty, and all weight on one
+  horizon reproduces that horizon's row exactly. Such rows carry ``horizonWeights`` and ``nByHorizon``.
+  The report-only market-state split reads the mix's heaviest horizon. Families the weights do not
+  cover keep ``family_horizons`` exactly as before.
   """
   # `by_horizon` is seeded so the return shape is the same whether or not anything settled — callers
   # (dashboard, agent state) should not have to distinguish "no data" from "key absent".
@@ -1050,19 +1180,43 @@ def signal_edge_stats(
   by_fam_side: Dict[str, Dict[str, List[float]]] = {}
   by_state: List[tuple] = []           # (breadth24 or None, signed) at each call's family horizon
   fam_h = {str(k).strip().lower(): int(v) for k, v in (family_horizons or {}).items() if v}
+  fam_w = {
+    str(k).strip().lower(): {int(h): float(w) for h, w in (v or {}).items() if w and float(w) > 0}
+    for k, v in (family_horizon_weights or {}).items()
+  }
+  fam_w = {k: v for k, v in fam_w.items() if v}
+
+  def _add_family_obs(fam: str, ctx: Dict[str, Any], signed: float) -> None:
+    by_fam.setdefault(fam, []).append(signed)
+    # The side split is taken AFTER the de-overlap, from the very same observations, so the two
+    # sides always sum to the pooled row and the de-overlap rule keeps living in one place.
+    side = str(ctx.get("positionSide") or "").lower()
+    by_fam_side.setdefault(fam, {}).setdefault(side, []).append(signed)
+    if market_state_split:
+      by_state.append((market_breadth(ctx.get("marketState")), signed))
+
+  # A family with holding-time weights keeps one de-overlapped sample PER weighted horizon (pooled and
+  # per side); its rows are mixed from those samples below (see _mixed_row).
+  mix_fam: Dict[str, Dict[int, List[float]]] = {}
+  mix_side: Dict[str, Dict[str, Dict[int, List[float]]]] = {}
   for _row, ctx, horizon, signed in _probe_observations(probes, horizons_min):
     by_h.setdefault(f"{horizon}m", []).append(signed)
     # Family scoring uses ONE horizon PER FAMILY so a setup is never counted twice with different
-    # holding periods — that horizon being the family's own, not a single one shared by all.
+    # holding periods — that horizon being the family's own, not a single one shared by all. A family
+    # with holding-time weights is scored on its mix instead.
     fam = infer_setup_family(ctx)
+    weights = fam_w.get(fam)
+    if weights:
+      if horizon in weights:
+        side = str(ctx.get("positionSide") or "").lower()
+        mix_fam.setdefault(fam, {}).setdefault(horizon, []).append(signed)
+        mix_side.setdefault(fam, {}).setdefault(side, {}).setdefault(horizon, []).append(signed)
+        # The report-only market-state split reads the mix's heaviest horizon.
+        if market_state_split and horizon == max(weights, key=lambda h: (weights[h], h)):
+          by_state.append((market_breadth(ctx.get("marketState")), signed))
+      continue
     if horizon == int(fam_h.get(fam, family_horizon_min)):
-      by_fam.setdefault(fam, []).append(signed)
-      # The side split is taken AFTER the de-overlap above, from the very same observations, so the
-      # two sides always sum to the pooled row and the de-overlap rule keeps living in one place.
-      side = str(ctx.get("positionSide") or "").lower()
-      by_fam_side.setdefault(fam, {}).setdefault(side, []).append(signed)
-      if market_state_split:
-        by_state.append((market_breadth(ctx.get("marketState")), signed))
+      _add_family_obs(fam, ctx, signed)
   if market_state_split:
     cuts = breadth_terciles([b for b, _ in by_state if b is not None])
     grouped: Dict[str, List[float]] = {k: [] for k in MARKET_STATE_BUCKETS}
@@ -1083,8 +1237,16 @@ def signal_edge_stats(
         for k, v in grouped.items()
       },
     }
-  if by_fam:
+  mixed_fam = {fam: _mixed_row(legs, fam_w[fam], cost_pct, min_samples) for fam, legs in mix_fam.items()}
+  mixed_fam = {fam: row for fam, row in mixed_fam.items() if row is not None}
+  mixed_side = {
+    fam: {side: row for side, legs in sorted(sides.items())
+          if (row := _mixed_row(legs, fam_w[fam], cost_pct, min_samples)) is not None}
+    for fam, sides in mix_side.items()
+  }
+  if by_fam or mixed_fam:
     out["by_family"] = {fam: _scored_row(vals, cost_pct, min_samples) for fam, vals in by_fam.items()}
+    out["by_family"].update(mixed_fam)
     # Each playbook split by SIDE at the family's own horizon. The Kelly stake is a bet on a side, and
     # a pooled row lets one side's record size the other: on 2026-09-24 continuation's 'edge' was
     # carried by its longs (n=40, +1.24%) while its shorts sat at n=9, -0.18% ± 1.05% — and the SPX
@@ -1094,6 +1256,7 @@ def signal_edge_stats(
       fam: {side: _scored_row(vals, cost_pct, min_samples) for side, vals in sorted(sides.items())}
       for fam, sides in by_fam_side.items()
     }
+    out["by_family_side"].update({fam: sides for fam, sides in mixed_side.items() if sides})
   if not by_h:
     return out
   scoring = {f"{int(h)}m" for h in verdict_horizons}

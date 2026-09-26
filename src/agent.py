@@ -66,6 +66,7 @@ from .edge import (
   exit_discipline_stats,
   family_scoring_horizons,
   safe_family_horizons,
+  safe_family_horizon_weights,
   expectancy_size_factor,
   edge_stats,
   entry_quality_stats,
@@ -472,6 +473,81 @@ def _build_compact_account_state(
     },
   }
   return result
+
+
+# A spot balance worth less than this cannot carry a protective order (it rounds below the exchange's
+# minimum size) and is not exposure worth managing. Shared with main._discover_unlisted_holdings so the
+# two views of "what do we hold" apply ONE dust rule.
+SPOT_DUST_VALUE_USD = 0.50
+
+
+def reconcile_spot_positions(
+  positions: Dict[str, Dict[str, Any]],
+  spot_totals: Dict[str, Any] | None,
+  symbols: Any,
+  current_prices: Dict[str, Any],
+  *,
+  dust_value_usd: float = SPOT_DUST_VALUE_USD,
+) -> Dict[str, Dict[str, Any]]:
+  """The spot positions the model sees: tracked positions reconciled with live balances, plus live
+  holdings of watched coins missing from the trade log — minus DUST.
+
+  Reconciling with live balances avoids phantom exposure when trades happen outside the agent. Dust is
+  dropped because it is not manageable exposure: 2026-09-25/26, a 0.0007 KCS spot remainder (~$0.005,
+  left by the KCS carry trade) appeared here as a position with unknown avgEntry, the prompt's
+  "unknown avgEntry → set protection" rule made the model try TP/SL on it (KuCoin rejected both legs),
+  and it re-audited that phantom in run after run. A balance whose price is unknown is kept (it cannot
+  be judged). Never raises on odd inputs.
+  """
+  balances = {
+    str(cur).upper(): _to_float((totals or {}).get("available"))
+    for cur, totals in (spot_totals or {}).items()
+  }
+  zero_tol = 1e-9
+
+  def _held(sym: str) -> float:
+    return balances.get(_base_currency(sym), 0.0)
+
+  def _is_dust(sym: str, qty: float) -> bool:
+    px = _to_float(current_prices.get(sym))
+    return px > 0 and qty * px < float(dust_value_usd)
+
+  out: Dict[str, Dict[str, Any]] = {}
+  for sym, pos in (positions or {}).items():
+    actual_qty = _held(sym)
+    if actual_qty <= zero_tol or _is_dust(sym, actual_qty):
+      # Drop positions when the wallet no longer holds the asset (or holds only dust).
+      continue
+    adj = dict(pos)
+    net = _to_float(pos.get("netSize"))
+    if abs(actual_qty - net) > zero_tol:
+      avg_entry = adj.get("avgEntry")
+      adj["netSize"] = actual_qty
+      if avg_entry is not None:
+        adj["cost"] = _to_float(avg_entry) * actual_qty
+        cur_price = current_prices.get(sym) or 0.0
+        adj["unrealizedPnl"] = (cur_price - _to_float(avg_entry)) * actual_qty if cur_price else None
+      else:
+        adj["cost"] = None
+        adj["unrealizedPnl"] = None
+    out[sym] = adj
+  # Add any live holdings that are missing from the recorded trade log.
+  for sym in symbols or []:
+    if sym in out:
+      continue
+    actual_qty = _held(sym)
+    if actual_qty <= zero_tol or _is_dust(sym, actual_qty):
+      continue
+    out[sym] = {
+      "netSize": actual_qty,
+      "cost": None,
+      "avgEntry": None,
+      "realizedPnl": None,
+      "unrealizedPnl": None,
+      "lastTs": None,
+      "currentPrice": current_prices.get(sym) or None,
+    }
+  return out
 
 
 def _base_currency(symbol: str) -> str:
@@ -1140,7 +1216,15 @@ def run_trading_agent(
           # Hold times come from a wide window of realized closes so a family's median is stable.
           _fam_horizons = safe_family_horizons(memory)
           state["family_horizons"] = _fam_horizons
-          state["signal_edge"] = signal_edge_stats(_probes, cost_pct=_cost, family_horizons=_fam_horizons)
+          # ...and scored over the MIX of horizons its recent trades were actually held for, so the
+          # verdict moves smoothly with holding time instead of jumping when the median hold crosses a
+          # log midpoint (edge.family_horizon_weights; 2026-09-25 continuation 240m -> 60m flip). The
+          # order path reads this same state, so the stake it applies is the one shown here.
+          _fam_weights = safe_family_horizon_weights(memory)
+          state["family_horizon_weights"] = _fam_weights
+          state["signal_edge"] = signal_edge_stats(
+            _probes, cost_pct=_cost, family_horizons=_fam_horizons, family_horizon_weights=_fam_weights,
+          )
           # TAKER FLOW: does the aggressor balance at the moment of the call carry information about
           # where price goes next, on this venue and at our horizons? Surfaced only once the sample
           # can answer — an n=5 reading in the prompt is an invitation to trade a coin flip, and the
@@ -1281,52 +1365,9 @@ def run_trading_agent(
     current_prices[candidate] = float(ticker.price)
     return candidate
 
-  positions = memory.positions(current_prices)
-  # Reconcile tracked positions with live spot balances to avoid phantom exposure when trades happen outside the agent.
-  spot_balances_by_currency = {
-    cur.upper(): _to_float(totals.get("available"))
-    for cur, totals in (spot_totals or {}).items()
-  }
-  reconciled_positions: Dict[str, Dict[str, Any]] = {}
-  zero_tol = 1e-9
-  for sym, pos in positions.items():
-    base = _base_currency(sym)
-    actual_qty = spot_balances_by_currency.get(base, 0.0)
-    net = _to_float(pos.get("netSize"))
-    if actual_qty <= zero_tol:
-      # Drop positions when the wallet no longer holds the asset.
-      continue
-    adj = dict(pos)
-    if abs(actual_qty - net) > zero_tol:
-      avg_entry = adj.get("avgEntry")
-      adj["netSize"] = actual_qty
-      if avg_entry is not None:
-        adj["cost"] = _to_float(avg_entry) * actual_qty
-        cur_price = current_prices.get(sym) or 0.0
-        adj["unrealizedPnl"] = (cur_price - _to_float(avg_entry)) * actual_qty if cur_price else None
-      else:
-        adj["cost"] = None
-        adj["unrealizedPnl"] = None
-    reconciled_positions[sym] = adj
-  # Add any live holdings that are missing from the recorded trade log.
-  for sym in snapshot.tickers.keys():
-    if sym in reconciled_positions:
-      continue
-    base = _base_currency(sym)
-    actual_qty = spot_balances_by_currency.get(base, 0.0)
-    if actual_qty <= zero_tol:
-      continue
-    cur_price = current_prices.get(sym) or None
-    reconciled_positions[sym] = {
-      "netSize": actual_qty,
-      "cost": None,
-      "avgEntry": None,
-      "realizedPnl": None,
-      "unrealizedPnl": None,
-      "lastTs": None,
-      "currentPrice": cur_price,
-    }
-  positions = reconciled_positions
+  positions = reconcile_spot_positions(
+    memory.positions(current_prices), spot_totals, snapshot.tickers.keys(), current_prices,
+  )
   triggers = memory.latest_triggers()
   latest_plan_entry = memory.latest_plan()
   research_plans = memory.latest_items("research", limit=5)
@@ -2404,6 +2445,11 @@ def run_trading_agent(
         "byCounterAtEntry and byHtfAligned split the same record by whether 15m and 1h already opposed "
         "the position at entry and whether 4h/1D agreed with it, with n shown before any verdict. Let "
         "that measurement, not a rule of thumb, decide how readily you close. "
+        # 2026-09-25/26: once the stake was shown BEFORE proposing, the model stopped proposing the
+        # benched side and declined it instead — 21 continuation-long declines in a few hours cited the
+        # stand-aside, none became a call, so no probe was recorded and the verdict could not move
+        # (the Sep 4-7 probe-starvation freeze, reached through the prompt this time). The nine
+        # "wasted" refusals of Sep 24 were in fact nine observations. Hence: submit, don't decline.
         "ACT ON THE SCOREBOARD: signalEdge measures whether your DIRECTION CALLS predict, separately "
         "per playbook and per side (by_family_side), against the cost each must clear. Every row "
         "carries t_stat (net divided by its own standard error). Code judges every entry on its SIDE, "
@@ -2418,9 +2464,13 @@ def run_trading_agent(
         "'unproven' means its net is positive but still inside its own noise (t below 1) — not a losing "
         "playbook, just not yet distinguishable from nothing. A refused proposal is still scored — the "
         "call is recorded before the stand-aside check — and that is the ONLY way a stood-aside family "
-        "or side can re-open: nothing else adds to its record. So do not force it, but when you see a "
-        "genuine, honestly-labelled setup in a stood-aside family or side, proposing it costs nothing "
-        "and feeds its verdict; otherwise spend your turns on the open families and sides: "
+        "or side can re-open: nothing else adds to its record. So when your best honest setup this run "
+        "is in a stood-aside family or side, SUBMIT it with its true label and a valid bracket anyway: "
+        "code records the call and refuses it, and that refusal is expected, costs you nothing, and is "
+        "exactly the evidence that lets the market re-open it. Declining it instead (decline_trade / "
+        "log_decision) records nothing, so a benched playbook that is paying again stays benched. Once "
+        "per setup is enough — repeats on the same symbol inside the scoring window add nothing. Never "
+        "relabel it to get past the refusal. Beyond that, spend your turns on the open families and sides: "
         "analyze_market_context reports entryMap.fadeSetup whenever 15m RSI is at an "
         "extreme, which is a ready-made fade_extreme candidate. A bet is judged on its SIDE once that "
         "side has its own sample (judgedOn 'own'). A side still thin on its own is judged on the pooled "

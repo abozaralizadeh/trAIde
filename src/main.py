@@ -16,7 +16,7 @@ from agents import set_default_openai_client
 from agents.tracing import (get_trace_provider)
 from .agent import (
   TradingSnapshot, run_trading_agent, setup_tracing, setup_lstracing, _build_openai_client,
-  _to_futures_symbol,
+  _to_futures_symbol, SPOT_DUST_VALUE_USD,
 )
 from .analytics import flow_reading_max_age_sec, market_state, taker_flow_summary
 from .config import load_config
@@ -912,7 +912,7 @@ def _fetch_tickers(
   return list(tickers.keys()), tickers
 
 
-def _discover_unlisted_holdings(kucoin: KucoinClient, spot_accounts: list, existing_tickers: dict, min_value_usd: float = 0.50) -> tuple[list[str], dict]:
+def _discover_unlisted_holdings(kucoin: KucoinClient, spot_accounts: list, existing_tickers: dict, min_value_usd: float = SPOT_DUST_VALUE_USD) -> tuple[list[str], dict]:
   """Discover spot holdings not in the active coin list by scanning balances."""
   known_bases = {sym.split("-")[0].upper() for sym in existing_tickers if "-" in sym}
   known_bases.add("USDT")

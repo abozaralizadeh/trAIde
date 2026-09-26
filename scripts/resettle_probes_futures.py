@@ -702,14 +702,15 @@ def _edge_summary(data: Dict[str, Any], cost_pct: float) -> Dict[str, Any]:
   'open' for funding_carry while code refused its shorts (2026-09-25 review).
   """
   from src.edge import (SIDES, annotate_family_stakes, family_explore_factor, safe_family_horizons,
-                        signal_edge_stats)
+                        safe_family_horizon_weights, signal_edge_stats)
 
   with tempfile.TemporaryDirectory() as tmp:
     path = Path(tmp) / "memory.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     store = MemoryStore(str(path))
     probes = store.signal_probes(limit=0)
-    stats = signal_edge_stats(probes, cost_pct=cost_pct, family_horizons=safe_family_horizons(store))
+    stats = signal_edge_stats(probes, cost_pct=cost_pct, family_horizons=safe_family_horizons(store),
+                              family_horizon_weights=safe_family_horizon_weights(store))
   board = annotate_family_stakes(stats)
   out = {"by_horizon": stats.get("by_horizon") or {}, "families": {}}
   for fam, row in sorted((board.get("by_family") or {}).items()):

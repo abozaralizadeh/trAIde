@@ -414,16 +414,23 @@ def stand_aside_message(status: Dict[str, Any], open_fams: Dict[str, Any] | None
   # be listed above as open — "the same playbook will be refused" would then contradict that list.
   _fam = str(st.get("family") or "other")
   _side = st.get("side")
-  _again = (f"Re-proposing this side of the playbook ({_fam} {_side}s) will be refused again while its "
-            f"measurement stands" if _side else "Re-proposing the same playbook will be refused again")
+  _again = (f"Re-proposing this side of the playbook ({_fam} {_side}s) will be refused while its "
+            f"measurement stands" if _side else "Re-proposing the same playbook will be refused while its "
+            "measurement stands")
+  # No "stand down until the regime turns" (2026-09-26): the only way the bot can SEE the regime turn
+  # for a benched side is new calls on it, and that advice — plus the stake shown before proposing —
+  # turned 21 genuine continuation-long setups into silent declines that recorded nothing.
   hint = (
     "This is bet-sizing on measured edge, not a directional veto — it re-opens automatically once "
-    "net exceeds its own SE (t≥1), recomputed every run from your calls (this refused call is still "
-    "recorded as evidence). " + " ".join(where) +
-    f" {_again}; take one of the above only if the "
-    "setup is genuinely there, otherwise stand down until the regime turns. Label honestly: declaring "
-    "this same setup as a different playbook to get past the refusal does not change the trade, and it "
-    "corrupts the scoreboard that sizes every future trade."
+    "net exceeds its own SE (t≥1), recomputed every run from your calls. This refused call WAS "
+    "recorded as evidence, and further genuine calls on this side are how it can re-open. "
+    + " ".join(where) +
+    f" {_again}, but each genuine, honestly-labelled setup is still worth submitting once — the "
+    "refusal is expected and costs nothing, while declining it records nothing (repeats on the same "
+    "symbol inside the scoring window add nothing either). Otherwise take one of the above if the "
+    "setup is genuinely there. Label honestly: declaring this same setup as a different playbook to get "
+    "past the refusal does not change the trade, and it corrupts the scoreboard that sizes every future "
+    "trade."
   )
   log = (
     f"{row_desc}: verdict={st.get('verdict')}, net_of_cost={_fmt_pct(net, '+.3f')}%, "

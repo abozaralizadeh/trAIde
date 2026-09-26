@@ -20,6 +20,7 @@ from .edge import (
   gate_scoreboard_from_store,
   probe_cost_pct,
   safe_family_horizons,
+  safe_family_horizon_weights,
   signal_edge_stats,
 )
 from .memory import MemoryStore
@@ -51,7 +52,8 @@ def edge_scoreboard(memory: Any, cfg: Any) -> Dict[str, Any]:
     horizons = safe_family_horizons(memory)
     # The owner's view also carries the report-only split by market state (breadth24 terciles); the
     # Trading Agent's copy never does — no per-state record reaches the model.
-    stats = signal_edge_stats(probes, cost_pct=cost, family_horizons=horizons, market_state_split=True)
+    stats = signal_edge_stats(probes, cost_pct=cost, family_horizons=horizons, market_state_split=True,
+                              family_horizon_weights=safe_family_horizon_weights(memory))
     explore = float(getattr(getattr(cfg, "edge", None), "explore_unproven_family_factor", 0.4) or 0.0)
     stand_aside = bool(getattr(getattr(cfg, "edge", None), "stand_aside_no_edge_family", True))
     return {

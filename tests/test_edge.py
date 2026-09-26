@@ -2081,3 +2081,138 @@ class TestHatchedCallsAreScoredAgainstCallsThatNeverMetTheGate:
     assert row["diffPct"] == pytest.approx(-2.0, abs=1e-6)
     assert row["byHatch"] == [{"hatch": "declared", "calls": 3}, {"hatch": "fade", "calls": 1}]
     assert "short" not in board["gates"]["h1_align"]["hatched"]
+
+
+# --- holding-time weighted family scoring (2026-09-26) --------------------------------------------
+# Live 2026-09-25: continuation's median hold straddled 120m (the log midpoint of 60m and 240m). One
+# fast +0.39R FET winner moved it 125.5 -> 118.5, the snapped horizon 240m -> 60m, and continuation
+# longs from +1.1% to -0.15% net: zero stake for the rest of an alt rally, which no new close could
+# undo because a benched family makes none. Weights make the verdict continuous in the holds.
+
+def test_horizon_weights_are_the_share_of_recent_holds_nearest_each_horizon():
+  from src.edge import family_horizon_weights
+  holds = [58, 63, 75, 140, 262, 576]
+  closes = [_hclose("continuation", m, ts=10_000_000 + i) for i, m in enumerate(holds)]
+  assert family_horizon_weights(closes) == {"continuation": {60: 0.5, 240: 0.5}}
+
+
+def test_horizon_weights_need_the_same_evidence_as_the_snapped_horizon():
+  from src.edge import family_horizon_weights
+  closes = [_hclose("breakout", 180)] * 2 + [_hclose("continuation", 162)] * 8
+  w = family_horizon_weights(closes)
+  assert "breakout" not in w and w["continuation"] == {240: 1.0}
+  assert family_horizon_weights(None) == {}
+  assert family_horizon_weights(["x", {}, {"ts": "bad", "entryContext": {}}]) == {}
+
+
+def _straddle_closes(n_short):
+  """20 recent continuation holds: ``n_short`` at 63m (-> 60m), the rest at 141m (-> 240m)."""
+  holds = [63] * n_short + [141] * (20 - n_short)
+  return [_hclose("continuation", m, ts=10_000_000 + i) for i, m in enumerate(holds)]
+
+
+def test_one_close_across_the_log_midpoint_no_longer_flips_the_stake():
+  """The live failure. Calls that sit flat at 60m and pay at 240m: under the snapped median, one more
+  short hold flips the horizon and benches the family; under the holding-time mix the same close moves
+  the score by one twentieth of the 60m/240m gap and the stake survives."""
+  from src.edge import (family_horizon_weights, family_scoring_horizons, family_stand_aside,
+                        signal_edge_stats)
+  probes = [_hprobe("continuation", 1_000_000 + i * 90_000, 100.0, 100.0 + ((-1) ** i) * 0.05, 101.5)
+            for i in range(30)]
+  before, after = _straddle_closes(9), _straddle_closes(10)
+  # The old rule, documented: the median crosses 120m and the verdict jumps.
+  assert family_scoring_horizons(before)["continuation"] == 240
+  assert family_scoring_horizons(after)["continuation"] == 60
+  snapped_before = signal_edge_stats(probes, cost_pct=0.0014, family_horizons=family_scoring_horizons(before))
+  snapped_after = signal_edge_stats(probes, cost_pct=0.0014, family_horizons=family_scoring_horizons(after))
+  assert family_stand_aside(snapped_before, "continuation") is False
+  assert family_stand_aside(snapped_after, "continuation") is True
+  # The new rule: both sides of the midpoint score the calls over their real holding mix.
+  mixed_before = signal_edge_stats(probes, cost_pct=0.0014, family_horizons=family_scoring_horizons(before),
+                                   family_horizon_weights=family_horizon_weights(before))
+  mixed_after = signal_edge_stats(probes, cost_pct=0.0014, family_horizons=family_scoring_horizons(after),
+                                  family_horizon_weights=family_horizon_weights(after))
+  assert family_stand_aside(mixed_before, "continuation") is False
+  assert family_stand_aside(mixed_after, "continuation") is False
+  gap = abs(mixed_before["by_family"]["continuation"]["mean_pct"]
+            - mixed_after["by_family"]["continuation"]["mean_pct"])
+  assert gap <= 1.5 / 20 + 1e-6          # one close = one twentieth of the 60m->240m difference (1.5%)
+  assert mixed_after["by_family"]["continuation"]["horizonWeights"] == {"60m": 0.5, "240m": 0.5}
+
+
+def test_a_probe_is_scored_on_the_mix_only_once_every_weighted_horizon_settled():
+  """A young probe must not be scored on its short leg alone while its long leg is still pending."""
+  from src.edge import signal_edge_stats
+  probes = [_hprobe("continuation", 1_000_000 + i * 90_000, 100.0, 100.2, None) for i in range(25)]
+  mixed = signal_edge_stats(probes, cost_pct=0.0014,
+                            family_horizon_weights={"continuation": {60: 0.5, 240: 0.5}})
+  assert "continuation" not in (mixed.get("by_family") or {})
+  only60 = signal_edge_stats(probes, cost_pct=0.0014, family_horizon_weights={"continuation": {60: 1.0}})
+  assert only60["by_family"]["continuation"]["n"] == 25
+
+
+def test_all_weight_on_one_horizon_reproduces_that_horizons_row_exactly():
+  """Backward compatibility by construction: a family held only at 240m scores exactly as the snapped
+  240m row did — same n, mean, SE, t and verdict — pooled and per side."""
+  from src.edge import signal_edge_stats
+  probes = [_hprobe("continuation", 1_000_000 + i * 90_000, 100.0, 100.1 + 0.02 * i, 100.6 + 0.07 * i,
+                    side=("long" if i % 3 else "short")) for i in range(30)]
+  snapped = signal_edge_stats(probes, cost_pct=0.0014, family_horizons={"continuation": 240})
+  mixed = signal_edge_stats(probes, cost_pct=0.0014, family_horizons={"continuation": 240},
+                            family_horizon_weights={"continuation": {240: 1.0}})
+  for key in ("n", "mean_pct", "hit_rate", "stderr_pct", "net_of_cost_pct", "t_stat", "verdict"):
+    assert mixed["by_family"]["continuation"][key] == snapped["by_family"]["continuation"][key], key
+    for side in ("long", "short"):
+      assert (mixed["by_family_side"]["continuation"][side][key]
+              == snapped["by_family_side"]["continuation"][side][key]), (side, key)
+
+
+def test_mixing_keeps_each_horizons_sample_and_never_overstates_certainty():
+  """Two calls on one symbol 90 minutes apart are two observations at 60m and one at 240m; the mix
+  keeps both legs' own samples (n = the thinner leg, not a re-decimated set that would push a side
+  under min_samples) and its SE is the weighted SUM of the legs' SEs — never tighter than the legs."""
+  from src.edge import signal_edge_stats
+
+  def _same_sym(ts, m60, m240):
+    row = _hprobe("continuation", ts, 100.0, m60, m240)
+    row["symbol"] = "SUI-USDT"
+    return row
+
+  probes = [_same_sym(1_000_000 + k * 5_400, 100.3 + 0.1 * k, 101.0 - 0.2 * k) for k in range(2)]
+  probes += [_hprobe("continuation", 9_000_000 + i * 90_000, 100.0, 99.8 + 0.03 * i, 100.9 - 0.05 * i)
+             for i in range(8)]
+  at60 = signal_edge_stats(probes, cost_pct=0.0014, min_samples=1, family_horizons={"continuation": 60})
+  at240 = signal_edge_stats(probes, cost_pct=0.0014, min_samples=1, family_horizons={"continuation": 240})
+  mixed = signal_edge_stats(probes, cost_pct=0.0014, min_samples=1,
+                            family_horizon_weights={"continuation": {60: 0.5, 240: 0.5}})
+  r60, r240, rm = (x["by_family"]["continuation"] for x in (at60, at240, mixed))
+  assert rm["nByHorizon"] == {"60m": r60["n"], "240m": r240["n"]}
+  assert rm["n"] == min(r60["n"], r240["n"])
+  assert abs(rm["mean_pct"] - 0.5 * (r60["mean_pct"] + r240["mean_pct"])) < 1e-3
+  assert abs(rm["stderr_pct"] - 0.5 * (r60["stderr_pct"] + r240["stderr_pct"])) < 1e-3
+
+
+def test_families_without_weights_are_scored_exactly_as_before():
+  from src.edge import signal_edge_stats
+  probes = ([_hprobe("continuation", 1_000_000 + i * 90_000, 100.0, 100.1, 101.0) for i in range(25)]
+            + [_hprobe("fade_extreme", 5_000_000 + i * 90_000, 100.4, 100.2, 99.0) for i in range(25)])
+  plain = signal_edge_stats(probes, cost_pct=0.0014, family_horizons={"fade_extreme": 15})
+  mixed = signal_edge_stats(probes, cost_pct=0.0014, family_horizons={"fade_extreme": 15},
+                            family_horizon_weights={"continuation": {60: 0.5, 240: 0.5}})
+  assert mixed["by_family"]["fade_extreme"] == plain["by_family"]["fade_extreme"]
+  assert mixed["by_family_side"]["fade_extreme"] == plain["by_family_side"]["fade_extreme"]
+  assert mixed["by_horizon"] == plain["by_horizon"]            # the reported horizons are untouched
+
+
+def test_every_verdict_path_scores_families_on_the_holding_time_mix():
+  """Wiring, not the pure function: the agent (whose state the ORDER PATH reads), the dashboard and
+  the Supervisor must all pass the weights, or the stake shown and the stake applied can disagree."""
+  import inspect
+  import src.agent as agent_mod
+  import src.dashboard_publisher as dash_mod
+  import src.supervisor as sup_mod
+  agent_src = inspect.getsource(agent_mod.run_trading_agent)
+  assert "_fam_weights = safe_family_horizon_weights(memory)" in agent_src
+  assert "family_horizon_weights=_fam_weights" in agent_src
+  assert "family_horizon_weights=safe_family_horizon_weights(memory)" in inspect.getsource(dash_mod)
+  assert "family_horizon_weights=safe_family_horizon_weights(memory)" in inspect.getsource(sup_mod)

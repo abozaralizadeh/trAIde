@@ -458,10 +458,15 @@ class TestStandAsideMessageTellsTheTruth:
     assert st["standAside"] is True
     hint = stand_aside_message(st, open_families(board))["hint"]
     assert "continuation long side only" in hint
-    assert "Re-proposing the same playbook will be refused again" not in hint
+    assert "Re-proposing the same playbook will be refused" not in hint
     assert "this side of the playbook (continuation shorts)" in hint
     pooled = stand_aside_message(self._status(0.47, 0.60, "edge"), {})["hint"]
-    assert "Re-proposing the same playbook will be refused again" in pooled
+    assert "Re-proposing the same playbook will be refused while its measurement stands" in pooled
+    # The refusal must keep the evidence flowing, not send the model away until "the regime turns":
+    # a benched side can only see the regime turn through new calls on it (2026-09-26).
+    for h in (hint, pooled):
+      assert "until the regime turns" not in h
+      assert "declining it records nothing" in h
 
   def test_the_order_path_takes_its_words_from_the_stake_status(self):
     """Wiring: the refusal and the log come from stand_aside_message over family_stake_status for the

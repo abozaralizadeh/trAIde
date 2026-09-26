@@ -34,6 +34,7 @@ from .edge import (
   exit_discipline_stats,
   family_scoring_horizons,
   safe_family_horizons,
+  safe_family_horizon_weights,
   family_size_factor,
   infer_setup_family,
   measured_slippage_pct,
@@ -369,7 +370,8 @@ class DashboardPublisher:
       # Same per-family horizons the entry gate uses, so the published verdict matches the bot's.
       probes = memory.signal_probes(limit=0)
       horizons = safe_family_horizons(memory)
-      stats = signal_edge_stats(probes, cost_pct=cost, family_horizons=horizons)
+      stats = signal_edge_stats(probes, cost_pct=cost, family_horizons=horizons,
+                                family_horizon_weights=safe_family_horizon_weights(memory))
       explore = float(getattr(getattr(cfg, "edge", None), "explore_unproven_family_factor", 0.4) or 0.0)
       # The same standAside / stake marks the agent reads (edge.annotate_family_stakes), so the panel
       # cannot show a family as 'edge' while the order path holds it at zero stake. Stakes are
