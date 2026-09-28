@@ -404,6 +404,18 @@ class TestDecisionFeedLabels:
     line = _summarize_tool_output({"orderId": "999", "side": "sell", "symbol": "SPX-USDT"})
     assert line.startswith("live order: sell SPX-USDT (orderId=999)")
 
+  def test_a_live_futures_entry_names_its_side_and_symbol(self):
+    # The real shape: exchange ack + tradeRecord/futuresSymbol, no top-level side/symbol (Sep 27-28 log:
+    # every live entry printed "live order: None None").
+    out = {"orderId": "494075593810386944", "clientOid": "traide-entry-x", "pendingLimitEntry": True,
+           "futuresSymbol": "EIGENUSDTM", "tradeRecord": {"symbol": "EIGEN-USDT", "side": "sell"},
+           "decisionLog": {"reason": "breakdown retest"}}
+    line = _summarize_tool_output(out)
+    assert line.startswith("live order: sell EIGEN-USDT (orderId=494075593810386944)"), line
+    assert "None" not in line.split("(orderId")[0]
+    line = _summarize_tool_output({"orderId": "1", "futuresSymbol": "EIGENUSDTM"})
+    assert "EIGENUSDTM" in line
+
   def test_the_run_uses_the_module_helper(self):
     src = inspect.getsource(_agent_mod.run_trading_agent)
     assert "summary = _summarize_tool_output(out)" in src
