@@ -732,8 +732,13 @@ def _summarize_tool_output(output: Any) -> str | None:
     suffix = f" rationale={rationale}" if rationale else ""
     return f"paper order: {req.get('side')} {req.get('symbol')} funds={req.get('funds') or req.get('size')} (pnl=n/a){suffix}"
   if output.get("orderId") or output.get("orderRequest"):
-    side = output.get("side") or output.get("orderRequest", {}).get("side")
-    osym = output.get("symbol") or output.get("orderRequest", {}).get("symbol")
+    # A live futures limit entry returns the exchange's ack ({orderId, clientOid}) plus our own keys, with
+    # the side and symbol only inside tradeRecord / futuresSymbol — every live entry in the Sep 27-28 log
+    # printed as "live order: None None", which is also what Telegram and the Supervisor's read_logs saw.
+    req = output.get("orderRequest") if isinstance(output.get("orderRequest"), dict) else {}
+    rec = output.get("tradeRecord") if isinstance(output.get("tradeRecord"), dict) else {}
+    side = output.get("side") or req.get("side") or rec.get("side")
+    osym = output.get("symbol") or req.get("symbol") or rec.get("symbol") or output.get("futuresSymbol")
     rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
     suffix = f" rationale={rationale}" if rationale else ""
     return f"live order: {side} {osym} (orderId={output.get('orderId')}) (pnl=n/a){suffix}"
