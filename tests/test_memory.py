@@ -1181,6 +1181,91 @@ class TestPerFamilyProbeRetention:
     assert fams.count("continuation") == MAX_PROBES_PER_FAMILY
 
 
+class TestPerSideRetention:
+  """2026-09-28: stakes are judged per SIDE, but retention was per family — continuation held 141 long : 9
+  short at its 150 cap, the busy long side evicting every pre-Sep-24 short. Same principle as the Sep 14
+  per-family fix, one level down: a busy side must not evict a quiet side's evidence."""
+
+  @staticmethod
+  def _probe(side, ts, family="continuation", symbol="X-USDT"):
+    return {"symbol": symbol, "ts": ts,
+            "entryContext": {"positionSide": side, "marketPriceAtSignal": 100.0,
+                             "setupFamily": family, "signalProbe": {}}}
+
+  def test_a_loud_side_cannot_evict_the_quiet_side_of_the_same_family(self):
+    from src.memory import _trim_probes_per_family, MAX_PROBES_PER_FAMILY
+    shorts = [self._probe("short", 1 + i) for i in range(9)]
+    longs = [self._probe("long", 1000 + i) for i in range(MAX_PROBES_PER_FAMILY * 2)]
+    kept = _trim_probes_per_family(shorts + longs)
+    sides = [r["entryContext"]["positionSide"] for r in kept]
+    assert sides.count("short") == 9, "the quiet side keeps ALL of its evidence"
+    assert sides.count("long") == MAX_PROBES_PER_FAMILY
+    assert [r["ts"] for r in kept] == sorted(r["ts"] for r in kept)
+
+  def test_each_side_is_capped_on_its_own(self):
+    from src.memory import _trim_probes_per_family, MAX_PROBES_PER_FAMILY
+    rows = [self._probe("short", i) for i in range(MAX_PROBES_PER_FAMILY + 5)]
+    rows += [self._probe("long", 10_000 + i) for i in range(MAX_PROBES_PER_FAMILY + 5)]
+    kept = _trim_probes_per_family(rows)
+    sides = [r["entryContext"]["positionSide"] for r in kept]
+    assert sides.count("short") == sides.count("long") == MAX_PROBES_PER_FAMILY
+
+  def test_side_n_never_drops_without_a_new_call_on_that_side(self, tmp_path):
+    """Property: recording calls on one side never reduces the other side's retained count."""
+    from src.memory import MAX_PROBES_PER_FAMILY
+    m = MemoryStore(str(tmp_path / "m.json"))
+    for i in range(5):
+      m.record_signal_probe(f"S{i}-USDT", "sell", 100.0, setup_family="continuation")
+    before = sum(1 for r in m._read()["signal_probes"] if r["entryContext"]["positionSide"] == "short")
+    for i in range(MAX_PROBES_PER_FAMILY + 30):
+      m.record_signal_probe(f"L{i}-USDT", "buy", 100.0, setup_family="continuation")
+    m._write(m._prune(m._read()))
+    after = sum(1 for r in m._read()["signal_probes"] if r["entryContext"]["positionSide"] == "short")
+    assert before == after == 5
+
+
+class TestSignalProbesUnionTwins:
+  """signal_probes() unions the bucket with order rows. A placed call's order row is written 2-7 s after its
+  probe (97 of 97 live rows, 2026-09-28), so the old (symbol, ts) dedupe never matched and every placed call
+  was counted twice; the same key also merged two different calls made in the same second."""
+
+  @staticmethod
+  def _row(side, ts, family="continuation", symbol="X-USDT"):
+    return {"symbol": symbol, "ts": ts,
+            "entryContext": {"positionSide": side, "marketPriceAtSignal": 100.0,
+                             "setupFamily": family, "signalProbe": {}}}
+
+  def _store(self, tmp_path, probes, trades):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    data = m._read()
+    data["signal_probes"] = probes
+    data["trades"] = trades
+    m._write(data)
+    return m
+
+  def test_a_placed_calls_order_row_is_not_a_second_observation(self, tmp_path):
+    m = self._store(tmp_path, [self._row("long", 1_000_000)], [self._row("long", 1_000_005)])
+    assert len(m.signal_probes(limit=0)) == 1
+
+  def test_an_orphan_order_row_is_still_evidence(self, tmp_path):
+    # Its probe was evicted by the cap before this fix; the order row is the only record left.
+    m = self._store(tmp_path, [], [self._row("short", 1_000_005)])
+    assert len(m.signal_probes(limit=0)) == 1
+
+  def test_a_different_side_or_family_is_not_a_twin(self, tmp_path):
+    m = self._store(tmp_path, [self._row("long", 1_000_000)],
+                    [self._row("short", 1_000_005), self._row("long", 1_000_006, family="breakout")])
+    assert len(m.signal_probes(limit=0)) == 3
+
+  def test_two_calls_in_the_same_second_are_both_kept(self, tmp_path):
+    m = self._store(tmp_path, [self._row("long", 1_000_000), self._row("short", 1_000_000, family="fade_extreme")], [])
+    assert len(m.signal_probes(limit=0)) == 2
+
+  def test_an_order_row_far_from_the_probe_is_its_own_call(self, tmp_path):
+    m = self._store(tmp_path, [self._row("long", 1_000_000)], [self._row("long", 1_000_000 + 3600)])
+    assert len(m.signal_probes(limit=0)) == 2
+
+
 class TestSignalProbesReadAll:
   def test_limit_zero_returns_everything_retained(self, tmp_path):
     """The entry gates must not re-truncate what retention deliberately kept — that second cut is

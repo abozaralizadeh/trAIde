@@ -1782,6 +1782,13 @@ async def trading_loop(
     )
 
   logger.info("Starting trading loop...")
+  # One process = one build (code/config are read at startup). Logged so a behaviour change in the log can
+  # be matched to the deploy that caused it; the same stamp rides on every probe and entry (buildinfo.py).
+  try:
+    from .buildinfo import code_build
+    logger.info("BUILD: code=%s model=%s", code_build() or "unknown", cfg.azure.deployment)
+  except Exception as exc:
+    logger.debug("BUILD: unavailable (%s)", exc)
   while not stop_event.is_set():
     try:
       snapshot = build_snapshot(cfg, kucoin, kucoin_futures, memory)

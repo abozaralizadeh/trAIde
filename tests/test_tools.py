@@ -1157,6 +1157,37 @@ class TestGateStatePredicateMatchesTheOrderPath:
     else:
       assert out.get("gate") not in DIRECTIONAL_GATES, out
 
+  @pytest.mark.parametrize("side, rsi, tf_conflict, bias_15m", [
+    ("buy", 25.0, True, "bearish"),     # Sep 28 TAO/FIL: advertised, then TF CONFLICT BLOCK
+    ("buy", 25.0, True, "neutral"),
+    ("buy", 25.0, False, "bearish"),
+    ("buy", 25.0, True, "bullish"),
+    ("sell", 75.0, True, "bullish"),
+    ("sell", 75.0, True, "bearish"),
+    ("sell", 75.0, False, "bullish"),
+  ])
+  def test_fade_setup_says_when_the_tf_conflict_gate_refuses_it(self, tmp_path, monkeypatch, side, rsi, tf_conflict, bias_15m):
+    """The fade hint must not advertise a fade the order path refuses: tfConflictRefuses is pinned to the
+    real refusal of a declared fade at the advertised extreme (1h against it, as a fade has by definition)."""
+    from src.regime import fade_setup_available
+    from src.tools import _fade_setup_with_gate
+    opposing_1h = "bearish" if side == "buy" else "bullish"
+    gate_extra = {"intraday_rsi_15m": rsi, "intraday_bias_1h": opposing_1h,
+                  "timeframe_conflict": tf_conflict, "intraday_bias_15m": bias_15m}
+    tools, _ = _gate_tools(tmp_path, monkeypatch, gate_extra=gate_extra)
+    import src.config as config_mod
+    fade = _fade_setup_with_gate(fade_setup_available(rsi, config_mod.load_config().regime), tf_conflict, bias_15m)
+    assert fade["side"] == side
+    order = dict(_LONG_ORDER) if side == "buy" else dict(
+      side="sell", entry_price=1.01, take_profit_price=0.95, stop_loss_price=1.03, confidence=0.70)
+    out = _place(tools, setup_family="fade_extreme", **order)
+    assert (out.get("gate") == "tf_conflict") is fade["tfConflictRefuses"], (fade, out)
+    assert ("has no fade route" in fade["note"]) is fade["tfConflictRefuses"]
+
+  def test_no_fade_means_nothing_to_annotate(self):
+    from src.tools import _fade_setup_with_gate
+    assert _fade_setup_with_gate(None, True, "bearish") is None
+
   def test_the_symbol_level_gates(self, tmp_path, monkeypatch):
     import time as _t
     from src.tools import directional_gates_against
@@ -1409,3 +1440,28 @@ class TestRemoveCoinIgnoresSpotDust:
   def test_an_unpriced_holding_still_blocks_removal(self, tmp_path):
     out = self._remove(tmp_path, 0.0007, None)                 # cannot judge -> treat as real
     assert out.get("rejected") and "Cannot remove" in out["reason"], out
+
+
+class TestBuildStampRidesOnEveryCall:
+  """buildinfo.build_stamp (code commit + prompt hash) is stamped on the signal probe, the gate refusal and
+  the entry — report-only, so a model switch and a prompt change can be told apart (2026-09-28)."""
+  _STAMP = {"code": "abcdef1234", "prompt": "0123456789ab"}
+
+  def test_admitted_call_and_its_entry_carry_the_stamp(self, tmp_path):
+    tools, memory = _limit_entry_tools(tmp_path, ctx_extra={"build_stamp": dict(self._STAMP)})
+    out = _place(tools, **_LONG_ORDER)
+    assert not out.get("rejected"), out
+    assert memory.signal_probes(limit=0)[0]["entryContext"]["build"] == self._STAMP
+    trades = [t for t in memory._read().get("trades", []) if (t.get("entryContext") or {}).get("build")]
+    assert trades and trades[-1]["entryContext"]["build"] == self._STAMP
+
+  def test_a_gate_refusal_carries_the_stamp(self, tmp_path):
+    tools, memory = _limit_entry_tools(tmp_path, gate_extra={"intraday_bias_1h": "bearish"},
+                                       ctx_extra={"build_stamp": dict(self._STAMP)})
+    assert _place(tools, **_LONG_ORDER)["gate"] == "h1_align"
+    assert memory.gate_probes()[0]["entryContext"]["build"] == self._STAMP
+
+  def test_no_stamp_records_none(self, tmp_path):
+    tools, memory = _limit_entry_tools(tmp_path)
+    _place(tools, **_LONG_ORDER)
+    assert "build" not in memory.signal_probes(limit=0)[0]["entryContext"]

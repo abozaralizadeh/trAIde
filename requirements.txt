@@ -4,6 +4,10 @@
 # still supports 3.12; numpy is the tightest at >=3.12).
 openai>=3.16.2                  # verified 3.16.2 (major bump from 2.x)
 openai-agents>=0.22.3           # verified 0.22.3 — strict tool schemas; see tests/test_tool_schemas.py
+# src/agent.py imports httpx directly (the per-event-loop retry transport). openai >= 3.19 moved to httpx2
+# and no longer pulls httpx in, so a fresh `pip install -r` could not even import the agent (found
+# 2026-09-28: 7 test modules failed to collect on a clean venv). Pinned to the version verified then.
+httpx>=0.28.1
 python-dotenv>=1.2.3
 requests>=2.34.2
 gunicorn>=26.2.0
