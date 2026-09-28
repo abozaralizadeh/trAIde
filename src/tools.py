@@ -4760,6 +4760,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "policyVersion": "completed-bars-net-rr-directional-risk-v1",
       "model": cfg.azure.deployment,
       "build": _build_now(),
+      # Leverage applied to this entry (after every cap) — a ratio, published on the closed-trade card.
+      "leverage": lev,
       "positionSide": "long" if side_lower == "buy" else "short",
       "entryPrice": entry_price_val,
       "takeProfitPrice": float(take_profit_price),

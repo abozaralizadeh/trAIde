@@ -41,7 +41,7 @@ from .edge import (
   signal_edge_stats,
   taker_flow_edge_stats,
 )
-from .regime import macro_event_entry_block, macro_event_window
+from .regime import coherent_risk_fraction, macro_event_entry_block, macro_event_window
 from .memory import MAX_SIGNAL_PROBES, MemoryStore
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -265,6 +265,7 @@ class DashboardPublisher:
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
+      "leverage": self._build_leverage(snapshot, cfg),
       "pendingOrders": self._sanitize_pending_orders(snapshot, family_index),
       "closedPositions": self._closed_position_lifecycles(memory),
       "coins": self._sanitize_coins(coins),
@@ -657,6 +658,75 @@ class DashboardPublisher:
       base = "BTC"
     return f"{base}-{quote}" if base else (fsym or "")
 
+  @staticmethod
+  def _position_leverage(p: Dict[str, Any]) -> tuple[Optional[float], Optional[str]]:
+    """(leverage, 'cross'|'isolated') of one KuCoin futures position. A ratio — never a size.
+
+    KuCoin reports the cross-margin setting in ``leverage`` and an isolated position's own leverage in
+    ``realLeverage``; read the one that belongs to the position's margin mode, the other as fallback
+    (protection.py reads the same two fields)."""
+    mode_raw = str(p.get("marginMode") or "").strip().upper()
+    if not mode_raw and p.get("crossMode") is not None:
+      mode_raw = "CROSS" if p.get("crossMode") else "ISOLATED"
+    mode = mode_raw.lower() if mode_raw in ("CROSS", "ISOLATED") else None
+    keys = ("leverage", "realLeverage") if mode == "cross" else ("realLeverage", "leverage")
+    for key in keys:
+      val = _f(p.get(key))
+      if val is not None and val > 0:
+        return round(val, 2), mode
+    return None, mode
+
+  def _build_leverage(self, snapshot, cfg) -> Dict[str, Any]:
+    """Leverage and the risk settings that actually size a trade — ratios and config only, no money.
+
+    The dashboard showed no leverage anywhere (owner request, 2026-09-28). Two different things are
+    published because they answer different questions:
+
+    - ``exposureX``: open futures exposure as a multiple of the futures account's value (sum of |mark
+      value| / account value). The real economic leverage of the book. A RATIO: neither side of it is
+      published, so no balance or position size can be recovered from it. None when either side is
+      unknown (a partial number would be worse than none).
+    - the per-trade RISK settings. On this bot leverage does not set risk: size = risk budget / stop
+      distance, and leverage only decides how much margin is posted for that size. So the number that
+      says "how aggressive" is ``riskPerTradePct`` (the EFFECTIVE fraction, coherent with the daily
+      drawdown stop — regime.coherent_risk_fraction, the same derivation the order path uses), with its
+      configured ceiling and the circuit-breaker values it is derived from.
+    Never raises; a broken part publishes as None.
+    """
+    out: Dict[str, Any] = {"exposureX": None}
+    try:
+      positions = [p for p in (getattr(snapshot, "futures_positions", None) or []) if isinstance(p, dict)]
+      open_positions = [p for p in positions if _f(p.get("currentQty"))]
+      account = getattr(snapshot, "futures_account", None) or {}
+      value = _f(account.get("accountEquity")) if isinstance(account, dict) else None
+      if not open_positions:
+        out["exposureX"] = 0.0
+      elif value and value > 0:
+        marks = [_f(p.get("markValue")) if _f(p.get("markValue")) is not None else _f(p.get("posCost"))
+                 for p in open_positions]
+        if all(m is not None for m in marks):
+          out["exposureX"] = round(sum(abs(m) for m in marks) / value, 2)
+    except Exception as exc:
+      logger.debug("dashboard leverage exposure unavailable: %s", exc)
+    try:
+      t, cb = cfg.trading, cfg.circuit_breaker
+      risk = coherent_risk_fraction(t.risk_per_trade_pct, cb.max_daily_drawdown_pct, cb.max_consecutive_losses)
+      caps = [c for c in (_f(t.max_leverage), _f(t.max_entry_leverage)) if c and c > 0]
+      pos_cap = _f(getattr(t, "max_position_equity_pct", None))
+      out.update({
+        "maxEntryLeverage": round(min(caps), 2) if caps else None,
+        "riskPerTradePct": round(float(risk.get("value") or 0.0) * 100.0, 3),
+        "riskPerTradeCeilingPct": round(float(t.risk_per_trade_pct or 0.0) * 100.0, 3),
+        "riskDerived": risk.get("source") == "derived",
+        "dailyDrawdownStopPct": _round(cb.max_daily_drawdown_pct, 3),
+        "maxConsecutiveLosses": int(cb.max_consecutive_losses),
+        "portfolioHeatCapPct": _round(cb.max_portfolio_heat_pct, 3),
+        "positionCapX": round(pos_cap, 2) if pos_cap and pos_cap > 0 else None,
+      })
+    except Exception as exc:
+      logger.debug("dashboard risk settings unavailable: %s", exc)
+    return out
+
   def _build_positions(self, snapshot, memory: MemoryStore, family_index: Optional[Dict[str, Any]] = None) -> list:
     """Open positions from the LIVE exchange snapshot (truth) — not MemoryStore, which only
     synthesizes positions from recorded trades and lingers after a TP/SL trigger closes one.
@@ -676,10 +746,13 @@ class DashboardPublisher:
       disp = self._futures_to_display(p.get("symbol") or "")
       side = "long" if qty > 0 else "short"
       tp, sl = self._bracket_for(getattr(snapshot, "futures_stop_orders", None), disp, side, mark)
+      lev, margin_mode = self._position_leverage(p)
       rec: Dict[str, Any] = {
         "symbol": disp,
         "side": side,
         "venue": "futures",
+        "leverage": lev,
+        "marginMode": margin_mode,
         "avgEntry": _round(entry),
         "currentPrice": _round(mark),
         "returnPct": self._return_pct(entry, mark, qty),
@@ -728,6 +801,8 @@ class DashboardPublisher:
         "symbol": sym,
         "side": "long",
         "venue": "spot",
+        "leverage": 1.0,          # spot holdings are unleveraged
+        "marginMode": None,
         "avgEntry": _round(entry),
         "currentPrice": _round(price),
         "returnPct": self._return_pct(entry, price, 1.0),
@@ -767,6 +842,8 @@ class DashboardPublisher:
           "type": (str(o.get("type") or "limit")).lower(),
           "venue": venue,
           "price": _round(o.get("price")),
+          # The leverage the order was submitted at (futures only; KuCoin echoes it on the order).
+          "leverage": (round(_f(o.get("leverage")), 2) if venue == "futures" and _f(o.get("leverage")) else None),
           "kind": "reduce" if reduce_only else "entry",
           "botEntry": str(o.get("clientOid") or "").startswith("traide-entry-"),
           "setupFamily": self._family_for(family_index, disp, o.get("side"), o.get("clientOid")),
@@ -998,6 +1075,8 @@ class DashboardPublisher:
         "maeR": mae_r,
         "mfeR": mfe_r,
         "entryExtensionAtr": round(entry_ext, 2) if entry_ext is not None else None,
+        # Leverage applied at entry (recorded since 2026-09-28; None on older closes). A ratio, not a size.
+        "leverage": _round(ctx.get("leverage"), 2) if _f(ctx.get("leverage")) else None,
         "betterEntryAvailable": (mae_r is not None and mae_r >= 0.5),
         # Which playbook this trade belonged to, so a losing family in strategyEdge can be traced to
         # the individual trades behind the number.

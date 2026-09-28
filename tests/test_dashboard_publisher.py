@@ -916,3 +916,94 @@ class TestGateScoreboardPanel:
     probes = [TestStrategyEdgePanel._probe("long", 100.0, 101.0, "continuation") for _ in range(3)]
     out = pub._build_strategy_edge(TestStrategyEdgePanel._memory(probes), TestStrategyEdgePanel._cfg())
     assert "gateScoreboard" not in out and out["n"] > 0
+
+
+class TestLeverageOnTheDashboard:
+  """Owner request 2026-09-28: the dashboard showed no leverage anywhere. Published as RATIOS and config
+  only — the disclosure policy (no balances, equity, sizes or account ids) still holds."""
+
+  @staticmethod
+  def _cfg():
+    return SimpleNamespace(
+      dashboard=SimpleNamespace(disclosure="normalized"),
+      trading=SimpleNamespace(risk_per_trade_pct=0.02, max_leverage=3.0, max_entry_leverage=3.0,
+                              max_position_equity_pct=0.5),
+      circuit_breaker=SimpleNamespace(max_daily_drawdown_pct=3.0, max_consecutive_losses=3,
+                                      max_portfolio_heat_pct=6.0),
+    )
+
+  @staticmethod
+  def _snap(positions, equity=75.0):
+    return SimpleNamespace(futures_positions=positions, futures_account={"accountEquity": equity},
+                           futures_stop_orders=[], spot_accounts=[], tickers={})
+
+  def test_position_leverage_reads_the_field_of_its_margin_mode(self):
+    lev = DashboardPublisher._position_leverage
+    assert lev({"marginMode": "CROSS", "leverage": 3, "realLeverage": 0.4}) == (3.0, "cross")
+    assert lev({"marginMode": "ISOLATED", "leverage": 3, "realLeverage": 2.5}) == (2.5, "isolated")
+    assert lev({"crossMode": True, "realLeverage": 2}) == (2.0, "cross")        # fallback field
+    assert lev({}) == (None, None)
+
+  def test_open_futures_position_carries_leverage_but_no_size(self):
+    pub = DashboardPublisher(self._cfg())
+    snap = self._snap([{"symbol": "PUMPUSDTM", "currentQty": 5, "avgEntryPrice": 0.0050, "markPrice": 0.0051,
+                        "marginMode": "CROSS", "leverage": 2, "markValue": 25.5}])
+    rows = pub._build_positions(snap, SimpleNamespace(positions=lambda venue=None: {}))
+    assert rows[0]["leverage"] == 2.0 and rows[0]["marginMode"] == "cross"
+    for banned in ("currentQty", "markValue", "size", "notional", "unrealizedPnl"):
+      assert banned not in rows[0]
+
+  def test_exposure_is_a_ratio_of_mark_value_to_account_value(self):
+    pub = DashboardPublisher(self._cfg())
+    snap = self._snap([
+      {"symbol": "PUMPUSDTM", "currentQty": 5, "markValue": 22.5},
+      {"symbol": "EIGENUSDTM", "currentQty": -19, "markValue": -4.85},   # shorts can report negative
+    ], equity=75.0)
+    out = pub._build_leverage(snap, self._cfg())
+    assert out["exposureX"] == round((22.5 + 4.85) / 75.0, 2)
+
+  def test_exposure_is_zero_when_flat_and_unknown_when_a_side_is_missing(self):
+    pub = DashboardPublisher(self._cfg())
+    assert pub._build_leverage(self._snap([]), self._cfg())["exposureX"] == 0.0
+    assert pub._build_leverage(self._snap([{"currentQty": 1, "markValue": 5}], equity=None),
+                               self._cfg())["exposureX"] is None
+    assert pub._build_leverage(self._snap([{"currentQty": 1}]), self._cfg())["exposureX"] is None
+
+  def test_risk_settings_use_the_same_derivation_as_the_order_path(self):
+    out = DashboardPublisher(self._cfg())._build_leverage(self._snap([]), self._cfg())
+    # min(2%, 3% daily stop / (3 + 1) tolerated stop-outs) = 0.75% — regime.coherent_risk_fraction.
+    assert out["riskPerTradePct"] == 0.75 and out["riskDerived"] is True
+    assert out["riskPerTradeCeilingPct"] == 2.0
+    assert out["maxEntryLeverage"] == 3.0 and out["positionCapX"] == 0.5
+    assert out["dailyDrawdownStopPct"] == 3.0 and out["maxConsecutiveLosses"] == 3
+
+  def test_the_block_publishes_no_money_or_account_figures(self):
+    import json
+    pub = DashboardPublisher(self._cfg())
+    snap = self._snap([{"symbol": "PUMPUSDTM", "currentQty": 5, "markValue": 22.4567}], equity=73.1234)
+    blob = json.dumps(pub._build_leverage(snap, self._cfg())).lower()
+    for banned in ("usd", "equity", "balance", "notional", "size", "accountid", "$", "22.4567", "73.1234"):
+      assert banned not in blob, banned
+
+  def test_a_broken_snapshot_never_breaks_the_publish(self):
+    pub = DashboardPublisher(self._cfg())
+    out = pub._build_leverage(SimpleNamespace(futures_positions="junk", futures_account="junk"), self._cfg())
+    assert "riskPerTradePct" in out
+
+  def test_pending_futures_order_shows_its_leverage(self):
+    pub = _publisher()
+    snap = SimpleNamespace(spot_pending_orders=[], futures_pending_orders=[
+      {"symbol": "EIGENUSDTM", "side": "sell", "price": "0.2555", "leverage": "1", "clientOid": "traide-entry-x"}])
+    assert pub._sanitize_pending_orders(snap)[0]["leverage"] == 1.0
+
+  def test_closed_trade_shows_entry_leverage_when_recorded(self, tmp_path):
+    import time
+    from src.memory import MemoryStore
+    m = MemoryStore(str(tmp_path / "m.json"))
+    data = m._read()
+    data["decisions"] = [{"symbol": "EIGEN-USDT", "action": "futures_buy_triggered", "pnl": 0.1, "ts": int(time.time()),
+                          "positionSide": "short", "entryPrice": 0.2555, "exitPrice": 0.24,
+                          "entryContext": {"leverage": 2.0, "setupFamily": "breakout"}}]
+    m._write(data)
+    rows = _publisher()._closed_position_lifecycles(m)
+    assert rows and rows[0]["leverage"] == 2.0
