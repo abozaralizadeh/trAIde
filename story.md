@@ -62,11 +62,16 @@ Save under `docs/story/` and link here. Dashboard discloses % and R only — nev
 | Sep 25 | The bot's own safety gates had never been graded. When a gate like "don't chase an exhausted daily trend" refused a trade, it left no record at all, and one of them didn't even write a log line. The study that said these gates save money only held because of one rally week. Now every refusal is labelled with the gate that made it and scored, and every market analysis records which gates *would* block each side, even when the model never proposes the trade. That second record catches the model quietly steering around the rules (most of its "no" answers cited the exhaustion gate). The result goes to the dashboard and the owner's Supervisor, never to the trading AI, so it can't learn to argue its way past a gate. | 8 refusals, 0 records → every refusal plus ~6x more "would block" readings; verdict only after 20+ same-day comparisons |
 | Sep 26 | The bot benched its own winning playbook in the middle of an alt rally — by rounding. It scores each playbook at the horizon it holds trades for (60m or 240m, picked by the median hold). Continuation's median sat at 118-141 minutes, right on the 120-minute midpoint, and one fast FET winner tipped it to 60m, where the calls look flat. Zero stake for 21 hours while 93 of the top 100 coins rose; the skipped calls were +1.44% four hours later. And because the model now saw the zero stake *before* proposing, it stopped proposing — so no new evidence could ever un-bench it. Now scored over the real mix of hold times, and the model is told to submit benched setups anyway. | 21h flat, 0 trades; skipped calls +0.05% @60m vs +1.44% @240m |
 | Sep 26 (pm) | The fix worked on its first run: shown a benched playbook, the model SUBMITTED an honest SOL continuation long instead of declining, and code recorded the call and refused it with the truth ('positive, not yet proven, t=0.76'). It then did it again next run — which exposed the next trap: continuation's evidence was already at its 150-row cap (only 88 independent), so every repeat would push out an older real observation until the verdict forgot itself. Repeats inside the scoring window are now not stored. And the one-off data fix that two deploys skipped now runs inside the deploy script itself. | 3 runs, 2 honest submits, 0 relabels |
+| Sep 28 | "It won a lot last week and loses now — why isn't it shorting the drop?" A 12-agent investigation, with every number re-derived by a skeptic, found the question mostly wrong and the answer interesting. The "loss" was −$0.28 over three days, after a +$8.35 week. The alts weren't falling for most of the week (only BTC was); shorting Sep 24–27 would have lost every day. The real change was the new AI model (switched Sep 23): its trend-following longs did worse than just buying the same coins, and once the rally evidence aged out of the store the bot rightly benched them — the benched calls went on to lose. When the real dump came (Sep 28, ~6h of data), shorts hit a lagging daily label that the prompt called "BLOCKED, not optional" even though the gate never refused a single trade, confidence bars the new model's honest ~0.69 never reaches, zero-stake short playbooks, and the model's own refusal to chase an oversold coin. Catching the whole flush was worth ~$1–2. Fix: tell the model the truth about its gates, measure more — don't loosen survival on one morning. Report: `docs/analysis/2026-09-28-why-few-trades-no-shorts.md`. | −$0.28 "loss"; 0 daily-gate refusals; 20 short vs 53 long calls; confidence p50 0.69, 1 of 97 calls at 0.80 |
 
-## Where it stands (Sep 20, 2026)
+## Where it stands (Sep 28, 2026)
 
-All-time: 190 closed trades, +1.2R, about +$1.9 (55% win). Honest equity curve still down since June
-(the pre-August losses), but the last week is +11.3R at 82% — one regime, so encouraging, not proven.
+Equity ~$75.5 (from ~$67 on Sep 17). Sep 17–23: 87 closes, +24.3R, +$8.35, 79% win — almost all trend longs in an
+alt rally. Since then nearly flat (Sep 24–28: +$0.23, −1.1R) and trading 1–4 positions a day instead of ~12: the
+trend playbook is benched on the new model's own record (t 0.5–0.8), and every other side trades at explore size.
+One regime of wins, one model switch, one six-hour dump — still encouraging, still not proven.
+
+(Sep 20 snapshot: 190 closed trades, +1.2R, about +$1.9 all-time; last week +11.3R at 82%.)
 
 ## Recurring themes (good angles for posts)
 
@@ -89,4 +94,8 @@ All-time: 190 closed trades, +1.2R, about +$1.9 (55% win). Honest equity curve s
 - Does the funding/positioning playbook survive 50+ samples?
 - Do the directional gates earn their keep? The gate scoreboard needs months of same-day comparisons across regimes before any gate should move.
 - Equity index has no concept of deposits/withdrawals yet.
+- Is the new model (gpt-6-luna, Sep 23) a worse trend-follower than gpt-5.6-luna, or was it the Sep 25 confidence
+  prompt? Nothing stamps which build made a call yet, so the two can't be separated (Sep 28 analysis, M0).
+- Can the bot short a fresh dump without chasing? The daily label lags by days by design; the only escape hatches key on
+  a confidence number that no longer ranks calls. Pre-registered in `docs/analysis/2026-09-28-recommendations.md` (S1–S5).
 - ~~The +13R "marketable entry" replay needs re-verifying with correct candle columns.~~ Done Sep 25: direction held (rally longs only), the RR-filter and wait-longer claims did not. Next: does the live execution map's `crossBand` ever show sub-floor crosses paying outside a rally?
