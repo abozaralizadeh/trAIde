@@ -25,7 +25,17 @@ from .config import RegimeConfig
 
 
 def is_hostile_regime(daily_bias: str, daily_exhausted: bool) -> bool:
-  """A regime where the bot should be more selective: bearish daily or RSI-exhausted (either side)."""
+  """A regime where the bot should be more selective: bearish daily or RSI-exhausted (either side).
+
+  SIDE-BLIND by construction: the caller passes no side, so the raised floor (REGIME_CAUTION_MIN_CONFIDENCE)
+  and the size factor (REGIME_CAUTION_SIZE_FACTOR) also apply to a trend-ALIGNED short on a bearish,
+  non-exhausted daily, while a trend-aligned long on a bullish daily keeps the base floor. That scope is an
+  accident of the original aim (throttling bounce-longs in a downtrend), not a measured choice. It is left
+  as is on purpose: all 13 confidence_floor refusals on record (Sep 25-28) were shorts, but only 5 were on a
+  bearish daily and those de-overlap to ~ +0.09% at 4h (about the fee). The side-aware form,
+  ``exhausted or daily opposes side``, is pre-registered with its evidence bar in
+  docs/analysis/2026-09-28-recommendations.md (S2) — change it on that evidence, not on one flush.
+  """
   return bool(daily_exhausted) or (daily_bias == "bearish")
 
 
@@ -955,6 +965,27 @@ def verify_declared_setup(setup_family, *, side=None, funding_setup=None, macro_
 
   # breakout / range_edge / anything else: no computable trigger exists, so the declaration stands.
   return None
+
+
+def tf_conflict_opposes(timeframe_conflict, bias_15m, side) -> bool:
+  """True when the timeframe-conflict gate's condition holds against ``side``: the summary flags a
+  timeframe conflict AND a non-neutral 15m bias opposes the entry.
+
+  ONE statement of the condition, shared by the order path (``tools._place_futures_limit_order_impl``),
+  the gate-state reading (``tools.directional_gates_against``) and ``entryMap.fadeSetup``. That gate has
+  no fade route — only a verified mechanical playbook passes it — so a fade the 15m opposes under a
+  conflict is refused in code. On Sep 28 the analysis advertised TAO x2 / FIL fade longs that this gate
+  then refused ("TF CONFLICT BLOCK"): the hint must not offer what the gate refuses.
+  """
+  s = str(side or "").strip().lower()
+  if s in ("long",):
+    s = "buy"
+  elif s in ("short",):
+    s = "sell"
+  b = str(bias_15m or "").strip().lower()
+  if not timeframe_conflict or b == "neutral":
+    return False
+  return (b == "bearish" and s == "buy") or (b == "bullish" and s == "sell")
 
 
 def fade_setup_available(rsi, cfg: RegimeConfig):

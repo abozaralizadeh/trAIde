@@ -69,6 +69,7 @@ from .regime import (
   resolve_gate_deadlock,
   reward_risk_ratio,
   risk_capped_contracts,
+  tf_conflict_opposes,
 )
 from .edge import (
   SETUP_FAMILIES,
@@ -529,8 +530,7 @@ def directional_gates_against(
     out.append("daily_opposing")
   if _bias_opposes(gate.get("intraday_bias_1h", "neutral"), s):
     out.append("h1_align")
-  bias_15m = gate.get("intraday_bias_15m", "neutral")
-  if gate.get("timeframe_conflict", False) and bias_15m != "neutral" and _bias_opposes(bias_15m, s):
+  if tf_conflict_opposes(gate.get("timeframe_conflict", False), gate.get("intraday_bias_15m", "neutral"), s):
     out.append("tf_conflict")
   if correlation_blocks and s == "buy":
     out.append("correlation")
@@ -538,6 +538,28 @@ def directional_gates_against(
     out.append("move_24h")
   if benched:
     out.append("bench")
+  return out
+
+
+def _fade_setup_with_gate(fade: Any, timeframe_conflict: Any, bias_15m: Any) -> Any:
+  """``entryMap.fadeSetup`` plus whether the timeframe-conflict gate will refuse it (``tfConflictRefuses``).
+
+  The fade hint used to be pinned only to the gate that ADMITS a fade (daily/1h hatches), so it advertised
+  fades the tf_conflict gate — which has no fade route — then refused: TAO x2 and FIL fade longs on Sep 28
+  went "FADE-EXTREME ALLOWED" straight into "TF CONFLICT BLOCK". Same predicate as the order path
+  (``regime.tf_conflict_opposes``). Adds facts only; the fade's thresholds and signature are unchanged.
+  """
+  if not isinstance(fade, dict):
+    return fade
+  refuses = tf_conflict_opposes(timeframe_conflict, bias_15m, fade.get("side"))
+  out = dict(fade)
+  out["tfConflictRefuses"] = bool(refuses)
+  if refuses:
+    out["note"] = (
+      f"{out.get('note', '')} BUT timeframe_conflict is true and the 15m ({bias_15m}) opposes this side, so the "
+      "timeframe-conflict gate refuses this fade in code — that gate has no fade route. A submission now is a "
+      "gate refusal, not fade evidence."
+    ).strip()
   return out
 
 
@@ -761,6 +783,16 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
   # Zero-arg callable returning the poll loop's hourly market-state block (main._MarketStateClock.current)
   # or None. Cache only — reading it never makes a network call, so stamping it on the order path is free.
   _market_state_source = getattr(ctx, "market_state", None)
+  # Which build is making this run's calls ({'code': commit, 'prompt': hash of the exact trading prompt}),
+  # filled by agent.run_trading_agent once the prompt is final — before any tool can run. Report-only.
+  _build_stamp_source = getattr(ctx, "build_stamp", None)
+
+  def _build_now() -> Dict[str, Any] | None:
+    """This run's build stamp (a copy), or None. Total: recording must never touch a trade."""
+    try:
+      return dict(_build_stamp_source) if isinstance(_build_stamp_source, dict) and _build_stamp_source else None
+    except Exception:
+      return None
 
   def _market_state_now() -> Dict[str, Any] | None:
     """The current market-state block, sanitized, or None. Total: recording must never touch a trade."""
@@ -1183,6 +1215,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         spot_symbol, side_lower, price, gate,
         setup_family=setup_family, price_source=source, model=cfg.azure.deployment,
         confidence=confidence, regime=_gate_for(spot_symbol), market_state=_market_state_now(),
+        build=_build_now(),
       )
     except Exception as exc:
       logger.warning("GATE PROBE LOST: %s %s refusal not recorded (%s)", symbol, side, exc)
@@ -2611,7 +2644,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     for iv in interval_order:
       interval_sec = INTERVAL_SECONDS[iv]
       if iv == "1day":
-        lookback_min = 43200  # 30 days
+        # 30 days of minutes, but `points` below floors every frame at 50 bars, so the 1D really fetches
+        # ~50 COMPLETED daily bars (closed_only at the dataframe step). Do not "fix" it to 30: EMA26 and the
+        # Wilder ADX seed weigh far more on 29 bars (~11%) than on 49 (~2%). The label cannot react intraday
+        # by design (no repaint); the reversal hatch is the designed escape at a turn.
+        lookback_min = 43200
       elif iv == "4hour":
         lookback_min = 2880
       else:
@@ -2773,7 +2810,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       # A live fade-extreme opportunity, when one exists. Unblocking the gates was not enough: of the
       # first 39 measured signals, 38 were continuation — the model had nothing at the point of
       # decision telling it a fade was on the table (see regime.fade_setup_available).
-      "fadeSetup": fade_setup_available(intraday_rsi_15m, cfg.regime),
+      "fadeSetup": _fade_setup_with_gate(
+        fade_setup_available(intraday_rsi_15m, cfg.regime),
+        summary.get("timeframe_conflict", False), summary.get("intraday_bias_15m", "neutral"),
+      ),
       "note": (
         "extensionAtr* = how many 15m ATRs price sits beyond the 15m VWAP in that direction. A large "
         "positive value means price is LATE/stretched in that direction — the highest-EV entry is usually "
@@ -4243,10 +4283,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       tf_conflict_fl = gate.get("timeframe_conflict", False)
       intraday_bias_15m_fl = gate.get("intraday_bias_15m", "neutral")
       if tf_conflict_fl and intraday_bias_15m_fl != "neutral":
-        intraday_opposes_fl = (
-          (intraday_bias_15m_fl == "bearish" and side_lower == "buy") or
-          (intraday_bias_15m_fl == "bullish" and side_lower == "sell")
-        )
+        # One statement of the condition (regime.tf_conflict_opposes), shared with the gate-state reading
+        # and entryMap.fadeSetup so the analysis never advertises a fade this gate refuses.
+        intraday_opposes_fl = tf_conflict_opposes(tf_conflict_fl, intraday_bias_15m_fl, side_lower)
         if intraday_opposes_fl and allow_mechanical_setup(setup_family=setup_family, cfg=cfg.regime):
           # The 15m bias is a DIRECTIONAL test, and a mechanical playbook does not claim to pass it:
           # the funding transfer happens whichever way price moves. Refusing a verified carry because
@@ -4454,6 +4493,8 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         # Gates this call faced and the hatch that admitted it ([] = faced none). Report-only.
         gates_passed=_gates_passed_fl,
         min_gap_sec=_repeat_gap_fl,
+        # Code commit + prompt hash, so a model switch and a prompt change can be told apart. Report-only.
+        build=_build_now(),
         **_xm_stamp_fl,
       )
       if _probe_stored_fl is False and _repeat_gap_fl > 0:
@@ -4718,6 +4759,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     _entry_context_fl = {
       "policyVersion": "completed-bars-net-rr-directional-risk-v1",
       "model": cfg.azure.deployment,
+      "build": _build_now(),
       "positionSide": "long" if side_lower == "buy" else "short",
       "entryPrice": entry_price_val,
       "takeProfitPrice": float(take_profit_price),

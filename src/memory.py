@@ -12,6 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+from .buildinfo import sanitize_build
 from .utils import normalize_symbol as _normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,13 @@ MAX_SIGNAL_PROBES = 400
 # 283 of 479 probes (59%), and truncating to the 400 cap dropped `fade_extreme` from n=27/"no edge"
 # to n=17/"insufficient data" — which RELEASED it to full size, and it promptly lost two trades.
 # Losing the evidence for a verdict must never be equivalent to never having had it.
+# Since 2026-09-28 the cap is per (family, SIDE): stakes are judged per side (edge.family_stake_status),
+# so the same eviction happened one level down — continuation held 141 long : 9 short at its cap, the
+# busy long side pushing the quiet short side's history out. The file bound doubles at worst (a small
+# fixed set of families x 2 sides x 150); a real book is lopsided, so in practice it grows far less.
 MAX_PROBES_PER_FAMILY = 150
+# A placed order's row is written after placement, a few seconds after its probe (signal_probes union).
+_TRADE_TWIN_WINDOW_SEC = 120
 MAX_EXIT_PROBES = 200
 # How long an exit probe waits for its bracket to resolve before it is marked to market. Shared by the
 # settle step and by the poll loop's "which symbols need a price" query, so both agree on a probe's life.
@@ -545,8 +552,14 @@ def _probe_family(row: Any) -> str:
   return str(ctx.get("setupFamily") or "other").strip().lower() or "other"
 
 
+def _probe_side(row: Any) -> Optional[str]:
+  ctx = row.get("entryContext") if isinstance(row, dict) else None
+  side = str(ctx.get("positionSide") or "").strip().lower() if isinstance(ctx, dict) else ""
+  return side if side in ("long", "short") else None
+
+
 def _trim_probes_per_family(probes: Any) -> list:
-  """Cap probe retention PER FAMILY, preserving chronological order.
+  """Cap probe retention PER (FAMILY, SIDE), preserving chronological order.
 
   A single global ring buffer makes families compete for one budget, and the family that generates
   the most probes is not the one that most needs them — a stood-aside playbook still records a probe
@@ -557,15 +570,18 @@ def _trim_probes_per_family(probes: Any) -> list:
 
   Keeping the newest ``MAX_PROBES_PER_FAMILY`` of each family bounds the file just as well (families
   are a small fixed set) while guaranteeing every playbook keeps enough evidence to sustain its own
-  verdict. Never raises; non-dict rows are dropped.
+  verdict. The same argument applies one level down now that each bet is judged per SIDE: a family's
+  busy side must not evict its quiet side (2026-09-28: continuation 141 long : 9 short at the cap, every
+  pre-Sep-24 short evicted by longs). So the bucket is (family, positionSide). Never raises; non-dict rows
+  are dropped.
   """
   rows = [r for r in (probes or []) if isinstance(r, dict)]
   if not rows:
     return []
   keep_ids: set[int] = set()
-  buckets: Dict[str, list] = {}
+  buckets: Dict[tuple, list] = {}
   for row in rows:
-    buckets.setdefault(_probe_family(row), []).append(row)
+    buckets.setdefault((_probe_family(row), _probe_side(row)), []).append(row)
   for bucket in buckets.values():
     for row in bucket[-MAX_PROBES_PER_FAMILY:]:
       keep_ids.add(id(row))
@@ -1887,6 +1903,7 @@ class MemoryStore:
     market_state: Optional[Dict[str, Any]] = None,
     gates_passed: Any = None,
     min_gap_sec: float = 0.0,
+    build: Any = None,
   ) -> bool:
     """Record a DIRECTION CALL for edge measurement, whether or not it becomes an order.
 
@@ -1945,6 +1962,11 @@ class MemoryStore:
     told to submit setups on a benched side, re-submitted the same SOL long every run; each repeat
     would have evicted an older independent observation until the verdict "un-learned" itself by
     forgetting. 0 (the default) records every call. Returns True when the call was stored.
+
+    ``build`` (``buildinfo.build_stamp``: the code commit and a hash of the exact trading prompt) says
+    which build made the call, so a model switch and a prompt change can be told apart (2026-09-28: the
+    gpt-6-luna switch of Sep 23 and the confidence prompt of Sep 25 could not be). Whitelisted by
+    ``buildinfo.sanitize_build``; recorded only.
     """
     try:
       px = float(market_price)
@@ -1969,6 +1991,9 @@ class MemoryStore:
     model_name = str(model or "").strip()[:80]
     if model_name:
       ctx["model"] = model_name
+    build_stamp = sanitize_build(build)
+    if build_stamp:
+      ctx["build"] = build_stamp
     for key, value in (("confidence", confidence), ("minConfidence", min_confidence)):
       try:
         val = float(value)
@@ -2076,6 +2101,7 @@ class MemoryStore:
     confidence: Any = None,
     regime: Optional[Dict[str, Any]] = None,
     market_state: Optional[Dict[str, Any]] = None,
+    build: Any = None,
   ) -> bool:
     """Record a direction call a gate HARD-REFUSED, for the gate scoreboard only. Returns True if stored.
 
@@ -2098,6 +2124,9 @@ class MemoryStore:
       model_name = str(model or "").strip()[:80]
       if model_name:
         ctx["model"] = model_name
+      build_stamp = sanitize_build(build)
+      if build_stamp:
+        ctx["build"] = build_stamp
       try:
         conf = float(confidence)
         if math.isfinite(conf):
@@ -2920,17 +2949,37 @@ class MemoryStore:
       data = self._read()
     out = []
     # The dedicated bucket is the current source (every direction call); trades-derived rows are the
-    # legacy shape recorded before probes were decoupled from order placement. Union so no history is
-    # lost, deduped on (symbol, ts) since a placed order appears in both.
+    # legacy shape recorded before probes were decoupled from order placement, plus placed calls whose
+    # probe the retention cap has since evicted. Union so no history is lost.
+    #
+    # A placed call appears in BOTH, and the two rows do not share a timestamp: the probe is stamped at the
+    # call, the order row after placement (2-7 s later on every one of 97 live rows, 2026-09-28), so the old
+    # (symbol, ts) key never matched and every placed call was counted twice by any consumer that does not
+    # de-overlap. The same key also merged two DIFFERENT calls made in the same second (a long and a short,
+    # or two families). A trade row is now the twin of a bucket row with the same symbol, side and family
+    # within ``_TRADE_TWIN_WINDOW_SEC``; the repeat gap (>= the family's shortest horizon) guarantees at most
+    # one such probe, so the match is unambiguous.
     seen = set()
-    for row in list(data.get("signal_probes") or []) + list(data.get("trades") or []):
+    twins: Dict[tuple, list] = {}
+    for row in list(data.get("signal_probes") or []):
       ctx = row.get("entryContext") if isinstance(row, dict) else None
       if not (isinstance(ctx, dict) and ctx.get("marketPriceAtSignal")):
         continue
-      key = (row.get("symbol"), int(row.get("ts") or 0))
-      if key in seen:
+      ts = int(row.get("ts") or 0)
+      key = (row.get("symbol"), _probe_side(row), _probe_family(row))
+      if key + (ts,) in seen:
         continue
-      seen.add(key)
+      seen.add(key + (ts,))
+      twins.setdefault(key, []).append(ts)
+      out.append(row)
+    for row in list(data.get("trades") or []):
+      ctx = row.get("entryContext") if isinstance(row, dict) else None
+      if not (isinstance(ctx, dict) and ctx.get("marketPriceAtSignal")):
+        continue
+      ts = int(row.get("ts") or 0)
+      key = (row.get("symbol"), _probe_side(row), _probe_family(row))
+      if any(abs(ts - t0) <= _TRADE_TWIN_WINDOW_SEC for t0 in twins.get(key, ())):
+        continue
       out.append(row)
     out.sort(key=lambda r: int(r.get("ts") or 0))
     lim = int(limit or 0)

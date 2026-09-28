@@ -442,7 +442,9 @@ class TestMarketStateForTheModel:
   def test_the_run_wires_the_reader_into_the_tools_and_the_payload(self):
     src = inspect.getsource(_agent_mod.run_trading_agent)
     assert inspect.signature(_agent_mod.run_trading_agent).parameters["market_state"].default is None
-    assert "market_state=market_state,\n  ))" in src           # build_tools ctx (entry + probe stamps)
+    # build_tools ctx (entry + probe stamps); build_stamp is filled once the prompt is final (buildinfo.py).
+    assert "market_state=market_state,\n    build_stamp=build_stamp,\n  ))" in src
+    assert src.index("build_stamp.update(_build_stamp_for(instructions))") < src.index('name="Trading Agent"')
     shown = src.index('user_state_obj["marketState"] = _ms_block')
     assert src.index("user_state_obj = json.loads(user_state)") < shown < src.index(
       "input_payload = json.dumps(user_state_obj)")

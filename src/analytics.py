@@ -990,13 +990,28 @@ def summarize_multi_timeframe(snapshots: List[Dict[str, Any]]) -> Dict[str, Any]
         "will enforce confirmation and reduced sizing."
       )
     elif daily_bias_raw == "bullish":
-      entry_hint += " DAILY EXHAUSTED: 1D bullish RSI extreme — do NOT open continuation longs. Counter-trend only with a strong reversal signal."
+      # daily_bias is 'neutral' here, so the opposing-daily gate refuses neither side: code refuses only the
+      # continuation LONG (anti-FOMO). A short is a counter-trend call — judgement, not a code block.
+      entry_hint += (
+        " DAILY EXHAUSTED: 1D bullish RSI extreme — continuation longs are refused in code. The daily gate does "
+        "not apply to shorts here; a short is counter-trend, so take it only on a real reversal or RSI extreme."
+      )
     else:
       entry_hint += " DAILY EXHAUSTED: 1D RSI is extreme — avoid chasing the extended move."
   elif daily_trend_weak:
     entry_hint += " DAILY TREND WEAK: 1D ADX is below 18, so its directional gate is neutralized; favor range-aware confirmation."
   elif daily_gate_applied:
-    entry_hint += f" DAILY GATE: 1D trend is {daily_bias} — opposing intraday bias was overridden to neutral. Do NOT open counter-daily trades."
+    # Was "Do NOT open counter-daily trades." — false: code admits a confirmed reversal and declared playbooks
+    # past this gate, and the model self-censored every counter-daily short on Sep 28 (0 hard refusals).
+    # tf_conflict is true by construction in this branch (daily vs intraday disagree), so the 15m-opposed side
+    # is refused too — say so, or "trade with the daily" reads as open when the 15m has turned against it.
+    counter_side = "short" if daily_bias == "bullish" else "long"
+    entry_hint += (
+      f" DAILY GATE: 1D trend (completed daily bars; today's move is not in it yet) is {daily_bias} and opposes the "
+      f"intraday bias, so overall_bias reads neutral. A plain {counter_side} is refused in code; it passes only as a "
+      "confirmed reversal (1h and 15m both turned, reversal confidence bar) or a declared playbook. timeframe_conflict "
+      "is also true, so an entry the 15m opposes is refused on either side."
+    )
   elif daily_bias != "neutral":
     entry_hint += f" Daily trend confirms: 1D bias is {daily_bias}."
 

@@ -48,6 +48,7 @@ from .analytics import (
   summarize_interval,
   summarize_multi_timeframe,
 )
+from .buildinfo import build_stamp as _build_stamp_for
 from .config import AppConfig
 from .kucoin import (
   KucoinAccount,
@@ -1036,6 +1037,83 @@ def _calendar_brief(state: Dict[str, Any] | None) -> str:
     return "- CURRENT CALENDAR: unavailable."
 
 
+def _daily_gate_rules(cfg: AppConfig) -> str:
+  """The STEP 2 text on the 1D gate, rendered from the SAME config the order path enforces.
+
+  The model obeys the prompt, not the gate. Until 2026-09-28 this block said counter-daily trades are
+  "BLOCKED at the code level ... NOT optional" while the order path (tools._place_futures_limit_order_impl)
+  admits a confirmed reversal, a declared fade, and any declared breakout/range_edge/carry playbook past
+  it. Over Sep 27-28 the `daily_opposing` gate made 0 hard refusals and the model still self-censored
+  every counter-daily short — including on exhausted coins where no daily gate applies at all, because
+  the label reads 'neutral' there. So this text states what the gate reads, what it refuses, and which
+  routes it admits, with thresholds taken from cfg (a hard-coded 0.80 would drift from
+  REVERSAL_*_MIN_CONFIDENCE). Only ENABLED routes are advertised. The judgement that rides along
+  ("the daily trend usually wins", "don't chase a fresh dump") is kept, labelled as judgement.
+  """
+  r = cfg.regime
+  routes: List[str] = []
+  rev_sides = []
+  if r.reversal_shorts_enabled:
+    rev_sides.append(
+      f"a SHORT under a bullish daily when 1h{' AND 15m have' if r.reversal_short_require_15m else ' has'} "
+      f"turned bearish and confidence >= {r.reversal_short_min_confidence:.2f}"
+    )
+  if r.reversal_longs_enabled:
+    alt_note = (" (a long on a non-major alt is still refused while BTC's daily is bearish — the correlation gate)"
+                if r.alt_long_block_enabled else "")
+    rev_sides.append(
+      f"a LONG under a bearish daily when 1h{' AND 15m have' if r.reversal_long_require_15m else ' has'} "
+      f"turned bullish and confidence >= {r.reversal_long_min_confidence:.2f}{alt_note}"
+    )
+  if rev_sides:
+    routes.append("a confirmed REVERSAL — " + "; ".join(rev_sides))
+  if r.fade_extreme_enabled:
+    routes.append(
+      f"setup_family='fade_extreme' at a genuine 15m RSI extreme against the entry "
+      f"(<= {r.fade_extreme_oversold_rsi:.0f} to buy, >= {r.fade_extreme_overbought_rsi:.0f} to sell)"
+    )
+  declarable = [str(f) for f in (r.declarable_setup_families or ()) if str(f).strip()]
+  if r.declared_setups_enabled and declarable:
+    routes.append(
+      "a declared " + "/".join(declarable) + " playbook, on your call (funding_carry and macro_event must also "
+      "have their mechanism present — code verifies it)"
+    )
+  exh_hatches: List[str] = []
+  if r.trend_shorts_enabled:
+    exh_hatches.append(
+      f"a continuation SHORT on an exhausted-BEARISH daily passes when 1h{' AND 15m are' if r.trend_short_require_15m else ' is'} "
+      f"bearish and confidence >= {r.trend_short_min_confidence:.2f}"
+    )
+  mechanical = [f for f in declarable if f in ("funding_carry", "macro_event")]
+  if r.declared_setups_enabled and mechanical:
+    exh_hatches.append("a verified " + "/".join(mechanical) + " passes on its mechanism")
+  exh_tail = (" — except: " + "; ".join(exh_hatches)) if exh_hatches else ""
+  routes_text = "; ".join(routes) if routes else "none are enabled"
+  return (
+    "  - What it READS: daily_bias is built from COMPLETED UTC daily candles only. Today's move is not in it "
+    "until the day closes at 00:00 UTC, and a turn takes several daily closes to flip it, so it lags at every "
+    "turning point by design. What is happening now is in intraday_bias_4h / intraday_bias_1h / intraday_bias_15m.\n"
+    "  - What code REFUSES: while daily_bias is 'bullish' or 'bearish', a PLAIN entry against it — a sell/short "
+    "under a bullish daily, a buy/long under a bearish one. Same rule for both sides.\n"
+    f"  - Routes code ADMITS past it: {routes_text}. Each is still sized and judged by its own family record. "
+    "Check the condition against the summary yourself: if it is true now, submit; if none is, the plain "
+    "counter-daily entry is refused.\n"
+    "  - When it does NOT apply: daily_exhausted=true or daily_trend_weak=true sets daily_bias='neutral' "
+    "(daily_bias_raw keeps the direction), and then the opposing-daily gate refuses NEITHER side. Exhaustion has "
+    "its own code gate instead: a continuation entry in the exhausted direction (a long into an exhausted-bullish "
+    f"daily, a short into an exhausted-bearish one) is refused{exh_tail}.\n"
+    "  - While the daily opposes the intraday bias, overall_bias reads neutral (daily_gate_applied=true) and "
+    "timeframe_conflict is true, so the timeframe-conflict gate also refuses an entry the 15m opposes — the "
+    "with-daily side included. Only a verified funding_carry/macro_event passes that gate.\n"
+    "  - If the 1D confirms your intraday bias, strength is boosted (e.g., moderate -> strong).\n"
+    "  - Judgement (yours, not a code rule): the daily trend usually wins, so a counter-daily entry needs a real "
+    "turn or a genuine playbook — never a knife-catch into a live move, and never a relabel to get past the gate "
+    "(the trade is scored under the family you declare, so a mislabel poisons that record). On an exhausted "
+    "daily, fading the move is the counter-trend trade and wants a real reversal or RSI extreme; resuming it "
+    "wants a rally/retest, not a chase of a fresh leg.\n"
+  )
+
+
 def run_trading_agent(
   cfg: AppConfig,
   snapshot: TradingSnapshot,
@@ -1491,6 +1569,9 @@ def run_trading_agent(
 
   # Tools live in src/tools.py; build them bound to this run's context (lazy import avoids a cycle).
   from .tools import build_tools
+  # Filled in place below once the trading prompt is final (before the Runner starts, so before any tool
+  # runs): which code commit and which exact prompt made this run's calls. Report-only (buildinfo.py).
+  build_stamp: Dict[str, str] = {}
   _tools = build_tools(SimpleNamespace(
     cfg=cfg,
     kucoin=kucoin,
@@ -1517,6 +1598,7 @@ def run_trading_agent(
     entry_token=entry_token,
     # Cache-only reader of the poll loop's hourly market state; stamped on every entry and probe.
     market_state=market_state,
+    build_stamp=build_stamp,
   ))
   place_market_order = _tools.place_market_order
   place_limit_order = _tools.place_limit_order
@@ -1577,9 +1659,11 @@ def run_trading_agent(
     "breakers, and an always-on protective bracket. So when a liquid setup shows a real directional edge with a "
     "structure-based invalidation and a reachable target, TAKE IT — you do not need every gate to be perfect, only a "
     "genuine edge that the risk caps can size safely.\n"
-    "- Trade STRENGTH. The account's biggest missed profits came from correctly identifying the market's strongest "
-    "trend (e.g. a coin up hundreds of percent in a month) and then either never filling a too-passive limit or being "
-    "shaken out of the runner. Prefer the clearest trend/relative-strength leader with room to its target; a "
+    "- Trade the clearest TREND, whichever direction: relative strength for a long, relative weakness for a short. The "
+    "account's biggest missed profits came from correctly identifying the market's strongest trend (e.g. a coin up "
+    "hundreds of percent in a month) and then either never filling a too-passive limit or being shaken out of the "
+    "runner — a coin in a sustained slide is the same trade mirrored. Prefer the clearest trend leader, up or down, "
+    "with room to its target; a "
     "MARKETABLE entry (crossing the spread) is one option alongside a resting limit — pick between them by "
     "executionMap's fillAdjustedR, not by how confident you feel. The bracket attaches either way.\n"
     "- Pick the best risk-adjusted setup across the WHOLE liquid universe — majors (BTC/ETH) and alts on equal footing. "
@@ -1676,16 +1760,8 @@ def run_trading_agent(
     "- Call analyze_market_context for each coin — it fetches 15m + 1h + 4h + 1D timeframes automatically. "
     "An entry requires dataQuality.ok=true and analysis no more than 15 minutes old; if either condition fails, refresh "
     "once and otherwise stand aside.\n"
-    "  The 4H timeframe has the highest intraday weight (40%). The 1D acts as a HARD REGIME GATE:\n"
-    "  - Counter-daily trades are BLOCKED at the code level. If daily_bias='bearish', buy/long orders are rejected. "
-    "If daily_bias='bullish', sell/short orders are rejected. This is NOT optional.\n"
-    "  - EXCEPTION — confirmed reversal (BOTH directions): the daily trend lags at turning points. A LONG "
-    "against a bearish daily is allowed IF 1h AND 15m have both turned bullish and confidence >= 0.80 "
-    "(majors only — alt longs stay blocked by the correlation gate). Symmetrically, a SHORT against a "
-    "bullish daily is allowed IF 1h AND 15m have both turned bearish and confidence >= 0.80. Confirmed "
-    "turns only — never knife-catch or fade mere strength/weakness without both timeframes agreeing.\n"
-    "  - If the 1D confirms your intraday bias, strength is boosted (e.g., moderate -> strong).\n"
-    "  - Check 'daily_bias' and 'daily_gate_applied' in the summary. Trade WITH the daily trend, not against it.\n"
+    "  The 4H timeframe has the highest intraday weight (40%). The 1D is a REGIME GATE — know exactly what it does:\n"
+    + _daily_gate_rules(cfg) +
     "  When futures are enabled, it also returns a 'futures' field with funding rate, open interest, basis, OI-price signal, and funding divergence.\n"
     "- The summary includes: weighted_score (-1 to +1), daily_bias, daily_gate_applied, timeframe_conflict (bool), and volume_profile (POC, VAH, VAL).\n"
     "- **Volume Profile levels**: POC = Point of Control (highest volume price, acts as magnet). "
@@ -1805,13 +1881,13 @@ def run_trading_agent(
 
     "**How to pick entry_price (REQUIRED for limit order tools):**\n"
     "Choose a level where MULTIPLE reference points converge (confluence of 2+ levels is far more reliable than any single one):\n"
-    "  - SHORT entry — set entry_price ABOVE current price at a resistance zone:\n"
+    "  - SHORT entry — entry_price at or above current price, at a resistance zone:\n"
     "    * 15m/1h EMA (price bouncing into a declining EMA from below)\n"
     "    * Upper Bollinger Band (price stretched to +2 SD, RSI > 65)\n"
     "    * Recent swing high or VAH (Value Area High from volume profile)\n"
     "    * VWAP retest from below after a breakdown\n"
     "    * Fibonacci retracement of the recent drop: 38.2%, 50%, or 61.8% bounce levels\n"
-    "  - LONG entry — set entry_price BELOW current price at a support zone:\n"
+    "  - LONG entry — entry_price at or below current price, at a support zone:\n"
     "    * 15m/1h EMA pullback (price returning to a rising EMA from above)\n"
     "    * Lower Bollinger Band (price stretched to -2 SD, RSI < 35)\n"
     "    * Recent swing low or VAL (Value Area Low)\n"
@@ -1851,7 +1927,7 @@ def run_trading_agent(
     "is an option — check its bucket.\n"
     "- **Volume check**: the target level is stronger when it coincides with a prior high-volume node (POC or VAH/VAL from volume profile).\n"
     "- **Rejection confirmation**: for shorts, prefer entry at resistance only when you also see bearish RSI divergence or RSI > 65. "
-    "For longs, prefer pullback entries when RSI < 40 or bullish divergence is present.\n"
+    "For longs, prefer entry at support only when you also see bullish RSI divergence or RSI < 35.\n"
     "- If current price is at/through your level: a marketable limit that crosses up to the code's marketable band "
     "secures the fill — the bracket attaches, so it is protected, and the post-cost RR gate checks that the worse "
     "entry still covers its costs (a fee guard, not a verdict on the trade). Pure market entry tools remain "
@@ -1880,18 +1956,20 @@ def run_trading_agent(
     "value zone where I could have entered cheaper?' If the honest answer is 'back to value', place the limit there.\n"
     "- This is your judgement, not a code rule: there is NO hard extension block. Own the entry-timing decision and "
     "state your target arrival price and why it is the highest-EV point.\n"
-    "- STRONG TREND THAT WON'T PULL BACK (the ONDO case): a pullback entry is only higher-EV if the pullback actually "
-    "arrives. On a confirmed strong-trend leader that keeps running without retracing — you see repeated `entryExpiries` "
-    "on it, and/or price sustains 1-2 ATR beyond the level without a deep pullback — 'wait for the pullback' has become "
+    "- STRONG TREND THAT WON'T PULL BACK (the ONDO case) — and its mirror, a BREAKDOWN THAT WON'T BOUNCE: a pullback "
+    "(or rally/retest) entry is only higher-EV if it actually arrives. On a confirmed strong-trend leader that keeps "
+    "running without retracing, up or down — you see repeated `entryExpiries` "
+    "on it, and/or price sustains 1-2 ATR beyond the level without a deep pullback/bounce — 'wait for the retrace' has become "
     "'miss the whole move'. Resolve it the way desks do: SCALE IN. Take a REDUCED-SIZE (e.g. ~40-60%) bracketed "
     "CONTINUATION entry near price now so you participate — crossing only if executionMap's marketable row "
     "supports it — then add the remainder on a shallow flag/consolidation "
-    "pullback if one appears. Do NOT re-place the same never-filling pullback limit run after run — either take the "
+    "retrace if one appears. Do NOT re-place the same never-filling pullback limit run after run — either take the "
     "reduced continuation or explicitly stand down and rotate to a leader that IS offering a clean entry. Keep this "
     "gated to an intact trend (daily+intraday aligned); a weakening/rolling-over trend gets no continuation chase.\n\n"
 
     "**Entry signal — trade when the 1h trend_bias is clear (bullish or bearish):**\n"
-    "- Strong setup (request normal risk size): 1h AND 15m both agree on direction, RSI 40–65, MACD confirms; "
+    "- Strong setup (request normal risk size): 1h AND 15m both agree on direction, RSI 40–65 for a long / 35–60 for a "
+    "short (room left in the trade's direction), MACD confirms; "
     "a catalyst is supporting evidence when one exists, not a reason to force a news lookup or a trade.\n"
     "- Normal setup (trade reduced size, 50–70% of normal): 1h is clear, 15m mixed, OR 1h mixed but strong news catalyst.\n"
     "- TREND-SHORT EXCEPTION (important): daily_bias_raw='bearish' plus daily_exhausted=true is NOT a blanket short veto. "
@@ -2009,7 +2087,9 @@ def run_trading_agent(
     "- **Daily trade cap**: move to another symbol.\n"
     "- **Profit too low**: improve the resting entry or use a realistic structural target; otherwise skip. Never increase "
     "size, leverage, or risk solely to pass a minimum-profit check.\n"
-    "- **Daily gate rejection**: the 1D trend opposes your trade direction. Do NOT retry the same direction — trade WITH the daily trend or move to another symbol.\n"
+    "- **Daily gate rejection**: the plain entry opposed a non-exhausted daily_bias and met none of the routes in STEP 2. "
+    "Do not resubmit it unchanged and do not relabel it to get past — trade the other side or another symbol, or submit "
+    "again only once a route's condition is genuinely true (e.g. 1h and 15m have both turned).\n"
     "- **Trade interval cooldown**: you traded this symbol too recently. Move to another symbol or wait.\n\n"
     "- **Pending atomic entry**: do not cancel/replace it before its deterministic lease expires merely because a later "
     "model run calls it stale. Early cancellation is allowed only after a completed 1h/daily direction flip objectively "
@@ -2127,8 +2207,9 @@ def run_trading_agent(
       "the same invalid candidate again.\n"
       "- THEN scan the whole market every run: call scan_futures_market (the ONLY tool that sees all ~500 "
       "perps, not just named ones) to find what is actually moving. The current 2-3 coins are almost never the "
-      "only opportunity — even in a bad tape, some liquid coin is trending. Scan 'momentum' and, in a bearish "
-      "BTC daily, 'losers'/'short'; then deep-validate the top few with analyze_market_context + fetch_futures_orderbook "
+      "only opportunity — even in a bad tape, some liquid coin is trending. Scan 'momentum' (the largest ABSOLUTE 24h "
+      "movers, both directions: a clean decliner is a short candidate exactly as a clean riser is a long one; "
+      "'losers'/side='short' gives the down-side list on its own); then deep-validate the top few with analyze_market_context + fetch_futures_orderbook "
       "(the perp book you would trade; fetch_orderbook is the SPOT book). Names under the scan's excluded "
       "have no spot pair, so this bot can never add or trade them — do not research them. A row carrying "
       "quarantined or lastAnalysisFailure will fail validation again until its remainingHours / retryInHours "
@@ -2187,6 +2268,7 @@ def run_trading_agent(
     model=model,
   )
 
+  build_stamp.update(_build_stamp_for(instructions))
   trading_agent = Agent(
     name="Trading Agent",
     instructions=instructions,
@@ -2464,9 +2546,10 @@ def run_trading_agent(
         "exactly the evidence that lets the market re-open it. Declining it instead (decline_trade / "
         "log_decision) records nothing, so a benched playbook that is paying again stays benched. Once "
         "per setup is enough — repeats on the same symbol inside the scoring window add nothing. Never "
-        "relabel it to get past the refusal. Beyond that, spend your turns on the open families and sides: "
-        "analyze_market_context reports entryMap.fadeSetup whenever 15m RSI is at an "
-        "extreme, which is a ready-made fade_extreme candidate. A bet is judged on its SIDE once that "
+        "relabel it to get past the refusal. Beyond that, spend your turns on the open families and sides. "
+        "analyze_market_context reports entryMap.fadeSetup whenever 15m RSI is at an extreme; it only flags "
+        "the extreme — check fade_extreme's stake on that side, and fadeSetup.tfConflictRefuses (true = the "
+        "timeframe-conflict gate refuses it in code). A bet is judged on its SIDE once that "
         "side has its own sample (judgedOn 'own'). A side still thin on its own is judged on the pooled "
         "family (judgedOn 'pooled'): it can be stood aside or shrunk on the pooled record, but it is "
         "never sized UP by it — it is capped at the reduced explore size. A "

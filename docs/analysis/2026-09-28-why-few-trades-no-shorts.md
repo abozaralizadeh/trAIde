@@ -146,6 +146,9 @@ absolute move, both sides).
 
 ## 5. What to do (short version — full plan with file:line, effort and risk in the recommendations file)
 
+> **Status (Sep 28, evening):** W1, W2, W3, W5, M0 and the per-side half of M1 are shipped (plus an `httpx`
+> requirements fix). No survival rule was loosened. See the Status block at the top of the recommendations file.
+
 **Do now: make the model's picture accurate (no gate or stake changes)**
 - **W1.** Rewrite the daily-gate prompt text to match what the code actually enforces: completed bars only, which side
   it gates, and which routes pass (rendered from config, so 0.80 isn't hard-coded). Keep the true judgement ("don't chase

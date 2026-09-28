@@ -18,6 +18,19 @@ Sources: the verified fact base (`docs/analysis/2026-09-28-facts.md`, cited as �
 
 ---
 
+## Status (updated Sep 28, evening)
+
+Shipped on branch `claude/jolly-curie-9nqogp`:
+- **W1** — the daily-gate prompt text is rendered from `cfg.regime` (`agent._daily_gate_rules`); the retry text and the analytics `DAILY GATE` / exhausted-bullish hints now say what code refuses and which routes pass.
+- **W2** — `regime.tf_conflict_opposes` is the single predicate (order path, `directional_gates_against`, `fadeSetup.tfConflictRefuses`); "ready-made" wording removed.
+- **W3** — mirrored wording (trend in either direction, RSI 65/35, strong band per side, entry headers, the ONDO case mirror with the intact-trend condition kept, research scan text). Pinned by `tests/test_prompt_honesty.py`.
+- **W5** — `is_hostile_regime` docstring (side-blind, S2 pointer) and the 1D window comment (~50 completed bars).
+- **M0** — `src/buildinfo.py`: `build = {code, prompt}` on signal probes, gate refusals and entries; `BUILD:` line at startup.
+- **M1 (part)** — retention per (family, side); `signal_probes()` twin dedupe (a placed call no longer counts twice: 492 → 401 rows on the Sep 28 store, no stake verdict changed). **Not done:** folding orphan order rows into the bucket and dropping the trades union (orphans still come from `trades` and still vanish when `MAX_TRADES` prunes them).
+- Also: `httpx` added to requirements.txt (openai ≥ 3.19 no longer installs it; a clean venv could not import `src.agent`).
+
+Not started: W4, W6, W7, W8, M2–M6, and everything in section 3 (by design — evidence first).
+
 ## 1. Do now: honesty and wisdom fixes (no gate or stake changes)
 
 ### W1. Describe the daily gate exactly as the code enforces it (PR1, modified). P1, ships first and alone after M0
