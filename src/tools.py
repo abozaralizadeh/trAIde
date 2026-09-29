@@ -4909,7 +4909,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       )
       decision = None
       if confidence is not None:
-        decision = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "paper futures limit entry", paper=True)
+        decision = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "paper futures limit entry", paper=True, leverage=lev)
       return {
         "paper": True,
         "pendingLimitEntry": True,
@@ -5019,7 +5019,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         entry_context=_entry_context_fl,
       )
       if confidence is not None:
-        res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False)
+        res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False, leverage=lev)
     except Exception as exc:
       logger.error("Live futures entry %s was placed but local memory logging failed: %s", _runtime_oid, exc)
       res["memoryError"] = str(exc)

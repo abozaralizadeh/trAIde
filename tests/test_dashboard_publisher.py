@@ -1007,3 +1007,97 @@ class TestLeverageOnTheDashboard:
     m._write(data)
     rows = _publisher()._closed_position_lifecycles(m)
     assert rows and rows[0]["leverage"] == 2.0
+
+
+class TestClosedTradeLeverage:
+  """'I don't see it in recently closed' (2026-09-29): close rows never carried leverage, so the card had
+  nothing to show. The exchange's history-positions row does — captured on every new close and backfilled
+  once onto stored closes, matched on the lifecycle identity (symbol, positionOpenTime)."""
+
+  @staticmethod
+  def _store(tmp_path, rows):
+    from src.memory import MemoryStore
+    m = MemoryStore(str(tmp_path / "m.json"))
+    data = m._read()
+    data["decisions"] = rows
+    m._write(data)
+    return m
+
+  @staticmethod
+  def _close(sym="FOLKS-USDT", open_ms=1790522194000, **extra):
+    import time
+    row = {"symbol": sym, "action": "futures_buy_triggered", "pnl": 0.144, "ts": int(time.time()),
+           "positionSide": "short", "entryPrice": 2.514, "exitPrice": 2.444, "closeType": "CLOSE_SHORT",
+           "positionOpenTime": open_ms, "reason": "TP/SL triggered (CLOSE_SHORT, ROE 2.70%)"}
+    row.update(extra)
+    return row
+
+  def test_log_decision_keeps_a_usable_leverage_only(self, tmp_path):
+    from src.memory import MemoryStore
+    m = MemoryStore(str(tmp_path / "m.json"))
+    assert m.log_decision("A-USDT", "futures_buy_triggered", 0.0, "x", pnl=0.1, leverage="3")["leverage"] == 3.0
+    for junk in (None, "", "abc", 0, -2, float("nan"), 1e9):
+      assert "leverage" not in m.log_decision("A-USDT", "futures_buy_triggered", 0.0, "x", pnl=0.1, leverage=junk)
+
+  def test_backfill_matches_on_symbol_and_open_time_and_never_overwrites(self, tmp_path):
+    m = self._store(tmp_path, [
+      self._close(),                                                   # gets 3x
+      self._close(sym="TAO-USDT", open_ms=111, leverage=2.0),          # already has one: untouched
+      self._close(sym="ZEC-USDT", open_ms=222),                        # no history row: untouched
+      {"symbol": "FOLKS-USDT", "action": "decline", "pnl": None, "positionOpenTime": 1790522194000, "ts": 1},
+    ])
+    history = [
+      {"symbol": "FOLKSUSDTM", "openTime": 1790522194000, "leverage": "3"},
+      {"symbol": "TAOUSDTM", "openTime": 111, "leverage": "5"},
+      {"symbol": "XUSDTM", "openTime": 999, "leverage": "junk"},
+    ]
+    assert m.backfill_close_leverage(history) == 1
+    rows = {r["symbol"]: r for r in m._read()["decisions"] if r.get("pnl") is not None}
+    assert rows["FOLKS-USDT"]["leverage"] == 3.0
+    assert rows["TAO-USDT"]["leverage"] == 2.0
+    assert "leverage" not in rows["ZEC-USDT"]
+    assert all("leverage" not in r for r in m._read()["decisions"] if r.get("pnl") is None)
+    assert m.backfill_close_leverage(history) == 0                    # idempotent
+
+  def test_backfill_is_total(self, tmp_path):
+    m = self._store(tmp_path, [])
+    assert m.backfill_close_leverage(None) == 0
+    assert m.backfill_close_leverage(["junk", 7, {"symbol": None}]) == 0
+
+  def test_closed_card_and_outcome_chart_show_the_exchange_leverage(self, tmp_path):
+    m = self._store(tmp_path, [self._close(leverage=3.0)])
+    pub = _publisher()
+    assert pub._closed_position_lifecycles(m)[0]["leverage"] == 3.0
+    assert pub._sanitize_decision(self._close(leverage=3.0))["leverage"] == 3.0
+    # Entry-time leverage is the fallback; nothing is invented when neither exists.
+    assert pub._sanitize_decision(self._close(entryContext={"leverage": 2}))["leverage"] == 2.0
+    assert "leverage" not in pub._sanitize_decision(self._close())
+    assert "leverage" not in pub._sanitize_decision({"symbol": "A", "action": "decline", "pnl": None})
+    # An entry logged with its applied leverage shows it in the feed.
+    assert pub._sanitize_decision({"symbol": "A", "action": "futures_sell_limit", "pnl": None, "leverage": 1.0})["leverage"] == 1.0
+
+  def test_startup_backfill_pages_the_history_and_survives_failures(self, tmp_path):
+    from src import main as main_mod
+    m = self._store(tmp_path, [self._close()])
+    calls = []
+
+    class _Fut:
+      def get_position_history(self, page=1, page_size=50):
+        calls.append(page)
+        return [{"symbol": "FOLKSUSDTM", "openTime": 1790522194000, "leverage": 3}] if page == 1 else []
+
+    assert main_mod._backfill_close_leverage(m, _Fut(), pages=2, page_size=1) == 1
+    assert calls == [1, 2]
+
+    class _Broken:
+      def get_position_history(self, page=1, page_size=50):
+        raise RuntimeError("504")
+
+    assert main_mod._backfill_close_leverage(m, _Broken()) == 0
+    assert main_mod._backfill_close_leverage(m, object()) == 0
+
+  def test_the_close_recorder_passes_the_exchange_leverage(self):
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
+    assert 'leverage=cp.get("leverage"),' in src
+    assert "memory.backfill_close_leverage(_lev_rows)" in src

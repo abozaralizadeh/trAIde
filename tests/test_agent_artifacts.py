@@ -415,6 +415,9 @@ class TestDecisionFeedLabels:
     assert "None" not in line.split("(orderId")[0]
     line = _summarize_tool_output({"orderId": "1", "futuresSymbol": "EIGENUSDTM"})
     assert "EIGENUSDTM" in line
+    # ...and the leverage it was placed at, when the tool reports it.
+    out["appliedLeverage"] = 2.0
+    assert _summarize_tool_output(out).startswith("live order: sell EIGEN-USDT 2x (orderId=")
 
   def test_the_run_uses_the_module_helper(self):
     src = inspect.getsource(_agent_mod.run_trading_agent)
