@@ -741,7 +741,9 @@ def _summarize_tool_output(output: Any) -> str | None:
     osym = output.get("symbol") or req.get("symbol") or rec.get("symbol") or output.get("futuresSymbol")
     rationale = output.get("rationale") or output.get("decisionLog", {}).get("reason")
     suffix = f" rationale={rationale}" if rationale else ""
-    return f"live order: {side} {osym} (orderId={output.get('orderId')}) (pnl=n/a){suffix}"
+    lev = output.get("appliedLeverage")
+    lev_txt = f" {float(lev):g}x" if isinstance(lev, (int, float)) and lev > 0 else ""
+    return f"live order: {side} {osym}{lev_txt} (orderId={output.get('orderId')}) (pnl=n/a){suffix}"
   if output.get("transfer"):
     t = output.get("transfer", {})
     return f"transfer: {output.get('amount')} {output.get('currency')} {output.get('direction')} (id={t.get('orderId') or t.get('applyId')})"

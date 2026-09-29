@@ -552,6 +552,17 @@ def _probe_family(row: Any) -> str:
   return str(ctx.get("setupFamily") or "other").strip().lower() or "other"
 
 
+def _positive_leverage(value: Any) -> Optional[float]:
+  """A usable leverage (finite, > 0, <= 200) rounded to 2 dp, else None. Never raises."""
+  try:
+    val = float(value)
+  except (TypeError, ValueError):
+    return None
+  if not math.isfinite(val) or val <= 0 or val > 200:
+    return None
+  return round(val, 2)
+
+
 def _probe_side(row: Any) -> Optional[str]:
   ctx = row.get("entryContext") if isinstance(row, dict) else None
   side = str(ctx.get("positionSide") or "").strip().lower() if isinstance(ctx, dict) else ""
@@ -1445,6 +1456,7 @@ class MemoryStore:
     position_side: Optional[str] = None,
     entry_price: Optional[float] = None,
     entry_context: Optional[Dict[str, Any]] = None,
+    leverage: Any = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -1492,6 +1504,11 @@ class MemoryStore:
           pass
       if close_type:
         entry["closeType"] = str(close_type)
+      lev = _positive_leverage(leverage)
+      if lev is not None:
+        # The exchange's own record of the closed position's leverage (history-positions). A ratio,
+        # published on the dashboard's closed-trade card; ROE% is only readable next to it.
+        entry["leverage"] = lev
       if position_id not in (None, ""):
         entry["positionId"] = str(position_id)
       if position_open_time not in (None, ""):
@@ -1509,6 +1526,51 @@ class MemoryStore:
       data["decisions"].append(entry)
       self._write(data)
       return entry
+
+  def backfill_close_leverage(self, closes: Any) -> int:
+    """Stamp the exchange's leverage onto realized-close rows recorded before it was captured.
+
+    ``closes`` are KuCoin history-positions rows (``symbol``, ``openTime``, ``leverage``). A close row is
+    matched on (symbol, positionOpenTime) — the lifecycle identity every close row carries (positionId
+    is often empty on this venue) — and only rows with a pnl and no ``leverage`` yet are touched, so it
+    is idempotent and never rewrites a value. Writes only when something changed. Returns rows stamped.
+    Never raises (it is dashboard garnish on the poll thread).
+    """
+    try:
+      wanted: Dict[tuple, float] = {}
+      for cp in closes or []:
+        if not isinstance(cp, dict):
+          continue
+        lev = _positive_leverage(cp.get("leverage"))
+        open_time = cp.get("openTime") or cp.get("openingTimestamp")
+        sym = _normalize_symbol(cp.get("symbol") or "")
+        if lev is None or open_time in (None, "") or not sym:
+          continue
+        try:
+          wanted[(sym, int(float(open_time)))] = lev
+        except (TypeError, ValueError):
+          continue
+      if not wanted:
+        return 0
+      stamped = 0
+      with self._lock:
+        data = self._read()
+        for row in data.get("decisions") or []:
+          if not isinstance(row, dict) or row.get("pnl") is None or row.get("leverage") is not None:
+            continue
+          try:
+            key = (row.get("symbol"), int(float(row.get("positionOpenTime"))))
+          except (TypeError, ValueError):
+            continue
+          if key in wanted:
+            row["leverage"] = wanted[key]
+            stamped += 1
+        if stamped:
+          self._write(data)
+      return stamped
+    except Exception as exc:
+      logger.warning("CLOSE LEVERAGE backfill skipped (%s) — dashboard shows none for older closes", exc)
+      return 0
 
   def trades_today_total(self) -> int:
     with self._lock:

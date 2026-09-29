@@ -924,7 +924,23 @@ class DashboardPublisher:
     m = re.search(r"ROE\s*(-?\d+(?:\.\d+)?)\s*%", d.get("reason") or "")
     if m:
       out["roePct"] = round(float(m.group(1)), 4)
+    # Entries (futures_*_limit, logged with the applied leverage) and closes (the exchange's record) carry
+    # leverage; ROE on a close is price return x leverage, so the outcome chart needs it to be read at all.
+    lev = self._close_leverage(d)
+    if lev is not None:
+      out["leverage"] = lev
     return out
+
+  @staticmethod
+  def _close_leverage(d: Dict[str, Any]) -> Optional[float]:
+    """Leverage on a decision row: the row's own ``leverage`` (a close: the exchange's history record,
+    captured and backfilled since 2026-09-28; an entry: what the order path applied), else what the order
+    path applied at entry (``entryContext.leverage``). None when neither exists. A ratio — never a size."""
+    for value in (d.get("leverage"), (d.get("entryContext") or {}).get("leverage") if isinstance(d.get("entryContext"), dict) else None):
+      val = _f(value)
+      if val is not None and val > 0:
+        return round(val, 2)
+    return None
 
   def _sanitize_notes(self, notes: Any) -> List[Dict[str, Any]]:
     return [
@@ -1075,8 +1091,8 @@ class DashboardPublisher:
         "maeR": mae_r,
         "mfeR": mfe_r,
         "entryExtensionAtr": round(entry_ext, 2) if entry_ext is not None else None,
-        # Leverage applied at entry (recorded since 2026-09-28; None on older closes). A ratio, not a size.
-        "leverage": _round(ctx.get("leverage"), 2) if _f(ctx.get("leverage")) else None,
+        # The closed position's leverage — a ratio, not a size (_close_leverage).
+        "leverage": self._close_leverage(d),
         "betterEntryAvailable": (mae_r is not None and mae_r >= 0.5),
         # Which playbook this trade belonged to, so a losing family in strategyEdge can be traced to
         # the individual trades behind the number.

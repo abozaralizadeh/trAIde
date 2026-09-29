@@ -251,6 +251,34 @@ def _measurement_client(kucoin_futures, timeout_sec: float = _MEASURE_TIMEOUT_SE
   return kucoin_futures
 
 
+def _backfill_close_leverage(memory: MemoryStore, kucoin_futures, *, pages: int = 2, page_size: int = 50) -> int:
+  """Once at startup: stamp leverage onto stored closes from the exchange's position history.
+
+  Close rows only started carrying ``leverage`` on 2026-09-28, and the poll loop's own history window is
+  24h on the first poll and minutes after that, so the dashboard's recently-closed cards (the last 12,
+  often older than a day at this trade rate) would never get it. Up to ``pages`` x ``page_size`` rows, on
+  the short-timeout measurement client, before the loop starts; the store is written only if a row
+  changed. Dashboard garnish: any failure logs and returns 0, never blocks startup. Returns rows stamped.
+  """
+  client = _measurement_client(kucoin_futures)
+  fetch = getattr(client, "get_position_history", None)
+  if not callable(fetch):
+    return 0
+  rows: list = []
+  try:
+    for page in range(1, max(1, int(pages)) + 1):
+      batch = fetch(page=page, page_size=page_size) or []
+      rows.extend(r for r in batch if isinstance(r, dict))
+      if len(batch) < page_size:
+        break
+  except Exception as exc:
+    logger.warning("CLOSE LEVERAGE: position history unavailable at startup (%s) — older closes keep no leverage", exc)
+  stamped = memory.backfill_close_leverage(rows) if rows else 0
+  if stamped:
+    logger.info("CLOSE LEVERAGE: stamped %d stored close(s) from the exchange's position history", stamped)
+  return stamped
+
+
 def _futures_settlement_marks(symbols, kucoin_futures, snapshot, *, budget: Optional[_MeasurementBudget] = None,
                               backoff: Optional[_MeasureBackoff] = None, now: Optional[float] = None
                               ) -> Dict[str, float]:
@@ -1732,6 +1760,8 @@ async def trading_loop(
   # Seed from the persisted set: a restart inside the 30-min fill lookback used to re-detect and
   # double-record the same close (an in-memory-only set), corrupting realized-PnL stats.
   logged_closed_position_ids: set[str] = set(memory.get_seen_close_ids())
+  # Close ids whose leverage has been checked against the stored close rows this process (see backfill below).
+  leverage_checked_close_ids: set[str] = set()
   logged_fill_ids: set[str] = set(memory.get_seen_fill_ids())
   for pending_event in memory.get_pending_agent_events():
     if pending_event.get("kind") in {"spot_fills", "futures_fills"}:
@@ -1756,6 +1786,8 @@ async def trading_loop(
   # Measurement reads on this thread (probe settlement, stack replays, market state) use a short HTTP
   # timeout, a per-poll wall-clock budget and a cross-poll backoff — see _MeasurementBudget.
   _measure_client = _measurement_client(kucoin_futures)
+  if cfg.kucoin_futures.enabled and kucoin_futures is not None:
+    _backfill_close_leverage(memory, kucoin_futures)
   _measure_backoff = _MeasureBackoff(float(cfg.trading.poll_interval_sec or 60))
   _market_state = _MarketStateClock(
     _measure_client,
@@ -2346,6 +2378,15 @@ async def trading_loop(
       )
       if memory.queue_agent_event("futures_fills", fill_id, fill):
         new_futures_fills.append(fill)
+    # Leverage for closes recorded before it was captured (2026-09-28): the exchange's history rows carry
+    # it, so stamp it once per close id — one local write at most, never a network call.
+    _lev_rows = [cp for cp in recent_fills["closed_positions"]
+                 if isinstance(cp, dict) and _close_event_id(cp) not in leverage_checked_close_ids]
+    if _lev_rows:
+      stamped = memory.backfill_close_leverage(_lev_rows)
+      if stamped:
+        logger.info("CLOSE LEVERAGE: stamped %d earlier close(s) from the exchange's position history", stamped)
+      leverage_checked_close_ids.update(_close_event_id(cp) for cp in _lev_rows)
     new_closed_positions = []
     for cp in recent_fills["closed_positions"]:
       close_id = _close_event_id(cp)
@@ -2443,6 +2484,7 @@ async def trading_loop(
           trough_pnl=trough_pnl,
           entry_price=entry_price,
           entry_context=entry_context,
+          leverage=cp.get("leverage"),
         )
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)
