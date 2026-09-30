@@ -1575,12 +1575,53 @@ class MemoryStore:
       logger.warning("JEV decision not recorded (%s)", exc)
       return False
 
+  def mark_jev_decisions_scored(self, keys: Any) -> int:
+    """Flag Jev decisions (by (ts, symbol)) as scored in LangSmith so they are posted once. Never raises."""
+    try:
+      wanted = {(int(ts), str(sym)) for ts, sym in keys or []}
+      if not wanted:
+        return 0
+      n = 0
+      with self._lock:
+        data = self._read()
+        for row in data.get("jev_decisions") or []:
+          if isinstance(row, dict) and (int(row.get("ts") or 0), str(row.get("symbol"))) in wanted:
+            row["lsScored"] = True
+            n += 1
+        if n:
+          self._write(data)
+      return n
+    except Exception as exc:
+      logger.warning("JEV decisions not marked scored (%s)", exc)
+      return 0
+
   def jev_decisions(self, limit: int = 50) -> list[Dict[str, Any]]:
     """The most recent Jev dual-run answers, oldest→newest (deep copies). ``limit=0`` = all retained."""
     with self._lock:
       rows = [copy.deepcopy(r) for r in (self._read().get("jev_decisions") or []) if isinstance(r, dict)]
     lim = int(limit or 0)
     return rows if lim <= 0 else rows[-lim:]
+
+  def set_jev_status(self, status: Dict[str, Any]) -> bool:
+    """Replace the Jev dual run's last-pass health record (src/jev.py ``_status``). Never raises."""
+    try:
+      clean = json.loads(json.dumps(status, default=str))
+      if not isinstance(clean, dict):
+        return False
+      with self._lock:
+        data = self._read()
+        data["jev_status"] = clean
+        self._write(data)
+      return True
+    except Exception as exc:
+      logger.warning("JEV status not recorded (%s)", exc)
+      return False
+
+  def jev_status(self) -> Dict[str, Any]:
+    """The Jev dual run's last-pass health record ({} before the first pass)."""
+    with self._lock:
+      status = self._read().get("jev_status")
+    return copy.deepcopy(status) if isinstance(status, dict) else {}
 
   def trader_for_order(self, order_id: Any = None, client_oid: Any = None) -> Optional[str]:
     """Which trader placed an entry order (its trade record's ``entryContext.trader``), or None if unknown."""

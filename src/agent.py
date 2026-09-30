@@ -2853,10 +2853,13 @@ def _run_jev_dual_pass(
   authority mid-flight (the same check that drops the LLM's handoff rows). Never raises into the loop.
   """
   mode = getattr(getattr(cfg, "jev", None), "mode", "off")
-  if mode not in ("shadow", "live") or not authorized:
+  if mode not in ("shadow", "live"):
+    return None
+  if not authorized:
+    logger.info("JEV (%s): skipped this run — the agent run lost its trading authority", mode)
     return None
   try:
-    from .jev import describe_pass, run_jev_pass
+    from .jev import describe_pass, langsmith_tracer, run_jev_pass
     edge = edge_state() or {}
     cost_rate = float(fees.get("futures_taker", 0.0006) or 0.0006) + float(edge.get("slippage_pct") or 0.0)
     summary = asyncio.run(run_jev_pass(
@@ -2865,9 +2868,40 @@ def _run_jev_dual_pass(
       equity_usd=float(snapshot.total_usdt or 0.0),
       noise_mult=float(edge.get("stop_atr_floor_mult", cfg.trading.stop_atr_floor_mult) or 0.0),
       cost_rate=cost_rate,
+      tracer=langsmith_tracer(cfg),
     ))
     logger.info(describe_pass(summary))
+    _jev_after_pass(cfg, memory)
     return {k: v for k, v in summary.items() if k != "rows"} | {"calls": len(summary.get("rows") or [])}
   except Exception as exc:
     logger.warning("JEV: dual-run pass skipped (%s)", exc)
     return None
+
+
+_jev_compare_hour: Dict[str, int] = {}
+
+
+def _jev_after_pass(cfg: AppConfig, memory: Any) -> None:
+  """Report-only follow-ups to a Jev pass: settled calls scored in LangSmith, and once an hour a log line
+  comparing the two traders over the same window (the dashboard panel, in text). Total."""
+  try:
+    from .jev import langsmith_scorer
+    scorer = langsmith_scorer(cfg)
+    if scorer is not None:
+      n = scorer(memory)
+      if n:
+        logger.info("JEV: %d settled call(s) scored in LangSmith (fwd_15m / fwd_60m / fwd_240m feedback)", n)
+  except Exception as exc:
+    logger.warning("JEV: LangSmith scoring skipped (%s)", exc)
+  try:
+    hour = int(time.time() // 3600)
+    if _jev_compare_hour.get("h") == hour:
+      return
+    _jev_compare_hour["h"] = hour
+    from .edge import probe_cost_pct
+    from .jev import describe_comparison, dual_run_report
+    line = describe_comparison(dual_run_report(memory, cfg, cost_pct=probe_cost_pct(memory, cfg)))
+    if line:
+      logger.info(line)
+  except Exception as exc:
+    logger.warning("JEV: comparison line skipped (%s)", exc)

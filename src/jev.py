@@ -31,7 +31,7 @@ import re
 import time
 from typing import Any, Dict, List, Optional
 
-from .edge import safe_family_horizon_weights, safe_family_horizons, signal_edge_stats
+from .edge import _signed_probe_return, safe_family_horizon_weights, safe_family_horizons, signal_edge_stats
 from .memory import DEFAULT_TRADER, KNOWN_TRADERS, SCORED_GATES, STRUCTURAL_REFUSALS
 from .regime import net_reward_risk_ratio
 from .utils import normalize_symbol
@@ -426,6 +426,93 @@ def _build_client(cfg: Any) -> Any:
     return None
 
 
+def _sdk_version() -> Optional[str]:
+  try:
+    from importlib.metadata import version
+    return version("typesafe-sdk")
+  except Exception:
+    return None
+
+
+def startup_line(cfg: Any) -> str:
+  """One line at process start saying exactly what the dual run will do (logged even when it is off)."""
+  jcfg = getattr(cfg, "jev", None)
+  mode = str(getattr(jcfg, "mode", "off") or "off")
+  if mode == "off":
+    return "JEV DUAL RUN: off (JEV_MODE=off) — set JEV_MODE=shadow and TYPESAFE_API_KEY in .env, then restart"
+  key = "set" if os.getenv("TYPESAFE_API_KEY", "").strip() else "MISSING (idle until TYPESAFE_API_KEY is set)"
+  sdk = _sdk_version()
+  ls = getattr(cfg, "langsmith", None)
+  traced = bool(ls and ls.enabled and ls.tracing and ls.api_key)
+  return (
+    f"JEV DUAL RUN: mode={mode} model={jcfg.model} key={key} "
+    f"sdk={'typesafe-sdk ' + sdk if sdk else 'MISSING (pip install -r requirements.txt)'} "
+    f"caps: {jcfg.max_open_positions} open, {jcfg.max_entries_per_day}/day, {jcfg.max_symbols_per_run} symbols/run, "
+    f"risk scale {jcfg.risk_scale:g} | langsmith={'on' if traced else 'off'}"
+  )
+
+
+def describe_row(row: Dict[str, Any]) -> str:
+  """One log line per symbol Jev was asked about: its answer, the code-built bracket and what happened."""
+  sym = row.get("symbol")
+  if row.get("direction") is None:
+    return f"JEV {sym}: {row.get('outcome') or 'error'} — {row.get('detail') or 'no answer'}"
+  p = row.get("probabilities") or {}
+  probs = f"(L {p.get('long', 0):.2f} / S {p.get('short', 0):.2f} / stand {p.get('stand_aside', 0):.2f})"
+  conf = row.get("confidence")
+  head = f"JEV {sym}: {row['direction'].upper().replace('_', ' ')} {conf:.2f} {probs}" if isinstance(conf, (int, float)) \
+    else f"JEV {sym}: {row['direction']} {probs}"
+  if row.get("direction") == "stand_aside":
+    return head + (f" {row['latencyMs']}ms" if row.get("latencyMs") is not None else "")
+  b = row.get("bracket") or {}
+  plan = f" {row.get('setupFamily')} · {b.get('entryKind') or row.get('entryKind')} · {b.get('targetKind') or row.get('targetKind')}"
+  if b:
+    plan += f" {b.get('targetNetR')}R | entry {b.get('entry'):.8g} stop {b.get('stop'):.8g} tp {b.get('takeProfit'):.8g}"
+  out = f"{row.get('outcome') or 'pending'}"
+  if row.get("detail"):
+    out += f" ({row['detail']})"
+  if row.get("repeat"):
+    out += " [repeat — not stored again]"
+  elif row.get("recorded"):
+    out += " [scored]"
+  if row.get("stake"):
+    out += f" stake {row['stake']}"
+  if row.get("heldBy"):
+    out += f" [{row['heldBy']} holds it]"
+  return f"{head}{plan} → {out}"
+
+
+def _status(cfg: Any, summary: Dict[str, Any], rows: List[Dict[str, Any]], now: float) -> Dict[str, Any]:
+  """The pass's health record (memory ``jev_status``) — read by the dashboard and the Supervisor."""
+  counts: Dict[str, int] = {}
+  for r in rows:
+    key = str(r.get("outcome") or "error")
+    counts[key] = counts.get(key, 0) + 1
+  lat = sorted(int(r["latencyMs"]) for r in rows if isinstance(r.get("latencyMs"), (int, float)))
+  resolved = next((r.get("model") for r in rows if r.get("model")), None)
+  state = "idle" if summary.get("skipped") else ("error" if summary.get("error") else "ok")
+  return {
+    "ts": int(now),
+    "mode": summary.get("mode"),
+    "model": getattr(cfg.jev, "model", None),
+    "resolvedModel": resolved,
+    "state": state,
+    "reason": summary.get("skipped") or summary.get("error"),
+    "asked": int(summary.get("asked") or 0),
+    "outcomes": counts,
+    "medianLatencyMs": lat[len(lat) // 2] if lat else None,
+    "inputTokens": sum(int(r.get("inputTokens") or 0) for r in rows) or None,
+    "traced": bool(summary.get("traced")),
+  }
+
+
+def _save_status(memory: Any, status: Dict[str, Any]) -> None:
+  try:
+    memory.set_jev_status(status)
+  except Exception as exc:
+    logger.warning("JEV: status not recorded (%s)", exc)
+
+
 async def run_jev_pass(
   cfg: Any,
   tools: Any,
@@ -437,13 +524,16 @@ async def run_jev_pass(
   cost_rate: float,
   client: Any = None,
   now: Optional[float] = None,
+  tracer: Any = None,
 ) -> Dict[str, Any]:
   """One dual-run pass: ask Jev about up to ``max_symbols_per_run`` symbols, then enter / shadow its calls.
 
   ``tools`` is the run's build_tools namespace (analysis cache, ownership, the order path); ``universe`` the
   tradeable spot symbols; ``equity_usd`` only seeds the requested notional (the order path sizes TO the risk
   budget); ``noise_mult`` and ``cost_rate`` are the run's measured stop floor and per-side cost. Returns a
-  summary for the log; every per-symbol answer is also stored with ``memory.record_jev_decision``.
+  summary for the log; every per-symbol answer is also stored with ``memory.record_jev_decision``, the pass's
+  health with ``memory.set_jev_status`` (idle passes too), and each symbol gets one INFO log line.
+  ``tracer`` (``langsmith_tracer``) receives the whole pass — states, questions, answers — for LangSmith.
   """
   jcfg = cfg.jev
   now = float(now if now is not None else time.time())
@@ -455,13 +545,18 @@ async def run_jev_pass(
     if not os.getenv("TYPESAFE_API_KEY", "").strip():
       _warn_once("key", "JEV: JEV_MODE=%s but TYPESAFE_API_KEY is not set — the dual run is idle", jcfg.mode)
       summary["skipped"] = "TYPESAFE_API_KEY not set"
-      return summary
-    client = _build_client(cfg)
-    if client is None:
-      summary["skipped"] = "client unavailable"
+    else:
+      client = _build_client(cfg)
+      if client is None:
+        summary["skipped"] = ("typesafe-sdk not installed" if _sdk_version() is None
+                              else "client unavailable (check TYPESAFE_API_KEY)")
+    if summary.get("skipped"):
+      _save_status(memory, _status(cfg, summary, [], now))
       return summary
 
   answers: List[Dict[str, Any]] = []
+  trace_inputs: Dict[str, Dict[str, Any]] = {}
+  started_at = time.time()
   try:
     # Candidates: what this run already analysed (free), then the rest of the universe in an hourly rotation
     # so every symbol is visited — Jev's record must not depend on which symbols the LLM chose to look at.
@@ -474,6 +569,7 @@ async def run_jev_pass(
       k = int(now // 3600) % len(rest)
       rest = rest[k:] + rest[:k]
     candidates = ordered[:budget]
+    from_run = len(candidates)
     for sym in rest:
       if len(candidates) >= budget:
         break
@@ -486,6 +582,9 @@ async def run_jev_pass(
         analyses[sym] = res
         candidates.append(sym)
 
+    logger.info("JEV (%s) pass: asking %d symbol(s) with %s — %d from this run's analyses, %d analysed now%s",
+                jcfg.mode, len(candidates), jcfg.model, from_run, len(candidates) - from_run,
+                f"; holding {', '.join(sorted(held))}" if held else "")
     near_r = max(float(cfg.trading.min_futures_rr or 0.0), 1.0) * NEAR_TARGET_CUSHION
     extended_r = near_r * EXTENDED_TARGET_MULT
     sem = asyncio.Semaphore(MAX_CONCURRENT_ASKS)
@@ -498,11 +597,14 @@ async def run_jev_pass(
       families = list(questions["setup_family"]["criteria"])
       async with sem:
         t0 = time.monotonic()
+        started = time.time()
         try:
           resp = await client.system_one(state=state, questions=questions)
         except Exception as exc:
+          trace_inputs[sym] = {"state": state, "questions": questions, "start": started, "end": time.time()}
           return {"symbol": sym, "outcome": "error", "detail": f"{type(exc).__name__}: {str(exc)[:120]}"}
         latency = int((time.monotonic() - t0) * 1000)
+      trace_inputs[sym] = {"state": state, "questions": questions, "start": started, "end": time.time()}
       parsed = parse_answers(resp, families=families)
       return {"symbol": sym, "latencyMs": latency, **parsed}
 
@@ -559,6 +661,16 @@ async def run_jev_pass(
       row["outcome"] = outcome
       if detail:
         row["detail"] = detail
+      if isinstance(result, dict):
+        # What the order path made of the call: was it stored as evidence (a repeat inside the family's
+        # shortest horizon is not), and the stake an entry would get on Jev's own record.
+        if result.get("shadow"):
+          row["recorded"] = bool(result.get("probeRecorded"))
+          row["repeat"] = bool(result.get("repeat"))
+          if result.get("stake"):
+            row["stake"] = str(result["stake"])[:80]
+        elif outcome == "placed":
+          row["recorded"] = True
       if dry_run and owner:
         row["heldBy"] = owner
       if outcome == "placed":
@@ -577,9 +689,208 @@ async def run_jev_pass(
     row.setdefault("outcome", "error")
     row["ts"] = int(now)
     row["mode"] = jcfg.mode
+    logger.info(describe_row(row))
+  if tracer is not None and (answers or summary.get("error")):
+    try:
+      posted = tracer({
+        "mode": jcfg.mode, "model": jcfg.model, "start": started_at, "end": time.time(),
+        "rows": answers, "inputs": trace_inputs, "error": summary.get("error"),
+      })
+      summary["traced"] = bool(posted)
+      # Each symbol's LangSmith run id rides on its decision row, so the market's answer can be attached
+      # to that run as feedback once the call settles (langsmith_scorer).
+      for row in answers:
+        rid = posted.get(row.get("symbol")) if isinstance(posted, dict) else None
+        if rid:
+          row["lsRunId"] = rid
+    except Exception as exc:
+      logger.warning("JEV: LangSmith trace failed (%s)", exc)
+  for row in answers:
     memory.record_jev_decision(row)
   summary["rows"] = answers
+  _save_status(memory, _status(cfg, summary, answers, now))
   return summary
+
+
+# ── LangSmith ────────────────────────────────────────────────────────────────────────────────────────
+_LS_CLIENTS: Dict[tuple, Any] = {}
+_ls_traced_once = False
+
+
+def _trace_worthy(record: Dict[str, Any]) -> bool:
+  """A pass that did something real: a live order attempt, a refusal of one, or an error."""
+  if record.get("error"):
+    return True
+  for r in record.get("rows") or []:
+    if r.get("outcome") in ("placed", "error") or (r.get("outcome") == "refused" and r.get("mode") == "live"):
+      return True
+  return False
+
+
+def langsmith_tracer(cfg: Any, *, client: Any = None, rng: Any = None) -> Any:
+  """A callable that posts one Jev pass to LangSmith as a trace, or None when LangSmith is off.
+
+  One root run per pass ("Jev Dual Run", tags trAIde/jev/<mode>) with one ``llm`` child per symbol: inputs =
+  the exact state and questions sent, outputs = Jev's answers, the code-built bracket and what the order
+  path did, plus the model version and input tokens. Its own LangSmith client WITHOUT the agent's head
+  sampling, so the policy here decides: the first pass after start, every pass that attempted or was
+  refused a live entry or hit an error, and the rest at LANGSMITH_SAMPLE_RATE — the same budget the agent
+  runs use (the monthly trace cap is why they are sampled). Returns True when the pass was posted.
+  """
+  ls = getattr(cfg, "langsmith", None)
+  if not (ls and getattr(ls, "enabled", False) and getattr(ls, "tracing", False) and getattr(ls, "api_key", None)):
+    return None
+  import random as _random
+  rand = rng or _random.random
+  rate = min(1.0, max(0.0, float(getattr(ls, "sample_rate", 1.0) or 0.0)))
+
+  def _client() -> Any:
+    if client is not None:
+      return client
+    key = (ls.api_key, getattr(ls, "api_url", None))
+    if key not in _LS_CLIENTS:
+      from langsmith import Client
+      _LS_CLIENTS[key] = Client(api_key=ls.api_key, api_url=getattr(ls, "api_url", None) or None)
+    return _LS_CLIENTS[key]
+
+  def trace(record: Dict[str, Any]) -> Dict[str, str]:
+    global _ls_traced_once
+    if _ls_traced_once and not _trace_worthy(record) and rand() >= rate:
+      return {}
+    from datetime import datetime, timezone
+    from langsmith.run_trees import RunTree
+
+    def ts(value: Any) -> Any:
+      return datetime.fromtimestamp(float(value), tz=timezone.utc) if value else None
+
+    rows = record.get("rows") or []
+    counts: Dict[str, int] = {}
+    for r in rows:
+      counts[str(r.get("outcome") or "error")] = counts.get(str(r.get("outcome") or "error"), 0) + 1
+    root = RunTree(
+      name=f"Jev Dual Run ({record.get('mode')})", run_type="chain",
+      inputs={"mode": record.get("mode"), "model": record.get("model"), "symbols": [r.get("symbol") for r in rows]},
+      tags=["trAIde", "jev", str(record.get("mode"))],
+      project_name=getattr(ls, "project", None) or None,
+      client=_client(), start_time=ts(record.get("start")),
+      extra={"metadata": {"ls_provider": "typesafe", "trader": "jev"}},
+    )
+    run_ids: Dict[str, str] = {}
+    for r in rows:
+      sent = (record.get("inputs") or {}).get(r.get("symbol")) or {}
+      child = root.create_child(
+        name=f"Jev {r.get('symbol')}", run_type="llm",
+        inputs={"state": sent.get("state"), "questions": sent.get("questions")},
+        start_time=ts(sent.get("start")),
+        extra={"metadata": {"ls_provider": "typesafe", "ls_model_name": r.get("model") or record.get("model")}},
+        tags=[str(r.get("outcome"))],
+      )
+      tokens = int(r.get("inputTokens") or 0)
+      child.end(
+        outputs={
+          "direction": r.get("direction"), "confidence": r.get("confidence"),
+          "probabilities": r.get("probabilities"), "setupFamily": r.get("setupFamily"),
+          "entryKind": r.get("entryKind"), "targetKind": r.get("targetKind"),
+          "bracket": r.get("bracket"), "outcome": r.get("outcome"), "detail": r.get("detail"),
+          "heldBy": r.get("heldBy"), "latencyMs": r.get("latencyMs"),
+          "usage_metadata": {"input_tokens": tokens, "output_tokens": 0, "total_tokens": tokens},
+        },
+        error=r.get("detail") if r.get("outcome") == "error" else None,
+        end_time=ts(sent.get("end")),
+      )
+      if r.get("symbol"):
+        run_ids[str(r["symbol"])] = str(child.id)
+    root.end(outputs={"asked": len(rows), "outcomes": counts}, error=record.get("error"), end_time=ts(record.get("end")))
+    root.post(exclude_child_runs=False)
+    _ls_traced_once = True
+    return run_ids or {"_root": str(root.id)}
+
+  return trace
+
+
+# A call is scored in LangSmith once its longest horizon has settled (or been written off): 240m plus the
+# settlement tolerance. Bounded per pass — feedback posts are one HTTP call each, on the agent's thread.
+SCORE_AFTER_SEC = (240 + 60) * 60
+SCORE_GIVE_UP_SEC = 48 * 3600
+MAX_SCORES_PER_PASS = 10
+
+
+def langsmith_scorer(cfg: Any, *, client: Any = None) -> Any:
+  """A callable(memory, now) that attaches the market's answer to traced Jev calls, or None when off.
+
+  For each traced decision whose 240m window has settled: its probe's signed forward return at 15m / 60m /
+  240m (%, price + funding — edge's one definition) as LangSmith feedback ``fwd_15m`` / ``fwd_60m`` /
+  ``fwd_240m``, plus ``right_way_60m`` (1 if the call pointed the right way at 60m). A stand-aside has no
+  direction and is not scored. Each decision is scored once (``lsScored``). Returns how many were scored.
+  """
+  ls = getattr(cfg, "langsmith", None)
+  if not (ls and getattr(ls, "enabled", False) and getattr(ls, "tracing", False) and getattr(ls, "api_key", None)):
+    return None
+
+  def _client() -> Any:
+    if client is not None:
+      return client
+    key = (ls.api_key, getattr(ls, "api_url", None))
+    if key not in _LS_CLIENTS:
+      from langsmith import Client
+      _LS_CLIENTS[key] = Client(api_key=ls.api_key, api_url=getattr(ls, "api_url", None) or None)
+    return _LS_CLIENTS[key]
+
+  def score(memory: Any, now: Optional[float] = None) -> int:
+    now = float(now if now is not None else time.time())
+    due = [r for r in memory.jev_decisions(limit=0)
+           if r.get("lsRunId") and not r.get("lsScored") and now - int(r.get("ts") or 0) >= SCORE_AFTER_SEC]
+    if not due:
+      return 0
+    index = _probe_index(memory.signal_probes(limit=0, trader="jev"))
+    done: List[tuple] = []
+    for r in due:
+      if len(done) >= MAX_SCORES_PER_PASS:
+        break
+      # Only a call that reached the probe (shadow, or a placed entry) has a forward return to score; a
+      # stand-aside, an error or a refusal before the probe is marked done with no feedback.
+      scoreable = r.get("direction") in ("long", "short") and (r.get("recorded") or r.get("outcome") == "placed")
+      fwd = _forward_pcts(_nearest_probe(index, r.get("symbol"), r.get("direction"), int(r.get("ts") or 0))) \
+        if scoreable else None
+      if scoreable and (not fwd or fwd.get("240m") is None) and now - int(r.get("ts") or 0) < SCORE_GIVE_UP_SEC:
+        continue                                   # not settled yet: try again next pass
+      for key, val in (fwd or {}).items():
+        if val is not None:
+          _client().create_feedback(r["lsRunId"], key=f"fwd_{key}", score=float(val),
+                                    comment=f"{r.get('symbol')} {r.get('direction')}: signed forward return, %")
+      if fwd and fwd.get("60m") is not None:
+        _client().create_feedback(r["lsRunId"], key="right_way_60m", score=1.0 if fwd["60m"] > 0 else 0.0)
+      done.append((int(r.get("ts") or 0), r.get("symbol")))
+    if done:
+      memory.mark_jev_decisions_scored(done)
+    return len(done)
+
+  return score
+
+
+def describe_comparison(report: Dict[str, Any]) -> Optional[str]:
+  """One log line comparing the two traders over the same window (the dashboard panel, in text)."""
+  tr = report.get("traders") or {}
+  if not tr:
+    return None
+
+  def side(name: str) -> str:
+    t = tr.get(name) or {}
+    h = (t.get("byHorizon") or {}).get("60m") or {}
+    net = h.get("netPct")
+    hit = h.get("hitRate")
+    return (f"{name.upper()} calls {t.get('calls', 0)}, @60m net {net:+.3f}% hit {hit * 100:.0f}% (n={h.get('n', 0)}), "
+            f"closes {t.get('closes', 0)} avg {t.get('avgR') if t.get('avgR') is not None else '—'}R"
+            if net is not None and hit is not None else
+            f"{name.upper()} calls {t.get('calls', 0)} (60m not settled yet), closes {t.get('closes', 0)}")
+
+  ag = report.get("agreement") or {}
+  oc = report.get("outcomes") or {}
+  since = report.get("since")
+  when = time.strftime("%Y-%m-%d %H:%M", time.gmtime(since)) if since else "start"
+  return (f"JEV vs LLM since {when} UTC — {side('jev')} | {side('llm')} | Jev outcomes "
+          + ", ".join(f"{k} {v}" for k, v in sorted(oc.items()))
+          + f" | same side as the LLM {ag.get('agree', 0)}/{ag.get('agree', 0) + ag.get('disagree', 0)}")
 
 
 def describe_pass(summary: Dict[str, Any]) -> str:
@@ -639,6 +950,77 @@ def _f(value: Any) -> Optional[float]:
   return _num(value)
 
 
+RECENT_ROWS = 40
+# A decision row and its probe are written in the same pass (seconds apart); this bounds the match.
+_PROBE_MATCH_SEC = 300
+FORWARD_HORIZONS_MIN = (15, 60, 240)
+
+
+def _probe_index(probes: List[Dict[str, Any]]) -> Dict[str, List[tuple]]:
+  """symbol -> [(ts, side, entryContext)] for fast nearest-call lookups."""
+  out: Dict[str, List[tuple]] = {}
+  for p in probes or []:
+    ctx = p.get("entryContext") if isinstance(p, dict) else None
+    if not isinstance(ctx, dict):
+      continue
+    sym = normalize_symbol(str(p.get("symbol") or ""))
+    out.setdefault(sym, []).append((int(p.get("ts") or 0), str(ctx.get("positionSide") or "").lower(), ctx))
+  return out
+
+
+def _nearest_call(index: Dict[str, List[tuple]], symbol: Any, ts: int) -> Optional[Dict[str, Any]]:
+  rows = [(abs(t - ts), side, ctx) for (t, side, ctx) in index.get(normalize_symbol(str(symbol or "")), [])
+          if abs(t - ts) <= AGREEMENT_WINDOW_SEC and side in ("long", "short")]
+  if not rows:
+    return None
+  _, side, ctx = min(rows, key=lambda x: x[0])
+  return {"side": side, "confidence": _r(ctx.get("confidence"), 3), "setupFamily": ctx.get("setupFamily")}
+
+
+def _nearest_probe(index: Dict[str, List[tuple]], symbol: Any, direction: Any, ts: int) -> Optional[Dict[str, Any]]:
+  if direction not in ("long", "short"):
+    return None
+  rows = [(abs(t - ts), ctx) for (t, side, ctx) in index.get(normalize_symbol(str(symbol or "")), [])
+          if side == direction and abs(t - ts) <= _PROBE_MATCH_SEC]
+  return min(rows, key=lambda x: x[0])[1] if rows else None
+
+
+def _forward_pcts(ctx: Optional[Dict[str, Any]]) -> Optional[Dict[str, Optional[float]]]:
+  """Signed forward return (%) of one call at 15m / 60m / 240m — edge's one definition (price + funding)."""
+  if not isinstance(ctx, dict):
+    return None
+  base = _num(ctx.get("marketPriceAtSignal"))
+  probe = ctx.get("signalProbe") if isinstance(ctx.get("signalProbe"), dict) else {}
+  side = str(ctx.get("positionSide") or "").lower()
+  if not base or base <= 0 or side not in ("long", "short"):
+    return None
+  out: Dict[str, Optional[float]] = {}
+  for h in FORWARD_HORIZONS_MIN:
+    try:
+      v = _signed_probe_return(ctx, probe, base, side, h)
+    except Exception:
+      v = None
+    out[f"{h}m"] = round(v * 100, 3) if v is not None else None
+  return out
+
+
+def public_status(status: Any) -> Optional[Dict[str, Any]]:
+  """The last pass's health, whitelisted: when, idle/ok/error and why, how many asked, outcome counts,
+  latency, the resolved model and whether it went to LangSmith. None before the first pass."""
+  if not isinstance(status, dict) or not status.get("ts"):
+    return None
+  return {
+    "ts": int(status.get("ts") or 0),
+    "state": status.get("state") if status.get("state") in ("ok", "idle", "error") else "error",
+    "reason": scrub_detail(status.get("reason")),
+    "asked": int(status.get("asked") or 0),
+    "outcomes": {str(k): int(v) for k, v in (status.get("outcomes") or {}).items() if isinstance(v, (int, float))},
+    "medianLatencyMs": status.get("medianLatencyMs"),
+    "resolvedModel": str(status.get("resolvedModel") or "")[:80] or None,
+    "traced": bool(status.get("traced")),
+  }
+
+
 def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]:
   """Both dual-run traders, each judged on its own calls over the SAME window (since Jev's first call).
 
@@ -655,15 +1037,16 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
     if mode == "off" and not recent:
       return out
     out["model"] = getattr(jcfg, "model", None)
+    out["status"] = public_status(memory.jev_status() if callable(getattr(memory, "jev_status", None)) else {})
     since = min((int(r.get("ts") or 0) for r in recent if r.get("ts")), default=None)
     out["since"] = since
     horizons = safe_family_horizons(memory)
     weights = safe_family_horizon_weights(memory)
     closes = memory.realized_closes(limit=400)
     traders: Dict[str, Any] = {}
+    probes_by_trader = {name: memory.signal_probes(limit=0, trader=name) for name in KNOWN_TRADERS}
     for name in KNOWN_TRADERS:
-      probes = [p for p in memory.signal_probes(limit=0, trader=name)
-                if since is None or int(p.get("ts") or 0) >= since]
+      probes = [p for p in probes_by_trader[name] if since is None or int(p.get("ts") or 0) >= since]
       stats = signal_edge_stats(probes, cost_pct=cost_pct, family_horizons=horizons, family_horizon_weights=weights)
       best = stats.get("best_horizon")
       row = (stats.get("by_horizon") or {}).get(best or "", {}) if best else {}
@@ -682,6 +1065,13 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
         "winRate": _r(wins / len(mine), 3) if mine else None,
         "avgR": _r(sum(rs) / len(rs), 3) if rs else None,
         "sumR": _r(sum(rs), 2) if rs else None,
+        # Every scored horizon, not only the best one: n (de-overlapped), mean and net of cost in %, and
+        # how often the call pointed the right way — the like-for-like comparison of the two traders.
+        "byHorizon": {
+          h: {"n": int(v.get("n") or 0), "meanPct": _r(v.get("mean_pct"), 4),
+              "netPct": _r(v.get("net_of_cost_pct"), 4), "hitRate": _r(v.get("hit_rate"), 3)}
+          for h, v in (stats.get("by_horizon") or {}).items() if isinstance(v, dict)
+        },
       }
     out["traders"] = traders
     counts: Dict[str, int] = {}
@@ -696,8 +1086,10 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
     llm_calls = [
       (normalize_symbol(str(p.get("symbol") or "")), int(p.get("ts") or 0),
        str(((p.get("entryContext") or {}).get("positionSide") or "")).lower())
-      for p in memory.signal_probes(limit=0, trader=DEFAULT_TRADER)
+      for p in probes_by_trader[DEFAULT_TRADER]
     ]
+    llm_index = _probe_index(probes_by_trader[DEFAULT_TRADER])
+    jev_index = _probe_index(probes_by_trader["jev"])
     agree = disagree = 0
     for r in recent[-200:]:
       if r.get("direction") not in ("long", "short"):
@@ -719,12 +1111,22 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
         "probabilities": {k: _r(v, 3) for k, v in (r.get("probabilities") or {}).items() if k in DIRECTIONS},
         "setupFamily": r.get("setupFamily"),
         "entryKind": (r.get("bracket") or {}).get("entryKind") or r.get("entryKind"),
+        "targetKind": (r.get("bracket") or {}).get("targetKind") or r.get("targetKind"),
         "targetNetR": (r.get("bracket") or {}).get("targetNetR"),
+        "stopAtr": (r.get("bracket") or {}).get("stopAtr"),
         "outcome": r.get("outcome"),
         "detail": scrub_detail(r.get("detail")),
+        "recorded": r.get("recorded"),
+        "repeat": bool(r.get("repeat")),
+        "stake": scrub_detail(r.get("stake")),
+        "heldBy": r.get("heldBy"),
         "latencyMs": r.get("latencyMs"),
+        # The LLM's own call on the same coin within the agreement window (None = it made none).
+        "llm": _nearest_call(llm_index, r.get("symbol"), int(r.get("ts") or 0)),
+        # How the market answered this call: its probe's signed forward return (%), once settled.
+        "fwdPct": _forward_pcts(_nearest_probe(jev_index, r.get("symbol"), r.get("direction"), int(r.get("ts") or 0))),
       }
-      for r in reversed(recent[-25:])
+      for r in reversed(recent[-RECENT_ROWS:])
     ]
   except Exception as exc:  # report-only: never raises into the loop or the publisher
     logger.warning("dual-run report unavailable: %s", exc)

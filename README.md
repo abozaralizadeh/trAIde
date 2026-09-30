@@ -895,6 +895,17 @@ LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
 
 Start with `JEV_MODE=shadow` for a few days, compare the two records in the panel, then `live`.
 
+**Seeing what Jev is doing**
+
+| Where | What you get |
+|---|---|
+| Log, at start | `JEV DUAL RUN: mode=shadow model=jev-latest key=set sdk=typesafe-sdk 0.7.2 caps: … langsmith=on` (also printed when off) |
+| Log, every pass | `JEV (shadow) pass: asking 8 symbol(s) …`, then one line per symbol — `JEV SOL-USDT: LONG 0.71 (L 0.71 / S 0.10 / stand 0.19) continuation · at_market · near 1.65R \| entry … stop … tp … → shadow [scored] stake explore 0.40` — and the pass summary |
+| Log, hourly | `JEV vs LLM since … — JEV calls n, @60m net %, hit % \| LLM … \| same side as the LLM a/b` |
+| Dashboard (`dualRun`, read from the published blob — never from the bot) | Last-pass health (or why it is idle), both traders side by side, a 15m / 1h / 4h table of "right way" % and net of cost for each, and every recent answer: Jev's call and probabilities, the LLM's call on the same coin at the same time, the code-built plan, what the order path did (scored / repeat / stake / gate) and how price moved its way after 15m / 1h / 4h |
+| LangSmith | One trace per pass, `Jev Dual Run (<mode>)`, with one `llm` run per symbol: the exact state and questions sent, Jev's answers, the bracket and the outcome, input tokens. Once a traced call's 4h window settles, its forward returns are attached as feedback (`fwd_15m`, `fwd_60m`, `fwd_240m`, `right_way_60m`). Posted: the first pass after start, every pass with a live entry attempt or an error, the rest at `LANGSMITH_SAMPLE_RATE` (the monthly trace cap) |
+| Supervisor | `get_dual_run_report` — the same report as the dashboard panel |
+
 ## Backtesting
 
 Run strategy backtests on historical data with parameter sweeps.

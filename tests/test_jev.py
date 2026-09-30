@@ -564,3 +564,140 @@ class TestReportingAndView:
     assert DashboardPublisher._row_trader({"entryContext": {"trader": "jev"}}) == "jev"
     assert DashboardPublisher._row_trader({"trader": "llm"}) is None
     assert DashboardPublisher._row_trader({}) is None
+
+
+# ── observability: logs, status, LangSmith, the enriched report (Sep 30 pm) ──────────────────────────
+class _LsClient:
+  """LangSmith stand-in: records every run RunTree posts and every feedback."""
+
+  def __init__(self):
+    self.runs, self.feedback = [], []
+
+  def create_run(self, **kw):
+    self.runs.append(kw)
+
+  def create_feedback(self, run_id, key, score=None, comment=None, **kw):
+    self.feedback.append((str(run_id), key, score))
+
+
+def _ls_cfg(mode="shadow", rate=0.1):
+  cfg = _cfg(mode)
+  cfg.langsmith = SimpleNamespace(enabled=True, tracing=True, api_key="k", api_url=None, project="p", sample_rate=rate)
+  return cfg
+
+
+class TestObservability:
+  def test_startup_line_says_what_will_happen(self, monkeypatch):
+    assert "off" in jev.startup_line(_cfg("off")) and "JEV_MODE=shadow" in jev.startup_line(_cfg("off"))
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    line = jev.startup_line(_cfg("shadow"))
+    assert "mode=shadow" in line and "key=MISSING" in line
+    monkeypatch.setenv("TYPESAFE_API_KEY", "k")
+    assert "key=set" in jev.startup_line(_ls_cfg("live")) and "langsmith=on" in jev.startup_line(_ls_cfg("live"))
+
+  def test_one_line_per_symbol(self):
+    row = {"symbol": "SOL-USDT", "direction": "long", "confidence": 0.71,
+           "probabilities": {"long": 0.71, "short": 0.1, "stand_aside": 0.19}, "setupFamily": "continuation",
+           "bracket": {"entryKind": "at_market", "targetKind": "near", "targetNetR": 1.65, "entry": 100.0,
+                       "stop": 98.0, "takeProfit": 103.4}, "outcome": "shadow", "recorded": True,
+           "stake": "explore 0.40"}
+    line = jev.describe_row(row)
+    assert line.startswith("JEV SOL-USDT: LONG 0.71 (L 0.71 / S 0.10 / stand 0.19)")
+    assert "entry 100 stop 98 tp 103.4 → shadow [scored] stake explore 0.40" in line
+    assert "stand" in jev.describe_row({"symbol": "X", "direction": "stand_aside", "confidence": 0.8, "probabilities": {}})
+    assert jev.describe_row({"symbol": "X", "outcome": "error", "detail": "boom"}) == "JEV X: error — boom"
+
+  def test_an_idle_pass_leaves_a_status_the_dashboard_can_show(self, tmp_path, monkeypatch):
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    m = MemoryStore(str(tmp_path / "m.json"))
+    asyncio.run(jev.run_jev_pass(_cfg("shadow"), _Tools({}), m, universe=[], equity_usd=1.0,
+                                 noise_mult=2.5, cost_rate=0.0016, now=1_790_000_000.0))
+    st = m.jev_status()
+    assert (st["state"], st["reason"], st["asked"]) == ("idle", "TYPESAFE_API_KEY not set", 0)
+    pub = jev.public_status(st)
+    assert set(pub) == {"ts", "state", "reason", "asked", "outcomes", "medianLatencyMs", "resolvedModel", "traced"}
+    assert pub["state"] == "idle" and pub["reason"] == "TYPESAFE_API_KEY not set"
+
+  def test_a_pass_records_status_and_what_the_order_path_said(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    tools = _Tools({}, results={"SOL-USDT": {"shadow": True, "probeRecorded": False, "repeat": True,
+                                             "stake": "explore 0.40 (n=3 < 20)"}})
+    _run(_cfg("shadow"), tools, m, _Client({"SOL-USDT": ("long", 0.7), "BTC-USDT": ("short", 0.66)}))
+    rows = {r["symbol"]: r for r in m.jev_decisions(limit=0)}
+    assert rows["SOL-USDT"]["repeat"] is True and rows["SOL-USDT"]["recorded"] is False
+    assert rows["SOL-USDT"]["stake"].startswith("explore 0.40")
+    st = m.jev_status()
+    assert st["state"] == "ok" and st["asked"] == 3 and st["outcomes"] == {"shadow": 2, "stand_aside": 1}
+    assert st["resolvedModel"] == "jev-1.4.2" and st["inputTokens"] == 2700
+
+  def test_langsmith_trace_posts_the_whole_pass_and_ids_ride_on_the_rows(self, tmp_path, monkeypatch):
+    monkeypatch.setattr(jev, "_ls_traced_once", False)
+    ls = _LsClient()
+    tracer = jev.langsmith_tracer(_ls_cfg(), client=ls, rng=lambda: 0.99)
+    m = MemoryStore(str(tmp_path / "m.json"))
+    out = _run(_cfg("shadow"), _Tools({}), m, _Client({"SOL-USDT": ("long", 0.7)}), tracer=tracer)
+    assert out["traced"] is True
+    names = [r["name"] for r in ls.runs]
+    assert names[0] == "Jev Dual Run (shadow)" and "Jev SOL-USDT" in names and len(names) == 4
+    child = next(r for r in ls.runs if r["name"] == "Jev SOL-USDT")
+    assert child["run_type"] == "llm" and child["inputs"]["state"]["symbol"] == "SOL-USDT"
+    assert child["outputs"]["direction"] == "long" and child["outputs"]["usage_metadata"]["input_tokens"] == 900
+    rows = {r["symbol"]: r for r in m.jev_decisions(limit=0)}
+    assert rows["SOL-USDT"]["lsRunId"] == str(child["id"])
+    # A routine pass after the first is sampled (0.99 >= 0.1: not posted)...
+    ls.runs.clear()
+    out = _run(_cfg("shadow"), _Tools({}), m, _Client({"SOL-USDT": ("long", 0.7)}), tracer=tracer)
+    assert out.get("traced") is False and ls.runs == []
+    # ...but a pass with an error always goes.
+    out = _run(_cfg("shadow"), _Tools({}), m, _Client({}, raise_for={"BTC-USDT"}), tracer=tracer)
+    assert out["traced"] is True and ls.runs
+
+  def test_no_langsmith_config_no_tracer(self):
+    assert jev.langsmith_tracer(_cfg()) is None and jev.langsmith_scorer(_cfg()) is None
+
+  def test_settled_calls_get_the_markets_answer_as_feedback_once(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    t0 = int(time.time()) - 6 * 3600
+    m.record_signal_probe("SOL-USDT", "buy", 100.0, "continuation", trader="jev")
+    d = m._read()
+    d["signal_probes"][0]["ts"] = t0
+    d["signal_probes"][0]["entryContext"]["signalProbe"] = {"m15": 100.5, "m60": 99.0, "m240": 102.0}
+    m._write(d)
+    m.record_jev_decision({"ts": t0, "symbol": "SOL-USDT", "direction": "long", "outcome": "shadow",
+                           "recorded": True, "lsRunId": "run-1"})
+    m.record_jev_decision({"ts": t0, "symbol": "BTC-USDT", "direction": "stand_aside", "outcome": "stand_aside",
+                           "lsRunId": "run-2"})
+    m.record_jev_decision({"ts": int(time.time()) - 600, "symbol": "ETH-USDT", "direction": "long",
+                           "outcome": "shadow", "recorded": True, "lsRunId": "run-3"})   # not due yet
+    ls = _LsClient()
+    score = jev.langsmith_scorer(_ls_cfg(), client=ls)
+    assert score(m) == 2
+    fb = {(rid, key): val for rid, key, val in ls.feedback}
+    assert fb[("run-1", "fwd_15m")] == pytest.approx(0.5) and fb[("run-1", "fwd_60m")] == pytest.approx(-1.0)
+    assert fb[("run-1", "fwd_240m")] == pytest.approx(2.0) and fb[("run-1", "right_way_60m")] == 0.0
+    assert not any(rid == "run-2" for rid, _, _ in ls.feedback)          # a stand-aside has no direction
+    assert score(m) == 0                                                 # each call scored once
+
+  def test_report_rows_carry_the_llms_call_and_the_forward_return(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    now = int(time.time())
+    m.record_signal_probe("SOL-USDT", "buy", 100.0, "continuation", trader="jev")
+    m.record_signal_probe("SOL-USDT", "sell", 100.0, "fade_extreme", confidence=0.74)
+    d = m._read()
+    for p in d["signal_probes"]:
+      p["ts"] = now - 7200
+      p["entryContext"]["signalProbe"] = {"m15": 101.0, "m60": 100.5}
+    m._write(d)
+    m.record_jev_decision({"ts": now - 7200, "symbol": "SOL-USDT", "direction": "long", "confidence": 0.7,
+                           "outcome": "shadow", "recorded": True, "stake": "explore 0.40",
+                           "bracket": {"entryKind": "at_market", "targetKind": "near", "targetNetR": 1.65, "stopAtr": 2.5}})
+    m.set_jev_status({"ts": now - 60, "state": "ok", "asked": 1, "outcomes": {"shadow": 1}, "resolvedModel": "jev-1.4.2"})
+    rep = jev.dual_run_report(m, _cfg("shadow"), cost_pct=0.0016)
+    row = rep["recent"][0]
+    assert row["llm"] == {"side": "short", "confidence": 0.74, "setupFamily": "fade_extreme"}
+    assert row["fwdPct"] == {"15m": pytest.approx(1.0), "60m": pytest.approx(0.5), "240m": None}
+    assert (row["recorded"], row["stake"], row["stopAtr"], row["targetKind"]) == (True, "explore 0.40", 2.5, "near")
+    assert rep["status"]["state"] == "ok" and rep["status"]["resolvedModel"] == "jev-1.4.2"
+    assert set(rep["traders"]["jev"]["byHorizon"]) >= {"15m", "60m"}
+    line = jev.describe_comparison(rep)
+    assert line.startswith("JEV vs LLM since") and "same side as the LLM 0/1" in line

@@ -1821,6 +1821,12 @@ async def trading_loop(
     logger.info("BUILD: code=%s model=%s", code_build() or "unknown", cfg.azure.deployment)
   except Exception as exc:
     logger.debug("BUILD: unavailable (%s)", exc)
+  # The Jev dual run's configuration, every start — including "off", which is otherwise silent by design.
+  try:
+    from .jev import startup_line
+    logger.info(startup_line(cfg))
+  except Exception as exc:
+    logger.warning("JEV DUAL RUN: status unavailable (%s)", exc)
   while not stop_event.is_set():
     try:
       snapshot = build_snapshot(cfg, kucoin, kucoin_futures, memory)
