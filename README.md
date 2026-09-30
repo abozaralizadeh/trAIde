@@ -12,6 +12,7 @@ Three specialized agents collaborate in a continuous loop: a **Trading Agent** t
 - [Configuration](#configuration) — all environment variables
 - [Telegram Notifications](#telegram-notifications)
 - [Supervisor Agent](#supervisor-agent-interactive-telegram-bot)
+- [Jev Dual Run](#jev-dual-run-a-second-trader) — a second, classifier trader (typesafe.ai Jev) on the same order path
 - [Backtesting](#backtesting)
 - [How the Main Loop Works](#how-the-main-loop-works)
 - [Project Structure](#project-structure)
@@ -749,6 +750,19 @@ If `AZURE_APIM_OPENAI_SUBSCRIPTION_KEY` is set, the client uses APIM endpoint/de
 
 OTLP export for Azure Monitor is supported via `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_EXPORTER_OTLP_HEADERS`.
 
+### Jev Dual Run
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `JEV_MODE` | `off` | `off` \| `shadow` (every Jev call gated + scored, no orders) \| `live` (trial-size real entries) |
+| `TYPESAFE_API_KEY` | — | typesafe.ai API key (read by `typesafe-sdk`); required for `shadow`/`live` |
+| `JEV_MODEL` | `jev-latest` | `jev-latest`, `jev-preview` or a pinned version (e.g. `jev-1.13.0`); the resolved version is stamped on every call |
+| `JEV_MAX_OPEN_POSITIONS` | `1` | Live: Jev's concurrent open positions + resting entries |
+| `JEV_MAX_ENTRIES_PER_DAY` | `6` | Live: Jev's new entries per UTC day |
+| `JEV_MAX_SYMBOLS_PER_RUN` | `8` | Symbols Jev is asked about per agent run |
+| `JEV_TIMEOUT_SEC` | `5` | Per-request timeout (one retry on 408/429/5xx) |
+| `JEV_RISK_SCALE` | `1.0` | Extra shrink (0 < x ≤ 1) on top of the explore floor — can only reduce Jev's risk |
+
 ## Telegram Notifications
 
 Get real-time updates on your phone for every trading decision, order execution, and error.
@@ -804,6 +818,7 @@ Talk back to the bot. The Supervisor Agent listens for your Telegram messages, p
 - **Fetch market data** -- funding rates, open interest, mark price for futures symbols.
 - **Read the gate scoreboard** -- `get_gate_scoreboard` returns, per directional gate and side, what the gate blocks vs what it allows on the same day (from model-independent gate-state readings, hard refusals and hatch admissions), net of cost with a day-clustered SE. Report-only: the Supervisor is told not to pass a gate verdict to the trading agent unless you ask.
 - **Read the edge scoreboard** -- `get_edge_scoreboard` returns each playbook's measured edge per family **and per side** (n, net of cost, SE, t, verdict) with the `standAside` / `stake` the order path applies right now, plus per-model confidence informativeness — so "why did it refuse continuation?" and "does the new model's confidence mean anything?" have a direct answer.
+- **Read the dual-run report** -- `get_dual_run_report` compares the LLM trader and the Jev trader (see [Jev Dual Run](#jev-dual-run-a-second-trader)), each on its own calls over the same window. Report-only: not relayed to the trading agent unless you ask.
 - **Web search** -- search the web for market context, news, or any other information.
 - **Write notes for the trading agent** -- influence the trading agent's behavior:
   - **Temporary notes** (one-time, highest priority): injected into the trading agent's system prompt on the next run only, then auto-deleted. These override any conflicting rules. Example: "Close all BTC positions immediately."
@@ -838,6 +853,47 @@ The supervisor runs as a daemon thread alongside the trading loop, using Telegra
 - "What's the current config?"
 - "Show me my KuCoin balances"
 - "What's the funding rate for XBTUSDTM?"
+
+## Jev Dual Run (a second trader)
+
+An experiment harness for **Jev** ([typesafe.ai](https://typesafe.ai), System One API): a fast classifier
+(~0.1–0.5 s, input tokens only) that returns calibrated probabilities over labelled choices instead of free
+text and tool calls. It runs **after** the Trading Agent each poll, on the same run's tools, analyses and gates.
+
+```
+LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
+                                        │ per symbol: state = the analysis (market facts only)
+                                        │ System One: direction (long/short/stand aside) · playbook ·
+                                        │             pullback vs market · near vs extended target
+                                        ▼
+                     code builds the bracket from the analysis levels
+                     (noise-floor stop → 1h Bollinger band, capped at 2× floor; target in NET R)
+                                        ▼
+            tools.place_futures_limit_order_for(trader=jev) — the LLM tool's own path:
+            every gate, risk cap, atomic bracket, stand-aside; ProtectionManager trails it
+```
+
+- **Survival stays code's, opportunity is Jev's.** Jev never sees balances, gates or its own scoreboard, and
+  never invents a stop: it picks between code-built bracket variants.
+- **Its own record.** Every call is stamped `trader: "jev"` and the resolved model version, and is scored in
+  its own buckets (`memory.signal_probes(trader="jev")` → `signal_edge_jev`). The LLM's verdicts, gate
+  scoreboard and retention never see Jev's rows. An unproven trader starts at the **explore floor** (trial
+  size) and earns stake by the same stateless t ≥ 1 bar as the LLM's playbooks.
+- **One owner per position lifecycle.** A symbol the LLM holds is not Jev's to trade and vice versa
+  (`trader_conflict`, a structural refusal). The LLM's tools refuse to close, cancel, add to or re-bracket a
+  Jev position; its prompt state marks those rows `managedBy: "jev"`. Jev positions exit by code only
+  (bracket + trailing protection). Account-level survival (circuit breakers, heat, loss streak, bench) is shared.
+- **Modes.** `shadow`: every call runs the full gate chain and is recorded as a probe — no order (`dry_run`).
+  `live`: the most confident free calls take up to `JEV_MAX_OPEN_POSITIONS` trial-size entries; calls past
+  the caps or on the LLM's symbols are still recorded as shadow calls, so Jev's record does not depend on
+  which symbols happened to be free.
+- **Reporting.** Every answer is kept in `jev_decisions` (probabilities, labels, outcome, gate code, latency).
+  The dashboard publishes a `dualRun` panel (both traders over the same window: calls, verdict, net %, t,
+  closes, win rate, R; outcomes; how often Jev agreed with the LLM) and tags Jev rows with a `JEV` chip — ratios
+  and counts only. The Supervisor's `get_dual_run_report` returns the same. One log line per pass:
+  `JEV (live): asked 8, stand aside 5 | SOL-USDT short 0.71 [placed]; ...`.
+
+Start with `JEV_MODE=shadow` for a few days, compare the two records in the panel, then `live`.
 
 ## Backtesting
 
@@ -884,7 +940,8 @@ src/
   position_context.py  Facts about the trade behind an open position (carry hold on the contract's funding clock, noise band, original risk, restart peak) + the model's entryThesis + exit-probe replay inputs
   protection.py        Code-driven profit guards: breakeven ratchet, give-back cap, no-chase (runs every poll)
   safety.py            Revocable background-run authority and serialized exchange-write lock
-  supervisor.py        Supervisor agent tools (read logs, memory, config, edge + gate scoreboards, write notes)
+  supervisor.py        Supervisor agent tools (read logs, memory, config, edge + gate scoreboards, dual-run report, write notes)
+  jev.py               Jev dual run: state, code-built bracket, System One questions, the pass, the dual-run report
   telegram.py          Telegram notification sender (async, background thread)
   telegram_bot.py      Telegram long-polling bot for Supervisor Agent
   utils.py             Symbol normalization utilities

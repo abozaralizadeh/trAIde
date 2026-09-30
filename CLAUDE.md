@@ -38,7 +38,7 @@ python -m src.main            # runs the poll loop (needs .env)
 Production runs under systemd via Gunicorn (`src.wsgi:application`, see `setup_service.sh`). Changes require a **bot restart to deploy** — config is read at startup.
 
 ```bash
-python -m pytest -q           # full suite (387+ tests, ~10s, no network — uses fakes)
+python -m pytest -q           # full suite (1,270+ tests, ~17s, no network — uses fakes)
 python -m pytest tests/test_protection.py -q
 ```
 
@@ -62,6 +62,7 @@ Config validity: `python -c "from src.config import load_config; load_config()"`
 | `src/supervisor.py` | Supervisor Agent + its inspection tools |
 | `src/dashboard_publisher.py` | Sanitized Azure publish (see disclosure policy below) |
 | `src/buildinfo.py` | Build stamp (code commit + trading-prompt hash) on every probe/refusal/entry — report-only |
+| `src/jev.py` | Jev dual run (`JEV_MODE` off/shadow/live): second trader (typesafe.ai System One), market-facts state, code-built bracket, the pass after the LLM run, `dual_run_report` (dashboard + Supervisor) |
 
 ## Conventions & gotchas
 
@@ -95,4 +96,5 @@ Config validity: `python -c "from src.config import load_config; load_config()"`
 - **Probe retention is per (family, SIDE)** (`memory._trim_probes_per_family`, since Sep 28; it was per family and continuation sat at 141 long : 9 short). `signal_probes()` unions the bucket with order rows; a placed call's order row is its probe's TWIN (same symbol/side/family within `_TRADE_TWIN_WINDOW_SEC` — the order row lands 2-7 s after the probe), never a second observation. Don't reintroduce a `(symbol, ts)` key: it never matched a twin and it merged two different same-second calls.
 - **Every call carries `build` = {code commit, prompt hash}** (`src/buildinfo.py`) next to `model`, on signal probes, gate refusals and entries — report-only, whitelisted by `buildinfo.sanitize_build`, total (never raises into a trade). It exists so a model switch and a prompt change can be told apart (Sep 23 gpt-5.6 → gpt-6 vs Sep 25 confidence prompt could not be). Any prompt edit changes the hash, which is the point.
 - **Analysing memory by hand:** sum P&L through `MemoryStore._authoritative_realized_rows` (a stop can be stored twice: `stop_loss_closed` + `futures_*_triggered`); a verdict can rest on a different model/regime than the trades you remember (rally evidence was evicted after the Sep 23 model switch); marketState exists only from Sep 25 13:05, stated confidence only from Sep 25 17:01, `build` only from Sep 28.
+- **Dual run: every call has ONE trader, and each trader is judged only on its own record** (`src/jev.py`, since Sep 30). The LLM is the default and is never stamped (`trader` absent = 'llm'), so pre-dual-run rows read unchanged; Jev rows carry `trader: "jev"`. `memory.signal_probes()` / `gate_probes()` default to the LLM (`trader="all"` for both); retention and the repeat check are per trader; the order path reads `signal_edge` for the LLM and `signal_edge_{name}` for another trader. A new consumer of probes must pick a trader on purpose. The order body is shared (`_place_futures_limit_order_impl(trader=..., dry_run=...)`) — Jev never gets its own copy of a gate, and `dry_run` (shadow) returns after the stand-aside, before sizing and any exchange write. Ownership: one trader per symbol lifecycle (`tools._not_yours` → `trader_conflict`, structural); every LLM futures write tool checks it, and Jev positions exit by code only. Jev never sees balances, gates or scoreboards (`jev_state` is market facts only) and never sets a stop (`build_bracket`). Long/short question wording is mirrored (a test pins it).
 - **`story.md` is the running build journal** (timeline, numbers, themes, screenshot checklist) and the raw material for posts like `medium_post.md`. Add a dated line when something story-worthy happens — a bug with a good number, a reversal, a milestone.

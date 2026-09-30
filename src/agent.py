@@ -848,6 +848,35 @@ def _attach_entry_theses(
   return count
 
 
+def _attach_dual_run_owners(user_state: Dict[str, Any], owner_of: Any) -> int:
+  """Mark every futures position / resting entry / stop that another dual-run trader owns (``managedBy``).
+
+  The Jev dual run (src/jev.py) trades its own lifecycles through the same account; the LLM's tools refuse
+  to touch them (tools._not_yours), and this tells the model so before it tries. Rows the LLM owns are left
+  exactly as they were. Returns how many rows were marked. Total.
+  """
+  marked = 0
+  if not isinstance(user_state, dict) or not callable(owner_of):
+    return 0
+  groups = [user_state.get("futuresPositions")]
+  for key in ("pendingLimitOrders", "stops"):
+    block = user_state.get(key)
+    if isinstance(block, dict):
+      groups.append(block.get("futures"))
+  for rows in groups:
+    for row in rows or []:
+      if not isinstance(row, dict) or not row.get("symbol"):
+        continue
+      try:
+        owner = owner_of(row.get("symbol"))
+      except Exception:
+        owner = None
+      if owner and owner != "llm":
+        row["managedBy"] = owner
+        marked += 1
+  return marked
+
+
 def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, float]) -> str:
   spot_accounts = snapshot.spot_accounts or snapshot.balances
   financial_accounts = snapshot.financial_accounts
@@ -1304,6 +1333,14 @@ def run_trading_agent(
           state["signal_edge"] = signal_edge_stats(
             _probes, cost_pct=_cost, family_horizons=_fam_horizons, family_horizon_weights=_fam_weights,
           )
+          # DUAL RUN (src/jev.py): the second trader is judged on ITS OWN calls, never the LLM's — the
+          # order path reads this row for Jev's stake exactly as it reads signal_edge for the LLM. Empty
+          # -> 'insufficient data' -> explore floor (trial size). Same cost, same holding-time mix.
+          if getattr(getattr(cfg, "jev", None), "mode", "off") != "off":
+            state["signal_edge_jev"] = signal_edge_stats(
+              memory.signal_probes(limit=0, trader="jev"), cost_pct=_cost,
+              family_horizons=_fam_horizons, family_horizon_weights=_fam_weights,
+            )
           # TAKER FLOW: does the aggressor balance at the moment of the call carry information about
           # where price goes next, on this venue and at our horizons? Surfaced only once the sample
           # can answer — an n=5 reading in the prompt is an invitation to trade a coin flip, and the
@@ -2349,6 +2386,17 @@ def run_trading_agent(
     _attach_entry_theses(user_state_obj, memory, time.time(), funding_clock=funding_clock)
   except Exception as exc:
     logger.warning("ENTRY THESIS: not attached this run (%s)", exc)
+  # Dual run (live): rows another trader owns carry managedBy, and a one-line note says what that means.
+  if getattr(getattr(cfg, "jev", None), "mode", "off") == "live":
+    try:
+      if _attach_dual_run_owners(user_state_obj, _tools.owner_of):
+        user_state_obj["dualRun"] = (
+          "Rows marked managedBy='jev' belong to the second trader of the dual run. Their exits are managed "
+          "by code (bracket + trailing protection); your tools will refuse to close, cancel, add to or "
+          "re-bracket them. Leave them out of your decisions and trade other symbols."
+        )
+    except Exception as exc:
+      logger.warning("DUAL RUN: owners not attached this run (%s)", exc)
   # The CURRENT market state as plain numbers — no per-state record, no rule, no size factor (see
   # _market_state_for_prompt for why). Absent when the poll loop has no fresh reading.
   try:
@@ -2780,6 +2828,10 @@ def run_trading_agent(
   if research_activity:
     logger.info("Research Agent activity: %s", " | ".join(research_activity))
 
+  jev_summary = _run_jev_dual_pass(
+    cfg, _tools, memory, snapshot, allowed_symbols, fees, _edge_state, authorized=run_still_authorized,
+  )
+
   return {
     "narrative": narrative,
     "tool_results": tool_outputs,
@@ -2787,4 +2839,35 @@ def run_trading_agent(
     "handoffs": handoff_events,
     "research": research_activity,
     "agentsUsed": sorted(agents_used),
+    "jev": jev_summary,
   }
+
+
+def _run_jev_dual_pass(
+  cfg: AppConfig, tools: Any, memory: Any, snapshot: TradingSnapshot, allowed_symbols: Any, fees: Dict[str, Any],
+  edge_state: Callable[[], Dict[str, Any]], *, authorized: bool = True,
+) -> Dict[str, Any] | None:
+  """The Jev dual run (src/jev.py) after the LLM's run, on the same tools, analyses and gates. Total.
+
+  Its own asyncio.run (its own event loop, its own SDK client). Skipped when off, and when the run lost its
+  authority mid-flight (the same check that drops the LLM's handoff rows). Never raises into the loop.
+  """
+  mode = getattr(getattr(cfg, "jev", None), "mode", "off")
+  if mode not in ("shadow", "live") or not authorized:
+    return None
+  try:
+    from .jev import describe_pass, run_jev_pass
+    edge = edge_state() or {}
+    cost_rate = float(fees.get("futures_taker", 0.0006) or 0.0006) + float(edge.get("slippage_pct") or 0.0)
+    summary = asyncio.run(run_jev_pass(
+      cfg, tools, memory,
+      universe=sorted(allowed_symbols or []),
+      equity_usd=float(snapshot.total_usdt or 0.0),
+      noise_mult=float(edge.get("stop_atr_floor_mult", cfg.trading.stop_atr_floor_mult) or 0.0),
+      cost_rate=cost_rate,
+    ))
+    logger.info(describe_pass(summary))
+    return {k: v for k, v in summary.items() if k != "rows"} | {"calls": len(summary.get("rows") or [])}
+  except Exception as exc:
+    logger.warning("JEV: dual-run pass skipped (%s)", exc)
+    return None

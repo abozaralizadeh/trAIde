@@ -42,6 +42,7 @@ from .edge import (
   taker_flow_edge_stats,
 )
 from .regime import coherent_risk_fraction, macro_event_entry_block, macro_event_window
+from .jev import dual_run_report, row_trader
 from .memory import MAX_SIGNAL_PROBES, MemoryStore
 from .utils import normalize_symbol as _normalize_symbol
 
@@ -262,11 +263,12 @@ class DashboardPublisher:
       "takerFlow": self._build_taker_flow(memory, cfg),
       "macroEvents": self._build_macro_events(memory, cfg),
       "exitDiscipline": self._build_exit_discipline(memory),
+      "dualRun": self._build_dual_run(memory, cfg),
       "drawdownPct": dd_total,
       "openPositions": len(pos_list),
       "positions": pos_list,
       "leverage": self._build_leverage(snapshot, cfg),
-      "pendingOrders": self._sanitize_pending_orders(snapshot, family_index),
+      "pendingOrders": self._sanitize_pending_orders(snapshot, family_index, memory),
       "closedPositions": self._closed_position_lifecycles(memory),
       "coins": self._sanitize_coins(coins),
       "feed": [self._sanitize_decision(d) for d in decisions],
@@ -304,7 +306,7 @@ class DashboardPublisher:
     by_oid: Dict[str, str] = {}
     by_symbol_side: Dict[str, str] = {}
     try:
-      for row in memory.recent_fills(limit=200) + memory.signal_probes(limit=200):
+      for row in memory.recent_fills(limit=200) + memory.signal_probes(limit=200, trader="all"):
         ctx = row.get("entryContext") if isinstance(row, dict) else None
         if not isinstance(ctx, dict):
           continue
@@ -596,6 +598,15 @@ class DashboardPublisher:
       logger.debug("exitDiscipline unavailable: %s", exc)
     return out
 
+  def _build_dual_run(self, memory: MemoryStore, cfg) -> Dict[str, Any]:
+    """The Jev dual run panel (``jev.dual_run_report``): both traders over the same window, on the same cost
+    basis as strategyEdge. Percentages, ratios and counts only — no $ in any disclosure mode. Never raises."""
+    try:
+      cost = self._cost_basis(memory, cfg)["cost"]
+    except Exception:
+      cost = 0.0
+    return dual_run_report(memory, cfg, cost_pct=cost)
+
   def _allow_usd(self) -> bool:
     return self.cfg.disclosure in ("absolute", "both")
 
@@ -763,6 +774,9 @@ class DashboardPublisher:
         "setupFamily": self._family_for(family_index, disp, side),
         "lastTs": int(time.time()),
       }
+      trader = self._position_trader(memory, disp, p, side)
+      if trader:
+        rec["trader"] = trader
       if self._allow_usd():
         upnl = p.get("unrealisedPnl")
         if upnl is None:
@@ -816,7 +830,8 @@ class DashboardPublisher:
 
     return out
 
-  def _sanitize_pending_orders(self, snapshot, family_index: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+  def _sanitize_pending_orders(self, snapshot, family_index: Optional[Dict[str, Any]] = None,
+                               memory: Optional[MemoryStore] = None) -> List[Dict[str, Any]]:
     """Resting (unfilled) limit/entry orders waiting to trigger — public-safe: symbol, side, type,
     limit price, venue, entry-vs-reduce, and age only. Never size/quantity (privacy). Entries the bot
     placed are tagged (`traide-entry-`) so the dashboard can show what it's waiting to open."""
@@ -836,6 +851,12 @@ class DashboardPublisher:
         if not disp:
           continue
         reduce_only = bool(o.get("reduceOnly")) or bool(o.get("closeOrder"))
+        trader = None
+        if memory is not None and venue == "futures" and not reduce_only:
+          try:
+            trader = memory.trader_for_order(o.get("id") or o.get("orderId"), o.get("clientOid"))
+          except Exception:
+            trader = None
         out.append({
           "symbol": disp,
           "side": (str(o.get("side") or "")).lower(),
@@ -848,6 +869,7 @@ class DashboardPublisher:
           "botEntry": str(o.get("clientOid") or "").startswith("traide-entry-"),
           "setupFamily": self._family_for(family_index, disp, o.get("side"), o.get("clientOid")),
           "ts": _normalize_ts_sec(o.get("createdAt") or o.get("orderTime") or o.get("ts")),
+          **({"trader": trader} if trader and trader != "llm" else {}),
         })
     out.sort(key=lambda r: r.get("ts") or 0, reverse=True)
     return out
@@ -929,7 +951,24 @@ class DashboardPublisher:
     lev = self._close_leverage(d)
     if lev is not None:
       out["leverage"] = lev
+    trader = self._row_trader(d)
+    if trader:
+      out["trader"] = trader
     return out
+
+  @staticmethod
+  def _row_trader(d: Dict[str, Any]) -> Optional[str]:
+    """'jev' when a decision / close row came from the dual run's second trader, else None (the LLM —
+    rows are only tagged when they are NOT the default, so the pre-dual-run feed renders unchanged)."""
+    return row_trader(d)
+
+  @staticmethod
+  def _position_trader(memory: Any, disp: str, p: Dict[str, Any], side: str) -> Optional[str]:
+    try:
+      t = memory.trader_for_position(disp, p.get("openingTimestamp") or p.get("openTime"), side)
+    except Exception:
+      return None
+    return t if t and t != "llm" else None
 
   @staticmethod
   def _close_leverage(d: Dict[str, Any]) -> Optional[float]:
@@ -1097,6 +1136,7 @@ class DashboardPublisher:
         # Which playbook this trade belonged to, so a losing family in strategyEdge can be traced to
         # the individual trades behind the number.
         "setupFamily": ctx.get("setupFamily") or (infer_setup_family(ctx) if ctx else None),
+        **({"trader": self._row_trader(d)} if self._row_trader(d) else {}),
       })
     rows.sort(key=lambda r: r["closeTs"], reverse=True)
     if unrenderable and unrenderable != self._last_unrenderable_closes:

@@ -172,7 +172,7 @@ class TestStrategyEdgePanel:
   @staticmethod
   def _memory(probes, fills=()):
     return SimpleNamespace(
-      signal_probes=lambda limit=200: list(probes),
+      signal_probes=lambda limit=200, trader="llm": list(probes),
       recent_fills=lambda limit=100: list(fills),
     )
 
@@ -247,7 +247,7 @@ class TestSetupFamilyOnPositions:
   def _memory(fills=(), probes=()):
     return SimpleNamespace(
       recent_fills=lambda limit=200: list(fills),
-      signal_probes=lambda limit=200: list(probes),
+      signal_probes=lambda limit=200, trader="llm": list(probes),
     )
 
   @staticmethod
@@ -580,7 +580,7 @@ class TestTakerFlowPanel:
   @staticmethod
   def _memory(probes=(), flow=None):
     return SimpleNamespace(
-      signal_probes=lambda limit=200: list(probes),
+      signal_probes=lambda limit=200, trader="llm": list(probes),
       recent_fills=lambda limit=100: [],
       get_agent_scheduler=lambda: {"flowObservations": dict(flow or {})},
     )

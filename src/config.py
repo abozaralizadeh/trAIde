@@ -172,6 +172,30 @@ class TradingConfig:
   price_trigger_max_multiplier: float = 2.0
 
 
+JEV_MODES = ("off", "shadow", "live")
+
+
+@dataclass
+class JevConfig:
+  """Dual run with TypeSafe AI's Jev (a "System One" model: typed answers with calibrated probabilities,
+  no free text, no tools) next to the LLM trading agent — see src/jev.py.
+
+  After every LLM agent run, Jev answers typed questions (long / short / stand aside, which playbook, which
+  code-built bracket) on the SAME analysis the LLM just saw, for each freshly analysed symbol. ``shadow``
+  records its calls as probes (its own evidence bucket, never the LLM's); ``live`` also places them as real
+  orders through the same order path — every gate, the risk-per-trade budget, the stand-aside (judged on
+  JEV'S OWN record, so it starts at explore size) and the atomic bracket. Code enforces survival for both
+  traders; each owns its positions. The API key is read from TYPESAFE_API_KEY by the SDK.
+  """
+  mode: str = "off"                 # off | shadow | live
+  model: str = "jev-latest"         # pin a versioned id (e.g. jev-1.13.0) once its record matters
+  max_open_positions: int = 1       # Jev-owned open positions + resting entries, at most
+  max_entries_per_day: int = 6      # Jev live entries per UTC day, at most (a runaway-model guard)
+  max_symbols_per_run: int = 8      # symbols Jev is asked about per run (freshest analyses first)
+  timeout_sec: float = 5.0          # per request; Jev answers in ~70-500 ms
+  risk_scale: float = 1.0           # extra multiplier on Jev's risk budget (<= 1 only shrinks)
+
+
 @dataclass
 class EdgeConfig:
   """Adaptive edge controller (src/edge.py) — risk posture derived from rolling realized results.
@@ -457,6 +481,7 @@ class AppConfig:
   # Adaptive edge controller — defaulted so existing AppConfig constructions keep working;
   # load_config wires env overrides explicitly.
   edge: EdgeConfig = field(default_factory=EdgeConfig)
+  jev: JevConfig = field(default_factory=JevConfig)
 
 
 def load_config() -> AppConfig:
@@ -667,6 +692,15 @@ def load_config() -> AppConfig:
     memory_file=os.getenv("MEMORY_FILE", ".agent_memory.json"),
     retention_days=int(os.getenv("RETENTION_DAYS", "90")),
     agent_max_turns=int(os.getenv("AGENT_MAX_TURNS", "20")),
+    jev=JevConfig(
+      mode=os.getenv("JEV_MODE", "off").strip().lower() or "off",
+      model=os.getenv("JEV_MODEL", "jev-latest").strip() or "jev-latest",
+      max_open_positions=int(os.getenv("JEV_MAX_OPEN_POSITIONS", "1")),
+      max_entries_per_day=int(os.getenv("JEV_MAX_ENTRIES_PER_DAY", "6")),
+      max_symbols_per_run=int(os.getenv("JEV_MAX_SYMBOLS_PER_RUN", "8")),
+      timeout_sec=float(os.getenv("JEV_TIMEOUT_SEC", "5")),
+      risk_scale=float(os.getenv("JEV_RISK_SCALE", "1.0")),
+    ),
   )
 
   validate_config(config)
@@ -733,6 +767,17 @@ def validate_config(cfg: AppConfig) -> None:
     invalid.append(f"RELATIVE_STRENGTH_SIZE_FACTOR={cfg.regime.relative_strength_size_factor} (must be >0 and <=1.0)")
   if not (0.0 <= cfg.circuit_breaker.max_portfolio_heat_pct <= 100.0):
     invalid.append(f"CB_MAX_PORTFOLIO_HEAT_PCT={cfg.circuit_breaker.max_portfolio_heat_pct} (must be 0–100)")
+  jev = cfg.jev
+  if jev.mode not in JEV_MODES:
+    invalid.append(f"JEV_MODE={jev.mode} (must be one of {', '.join(JEV_MODES)})")
+  if jev.max_open_positions < 0 or jev.max_entries_per_day < 0:
+    invalid.append("JEV_MAX_OPEN_POSITIONS and JEV_MAX_ENTRIES_PER_DAY must be >=0")
+  if jev.max_symbols_per_run < 1:
+    invalid.append(f"JEV_MAX_SYMBOLS_PER_RUN={jev.max_symbols_per_run} (must be >=1)")
+  if not (0.0 < jev.timeout_sec <= 60.0):
+    invalid.append(f"JEV_TIMEOUT_SEC={jev.timeout_sec} (must be >0 and <=60)")
+  if not (0.0 < jev.risk_scale <= 1.0):
+    invalid.append(f"JEV_RISK_SCALE={jev.risk_scale} (must be >0 and <=1.0 — it can only shrink Jev's risk)")
 
   if invalid:
     raise ValueError(

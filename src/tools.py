@@ -13,6 +13,7 @@ Import note: this module imports a few low-level helpers from ``agent`` and ``ag
 from __future__ import annotations
 
 import contextlib
+import copy
 import math
 import threading
 import time
@@ -835,6 +836,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if _oid:
       _runtime_futures_pending[_oid] = dict(_o)
 
+  # The latest full analyze_market_context result per symbol this run, for code consumers that must see
+  # exactly what the model saw (the Jev dual run decides on these). Read-only copies go out.
+  _analysis_cache: Dict[str, Dict[str, Any]] = {}
+
   def _order_flag(value: Any) -> bool:
     return value is True or str(value or "").strip().lower() in {"1", "true", "yes"}
 
@@ -1190,7 +1195,93 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     except Exception as exc:
       logger.warning("GATE STATE PROBE LOST: %s not recorded (%s)", symbol, exc)
 
-  def _record_gate_refusal(result: Any, symbol: Any, side: Any, setup_family: Any, confidence: Any) -> None:
+  # ── Dual run (src/jev.py): who is calling the order path ────────────────────────────────────────────
+  # The LLM agent's tools never pass a trader (None == the LLM, exactly as before). The Jev pass calls the
+  # SAME order body with {"name": "jev", "model": <jev model id>, "sizeScale": <=1}: every gate, the risk
+  # budget and the bracket apply unchanged; only the stamps, the evidence it is judged on (its own record,
+  # ``signal_edge_jev``) and an optional extra shrink differ.
+  def _trader_name(trader: Dict[str, Any] | None) -> str:
+    name = str((trader or {}).get("name") or "llm").strip().lower()
+    return name if name in ("llm", "jev") else "llm"
+
+  def _trader_model(trader: Dict[str, Any] | None) -> str:
+    if _trader_name(trader) == "llm":
+      return cfg.azure.deployment
+    return str((trader or {}).get("model") or _trader_name(trader))[:80]
+
+  def _trader_size_scale(trader: Dict[str, Any] | None) -> float:
+    try:
+      val = float((trader or {}).get("sizeScale", 1.0))
+    except (TypeError, ValueError):
+      return 1.0
+    return min(1.0, val) if math.isfinite(val) and val > 0 else 1.0
+
+  def _owner_of_futures_symbol(futures_symbol: str | None) -> str | None:
+    """Which trader owns the resting entry or live position on this contract ('llm' / 'jev'), None if flat.
+
+    Resting entries first (the runtime map this run keeps current), then the live position (snapshot). An
+    order or position with no recorded trader — manual, or placed before the dual run — belongs to the
+    LLM, the pre-dual-run default. Never raises (None on any failure: ownership never blocks by accident)."""
+    try:
+      fsym = str(futures_symbol or "").upper()
+      if not fsym:
+        return None
+      pending = _pending_entry_for(fsym)
+      if pending:
+        return memory.trader_for_order(pending.get("id") or pending.get("orderId"), pending.get("clientOid")) or "llm"
+      for pos in snapshot.futures_positions or []:
+        if not isinstance(pos, dict) or str(pos.get("symbol") or "").upper() != fsym:
+          continue
+        qty = _to_float(pos.get("currentQty")) or 0.0
+        if not qty:
+          continue
+        return memory.trader_for_position(
+          _normalize_symbol(fsym), pos.get("openingTimestamp") or pos.get("openTime"),
+          "long" if qty > 0 else "short",
+        ) or "llm"
+    except Exception as exc:
+      logger.debug("ownership lookup failed for %s: %s", futures_symbol, exc)
+    return None
+
+  def _not_yours(symbol: Any, caller: Dict[str, Any] | None = None) -> Dict[str, Any] | None:
+    """Refusal when ``caller`` would touch a position/entry another dual-run trader owns, else None.
+
+    Structural, not directional: two traders cannot share one one-way position lifecycle, and each
+    trader's record must hold only its own calls. The owner's exits stay code-managed (bracket + trail)."""
+    spot = _resolve_allowed_spot_symbol(str(symbol or ""), allowed_symbols) or _normalize_symbol(str(symbol or ""))
+    owner = _owner_of_futures_symbol(_to_futures_symbol(spot) if spot else None)
+    me = _trader_name(caller)
+    if owner and owner != me:
+      return {
+        "rejected": True, "gate": "trader_conflict", "owner": owner,
+        "reason": (f"{spot} is held by the {owner} trader of the dual run (a resting entry or an open position). "
+                   f"Its exits are managed by code (bracket + trailing protection); another trader may not open, "
+                   f"add to, close or re-bracket it."),
+        "hint": "Leave it alone and trade a different symbol.",
+      }
+    return None
+
+  def _cancel_not_yours(order_id: Any, symbol: Any = None) -> Dict[str, Any] | None:
+    """The LLM may not cancel an order that belongs to another dual-run trader (its entry, or a bracket leg
+    on the position it owns). None when allowed or when ownership cannot be told."""
+    owner = memory.trader_for_order(order_id, order_id)
+    if owner and owner != "llm":
+      return {
+        "rejected": True, "gate": "trader_conflict", "owner": owner, "orderId": order_id,
+        "reason": f"Order {order_id} belongs to the {owner} trader of the dual run; its lifecycle is code-managed.",
+        "hint": "Leave it alone and trade a different symbol.",
+      }
+    sym = symbol
+    if not sym:
+      for order in (list(_runtime_futures_pending.values()) + list(snapshot.futures_pending_orders or [])
+                    + list(getattr(snapshot, "futures_stop_orders", None) or [])):
+        if isinstance(order, dict) and str(order_id) in {str(order.get(k) or "") for k in ("id", "orderId", "clientOid")}:
+          sym = order.get("symbol")
+          break
+    return _not_yours(sym) if sym else None
+
+  def _record_gate_refusal(result: Any, symbol: Any, side: Any, setup_family: Any, confidence: Any,
+                           trader: Dict[str, Any] | None = None) -> None:
     """Record a HARD refusal by a scored gate as a gate probe (memory.record_gate_probe).
 
     Reads the refusal, never changes it. Base = the live price now (futures mark, spot only as a labelled
@@ -1213,9 +1304,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         return
       memory.record_gate_probe(
         spot_symbol, side_lower, price, gate,
-        setup_family=setup_family, price_source=source, model=cfg.azure.deployment,
+        setup_family=setup_family, price_source=source, model=_trader_model(trader),
         confidence=confidence, regime=_gate_for(spot_symbol), market_state=_market_state_now(),
-        build=_build_now(),
+        build=_build_now() if _trader_name(trader) == "llm" else None, trader=_trader_name(trader),
       )
     except Exception as exc:
       logger.warning("GATE PROBE LOST: %s %s refusal not recorded (%s)", symbol, side, exc)
@@ -2613,14 +2704,14 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     except Exception as exc:
       logger.warning("ANALYSIS FAILURE not cleared for %s (%s) — the scan may flag it until expiry", symbol, exc)
 
-  @function_tool
-  async def analyze_market_context(
+  async def _analyze_market_context_impl(
     symbol: str,
     fast_interval: str = "15min",
     slow_interval: str = "1hour",
     lookback_minutes: int = 360,
   ) -> Dict[str, Any]:
-    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP/VolumeProfile across up to four intervals (15m, 1h, 4h, 1d) and summarize bias. The 1D acts as a regime gate — it can veto counter-trend trades. When futures are enabled, also returns funding rate, open interest, basis, OI-price signal, and funding divergence."""
+    """Body of the analyze_market_context tool (whose docstring is the model-facing one). Code callers (the
+    Jev dual run) analyse through here, so their entries face the same fresh-analysis gate state."""
     symbol = _normalize_symbol(symbol)
 
     interval_order: list[str] = []
@@ -2958,7 +3049,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # mark it is based on and the 24h move the move cap reads. Total.
     if cfg.kucoin_futures.enabled and kucoin_futures:
       _record_gate_state(symbol, result)
+    _analysis_cache[symbol] = {"ts": time.time(), "result": result}
     return result
+
+  @function_tool
+  async def analyze_market_context(
+    symbol: str,
+    fast_interval: str = "15min",
+    slow_interval: str = "1hour",
+    lookback_minutes: int = 360,
+  ) -> Dict[str, Any]:
+    """Compute EMA/RSI/MACD/ATR/Bollinger/VWAP/VolumeProfile across up to four intervals (15m, 1h, 4h, 1d) and summarize bias. The 1D acts as a regime gate — it can veto counter-trend trades. When futures are enabled, also returns funding rate, open interest, basis, OI-price signal, and funding divergence."""
+    return await _analyze_market_context_impl(symbol, fast_interval, slow_interval, lookback_minutes)
 
   @function_tool
   async def plan_spot_position(
@@ -3090,6 +3192,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     auto_protect: bool = True,
   ) -> Dict[str, Any]:
     """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
+    _foreign_mk = _not_yours(symbol)
+    if _foreign_mk:
+      return _foreign_mk
     spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not spot_symbol:
       spot_symbol = _repair_allowed_symbol(symbol)
@@ -4056,8 +4161,18 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     take_profit_price: float | None = None,
     stop_loss_price: float | None = None,
     setup_family: str | None = None,
+    *,
+    trader: Dict[str, Any] | None = None,
+    dry_run: bool = False,
   ) -> Dict[str, Any]:
     """Body of the place_futures_limit_order tool (whose docstring is the model-facing one).
+
+    ``trader`` is set only by code callers (the Jev dual run, src/jev.py); the LLM-facing tool never passes
+    it. It changes the stamps and the record the call is judged on, never a gate (see _trader_name).
+    ``dry_run`` (dual-run shadow) runs the SAME gates and records the SAME signal probe, then returns
+    ``{"shadow": True, ...}`` right after the stand-aside — before any sizing, bracket rounding or exchange
+    write. It skips only the two ownership checks (resting entry, other trader's lifecycle): no order is
+    placed, so there is nothing to collide with, and the call is still evidence.
 
     Every refusal returned BEFORE the signal probe carries a ``gate`` code: one of memory.SCORED_GATES
     (a rule that judged THIS call — the tool wrapper records it as a gate probe) or of
@@ -4073,7 +4188,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if side_lower is None:
       return {"error": "Invalid futures side", "allowed": ["buy", "sell", "long", "short"]}
     _pre_futures_symbol_fl = _to_futures_symbol(spot_symbol)
-    if _pre_futures_symbol_fl:
+    if _pre_futures_symbol_fl and not dry_run:
       existing_pending = _pending_entry_for(_pre_futures_symbol_fl)
       if existing_pending:
         return {
@@ -4083,6 +4198,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
           "hint": "Only one resting entry per symbol is allowed; stacking GTC orders can multiply exposure when they fill together.",
         }
+    _conflict_fl = None if dry_run else _not_yours(spot_symbol, trader)
+    if _conflict_fl:
+      return _conflict_fl
     if take_profit_price is None or stop_loss_price is None:
       return {
         "rejected": True,
@@ -4122,7 +4240,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return {"rejected": True, "gate": "live_book", "reason": live_entry_book["error"]}
     initial_entry_fingerprint = live_entry_book.get("fingerprint")
     initial_entry_equity = float(live_entry_book.get("futuresEquity") or 0.0)
-    if _pre_futures_symbol_fl:
+    if _pre_futures_symbol_fl and not dry_run:
       existing_pending = _pending_entry_for(_pre_futures_symbol_fl)
       if existing_pending:
         return {
@@ -4395,7 +4513,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # and the no-edge shrink but is capped at the explore floor (edge.family_evidence_row). 2026-09-24:
     # continuation SHORTS (n=9, -0.18%) were sized 0.52-0.79 on the LONGS' record (n=40, +1.24%).
     _side_fl = "long" if side_lower == "buy" else "short"
-    _signal_edge_fl = _edge_state().get("signal_edge") or {}
+    # Each dual-run trader is judged on ITS OWN record: the LLM on signal_edge, Jev on signal_edge_jev
+    # (empty at first -> 'insufficient data' -> the explore floor, the trial size an unproven caller gets).
+    _signal_edge_fl = _edge_state().get(
+      "signal_edge" if _trader_name(trader) == "llm" else f"signal_edge_{_trader_name(trader)}"
+    ) or {}
     _family_measured_fl = family_size_factor(_signal_edge_fl, _family_fl or "other", side=_side_fl)
     _family_explore_fl = family_explore_factor(
       _signal_edge_fl, _family_fl or "other",
@@ -4410,7 +4532,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # a $10.24 contract minimum. Every entry was rejected — **79 agent runs, zero orders placed** in
     # 12.5 hours. Taking the minimum still lets the evidence-based factor dominate whenever it is the
     # more cautious of the two (0.25 here), without stacking two independent cautions into fee-dust.
-    _atr_scale_fl = _vol_scale_fl * min(_quality_fl, _family_scale_fl)
+    _atr_scale_fl = _vol_scale_fl * min(_quality_fl, _family_scale_fl) * _trader_size_scale(trader)
     logger.info("SIZE FACTORS: futures limit %s vol=%.2f quality=%.2f family=%.2f(%s: measured=%.2f explore=%.2f, %s) → worst=%.2f (soft=%s floor=%.2f) → %.0f%%",
                 spot_symbol, _vol_scale_fl, _quality_fl, _family_scale_fl, _family_fl or "other",
                 _family_measured_fl, _family_explore_fl, describe_stake_row(_stake_fl),
@@ -4478,6 +4600,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # no observation but costs a retention slot (memory.record_signal_probe, 2026-09-26).
     _repeat_gap_fl = repeat_gap_seconds(_edge_state().get("family_horizon_weights"), _family_fl)
     _probe_repeat_fl = False
+    _probe_stored_fl: Any = False
     try:
       _probe_stored_fl = memory.record_signal_probe(
         spot_symbol, side_lower, current_price, setup_family,
@@ -4487,14 +4610,16 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         price_source=_price_source,
         # Which model made the call, how sure it said it was, and the floor it had to clear — so
         # edge.confidence_edge_stats can measure, per model, whether stated confidence ranks calls.
-        model=cfg.azure.deployment,
+        model=_trader_model(trader),
         confidence=confidence,
         min_confidence=_eff_min_fl,
         # Gates this call faced and the hatch that admitted it ([] = faced none). Report-only.
         gates_passed=_gates_passed_fl,
         min_gap_sec=_repeat_gap_fl,
         # Code commit + prompt hash, so a model switch and a prompt change can be told apart. Report-only.
-        build=_build_now(),
+        # (The prompt hash is the LLM's prompt, so a second trader's call carries none.)
+        build=_build_now() if _trader_name(trader) == "llm" else None,
+        trader=_trader_name(trader),
         **_xm_stamp_fl,
       )
       if _probe_stored_fl is False and _repeat_gap_fl > 0:
@@ -4532,6 +4657,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         "reason": _refusal["reason"],
         "openFamilies": _open,
         "hint": _refusal["hint"],
+      }
+
+    if dry_run:
+      # Dual-run shadow: every gate ran and the call is on record (unless it repeated one inside the
+      # family's shortest horizon). Stop before sizing and the exchange — nothing below is a gate on the call.
+      return {
+        "shadow": True,
+        "symbol": spot_symbol,
+        "side": side_lower,
+        "setupFamily": _family_fl,
+        "probeRecorded": bool(_probe_stored_fl) if not _probe_repeat_fl else False,
+        "repeat": _probe_repeat_fl,
+        "stake": describe_stake_row(_stake_fl),
+        "sizeScale": round(_atr_scale_fl, 3),
+        "livePrice": current_price,
       }
 
     # Noise floor on the bracket, applied BEFORE tick rounding, the RR gate and sizing, so the whole
@@ -4758,8 +4898,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     )
     _entry_context_fl = {
       "policyVersion": "completed-bars-net-rr-directional-risk-v1",
-      "model": cfg.azure.deployment,
-      "build": _build_now(),
+      "model": _trader_model(trader),
+      "build": _build_now() if _trader_name(trader) == "llm" else None,
+      # Which dual-run trader owns this lifecycle (None = the LLM agent, as before the dual run).
+      "trader": None if _trader_name(trader) == "llm" else _trader_name(trader),
       # Leverage applied to this entry (after every cap) — a ratio, published on the closed-trade card.
       "leverage": lev,
       "positionSide": "long" if side_lower == "buy" else "short",
@@ -4909,7 +5051,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       )
       decision = None
       if confidence is not None:
-        decision = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "paper futures limit entry", paper=True, leverage=lev)
+        decision = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "paper futures limit entry", paper=True, leverage=lev, trader=_trader_name(trader))
       return {
         "paper": True,
         "pendingLimitEntry": True,
@@ -5019,7 +5161,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         entry_context=_entry_context_fl,
       )
       if confidence is not None:
-        res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False, leverage=lev)
+        res["decisionLog"] = memory.log_decision(spot_symbol, f"futures_{side_lower}_limit", float(confidence), rationale or "live futures limit entry", paper=False, leverage=lev, trader=_trader_name(trader))
     except Exception as exc:
       logger.error("Live futures entry %s was placed but local memory logging failed: %s", _runtime_oid, exc)
       res["memoryError"] = str(exc)
@@ -5221,6 +5363,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     client_oid: str | None = None,
   ) -> Dict[str, Any]:
     """Place a futures stop/TP/SL order (works for reduce-only hedges)."""
+    _foreign_st = _not_yours(symbol)
+    if _foreign_st:
+      return _foreign_st
     return await _place_futures_stop_order_impl(
       symbol=symbol,
       side=side,
@@ -5244,6 +5389,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     authority_error = _authority_error()
     if authority_error:
       return {"rejected": True, "reason": authority_error}
+    _foreign = _cancel_not_yours(order_id, symbol)
+    if _foreign:
+      return _foreign
     if snapshot.paper_trading:
       _runtime_futures_pending.pop(str(order_id), None)
       return {"paper": True, "cancelled": {"orderId": order_id, "symbol": symbol}}
@@ -5652,6 +5800,9 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     authority_error = _authority_error()
     if authority_error:
       return {"rejected": True, "reason": authority_error}
+    _foreign = _not_yours(symbol)
+    if _foreign:
+      return _foreign
     requested_symbol = symbol
     symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
     if not symbol:
@@ -6478,7 +6629,51 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     entry = memory.save_plan(title=f"Removed Source: {name}", summary=reason, actions=[], author="Research Agent")
     return {"removed": entry}
 
+  # ── Dual run: code-only entry points (src/jev.py). Never registered as agent tools. ────────────────
+  async def place_futures_limit_order_for(trader: Dict[str, Any], dry_run: bool = False, **kwargs: Any) -> Dict[str, Any]:
+    """The LLM tool's exact path (body + gate-refusal record) for a code caller that names its trader.
+
+    ``dry_run`` = shadow: same gates, same signal probe, no order (see _place_futures_limit_order_impl)."""
+    result = await _place_futures_limit_order_impl(**kwargs, trader=trader, dry_run=dry_run)
+    _record_gate_refusal(result, kwargs.get("symbol"), kwargs.get("side"), kwargs.get("setup_family"),
+                         kwargs.get("confidence"), trader=trader)
+    return result
+
+  async def analyze_for(symbol: str) -> Dict[str, Any]:
+    """analyze_market_context for a code caller: same body, same gate state and analysis cache."""
+    return await _analyze_market_context_impl(symbol)
+
+  def latest_analyses(max_age_sec: float = 600.0) -> Dict[str, Dict[str, Any]]:
+    """{symbol: analysis result} for every symbol analysed this run within ``max_age_sec`` (deep copies)."""
+    now = time.time()
+    return {
+      sym: copy.deepcopy(entry["result"]) for sym, entry in list(_analysis_cache.items())
+      if isinstance(entry, dict) and now - float(entry.get("ts") or 0.0) <= max_age_sec
+    }
+
+  def owner_of(symbol: str) -> str | None:
+    """'llm' / 'jev' when that trader holds a resting entry or an open position on ``symbol``, else None."""
+    spot = _resolve_allowed_spot_symbol(str(symbol or ""), allowed_symbols) or _normalize_symbol(str(symbol or ""))
+    return _owner_of_futures_symbol(_to_futures_symbol(spot) if spot else None)
+
+  def trader_book(name: str) -> list[str]:
+    """Spot symbols on which trader ``name`` holds a resting entry or an open position right now."""
+    fsyms = {str(o.get("symbol") or "").upper() for o in _runtime_futures_pending.values()
+             if isinstance(o, dict) and not _order_flag(o.get("reduceOnly")) and not _order_flag(o.get("closeOrder"))}
+    fsyms |= {str(p.get("symbol") or "").upper() for p in (snapshot.futures_positions or [])
+              if isinstance(p, dict) and (_to_float(p.get("currentQty")) or 0.0)}
+    out = []
+    for fsym in sorted(f for f in fsyms if f):
+      if _owner_of_futures_symbol(fsym) == name:
+        out.append(_normalize_symbol(fsym))
+    return out
+
   return SimpleNamespace(
+    place_futures_limit_order_for=place_futures_limit_order_for,
+    analyze_for=analyze_for,
+    latest_analyses=latest_analyses,
+    owner_of=owner_of,
+    trader_book=trader_book,
     place_market_order=place_market_order,
     place_limit_order=place_limit_order,
     place_spot_stop_order=place_spot_stop_order,
