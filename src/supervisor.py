@@ -23,6 +23,7 @@ from .edge import (
   safe_family_horizon_weights,
   signal_edge_stats,
 )
+from .jev import dual_run_report
 from .memory import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,15 @@ def run_supervisor_agent(
     return gate_scoreboard_report(memory, cfg)
 
   @function_tool
+  async def get_dual_run_report() -> Dict[str, Any]:
+    """REPORT-ONLY: the Jev dual run (JEV_MODE) — the LLM trader and the Jev trader (typesafe.ai), each
+    judged on its OWN calls over the same window: signal edge (net of cost, t, verdict), closes (wins, R),
+    Jev's outcomes (placed / shadow / refused / stand aside), median latency, how often it agreed with the
+    LLM, and its latest answers. Never relay Jev's record or verdict to the trading agent unasked — the two
+    traders are kept independent on purpose."""
+    return dual_run_report(memory, cfg, cost_pct=probe_cost_pct(memory, cfg))
+
+  @function_tool
   async def get_positions() -> Dict[str, Any]:
     """Get current tracked positions with unrealized PnL."""
     return memory.positions()
@@ -261,6 +271,11 @@ def run_supervisor_agent(
       "memory_file": cfg.memory_file,
       "retention_days": cfg.retention_days,
       "agent_max_turns": cfg.agent_max_turns,
+      "jev_dual_run": {
+        "mode": cfg.jev.mode, "model": cfg.jev.model, "max_open_positions": cfg.jev.max_open_positions,
+        "max_entries_per_day": cfg.jev.max_entries_per_day, "max_symbols_per_run": cfg.jev.max_symbols_per_run,
+        "risk_scale": cfg.jev.risk_scale,
+      },
     }
 
   @function_tool
@@ -471,6 +486,9 @@ def run_supervisor_agent(
     "blocks against what it allows. It is report-only evidence for the OWNER: do not pass a gate verdict "
     "to the trading agent in a note unless the owner explicitly asks — a 'this gate costs money' line in "
     "its prompt invites relabelling calls past the gates, and a verdict needs months across regimes\n"
+    "- Read the dual-run report (get_dual_run_report): the LLM trader vs the Jev trader (typesafe.ai), each "
+    "on its own calls over the same window. Jev's positions are exited by code only (bracket + trail). It is "
+    "report-only evidence for the OWNER: do not relay it to the trading agent unless the owner asks\n"
     "- Read source code files\n"
     "- View non-secret configuration\n"
     "- Fetch live KuCoin account balances and positions\n"
@@ -518,6 +536,7 @@ def run_supervisor_agent(
       get_performance_summary,
       get_edge_scoreboard,
       get_gate_scoreboard,
+      get_dual_run_report,
       get_positions,
       get_recent_decisions,
       get_recent_trades,

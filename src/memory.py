@@ -48,6 +48,14 @@ MAX_SIGNAL_PROBES = 400
 MAX_PROBES_PER_FAMILY = 150
 # A placed order's row is written after placement, a few seconds after its probe (signal_probes union).
 _TRADE_TWIN_WINDOW_SEC = 120
+# Dual run (src/jev.py): every probe, gate probe, decision and entry names the TRADER that made the call.
+# The LLM agent is the default and is never written ("llm" rows stay byte-identical to before); a second
+# trader's rows carry ``trader`` and live in their own retention bucket and their own verdicts — the two
+# records never mix, so neither trader's stand-aside is decided (or evicted) by the other's calls.
+DEFAULT_TRADER = "llm"
+KNOWN_TRADERS = ("llm", "jev")
+# Every Jev answer (trade or stand-aside, placed or refused), for the head-to-head report. Retained by count.
+MAX_JEV_DECISIONS = 400
 MAX_EXIT_PROBES = 200
 # How long an exit probe waits for its bracket to resolve before it is marked to market. Shared by the
 # settle step and by the poll loop's "which symbols need a price" query, so both agree on a probe's life.
@@ -87,6 +95,8 @@ SCORED_GATES: tuple[str, ...] = DIRECTIONAL_GATES + (
 STRUCTURAL_REFUSALS: tuple[str, ...] = (
   "pending_entry", "bracket_missing", "bracket_invalid", "atomic_bracket_disabled", "entry_context",
   "live_book", "restricted", "trade_cap", "sentiment", "new_listing",
+  # Dual run: the symbol's resting entry / open position belongs to the other trader (src/jev.py).
+  "trader_conflict",
 )
 # Hard-refusal rows are kept per gate, mirroring MAX_PROBES_PER_FAMILY: a loud gate (the exhaustion
 # gate in a rally) must not evict a quiet one's history. Retained by count, never by clock.
@@ -563,6 +573,17 @@ def _positive_leverage(value: Any) -> Optional[float]:
   return round(val, 2)
 
 
+def _normalize_trader(value: Any) -> str:
+  """'llm' unless ``value`` names another known trader."""
+  t = str(value or "").strip().lower()
+  return t if t in KNOWN_TRADERS else DEFAULT_TRADER
+
+
+def _probe_trader(row: Any) -> str:
+  ctx = row.get("entryContext") if isinstance(row, dict) else None
+  return _normalize_trader(ctx.get("trader") if isinstance(ctx, dict) else None)
+
+
 def _probe_side(row: Any) -> Optional[str]:
   ctx = row.get("entryContext") if isinstance(row, dict) else None
   side = str(ctx.get("positionSide") or "").strip().lower() if isinstance(ctx, dict) else ""
@@ -583,8 +604,9 @@ def _trim_probes_per_family(probes: Any) -> list:
   are a small fixed set) while guaranteeing every playbook keeps enough evidence to sustain its own
   verdict. The same argument applies one level down now that each bet is judged per SIDE: a family's
   busy side must not evict its quiet side (2026-09-28: continuation 141 long : 9 short at the cap, every
-  pre-Sep-24 short evicted by longs). So the bucket is (family, positionSide). Never raises; non-dict rows
-  are dropped.
+  pre-Sep-24 short evicted by longs). So the bucket is (family, positionSide) — and, since the Jev dual run,
+  the trader too: a second model's calls must never evict the first's evidence. Never raises; non-dict
+  rows are dropped.
   """
   rows = [r for r in (probes or []) if isinstance(r, dict)]
   if not rows:
@@ -592,7 +614,7 @@ def _trim_probes_per_family(probes: Any) -> list:
   keep_ids: set[int] = set()
   buckets: Dict[tuple, list] = {}
   for row in rows:
-    buckets.setdefault((_probe_family(row), _probe_side(row)), []).append(row)
+    buckets.setdefault((_probe_family(row), _probe_side(row), _probe_trader(row)), []).append(row)
   for bucket in buckets.values():
     for row in bucket[-MAX_PROBES_PER_FAMILY:]:
       keep_ids.add(id(row))
@@ -978,6 +1000,8 @@ class MemoryStore:
     # not rewritten just to add empty keys.
     if "gate_probes" in data:
       data["gate_probes"] = _trim_gate_probes(data.get("gate_probes"))
+    if "jev_decisions" in data:
+      data["jev_decisions"] = [r for r in (data.get("jev_decisions") or []) if isinstance(r, dict)][-MAX_JEV_DECISIONS:]
     if "gate_state_days" in data:
       data["gate_state_days"] = _trim_gate_state_days(data.get("gate_state_days"))
     # The macro calendar is forward-looking: drop anything more than a day past, cap the rest. A stale
@@ -1457,6 +1481,7 @@ class MemoryStore:
     entry_price: Optional[float] = None,
     entry_context: Optional[Dict[str, Any]] = None,
     leverage: Any = None,
+    trader: Any = None,
   ) -> Dict[str, Any]:
     with self._lock:
       data = self._prune(self._read())
@@ -1504,6 +1529,8 @@ class MemoryStore:
           pass
       if close_type:
         entry["closeType"] = str(close_type)
+      if _normalize_trader(trader) != DEFAULT_TRADER:
+        entry["trader"] = _normalize_trader(trader)
       lev = _positive_leverage(leverage)
       if lev is not None:
         # The exchange's own record of the closed position's leverage (history-positions). A ratio,
@@ -1526,6 +1553,58 @@ class MemoryStore:
       data["decisions"].append(entry)
       self._write(data)
       return entry
+
+  def record_jev_decision(self, row: Dict[str, Any]) -> bool:
+    """Append one Jev dual-run answer (see src/jev.py) to ``jev_decisions`` (count-capped). Never raises.
+
+    Stored as given minus anything that is not plain JSON; callers pass only ratios, prices, probabilities
+    and labels — never balances or sizes (the dashboard/Supervisor read this list)."""
+    try:
+      clean = json.loads(json.dumps(row, default=str))
+      if not isinstance(clean, dict):
+        return False
+      clean.setdefault("ts", int(time.time()))
+      with self._lock:
+        data = self._read()
+        rows = [r for r in (data.get("jev_decisions") or []) if isinstance(r, dict)]
+        rows.append(clean)
+        data["jev_decisions"] = rows[-MAX_JEV_DECISIONS:]
+        self._write(data)
+      return True
+    except Exception as exc:
+      logger.warning("JEV decision not recorded (%s)", exc)
+      return False
+
+  def jev_decisions(self, limit: int = 50) -> list[Dict[str, Any]]:
+    """The most recent Jev dual-run answers, oldest→newest (deep copies). ``limit=0`` = all retained."""
+    with self._lock:
+      rows = [copy.deepcopy(r) for r in (self._read().get("jev_decisions") or []) if isinstance(r, dict)]
+    lim = int(limit or 0)
+    return rows if lim <= 0 else rows[-lim:]
+
+  def trader_for_order(self, order_id: Any = None, client_oid: Any = None) -> Optional[str]:
+    """Which trader placed an entry order (its trade record's ``entryContext.trader``), or None if unknown."""
+    oid, coid = str(order_id or "").strip(), str(client_oid or "").strip()
+    if not oid and not coid:
+      return None
+    with self._lock:
+      trades = list(self._read().get("trades") or [])
+    for trade in reversed(trades):
+      if not isinstance(trade, dict):
+        continue
+      if (oid and str(trade.get("orderId") or "") == oid) or (coid and str(trade.get("clientOid") or "") == coid):
+        return _probe_trader(trade)
+    return None
+
+  def trader_for_position(self, symbol: str, position_open_time: Any, position_side: str | None) -> Optional[str]:
+    """Which trader owns an open position lifecycle (its filled entry's ``entryContext.trader``), or None."""
+    try:
+      ctx = self.entry_context_for_position(symbol, position_open_time, position_side)
+    except Exception:
+      return None
+    if not isinstance(ctx, dict):
+      return None
+    return _normalize_trader(ctx.get("trader"))
 
   def backfill_close_leverage(self, closes: Any) -> int:
     """Stamp the exchange's leverage onto realized-close rows recorded before it was captured.
@@ -1966,6 +2045,7 @@ class MemoryStore:
     gates_passed: Any = None,
     min_gap_sec: float = 0.0,
     build: Any = None,
+    trader: Any = None,
   ) -> bool:
     """Record a DIRECTION CALL for edge measurement, whether or not it becomes an order.
 
@@ -2029,6 +2109,10 @@ class MemoryStore:
     which build made the call, so a model switch and a prompt change can be told apart (2026-09-28: the
     gpt-6-luna switch of Sep 23 and the confidence prompt of Sep 25 could not be). Whitelisted by
     ``buildinfo.sanitize_build``; recorded only.
+
+    ``trader`` names who made the call ('llm' by default, not written; 'jev' for the dual run). A Jev row
+    lives in its own retention bucket and is returned only by ``signal_probes(trader='jev')``, so it can
+    never move, or evict, the LLM's verdicts — and vice versa.
     """
     try:
       px = float(market_price)
@@ -2056,6 +2140,9 @@ class MemoryStore:
     build_stamp = sanitize_build(build)
     if build_stamp:
       ctx["build"] = build_stamp
+    trader_name = _normalize_trader(trader)
+    if trader_name != DEFAULT_TRADER:
+      ctx["trader"] = trader_name
     for key, value in (("confidence", confidence), ("minConfidence", min_confidence)):
       try:
         val = float(value)
@@ -2105,7 +2192,7 @@ class MemoryStore:
             break                      # rows are chronological: nothing older can be within the gap
           prev_ctx = prev.get("entryContext") if isinstance(prev.get("entryContext"), dict) else {}
           if (prev.get("symbol") == row["symbol"] and prev_ctx.get("positionSide") == position_side
-              and _probe_family(prev) == family):
+              and _probe_family(prev) == family and _probe_trader(prev) == trader_name):
             return False
       probes.append(row)
       data["signal_probes"] = _trim_probes_per_family(probes)
@@ -2164,6 +2251,7 @@ class MemoryStore:
     regime: Optional[Dict[str, Any]] = None,
     market_state: Optional[Dict[str, Any]] = None,
     build: Any = None,
+    trader: Any = None,
   ) -> bool:
     """Record a direction call a gate HARD-REFUSED, for the gate scoreboard only. Returns True if stored.
 
@@ -2189,6 +2277,8 @@ class MemoryStore:
       build_stamp = sanitize_build(build)
       if build_stamp:
         ctx["build"] = build_stamp
+      if _normalize_trader(trader) != DEFAULT_TRADER:
+        ctx["trader"] = _normalize_trader(trader)
       try:
         conf = float(confidence)
         if math.isfinite(conf):
@@ -2259,11 +2349,16 @@ class MemoryStore:
       logger.warning("GATE STATE PROBE LOST: %s not stored (%s)", symbol, exc)
       return 0
 
-  def gate_probes(self) -> list[Dict[str, Any]]:
-    """Every retained gate-probe row (refusal and unfolded state), oldest first, as deep copies."""
+  def gate_probes(self, trader: str = DEFAULT_TRADER) -> list[Dict[str, Any]]:
+    """Every retained gate-probe row (refusal and unfolded state), oldest first, as deep copies.
+
+    ``trader`` keeps one dual-run trader's refusals (default the LLM, so the gate scoreboard reads exactly
+    what it read before the dual run; state rows carry no trader and always count); ``"all"`` keeps every row."""
+    want = str(trader or DEFAULT_TRADER).strip().lower()
     with self._lock:
       data = self._read()
-    rows = [copy.deepcopy(r) for r in (data.get("gate_probes") or []) if _gate_probe_kind(r)]
+    rows = [copy.deepcopy(r) for r in (data.get("gate_probes") or []) if _gate_probe_kind(r)
+            and (want == "all" or _probe_trader(r) == _normalize_trader(want))]
     rows.sort(key=lambda r: int(r.get("ts") or 0))
     return rows
 
@@ -2995,8 +3090,11 @@ class MemoryStore:
         self._write(data)
     return settled
 
-  def signal_probes(self, limit: int = 200) -> list[Dict[str, Any]]:
+  def signal_probes(self, limit: int = 200, trader: str = DEFAULT_TRADER) -> list[Dict[str, Any]]:
     """Entry signals carrying a market-price-at-signal stamp, for edge measurement.
+
+    ``trader`` selects whose calls: the LLM agent's by default (every existing verdict path), 'jev' for the
+    dual-run model, 'all' for both. One trader's record is never scored as the other's.
 
     ``limit=0`` means EVERYTHING retained, which is what the entry gates and the dashboard want.
     Asking for a fixed slice is how a verdict gets silently un-learned: retention is already bounded
@@ -3023,9 +3121,12 @@ class MemoryStore:
     # one such probe, so the match is unambiguous.
     seen = set()
     twins: Dict[tuple, list] = {}
+    wanted = None if str(trader or "").strip().lower() == "all" else _normalize_trader(trader)
     for row in list(data.get("signal_probes") or []):
       ctx = row.get("entryContext") if isinstance(row, dict) else None
       if not (isinstance(ctx, dict) and ctx.get("marketPriceAtSignal")):
+        continue
+      if wanted is not None and _probe_trader(row) != wanted:
         continue
       ts = int(row.get("ts") or 0)
       key = (row.get("symbol"), _probe_side(row), _probe_family(row))
@@ -3037,6 +3138,8 @@ class MemoryStore:
     for row in list(data.get("trades") or []):
       ctx = row.get("entryContext") if isinstance(row, dict) else None
       if not (isinstance(ctx, dict) and ctx.get("marketPriceAtSignal")):
+        continue
+      if wanted is not None and _probe_trader(row) != wanted:
         continue
       ts = int(row.get("ts") or 0)
       key = (row.get("symbol"), _probe_side(row), _probe_family(row))

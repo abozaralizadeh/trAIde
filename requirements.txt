@@ -18,3 +18,6 @@ pandas>=3.0.6                   # verified 3.0.6 (major bump from 2.x); requires
 langsmith[openai-agents]>=0.13.0
 azure-data-tables>=12.7.0
 azure-storage-blob>=12.30.2
+# Jev dual run (src/jev.py, JEV_MODE=shadow|live): the official typesafe.ai SDK (System One API). Imported
+# lazily, so JEV_MODE=off never touches it. Verified 0.7.2 (2026-09-30; pulls tenacity, uses httpx2).
+typesafe-sdk>=0.7.2
