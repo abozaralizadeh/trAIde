@@ -684,12 +684,13 @@ class ProtectionManager:
           self._naked_since.pop(fsym, None)
           self._emergency_placed_legs.pop(fsym, None)
 
-        hold_until = noise_band = None
+        hold_until = noise_band = owner = None
         if self._trade_context_lookup is not None:
           try:
             _tc = self._trade_context_lookup(fsym, pos) or {}
             hold_until = _tc.get("holdUntilTs")
             noise_band = _tc.get("noiseBandR")
+            owner = _tc.get("trader")
             # Restart safety. Both dicts below live only in this process. The live capture above
             # only fires when a stop is still BELOW entry, so after a restart a winner already
             # ratcheted to breakeven would never regain its 1R anchor and every R-based rule would go
@@ -735,6 +736,8 @@ class ProtectionManager:
         action = decision.get("action")
         if action == "none":
           continue
+        if owner:
+          decision["trader"] = owner      # log/notify tag only (dual run); the decision itself is unchanged
 
         result = self._apply(fsym, pos, side_long, stops, decision)
         if result:
@@ -859,6 +862,9 @@ class ProtectionManager:
     action = decision.get("action")
     reason = decision.get("reason", "")
     record = {"symbol": spot_symbol, "futuresSymbol": fsym, "action": action, "reason": reason}
+    if decision.get("trader"):
+      record["trader"] = decision["trader"]
+      spot_symbol = f"{spot_symbol} [{decision['trader']}]"   # every log/notify line below names the owner
 
     if self.cfg.dry_run:
       logger.warning("PROFIT-LOCK [DRY-RUN] %s on %s — %s", action, spot_symbol, reason)

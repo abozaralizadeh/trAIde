@@ -762,6 +762,7 @@ OTLP export for Azure Monitor is supported via `OTEL_EXPORTER_OTLP_ENDPOINT` and
 | `JEV_MAX_SYMBOLS_PER_RUN` | `8` | Symbols Jev is asked about per agent run |
 | `JEV_TIMEOUT_SEC` | `5` | Per-request timeout (one retry on 408/429/5xx) |
 | `JEV_RISK_SCALE` | `1.0` | Extra shrink (0 < x ≤ 1) on top of the explore floor — can only reduce Jev's risk |
+| `JEV_MANAGE_POSITIONS` | `true` | Live: each pass Jev reviews its own open positions and may hold / tighten the stop / move the target / close (above the entry confidence floor) |
 
 ## Telegram Notifications
 
@@ -859,12 +860,16 @@ The supervisor runs as a daemon thread alongside the trading loop, using Telegra
 An experiment harness for **Jev** ([typesafe.ai](https://typesafe.ai), System One API): a fast classifier
 (~0.1–0.5 s, input tokens only) that returns calibrated probabilities over labelled choices instead of free
 text and tool calls. It runs **after** the Trading Agent each poll, on the same run's tools, analyses and gates.
+How it is used follows TypeSafe's guidance and independent evaluations — see
+[`docs/analysis/2026-09-30-jev-best-practices.md`](docs/analysis/2026-09-30-jev-best-practices.md).
 
 ```
 LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
-                                        │ per symbol: state = the analysis (market facts only)
-                                        │ System One: direction (long/short/stand aside) · playbook ·
-                                        │             pullback vs market · near vs extended target
+   1. its OWN open positions (live): position in words + what changed since entry + the market now
+        → hold / protect (tighten stop) / extend (move target) / close   — code executes, stop monotonic
+   2. new calls, one coin per request: state = LABELS, never raw numbers (+ BTC/market breadth, research
+      sentiment, macro releases, the owner's notes on that coin; third-party text fenced as untrusted)
+        → direction asked in 3 option orders and averaged · playbook / entry / target asked per side
                                         ▼
                      code builds the bracket from the analysis levels
                      (noise-floor stop → 1h Bollinger band, capped at 2× floor; target in NET R)
@@ -872,6 +877,22 @@ LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
             tools.place_futures_limit_order_for(trader=jev) — the LLM tool's own path:
             every gate, risk cap, atomic bracket, stand-aside; ProtectionManager trails it
 ```
+
+- **Labels, not numbers.** Numbers are one of Jev's documented weak spots, so code turns every indicator into
+  a named category ("RSI overbought", "trend forming", "far above value") using the bot's own thresholds;
+  nothing Jev reads is a raw float (a test pins it).
+- **Option-order debiasing.** Measured studies show the listed order moves Jev's answers, so every choice that
+  drives money is asked once per rotation of its options, in the same request, and averaged. How much the
+  order mattered is recorded (`orderSpread`) and shown on the dashboard.
+- **Explicit premises.** Questions never see each other's answers, so the follow-ups are asked per side
+  ("suppose a LONG is opened…" / "suppose a SHORT…") and code keeps the side the direction picked. Every
+  choice has a no-match option (stand aside / none fits / hold).
+- **It manages its own positions** (`JEV_MANAGE_POSITIONS`, live): each pass starts with Jev's open positions —
+  how long it has been open, where it stands in R (now / best / worst), where the stop is, how each timeframe
+  changed since entry — and Jev may hold, tighten the stop, move the target or close. It acts only above the
+  same confidence floor an entry needs; closes go through the LLM's own reduce-only close path, re-brackets
+  through its monotonic protection path (a stop can only tighten), and a Jev close is scored on Jev's own exit
+  record against the replayed exit rules, exactly like the LLM's.
 
 - **Survival stays code's, opportunity is Jev's.** Jev never sees balances, gates or its own scoreboard, and
   never invents a stop: it picks between code-built bracket variants.
@@ -881,8 +902,9 @@ LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
   size) and earns stake by the same stateless t ≥ 1 bar as the LLM's playbooks.
 - **One owner per position lifecycle.** A symbol the LLM holds is not Jev's to trade and vice versa
   (`trader_conflict`, a structural refusal). The LLM's tools refuse to close, cancel, add to or re-bracket a
-  Jev position; its prompt state marks those rows `managedBy: "jev"`. Jev positions exit by code only
-  (bracket + trailing protection). Account-level survival (circuit breakers, heat, loss streak, bench) is shared.
+  Jev position; its prompt state marks those rows `managedBy: "jev"`. A Jev position is managed by Jev (above)
+  and by code (bracket + trailing protection); the LLM's call on a Jev-held coin is still recorded as evidence.
+  Account-level survival (circuit breakers, heat, loss streak, bench) is shared.
 - **Modes.** `shadow`: every call runs the full gate chain and is recorded as a probe — no order (`dry_run`).
   `live`: the most confident free calls take up to `JEV_MAX_OPEN_POSITIONS` trial-size entries; calls past
   the caps or on the LLM's symbols are still recorded as shadow calls, so Jev's record does not depend on
@@ -900,10 +922,10 @@ Start with `JEV_MODE=shadow` for a few days, compare the two records in the pane
 | Where | What you get |
 |---|---|
 | Log, at start | `JEV DUAL RUN: mode=shadow model=jev-latest key=set sdk=typesafe-sdk 0.7.2 caps: … langsmith=on` (also printed when off) |
-| Log, every pass | `JEV (shadow) pass: asking 8 symbol(s) …`, then one line per symbol — `JEV SOL-USDT: LONG 0.71 (L 0.71 / S 0.10 / stand 0.19) continuation · at_market · near 1.65R \| entry … stop … tp … → shadow [scored] stake explore 0.40` — and the pass summary |
+| Log, every pass | `JEV MANAGE SOL-USDT (long, up about its risk (1R), stop at breakeven…): PROTECT 0.71 (hold 0.20 / protect 0.71 / extend 0.05 / close 0.04), thesis intact 0.64 → protected` for each own position, `JEV (shadow) pass: asking 8 symbol(s) …`, then one line per symbol — `JEV SOL-USDT: LONG 0.71 (L 0.71 / S 0.10 / stand 0.19) continuation · at_market · near 1.65R \| entry … stop … tp … → shadow [scored] stake explore 0.40` — and the pass summary. Exit-manager lines on a Jev position read `PROFIT-LOCK … SOL-USDT [jev]` |
 | Log, hourly | `JEV vs LLM since … — JEV calls n, @60m net %, hit % \| LLM … \| same side as the LLM a/b` |
-| Dashboard (`dualRun`, read from the published blob — never from the bot) | Last-pass health (or why it is idle), both traders side by side, a 15m / 1h / 4h table of "right way" % and net of cost for each, and every recent answer: Jev's call and probabilities, the LLM's call on the same coin at the same time, the code-built plan, what the order path did (scored / repeat / stake / gate) and how price moved its way after 15m / 1h / 4h |
-| LangSmith | One trace per pass, `Jev Dual Run (<mode>)`, with one `llm` run per symbol: the exact state and questions sent, Jev's answers, the bracket and the outcome, input tokens. Once a traced call's 4h window settles, its forward returns are attached as feedback (`fwd_15m`, `fwd_60m`, `fwd_240m`, `right_way_60m`). Posted: the first pass after start, every pass with a live entry attempt or an error, the rest at `LANGSMITH_SAMPLE_RATE` (the monthly trace cap) |
+| Dashboard (`dualRun`, read from the published blob — never from the bot) | Last-pass health (or why it is idle), both traders side by side (incl. each one's early closes vs the exit rules), a 15m / 1h / 4h table of "right way" % and net of cost, a calibration table (stated confidence vs right-way share), option-order sensitivity, and every recent answer: Jev's call and probabilities, the LLM's call on the same coin at the same time, the code-built plan, what the order path did (scored / repeat / stake / gate), the trade's result once closed, how price moved its way after 15m / 1h / 4h — and Jev's management answers on its own positions |
+| LangSmith | One trace per pass, `Jev Dual Run (<mode>)`, with one `llm` run per position managed (`Jev manage SOL-USDT`) and per symbol asked: the exact state and questions sent, Jev's answers, the bracket / action and the outcome, input tokens. Once a traced call's 4h window settles, its forward returns are attached as feedback (`fwd_15m`, `fwd_60m`, `fwd_240m`, `right_way_60m`); a placed call also gets `realized_r` when its trade closes. Posted: the first pass after start, every pass with a live entry attempt, an action on a position, or an error, the rest at `LANGSMITH_SAMPLE_RATE` (the monthly trace cap) |
 | Supervisor | `get_dual_run_report` — the same report as the dashboard panel |
 
 ## Backtesting

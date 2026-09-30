@@ -82,6 +82,7 @@ from .edge import (
   open_families,
   passive_distance_atr,
 )
+from .buildinfo import sanitize_build
 from .memory import SCORED_GATES, sanitize_market_state
 from .utils import SPOT_DUST_VALUE_USD, normalize_symbol as _normalize_symbol
 from .agent import (
@@ -1209,6 +1210,16 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       return cfg.azure.deployment
     return str((trader or {}).get("model") or _trader_name(trader))[:80]
 
+  def _build_for(trader: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    """The build stamp for a call: this run's (code + the LLM's prompt hash) for the LLM, or the stamp a
+    dual-run trader brings (code + ITS question-set hash, src/jev.py ``jev_build``). Report-only, total."""
+    if _trader_name(trader) == "llm":
+      return _build_now()
+    try:
+      return sanitize_build((trader or {}).get("build"))
+    except Exception:
+      return None
+
   def _trader_size_scale(trader: Dict[str, Any] | None) -> float:
     try:
       val = float((trader or {}).get("sizeScale", 1.0))
@@ -1306,7 +1317,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         spot_symbol, side_lower, price, gate,
         setup_family=setup_family, price_source=source, model=_trader_model(trader),
         confidence=confidence, regime=_gate_for(spot_symbol), market_state=_market_state_now(),
-        build=_build_now() if _trader_name(trader) == "llm" else None, trader=_trader_name(trader),
+        build=_build_for(trader), trader=_trader_name(trader),
       )
     except Exception as exc:
       logger.warning("GATE PROBE LOST: %s %s refusal not recorded (%s)", symbol, side, exc)
@@ -3174,8 +3185,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
 
   # ── Futures trading — orders, stops & positions ─────────────────────────────────────────────────
-  @function_tool
-  async def place_futures_market_order(
+  async def _place_futures_market_order_impl(
     symbol: str,
     side: str,
     notional_usd: float,
@@ -3190,9 +3200,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     stop_loss_price: float | None = None,
     reduce_only: bool | None = None,
     auto_protect: bool = True,
+    *,
+    trader: Dict[str, Any] | None = None,
   ) -> Dict[str, Any]:
-    """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
-    _foreign_mk = _not_yours(symbol)
+    """Body of the place_futures_market_order tool (whose docstring is the model-facing one). ``trader`` is set
+    only by code callers (a dual-run trader closing its OWN position, src/jev.py); it is checked for ownership
+    and stamped on the close marker and the decision row, never a looser path."""
+    _foreign_mk = _not_yours(symbol, trader)
     if _foreign_mk:
       return _foreign_mk
     spot_symbol = _resolve_allowed_spot_symbol(symbol, allowed_symbols)
@@ -4005,6 +4019,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         rationale or "paper trade",
         pnl=None,
         paper=True,
+        trader=_trader_name(trader),
       )
       return_val = {
         "paper": True,
@@ -4046,7 +4061,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if reduce_only:
         # This is the MODEL closing a position. ProtectionManager places its own closes directly and
         # never passes through here, so this is the only reliable place to tell the two apart.
-        memory.note_agent_close(spot_symbol)
+        memory.note_agent_close(spot_symbol, trader=_trader_name(trader))
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
@@ -4057,6 +4072,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           rationale or "live trade",
           pnl=None,
           paper=False,
+          trader=_trader_name(trader),
         )
       res["rationale"] = rationale
       res["feeRate"] = fee_rate
@@ -4105,7 +4121,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       if reduce_only:
         # This is the MODEL closing a position. ProtectionManager places its own closes directly and
         # never passes through here, so this is the only reliable place to tell the two apart.
-        memory.note_agent_close(spot_symbol)
+        memory.note_agent_close(spot_symbol, trader=_trader_name(trader))
       record = memory.record_trade(spot_symbol, side, notional, paper=False, price=price, size=contracts * multiplier, venue="futures")
       res["tradeRecord"] = record
       if confidence is not None:
@@ -4116,6 +4132,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           rationale or "live trade",
           pnl=None,
           paper=False,
+          trader=_trader_name(trader),
         )
       res["rationale"] = rationale
       res["feeRate"] = fee_rate
@@ -4148,6 +4165,29 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "marginModeDetected": margin_mode,
       "transferUsed": transfer_used,
     }
+
+  @function_tool
+  async def place_futures_market_order(
+    symbol: str,
+    side: str,
+    notional_usd: float,
+    leverage: float = 1.0,
+    size_override: float | None = None,
+    confidence: float | None = None,
+    rationale: str | None = None,
+    stop: str | None = None,
+    stop_price_type: str | None = None,
+    stop_price: float | None = None,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    reduce_only: bool | None = None,
+    auto_protect: bool = True,
+  ) -> Dict[str, Any]:
+    """Place a linear futures market order using notional and leverage (supports optional attached TP/SL). Falls back to paper if futures disabled."""
+    return await _place_futures_market_order_impl(
+      symbol, side, notional_usd, leverage, size_override, confidence, rationale, stop, stop_price_type,
+      stop_price, take_profit_price, stop_loss_price, reduce_only, auto_protect,
+    )
 
   async def _place_futures_limit_order_impl(
     symbol: str,
@@ -4618,7 +4658,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
         min_gap_sec=_repeat_gap_fl,
         # Code commit + prompt hash, so a model switch and a prompt change can be told apart. Report-only.
         # (The prompt hash is the LLM's prompt, so a second trader's call carries none.)
-        build=_build_now() if _trader_name(trader) == "llm" else None,
+        build=_build_for(trader),
         trader=_trader_name(trader),
         **_xm_stamp_fl,
       )
@@ -4899,7 +4939,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     _entry_context_fl = {
       "policyVersion": "completed-bars-net-rr-directional-risk-v1",
       "model": _trader_model(trader),
-      "build": _build_now() if _trader_name(trader) == "llm" else None,
+      "build": _build_for(trader),
       # Which dual-run trader owns this lifecycle (None = the LLM agent, as before the dual run).
       "trader": None if _trader_name(trader) == "llm" else _trader_name(trader),
       # Leverage applied to this entry (after every cap) — a ratio, published on the closed-trade card.
@@ -5239,6 +5279,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # at all — the gates return before the signal probe. Record it (report-only, its own bucket) and
     # hand back the refusal exactly as the body returned it. Total: _record_gate_refusal never raises.
     _record_gate_refusal(result, symbol, side, setup_family, confidence)
+    if isinstance(result, dict) and result.get("gate") == "trader_conflict":
+      # The coin is another dual-run trader's lifecycle, so no order — but the call itself is still a direction
+      # call, and Jev's calls on the LLM's coins ARE recorded (its shadow path). Record this one the same way
+      # (same gates, same probe, no order), so neither trader's record depends on which coins the other held.
+      try:
+        shadow = await _place_futures_limit_order_impl(
+          symbol=symbol, side=side, notional_usd=notional_usd, entry_price=entry_price, leverage=leverage,
+          size_override=size_override, confidence=confidence, rationale=rationale,
+          take_profit_price=take_profit_price, stop_loss_price=stop_loss_price, setup_family=setup_family,
+          dry_run=True,
+        )
+        _record_gate_refusal(shadow, symbol, side, setup_family, confidence)
+        result = {**result, "callRecorded": bool(isinstance(shadow, dict) and shadow.get("probeRecorded"))}
+      except Exception as exc:
+        logger.warning("TRADER CONFLICT: %s %s call not recorded (%s)", symbol, side, exc)
     return result
 
   async def _place_futures_stop_order_impl(
@@ -5788,19 +5843,21 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     except Exception as exc:
       return {"error": str(exc), "symbol": fsym}
 
-  @function_tool
-  async def set_futures_position_protection(
+  async def _set_futures_position_protection_impl(
     symbol: str,
     take_profit_price: float | None = None,
     stop_loss_price: float | None = None,
     stop_price_type: str = "MP",
     cancel_existing: bool = True,
+    *,
+    trader: Dict[str, Any] | None = None,
   ) -> Dict[str, Any]:
-    """Add or replace TP/SL for an existing open futures position using reduce-only close orders."""
+    """Body of the set_futures_position_protection tool. ``trader`` is set only by code callers (a dual-run
+    trader re-bracketing its OWN position); the stop stays monotonic whoever calls (it can only tighten)."""
     authority_error = _authority_error()
     if authority_error:
       return {"rejected": True, "reason": authority_error}
-    _foreign = _not_yours(symbol)
+    _foreign = _not_yours(symbol, trader)
     if _foreign:
       return _foreign
     requested_symbol = symbol
@@ -6031,6 +6088,19 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       "stopAdjustment": stop_adjustment,
       "position": position,
     }
+
+  @function_tool
+  async def set_futures_position_protection(
+    symbol: str,
+    take_profit_price: float | None = None,
+    stop_loss_price: float | None = None,
+    stop_price_type: str = "MP",
+    cancel_existing: bool = True,
+  ) -> Dict[str, Any]:
+    """Add or replace TP/SL for an existing open futures position using reduce-only close orders."""
+    return await _set_futures_position_protection_impl(
+      symbol, take_profit_price, stop_loss_price, stop_price_type, cancel_existing,
+    )
 
 
   # ── Transfers & account state ───────────────────────────────────────────────────────────────────
@@ -6656,6 +6726,59 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     spot = _resolve_allowed_spot_symbol(str(symbol or ""), allowed_symbols) or _normalize_symbol(str(symbol or ""))
     return _owner_of_futures_symbol(_to_futures_symbol(spot) if spot else None)
 
+  async def close_futures_position_for(trader: Dict[str, Any], symbol: str, *, confidence: float | None = None,
+                                       rationale: str | None = None) -> Dict[str, Any]:
+    """Close the WHOLE live position on ``symbol`` for a dual-run trader that owns it, through the LLM's own
+    reduce-only market-order body (live position re-read there, ownership checked, close marker stamped).
+    Sized from the live position; never opens exposure (reduce_only)."""
+    spot = _resolve_allowed_spot_symbol(str(symbol or ""), allowed_symbols) or _normalize_symbol(str(symbol or ""))
+    fsym = _to_futures_symbol(spot) if spot else None
+    if not fsym or not kucoin_futures:
+      return {"error": "Futures unavailable for this symbol", "symbol": symbol}
+    try:
+      pos = kucoin_futures.get_position(fsym) or {}
+    except Exception as exc:
+      return {"error": f"Position lookup failed: {exc}", "symbol": spot}
+    qty = _to_float(pos.get("currentQty")) or 0.0
+    if not qty:
+      return {"error": "No open position to close", "symbol": spot}
+    contract = _get_contract_spec(fsym) or {}
+    multiplier = _to_float(contract.get("multiplier")) or 0.0
+    price = _to_float(pos.get("markPrice")) or _live_entry_price(spot) or 0.0
+    if multiplier <= 0 or price <= 0:
+      return {"error": "Contract multiplier or mark price unavailable", "symbol": spot}
+    size = abs(qty) * multiplier
+    return await _place_futures_market_order_impl(
+      symbol=spot, side="sell" if qty > 0 else "buy", notional_usd=size * price * 1.05, leverage=1.0,
+      size_override=size, confidence=confidence, rationale=rationale or "dual-run position close",
+      reduce_only=True, auto_protect=False, trader=trader,
+    )
+
+  async def protect_position_for(trader: Dict[str, Any], symbol: str, *, stop_loss_price: float | None = None,
+                                 take_profit_price: float | None = None) -> Dict[str, Any]:
+    """Re-bracket a dual-run trader's OWN position through the LLM tool's body (the stop stays monotonic)."""
+    return await _set_futures_position_protection_impl(
+      symbol, take_profit_price=take_profit_price, stop_loss_price=stop_loss_price, trader=trader,
+    )
+
+  def positions_of(name: str) -> list[Dict[str, Any]]:
+    """Open futures positions trader ``name`` owns, each with its live stop orders: [{position, stops}]."""
+    out = []
+    for p in snapshot.futures_positions or []:
+      if not isinstance(p, dict) or not (_to_float(p.get("currentQty")) or 0.0):
+        continue
+      fsym = str(p.get("symbol") or "").upper()
+      if _owner_of_futures_symbol(fsym) != name:
+        continue
+      stops = [o for o in (snapshot.futures_stop_orders or []) if isinstance(o, dict)
+               and str(o.get("symbol") or "").upper() == fsym]
+      out.append({"position": copy.deepcopy(p), "stops": copy.deepcopy(stops)})
+    return out
+
+  def market_state_now() -> Dict[str, Any] | None:
+    """The poll loop's cached market state (cache read only — never a fetch)."""
+    return _market_state_now()
+
   def trader_book(name: str) -> list[str]:
     """Spot symbols on which trader ``name`` holds a resting entry or an open position right now."""
     fsyms = {str(o.get("symbol") or "").upper() for o in _runtime_futures_pending.values()
@@ -6670,6 +6793,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
   return SimpleNamespace(
     place_futures_limit_order_for=place_futures_limit_order_for,
+    close_futures_position_for=close_futures_position_for,
+    protect_position_for=protect_position_for,
+    positions_of=positions_of,
+    market_state_now=market_state_now,
     analyze_for=analyze_for,
     latest_analyses=latest_analyses,
     owner_of=owner_of,

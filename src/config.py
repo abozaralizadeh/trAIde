@@ -186,6 +186,10 @@ class JevConfig:
   orders through the same order path — every gate, the risk-per-trade budget, the stand-aside (judged on
   JEV'S OWN record, so it starts at explore size) and the atomic bracket. Code enforces survival for both
   traders; each owns its positions. The API key is read from TYPESAFE_API_KEY by the SDK.
+
+  ``manage_positions`` (live): each pass first shows Jev its own open positions — what happened since entry —
+  and lets it hold, tighten the stop, extend the target or close, executed by code through the LLM's own
+  monotonic tool bodies and scored like the LLM's closes (exit probes vs the replayed exit stack).
   """
   mode: str = "off"                 # off | shadow | live
   model: str = "jev-latest"         # pin a versioned id (e.g. jev-1.13.0) once its record matters
@@ -194,6 +198,7 @@ class JevConfig:
   max_symbols_per_run: int = 8      # symbols Jev is asked about per run (freshest analyses first)
   timeout_sec: float = 5.0          # per request; Jev answers in ~70-500 ms
   risk_scale: float = 1.0           # extra multiplier on Jev's risk budget (<= 1 only shrinks)
+  manage_positions: bool = True     # live: Jev may hold / protect / extend / close its own open positions
 
 
 @dataclass
@@ -700,6 +705,7 @@ def load_config() -> AppConfig:
       max_symbols_per_run=int(os.getenv("JEV_MAX_SYMBOLS_PER_RUN", "8")),
       timeout_sec=float(os.getenv("JEV_TIMEOUT_SEC", "5")),
       risk_scale=float(os.getenv("JEV_RISK_SCALE", "1.0")),
+      manage_positions=_as_bool(os.getenv("JEV_MANAGE_POSITIONS"), True),
     ),
   )
 
