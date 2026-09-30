@@ -104,6 +104,9 @@ def trade_context(
     )
 
     if isinstance(ctx, dict):
+      # Whose lifecycle this is (dual run; absent = the LLM) — used only to tag the manager's log lines.
+      if ctx.get("trader"):
+        out["trader"] = str(ctx.get("trader"))
       try:
         atr_mult = float(ctx.get("stopAtrMult") or 0.0)
       except (TypeError, ValueError):

@@ -2830,6 +2830,7 @@ def run_trading_agent(
 
   jev_summary = _run_jev_dual_pass(
     cfg, _tools, memory, snapshot, allowed_symbols, fees, _edge_state, authorized=run_still_authorized,
+    funding_clock=funding_clock,
   )
 
   return {
@@ -2845,7 +2846,7 @@ def run_trading_agent(
 
 def _run_jev_dual_pass(
   cfg: AppConfig, tools: Any, memory: Any, snapshot: TradingSnapshot, allowed_symbols: Any, fees: Dict[str, Any],
-  edge_state: Callable[[], Dict[str, Any]], *, authorized: bool = True,
+  edge_state: Callable[[], Dict[str, Any]], *, authorized: bool = True, funding_clock: Any = None,
 ) -> Dict[str, Any] | None:
   """The Jev dual run (src/jev.py) after the LLM's run, on the same tools, analyses and gates. Total.
 
@@ -2869,6 +2870,7 @@ def _run_jev_dual_pass(
       noise_mult=float(edge.get("stop_atr_floor_mult", cfg.trading.stop_atr_floor_mult) or 0.0),
       cost_rate=cost_rate,
       tracer=langsmith_tracer(cfg),
+      funding_clock=funding_clock,
     ))
     logger.info(describe_pass(summary))
     _jev_after_pass(cfg, memory)

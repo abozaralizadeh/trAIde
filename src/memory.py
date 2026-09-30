@@ -1575,8 +1575,9 @@ class MemoryStore:
       logger.warning("JEV decision not recorded (%s)", exc)
       return False
 
-  def mark_jev_decisions_scored(self, keys: Any) -> int:
-    """Flag Jev decisions (by (ts, symbol)) as scored in LangSmith so they are posted once. Never raises."""
+  def mark_jev_decisions_scored(self, keys: Any, flag: str = "lsScored") -> int:
+    """Flag Jev decisions (by (ts, symbol)) as scored in LangSmith (``flag``: forward returns ``lsScored``, the
+    trade result ``lsResultScored``) so each is posted once. Never raises."""
     try:
       wanted = {(int(ts), str(sym)) for ts, sym in keys or []}
       if not wanted:
@@ -1586,7 +1587,7 @@ class MemoryStore:
         data = self._read()
         for row in data.get("jev_decisions") or []:
           if isinstance(row, dict) and (int(row.get("ts") or 0), str(row.get("symbol"))) in wanted:
-            row["lsScored"] = True
+            row[flag if flag in ("lsScored", "lsResultScored") else "lsScored"] = True
             n += 1
         if n:
           self._write(data)
@@ -2547,7 +2548,7 @@ class MemoryStore:
     except (TypeError, ValueError):
       return None
 
-  def note_agent_close(self, symbol: str) -> None:
+  def note_agent_close(self, symbol: str, trader: Any = None) -> None:
     """Remember that the MODEL just closed a position on ``symbol`` (its reduce-only order was accepted).
 
     Exit probes are recorded later, when the poll loop notices the position is gone, and by then the
@@ -2562,7 +2563,10 @@ class MemoryStore:
     with self._lock:
       data = self._read()
       marks = [m for m in (data.get("agent_closes") or []) if isinstance(m, dict)]
-      marks.append({"symbol": sym, "ts": int(time.time())})
+      mark = {"symbol": sym, "ts": int(time.time())}
+      if _normalize_trader(trader) != DEFAULT_TRADER:
+        mark["trader"] = _normalize_trader(trader)    # a dual-run trader closing its own position
+      marks.append(mark)
       data["agent_closes"] = marks[-200:]
       self._write(data)
 
@@ -2603,8 +2607,13 @@ class MemoryStore:
     htf_aligned: Optional[bool] = None,
     market_state: Optional[Dict[str, Any]] = None,
     market_state_at_exit: Optional[Dict[str, Any]] = None,
+    trader: Any = None,
   ) -> None:
     """Record an EARLY close so it can later be scored against the bracket it overrode.
+
+    ``trader`` names the dual-run trader whose position it was (the entry's ``entryContext.trader``; absent =
+    the LLM). A Jev close is still ``closedBy: "agent"`` — a model's discretionary exit, replayed against the
+    live exit stack exactly like the LLM's — and ``exit_probes(trader=...)`` keeps the two records apart.
 
     ``closed_by`` is "agent" when the model closed it and "protection" when the code's trailing stop
     or profit-lock did. Both land between the original stop and target, so both are worth scoring —
@@ -2671,6 +2680,7 @@ class MemoryStore:
       "realizedR": rr,
       "setupFamily": (str(setup_family).strip().lower() or None) if setup_family else None,
       "closedBy": (str(closed_by).strip().lower() or None) if closed_by else None,
+      **({"trader": _normalize_trader(trader)} if _normalize_trader(trader) != DEFAULT_TRADER else {}),
       # The entry's own regime read (market_regime / strength) so trail-vs-bracket can be split by the
       # market it happened in. The trail is right in chop and wrong in a trend; a regime-adaptive
       # trail needs evidence from BOTH, and this is where that evidence accumulates on its own.
@@ -2915,11 +2925,15 @@ class MemoryStore:
           continue
     return out
 
-  def exit_probes(self, limit: int = 200) -> list[Dict[str, Any]]:
-    """Recorded discretionary closes, newest last."""
+  def exit_probes(self, limit: int = 200, trader: str = DEFAULT_TRADER) -> list[Dict[str, Any]]:
+    """Recorded discretionary closes, newest last — one dual-run trader's (default the LLM, so its
+    exitDiscipline reads exactly what it did before the dual run), or every row with ``trader="all"`` (the
+    stack replay and the late-row sweep, which serve both)."""
+    want = str(trader or DEFAULT_TRADER).strip().lower()
     with self._lock:
       data = self._read()
-    rows = [r for r in (data.get("exit_probes") or []) if isinstance(r, dict)]
+    rows = [r for r in (data.get("exit_probes") or []) if isinstance(r, dict)
+            and (want == "all" or _normalize_trader(r.get("trader")) == _normalize_trader(want))]
     return rows[-max(1, int(limit)):]
 
   def settle_signal_probes(

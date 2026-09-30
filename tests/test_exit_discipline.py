@@ -168,7 +168,8 @@ def test_the_marker_is_set_only_where_the_model_closes():
   from pathlib import Path
   root = Path(__file__).resolve().parents[1] / "src"
   assert "note_agent_close" not in (root / "protection.py").read_text()
-  assert (root / "tools.py").read_text().count("memory.note_agent_close(spot_symbol)") == 2
+  # The marker names the dual-run trader that closed (absent = the LLM), so each trader's exit record is its own.
+  assert (root / "tools.py").read_text().count("memory.note_agent_close(spot_symbol, trader=_trader_name(trader))") == 2
 
 
 # --- a flip must not stamp the closed side with the new side's lifecycle -------------------------

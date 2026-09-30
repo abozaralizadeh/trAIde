@@ -621,7 +621,7 @@ def _score_exit_probe_stacks(
   horizon_sec = float(expire_hours) * 3600.0
   stored = 0
   try:
-    rows = memory.exit_probes(limit=200)
+    rows = memory.exit_probes(limit=200, trader="all")   # every trader's agent closes are replayed
   except Exception as exc:
     logger.warning("EXIT STACK: could not read exit probes (%s)", exc)
     return 0
@@ -2494,7 +2494,9 @@ async def trading_loop(
         )
         logged_closed_position_ids.add(cp_id)
         memory.record_seen_close_id(cp_id)
-        logger.info("Recorded triggered close for %s: PnL=%.4f (%s)", sym, pnl, close_type)
+        _owner = (entry_context or {}).get("trader") if isinstance(entry_context, dict) else None
+        logger.info("Recorded triggered close for %s%s: PnL=%.4f (%s)", sym, f" [{_owner}]" if _owner else "",
+                    pnl, close_type)
         # An exit that reached NEITHER the stop nor the target was somebody's discretionary call, not
         # the bracket resolving. Score it later against what the bracket would have done — that is the
         # book's largest measured leak and the model currently gets no feedback on it at all.
@@ -2526,6 +2528,8 @@ async def trading_loop(
                 # and the loop's current reading at the close. Cache reads only.
                 market_state=_ctx.get("marketState") if isinstance(_ctx.get("marketState"), dict) else None,
                 market_state_at_exit=_market_state.current(),
+                # Whose position it was (dual run): a Jev close is scored on Jev's exit record, never the LLM's.
+                trader=_ctx.get("trader"),
               )
         except Exception as exc:
           logger.warning("EXIT PROBE: recording failed for %s (%s) — exitDiscipline misses this close",
