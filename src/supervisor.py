@@ -198,10 +198,12 @@ def run_supervisor_agent(
   @function_tool
   async def get_dual_run_report() -> Dict[str, Any]:
     """REPORT-ONLY: the Jev dual run (JEV_MODE) — the LLM trader and the Jev trader (typesafe.ai), each
-    judged on its OWN calls over the same window: signal edge (net of cost, t, verdict), closes (wins, R),
-    Jev's outcomes (placed / shadow / refused / stand aside), median latency, how often it agreed with the
-    LLM, and its latest answers. Never relay Jev's record or verdict to the trading agent unasked — the two
-    traders are kept independent on purpose."""
+    judged on its OWN calls over the same window: signal edge (net of cost, t, verdict) per horizon with the
+    share of calls the market moved toward, closes (wins, R), Jev's outcomes (placed / shadow / refused /
+    stand aside), the last pass's health (status: ok / idle / error and why), median latency, how often it
+    agreed with the LLM, and its latest answers — each with the LLM's call on the same coin at the time, what
+    the order path did and the call's forward return at 15m / 60m / 240m. Never relay Jev's record or verdict
+    to the trading agent unasked — the two traders are kept independent on purpose."""
     return dual_run_report(memory, cfg, cost_pct=probe_cost_pct(memory, cfg))
 
   @function_tool
