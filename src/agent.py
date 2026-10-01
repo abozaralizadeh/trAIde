@@ -1335,11 +1335,15 @@ def run_trading_agent(
           )
           # DUAL RUN (src/jev.py): the second trader is judged on ITS OWN calls, never the LLM's — the
           # order path reads this row for Jev's stake exactly as it reads signal_edge for the LLM. Empty
-          # -> 'insufficient data' -> explore floor (trial size). Same cost, same holding-time mix.
+          # -> 'insufficient data' -> explore floor (trial size). Same cost; its OWN holding-time mix (the
+          # LLM's holds per family until Jev has closed it often enough — edge._owned_hold_mix), and the
+          # LLM's mix above is the LLM's closes alone, so a Jev close never moves an LLM verdict.
           if getattr(getattr(cfg, "jev", None), "mode", "off") != "off":
+            _jev_weights = safe_family_horizon_weights(memory, trader="jev")
+            state["family_horizon_weights_jev"] = _jev_weights
             state["signal_edge_jev"] = signal_edge_stats(
               memory.signal_probes(limit=0, trader="jev"), cost_pct=_cost,
-              family_horizons=_fam_horizons, family_horizon_weights=_fam_weights,
+              family_horizons=safe_family_horizons(memory, trader="jev"), family_horizon_weights=_jev_weights,
             )
           # TAKER FLOW: does the aggressor balance at the moment of the call carry information about
           # where price goes next, on this venue and at our horizons? Surfaced only once the sample

@@ -758,7 +758,7 @@ OTLP export for Azure Monitor is supported via `OTEL_EXPORTER_OTLP_ENDPOINT` and
 | `TYPESAFE_API_KEY` | — | typesafe.ai API key (read by `typesafe-sdk`); required for `shadow`/`live` |
 | `JEV_MODEL` | `jev-latest` | `jev-latest`, `jev-preview` or a pinned version (e.g. `jev-1.13.0`); the resolved version is stamped on every call |
 | `JEV_MAX_OPEN_POSITIONS` | `1` | Live: Jev's concurrent open positions + resting entries |
-| `JEV_MAX_ENTRIES_PER_DAY` | `6` | Live: Jev's new entries per UTC day |
+| `JEV_MAX_ENTRIES_PER_DAY` | `6` | Live: Jev's new entry orders per UTC day (counted from the trade record; if it can't be read, no new entry) |
 | `JEV_MAX_SYMBOLS_PER_RUN` | `8` | Symbols Jev is asked about per agent run |
 | `JEV_TIMEOUT_SEC` | `5` | Per-request timeout (one retry on 408/429/5xx) |
 | `JEV_RISK_SCALE` | `1.0` | Extra shrink (0 < x ≤ 1) on top of the explore floor — can only reduce Jev's risk |
@@ -891,15 +891,19 @@ LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
   how long it has been open, where it stands in R (now / best / worst), where the stop is, how each timeframe
   changed since entry — and Jev may hold, tighten the stop, move the target or close. It acts only above the
   same confidence floor an entry needs; closes go through the LLM's own reduce-only close path, re-brackets
-  through its monotonic protection path (a stop can only tighten), and a Jev close is scored on Jev's own exit
-  record against the replayed exit rules, exactly like the LLM's.
+  through its monotonic protection path (a stop can only tighten, placed one noise band behind the LIVE mark —
+  never the snapshot's), and a Jev close is scored on Jev's own exit record against the replayed exit rules,
+  exactly like the LLM's.
 
 - **Survival stays code's, opportunity is Jev's.** Jev never sees balances, gates or its own scoreboard, and
   never invents a stop: it picks between code-built bracket variants.
 - **Its own record.** Every call is stamped `trader: "jev"` and the resolved model version, and is scored in
   its own buckets (`memory.signal_probes(trader="jev")` → `signal_edge_jev`). The LLM's verdicts, gate
-  scoreboard and retention never see Jev's rows. An unproven trader starts at the **explore floor** (trial
-  size) and earns stake by the same stateless t ≥ 1 bar as the LLM's playbooks.
+  scoreboard and retention never see Jev's rows: probes, gate refusals and exit probes are each kept per
+  trader, and each verdict is scored over its own trader's holding-time mix (Jev's closes per playbook, the
+  LLM's holds until Jev has closed that playbook 6 times), so a Jev close never moves an LLM stake. An
+  unproven trader starts at the **explore floor** (trial size) and earns stake by the same stateless t ≥ 1 bar
+  as the LLM's playbooks.
 - **One owner per position lifecycle.** A symbol the LLM holds is not Jev's to trade and vice versa
   (`trader_conflict`, a structural refusal). The LLM's tools refuse to close, cancel, add to or re-bracket a
   Jev position; its prompt state marks those rows `managedBy: "jev"`. A Jev position is managed by Jev (above)

@@ -39,6 +39,7 @@ from .edge import (
   _probe_observations,
   _signed_probe_return,
   exit_discipline_stats,
+  row_owner,
   safe_family_horizon_weights,
   safe_family_horizons,
   signal_edge_stats,
@@ -281,6 +282,19 @@ def _session_label(now: float) -> str:
   session = ("Asia session" if hour < 7 else "Europe session" if hour < 13
              else "US session" if hour < 21 else "late US / quiet hours")
   return f"{session}, {'weekend' if t.tm_wday >= 5 else 'weekday'}"
+
+
+def _direction_word(bias: Any) -> Optional[str]:
+  """A trend label in the bot's own 3-way vocabulary (``analytics`` ``_direction``): the words entry biases are
+  recorded in (``entryContext.regime.intraday_bias_*``), so 'then → now' compares like with like."""
+  b = str(bias or "").strip().lower()
+  if not b:
+    return None
+  if b.startswith("bullish") or b == "neutral-to-bullish":
+    return "bullish"
+  if b.startswith("bearish") or b == "neutral-to-bearish":
+    return "bearish"
+  return "neutral"
 
 
 def _interval_row(snap: Dict[str, Any], oversold: float, overbought: float) -> Dict[str, Any]:
@@ -565,11 +579,18 @@ def position_state(facts: Dict[str, Any], market_state: Dict[str, Any]) -> Dict[
     ratio = held / usual
     vs_usual = ("early in its usual holding time" if ratio < 0.5 else "around its usual holding time"
                 if ratio < 1.5 else "held longer than usual for this playbook")
+  # Entry biases are stored in the bot's 3-way words (and the 1D one AFTER the daily gate's exhausted/weak ->
+  # neutral rule), so the current reading is mapped the same way before comparing: comparing the stored
+  # 'bullish' with the raw 'neutral-to-bullish' reported a change that never happened, and this block is what
+  # the management question tells Jev to judge on (2026-10-01 review).
   since_entry = {}
   for tf in ("15m", "1h", "4h", "1D"):
-    then = (facts.get("entryBias") or {}).get(tf)
-    key = {"15m": "15min", "1h": "1hour", "4h": "4hour", "1D": "1day"}[tf]
-    now_bias = ((market_state.get("timeframes") or {}).get(key) or {}).get("trend")
+    then = _direction_word((facts.get("entryBias") or {}).get(tf))
+    if tf == "1D":
+      now_bias = _direction_word((market_state.get("summary") or {}).get("dailyBias"))
+    else:
+      key = {"15m": "15min", "1h": "1hour", "4h": "4hour"}[tf]
+      now_bias = _direction_word(((market_state.get("timeframes") or {}).get(key) or {}).get("trend"))
     if then or now_bias:
       since_entry[tf] = (f"{then or '?'} → {now_bias or '?'}" + (" (unchanged)" if then == now_bias else " (changed)"))
   funding = None
@@ -723,7 +744,7 @@ def _rotated(prefix: str, instructions: str, criteria: Dict[str, str]) -> Dict[s
 
 
 def jev_questions(state: Dict[str, Any], *, near_r: float, extended_r: float,
-                  cost_pct: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+                  cost_pct: Optional[float] = None, rotate_followups: bool = True) -> Dict[str, Dict[str, Any]]:
   """The System One questions for one coin (raw question dicts — the SDK accepts them as-is).
 
   * ``direction_0..2`` — long / short / stand aside, in three option orders (averaged in code, F2).
@@ -731,6 +752,12 @@ def jev_questions(state: Dict[str, Any], *, near_r: float, extended_r: float,
     the premise stated (F3: questions never see each other's answers, so "which playbook?" asked without the
     side was answered not knowing the side). Code keeps the side the direction picked (speculative fan-out).
   * Every choice has a no-match option (F4): ``stand_aside``, ``none_fits`` (scored as the 'other' family).
+
+  The follow-ups are rotated like the direction (``setup_if_long_0..n`` …) and averaged in ``parse_answers``:
+  the playbook choice decides which gates and hatches apply and which stake bucket is read, and the target
+  choice doubles the TP distance — both money-driving, and asked in one fixed order they leaned on the first
+  option (2026-10-01: continuation 196 / fade 60 / carry 2 / breakout 0 / range_edge 0 / none_fits 0).
+  ``rotate_followups=False`` is the previous wire shape, used only when the service refuses the larger set.
 
   Long and short are described in mirrored words; neither is the default. ``funding_carry`` is offered only when
   the state carries a live carry (its mechanism is otherwise absent and the order path would refuse the label).
@@ -763,30 +790,32 @@ def jev_questions(state: Dict[str, Any], *, near_r: float, extended_r: float,
                                    "(`futures.carryTrade`), whichever way price moves.")
     families[SETUP_NONE] = f"None of these describes a {side} trade here."
     pull = "below" if side == "long" else "above"
-    questions[f"setup_if_{side}"] = {
-      "type": "choice",
-      "instructions": f"Suppose a {word} position is opened on `symbol` now. Which playbook would that trade be?",
-      "criteria": families,
-    }
-    questions[f"entry_if_{side}"] = {
-      "type": "choice",
-      "instructions": f"Suppose a {word} position is opened on `symbol`. How should it enter?",
-      "criteria": {
+    followups = {
+      f"setup_if_{side}": (
+        f"Suppose a {word} position is opened on `symbol` now. Which playbook would that trade be?", families),
+      f"entry_if_{side}": (f"Suppose a {word} position is opened on `symbol`. How should it enter?", {
         "at_market": "Enter now at the live price; it fills immediately at the current level.",
         "pullback": (f"Rest a limit {pull} the price at the nearest 15m value level (VWAP or Bollinger middle; "
                      f"`price.pullbackEntryFor{side.capitalize()}`): a better price, but it may not fill before the "
                      f"order expires if price runs away."),
-      },
-    }
-    questions[f"target_if_{side}"] = {
-      "type": "choice",
-      "instructions": f"Suppose a {word} position is opened on `symbol`. Where should its take-profit sit?",
-      "criteria": {
+      }),
+      f"target_if_{side}": (f"Suppose a {word} position is opened on `symbol`. Where should its take-profit sit?", {
         "near": f"About {near_r:.1f} times the risk after costs: reached more often, smaller win.",
         "extended": f"About {extended_r:.1f} times the risk after costs: a bigger win, reached less often.",
-      },
+      }),
     }
+    for name, (instructions, criteria) in followups.items():
+      if rotate_followups:
+        questions.update(_rotated(name, instructions, criteria))
+      else:
+        questions[name] = {"type": "choice", "instructions": instructions, "criteria": criteria}
   return questions
+
+
+def followup_labels(questions: Dict[str, Dict[str, Any]], name: str) -> List[str]:
+  """The option labels of a follow-up question in either wire shape (rotated ``name_0`` or plain ``name``)."""
+  q = questions.get(f"{name}_0") or questions.get(name) or {}
+  return list((q.get("criteria") or {}).keys())
 
 
 def manage_questions(state: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -882,7 +911,9 @@ def parse_answers(resp: Any, *, families_by_side: Optional[Dict[str, List[str]]]
   """Jev's entry answers as plain data: the order-debiased direction and its probability (the stated confidence),
   and — for the side it picked — playbook, entry style and target."""
   probs, spread = _averaged(resp, "direction", DIRECTIONS)
-  direction = max(probs, key=probs.get) if probs else None
+  # No usable probability at all (labels not recognised, or nothing came back) is no answer — never a
+  # zero-confidence 'long' picked by dict order.
+  direction = max(probs, key=probs.get) if probs and max(probs.values()) > 0 else None
   confidence = probs.get(direction) if direction else None
   out: Dict[str, Any] = {
     "direction": direction,
@@ -893,13 +924,28 @@ def parse_answers(resp: Any, *, families_by_side: Optional[Dict[str, List[str]]]
   }
   if direction in ("long", "short"):
     allowed = list((families_by_side or {}).get(direction) or families or JEV_FAMILIES) + [SETUP_NONE]
-    fam = _pick(_answer(resp, f"setup_if_{direction}") or _answer(resp, "setup_family"), allowed, "continuation")
+    # Rotated follow-ups are averaged over their option orders (the unrotated wire shape still parses), then
+    # the most probable offered label wins. A missing answer is 'none fits' -> 'other', never a silent
+    # 'continuation' (which would also pick that family's gates and stake bucket).
+    fam = _averaged_pick(resp, f"setup_if_{direction}", allowed, SETUP_NONE, legacy="setup_family")
     out["setupFamily"] = "other" if fam == SETUP_NONE else fam
-    out["entryKind"] = _pick(_answer(resp, f"entry_if_{direction}") or _answer(resp, "entry"),
-                             ("at_market", "pullback"), "at_market")
-    out["targetKind"] = _pick(_answer(resp, f"target_if_{direction}") or _answer(resp, "target"),
-                              ("near", "extended"), "near")
+    out["entryKind"] = _averaged_pick(resp, f"entry_if_{direction}", ["at_market", "pullback"], "at_market",
+                                      legacy="entry")
+    out["targetKind"] = _averaged_pick(resp, f"target_if_{direction}", ["near", "extended"], "near",
+                                       legacy="target")
   return out
+
+
+def _averaged_pick(resp: Any, prefix: str, labels: List[str], default: str, *, legacy: Optional[str] = None) -> str:
+  """The most probable label of a (possibly rotated) choice, averaged over its option orders; ``default`` when
+  no usable answer came back. ``legacy`` is an older single-question name still accepted."""
+  probs, _ = _averaged(resp, prefix, tuple(labels))
+  if (not probs or max(probs.values()) <= 0) and legacy:
+    picked = _pick(_answer(resp, legacy), labels, None)
+    return picked or default
+  if not probs or max(probs.values()) <= 0:
+    return default
+  return max(probs, key=probs.get)
 
 
 def parse_manage(resp: Any) -> Dict[str, Any]:
@@ -921,12 +967,18 @@ def parse_manage(resp: Any) -> Dict[str, Any]:
 
 # ── The pass ─────────────────────────────────────────────────────────────────────────────────────────
 def _entries_today(memory: Any, now: float) -> int:
+  """Jev's live entry orders since 00:00 UTC, from the durable trades ledger (``memory.entries_placed_since``).
+
+  It used to count 'placed' rows in ``jev_decisions`` — a 400-row log that spans ~6 h at the real pass rate, so
+  ``JEV_MAX_ENTRIES_PER_DAY`` silently became ~6 per 6 h (2026-10-01 review: the WLD entry had scrolled out by
+  morning). A count that cannot be read returns a huge number: the cap fails CLOSED (shadow only), never open.
+  """
   day_start = int(now // 86400) * 86400
   try:
-    rows = memory.jev_decisions(limit=0)
-  except Exception:
-    return 0
-  return sum(1 for r in rows if r.get("outcome") == "placed" and int(r.get("ts") or 0) >= day_start)
+    return int(memory.entries_placed_since("jev", day_start))
+  except Exception as exc:
+    _warn_once("entries_today", "JEV: today's entry count unavailable (%s) — live entries paused this pass", exc)
+    return 10 ** 6
 
 
 def _outcome(result: Any, dry_run: bool) -> tuple[str, Optional[str]]:
@@ -1139,7 +1191,7 @@ async def _manage_positions(cfg: Any, tools: Any, memory: Any, client: Any, anal
   rows: List[Dict[str, Any]] = []
   floor = float(getattr(cfg.trading, "min_confidence", 0.65) or 0.65)
   try:
-    family_minutes = safe_family_horizons(memory)
+    family_minutes = safe_family_horizons(memory, trader="jev")    # Jev's own holds, the LLM's until it has some
   except Exception:
     family_minutes = {}
   for item in tools.positions_of("jev"):
@@ -1189,7 +1241,18 @@ async def _manage_positions(cfg: Any, tools: Any, memory: Any, client: Any, anal
         ok, detail = _action_ok(await tools.close_futures_position_for(trader, sym, confidence=conf, rationale=why))
         row.update(outcome="closed" if ok else "error", **({"detail": detail} if detail else {}))
       elif action == "protect":
-        new_stop = protect_stop(facts, analysis, noise_mult)
+        # One noise band behind the LIVE mark: the position's mark comes from the snapshot taken when the run
+        # started, minutes before this pass, and a band measured from a stale price can land inside the
+        # noise of the real one (an instant stop-out). No live mark -> hold.
+        live = None
+        try:
+          live = _num(tools.live_mark_for(sym)) if callable(getattr(tools, "live_mark_for", None)) else None
+        except Exception:
+          live = None
+        if not live:
+          row.update(outcome="held", detail="protect: live mark unavailable")
+          continue
+        new_stop = protect_stop({**facts, "mark": live}, analysis, noise_mult)
         if new_stop is None:
           row.update(outcome="held", detail="protect: no tighter stop than the live one")
           continue
@@ -1320,13 +1383,25 @@ async def run_jev_pass(
         return {"kind": "entry", "symbol": sym, "traceKey": key, "outcome": "error", "detail": "analysis unusable"}
       questions = jev_questions(state, near_r=near_r, extended_r=extended_r, cost_pct=cost_pct)
       families_by_side = {
-        side: [f for f in questions[f"setup_if_{side}"]["criteria"] if f != SETUP_NONE] for side in ("long", "short")
+        side: [f for f in followup_labels(questions, f"setup_if_{side}") if f != SETUP_NONE]
+        for side in ("long", "short")
       }
       async with sem:
         t0 = time.monotonic()
         started = time.time()
         try:
-          resp = await client.system_one(state=state, questions=questions)
+          try:
+            resp = await client.system_one(state=state, questions=questions)
+          except Exception as first:
+            # The rotated follow-ups make a larger question set; if the service refuses the request shape
+            # (400 / 413 / 422), ask once more in the previous shape rather than leaving Jev idle.
+            if getattr(first, "status", None) not in (400, 413, 422):
+              raise
+            _warn_once("followups", "JEV: the service refused the rotated question set (%s) — asking the "
+                       "follow-ups unrotated (first-option bias returns)", first)
+            questions = jev_questions(state, near_r=near_r, extended_r=extended_r, cost_pct=cost_pct,
+                                      rotate_followups=False)
+            resp = await client.system_one(state=state, questions=questions)
         except Exception as exc:
           trace_inputs[key] = {"state": state, "questions": questions, "start": started, "end": time.time()}
           return {"kind": "entry", "symbol": sym, "traceKey": key, "outcome": "error",
@@ -1435,8 +1510,12 @@ async def run_jev_pass(
           row["lsRunId"] = rid
     except Exception as exc:
       logger.warning("JEV: LangSmith trace failed (%s)", exc)
-  for row in answers:
-    memory.record_jev_decision(row)
+  # One read-modify-write for the whole pass (was one full-file rewrite per row).
+  if callable(getattr(memory, "record_jev_decisions", None)):
+    memory.record_jev_decisions(answers)
+  else:
+    for row in answers:
+      memory.record_jev_decision(row)
   summary["rows"] = answers
   _save_status(memory, _status(cfg, summary, answers, now))
   return summary
@@ -1697,21 +1776,19 @@ def describe_pass(summary: Dict[str, Any]) -> str:
 
 # ── Report (dashboard dualRun panel + Supervisor) ────────────────────────────────────────────────────
 # Money words whose trailing figure must not leave the box (a refusal reason can quote a notional).
-_MONEY_RE = re.compile(r"(\$|usdt?|notional|equity|balance|margin|risk)(\W{0,3})[-+]?\d[\d.,]*", re.I)
+_MONEY_RE = re.compile(
+  r"(\$|usdt?|usd|notional|equity|balance|margin|risk|cost|fee|fees|pnl|profit|loss|amount|value|available|required)"
+  r"(\W{0,3})[-+]?\d[\d.,]*", re.I)
+# The same figure written BEFORE its unit ("2.5 USDT", "12.34 more USDT") — exchange error text puts it there.
+_MONEY_AFTER_RE = re.compile(r"[-+]?\d[\d.,]*((?:\s+[a-z]+){0,2}\s*)(usdt?|usd|\$)(?![a-z])", re.I)
 # An LLM call on the same symbol within this window counts as "the same moment" for the agreement tally.
 AGREEMENT_WINDOW_SEC = 1800
 
 
 def row_trader(d: Any) -> Optional[str]:
   """'jev' when a decision / close / probe row came from the dual run's second trader, else None."""
-  if not isinstance(d, dict):
-    return None
-  ctx = d.get("entryContext") if isinstance(d.get("entryContext"), dict) else {}
-  for value in (d.get("trader"), ctx.get("trader")):
-    t = str(value or "").strip().lower()
-    if t and t != DEFAULT_TRADER and t in KNOWN_TRADERS:
-      return t
-  return None
+  owner = row_owner(d)        # the ONE ownership rule (edge.row_owner), also behind each trader's holding mix
+  return None if owner == DEFAULT_TRADER else owner
 
 
 def scrub_detail(text: Any) -> Optional[str]:
@@ -1721,7 +1798,8 @@ def scrub_detail(text: Any) -> Optional[str]:
     return None
   if t in SCORED_GATES or t in STRUCTURAL_REFUSALS:
     return t
-  return _MONEY_RE.sub(lambda m: m.group(1) + m.group(2) + "…", t)[:100]
+  t = _MONEY_RE.sub(lambda m: m.group(1) + m.group(2) + "…", t)
+  return _MONEY_AFTER_RE.sub(lambda m: "…" + m.group(1) + m.group(2), t)[:100]
 
 
 def _f(value: Any) -> Optional[float]:
@@ -1882,14 +1960,15 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
     out["status"] = public_status(memory.jev_status() if callable(getattr(memory, "jev_status", None)) else {})
     since = min((int(r.get("ts") or 0) for r in recent if r.get("ts")), default=None)
     out["since"] = since
-    horizons = safe_family_horizons(memory)
-    weights = safe_family_horizon_weights(memory)
     closes = memory.realized_closes(limit=400)
     traders: Dict[str, Any] = {}
     probes_by_trader = {name: memory.signal_probes(limit=0, trader=name) for name in KNOWN_TRADERS}
     for name in KNOWN_TRADERS:
       probes = [p for p in probes_by_trader[name] if since is None or int(p.get("ts") or 0) >= since]
-      stats = signal_edge_stats(probes, cost_pct=cost_pct, family_horizons=horizons, family_horizon_weights=weights)
+      # Each trader at its OWN holding mix — the one its order path is staked on (agent's signal_edge_{name}).
+      stats = signal_edge_stats(probes, cost_pct=cost_pct,
+                                family_horizons=safe_family_horizons(memory, trader=name),
+                                family_horizon_weights=safe_family_horizon_weights(memory, trader=name))
       best = stats.get("best_horizon")
       row = (stats.get("by_horizon") or {}).get(best or "", {}) if best else {}
       mine = [c for c in closes if (row_trader(c) or DEFAULT_TRADER) == name

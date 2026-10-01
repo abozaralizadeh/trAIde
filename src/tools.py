@@ -1205,6 +1205,11 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     name = str((trader or {}).get("name") or "llm").strip().lower()
     return name if name in ("llm", "jev") else "llm"
 
+  def _edge_key(base: str, trader: Dict[str, Any] | None) -> str:
+    """The edge-state key a trader is judged on: ``base`` for the LLM, ``base_<name>`` for another trader."""
+    name = _trader_name(trader)
+    return base if name == "llm" else f"{base}_{name}"
+
   def _trader_model(trader: Dict[str, Any] | None) -> str:
     if _trader_name(trader) == "llm":
       return cfg.azure.deployment
@@ -4228,6 +4233,12 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     if side_lower is None:
       return {"error": "Invalid futures side", "allowed": ["buy", "sell", "long", "short"]}
     _pre_futures_symbol_fl = _to_futures_symbol(spot_symbol)
+    # Ownership FIRST: when the other dual-run trader holds this coin's resting entry, the caller gets the
+    # trader_conflict refusal — which the LLM tool turns into a recorded (shadow) call, exactly as Jev's calls
+    # on an LLM coin are — instead of a structural 'pending_entry' that recorded nothing (2026-10-01 review).
+    _conflict_fl = None if dry_run else _not_yours(spot_symbol, trader)
+    if _conflict_fl:
+      return _conflict_fl
     if _pre_futures_symbol_fl and not dry_run:
       existing_pending = _pending_entry_for(_pre_futures_symbol_fl)
       if existing_pending:
@@ -4238,9 +4249,6 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
           "existingOrderId": existing_pending.get("id") or existing_pending.get("orderId"),
           "hint": "Only one resting entry per symbol is allowed; stacking GTC orders can multiply exposure when they fill together.",
         }
-    _conflict_fl = None if dry_run else _not_yours(spot_symbol, trader)
-    if _conflict_fl:
-      return _conflict_fl
     if take_profit_price is None or stop_loss_price is None:
       return {
         "rejected": True,
@@ -4555,9 +4563,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     _side_fl = "long" if side_lower == "buy" else "short"
     # Each dual-run trader is judged on ITS OWN record: the LLM on signal_edge, Jev on signal_edge_jev
     # (empty at first -> 'insufficient data' -> the explore floor, the trial size an unproven caller gets).
-    _signal_edge_fl = _edge_state().get(
-      "signal_edge" if _trader_name(trader) == "llm" else f"signal_edge_{_trader_name(trader)}"
-    ) or {}
+    _signal_edge_fl = _edge_state().get(_edge_key("signal_edge", trader)) or {}
     _family_measured_fl = family_size_factor(_signal_edge_fl, _family_fl or "other", side=_side_fl)
     _family_explore_fl = family_explore_factor(
       _signal_edge_fl, _family_fl or "other",
@@ -4637,8 +4643,13 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     # verdicts can later be split by market state; nothing on this path reads it back.
     _market_state_fl = _market_state_now()
     # A repeat of the same call (symbol, side, family) inside the family's shortest scored horizon adds
-    # no observation but costs a retention slot (memory.record_signal_probe, 2026-09-26).
-    _repeat_gap_fl = repeat_gap_seconds(_edge_state().get("family_horizon_weights"), _family_fl)
+    # no observation but costs a retention slot (memory.record_signal_probe, 2026-09-26). Measured on the
+    # caller's own holding mix — the one its verdict is scored over (agent: family_horizon_weights_{name}).
+    _repeat_gap_fl = repeat_gap_seconds(
+      _edge_state().get(_edge_key("family_horizon_weights", trader))
+      or _edge_state().get("family_horizon_weights"),
+      _family_fl,
+    )
     _probe_repeat_fl = False
     _probe_stored_fl: Any = False
     try:
@@ -6775,6 +6786,20 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
       out.append({"position": copy.deepcopy(p), "stops": copy.deepcopy(stops)})
     return out
 
+  def live_mark_for(symbol: Any) -> float | None:
+    """The contract's LIVE mark price (one public read), or None. For a dual-run trader's protect step: the
+    position's own ``markPrice`` comes from the snapshot taken when the run started, minutes earlier, and a
+    stop placed one noise band from a stale price can sit inside the noise of the real one. Never raises."""
+    try:
+      fsym = _to_futures_symbol(_normalize_symbol(str(symbol or ""))) if kucoin_futures else None
+      if not fsym:
+        return None
+      mark = _to_float((kucoin_futures.get_mark_price(fsym) or {}).get("value"))
+      return mark if mark and mark > 0 else None
+    except Exception as exc:
+      logger.debug("live mark unavailable for %s: %s", symbol, exc)
+      return None
+
   def market_state_now() -> Dict[str, Any] | None:
     """The poll loop's cached market state (cache read only — never a fetch)."""
     return _market_state_now()
@@ -6796,6 +6821,7 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     close_futures_position_for=close_futures_position_for,
     protect_position_for=protect_position_for,
     positions_of=positions_of,
+    live_mark_for=live_mark_for,
     market_state_now=market_state_now,
     analyze_for=analyze_for,
     latest_analyses=latest_analyses,

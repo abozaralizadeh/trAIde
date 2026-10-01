@@ -27,6 +27,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from .config import EdgeConfig
+from .memory import DEFAULT_TRADER, KNOWN_TRADERS
 
 
 def _f(value: Any) -> float | None:
@@ -970,24 +971,60 @@ def family_horizon_weights(
   return out
 
 
-def safe_family_horizons(memory: Any, **kwargs: Any) -> Dict[str, int]:
-  """`family_scoring_horizons` over a store's realized closes, or {} if they cannot be read.
+def row_owner(row: Any) -> str:
+  """The dual-run trader a close / decision row belongs to: its own stamp, else its entry's, else the LLM.
+
+  Unstamped rows are the LLM's — every row from before the dual run, and every LLM row after it — and an
+  unknown name counts as the LLM's, the store's own rule (`memory._normalize_trader`).
+  """
+  if not isinstance(row, dict):
+    return DEFAULT_TRADER
+  ctx = row.get("entryContext") if isinstance(row.get("entryContext"), dict) else {}
+  for value in (row.get("trader"), ctx.get("trader")):
+    t = str(value or "").strip().lower()
+    if t != DEFAULT_TRADER and t in KNOWN_TRADERS:
+      return t
+  return DEFAULT_TRADER
+
+
+def _owned_hold_mix(memory: Any, trader: str, derive: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+  """``derive`` over ``trader``'s OWN realized closes; another trader falls back to the LLM's per family.
+
+  How long a playbook is held is part of a trader's record, and each dual-run trader is judged on its own
+  record. Pooled, every Jev close moved the LLM's holding mix — the knife-edge that benched continuation
+  on Sep 25 — so the LLM's mix comes from the LLM's closes alone. A family another trader has closed
+  fewer than ``min_trades`` times reads the LLM's holds (same exit stack, the best prior it has) until its
+  own sample takes over.
+  """
+  name = str(trader or DEFAULT_TRADER).strip().lower()
+  closes = [c for c in (memory.realized_closes(limit=1000) or []) if isinstance(c, dict)]
+  out = dict(derive([c for c in closes if row_owner(c) == DEFAULT_TRADER], **kwargs))
+  if name != DEFAULT_TRADER:
+    out.update(derive([c for c in closes if row_owner(c) == name], **kwargs))
+  return out
+
+
+def safe_family_horizons(memory: Any, *, trader: str = DEFAULT_TRADER, **kwargs: Any) -> Dict[str, int]:
+  """`family_scoring_horizons` over ``trader``'s realized closes (`_owned_hold_mix`), or {} if they
+  cannot be read.
 
   Hold-time derivation is a refinement of the verdict, not a precondition for having one: if it
   fails, every family falls back to the default horizon rather than the whole edge report going blank
   (which silently disables the stand-aside and every family size factor with it).
   """
   try:
-    return family_scoring_horizons(memory.realized_closes(limit=1000), **kwargs)
+    return _owned_hold_mix(memory, trader, family_scoring_horizons, kwargs)
   except Exception:
     return {}
 
 
-def safe_family_horizon_weights(memory: Any, **kwargs: Any) -> Dict[str, Dict[int, float]]:
-  """`family_horizon_weights` over a store's realized closes, or {} if they cannot be read (the
-  verdict then falls back to the snapped horizon, never to a blank report)."""
+def safe_family_horizon_weights(
+  memory: Any, *, trader: str = DEFAULT_TRADER, **kwargs: Any,
+) -> Dict[str, Dict[int, float]]:
+  """`family_horizon_weights` over ``trader``'s realized closes (`_owned_hold_mix`), or {} if they
+  cannot be read (the verdict then falls back to the snapped horizon, never to a blank report)."""
   try:
-    return family_horizon_weights(memory.realized_closes(limit=1000), **kwargs)
+    return _owned_hold_mix(memory, trader, family_horizon_weights, kwargs)
   except Exception:
     return {}
 

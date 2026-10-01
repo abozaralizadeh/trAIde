@@ -14,8 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 from src import jev
-from src.memory import MemoryStore
+from src.memory import LIMIT_ENTRY_CLIENT_OID_PREFIX, MemoryStore
 from src.regime import net_reward_risk_ratio
+from src.utils import normalize_symbol
 import tests.test_tools as tests_test_tools
 from tests.test_tools import _invoke_tool, _limit_entry_tools, _place
 
@@ -56,6 +57,14 @@ def _cfg(mode="shadow", **jev_over):
     trading=SimpleNamespace(min_futures_rr=1.5, max_entry_leverage=3.0, estimated_slippage_pct=0.001, stop_atr_floor_mult=2.5,
                             slippage_autotune_min_samples=8),
   )
+
+
+def _jev_entry_order(memory, symbol, *, side="buy", trader="jev", n=[0]):
+  """A durable live entry ORDER row (tagged clientOid, trader stamped) — what every live entry writes."""
+  n[0] += 1
+  memory.record_trade(symbol, side, 20.0, paper=False, price=100.0, size=1, venue="futures", filled=False,
+                      track_position=False, client_oid=f"{LIMIT_ENTRY_CLIENT_OID_PREFIX}t{n[0]}",
+                      entry_context={"trader": trader, "positionSide": "long" if side == "buy" else "short"})
 
 
 def _choice(label, probs):
@@ -106,10 +115,21 @@ class _Client:
 
 
 class _Tools:
-  def __init__(self, analyses, *, owners=None, held=(), results=None, positions=None, market=None):
+  def __init__(self, analyses, *, owners=None, held=(), results=None, positions=None, market=None,
+               live_marks=None):
     self.analyses, self.owners, self.held = analyses, owners or {}, list(held)
     self.results, self.orders, self.analyzed = results or {}, [], []
     self.positions, self.market, self.closes, self.protects = list(positions or []), market, [], []
+    self.live_marks = live_marks
+
+  def live_mark_for(self, symbol):
+    if self.live_marks is not None:
+      return self.live_marks.get(symbol)
+    for item in self.positions:
+      pos = item.get("position") or {}
+      if normalize_symbol(str(pos.get("symbol") or "")) == symbol:
+        return float(pos.get("markPrice") or 0) or None
+    return None
 
   def latest_analyses(self, max_age_sec=600.0):
     return dict(self.analyses)
@@ -303,11 +323,26 @@ class TestState:
 
   def test_follow_ups_state_their_premise_per_side(self):
     q = jev.jev_questions(jev.jev_state("S", _analysis()), near_r=1.65, extended_r=3.3, cost_pct=0.32)
-    assert {"direction_0", "direction_1", "direction_2", "setup_if_long", "setup_if_short", "entry_if_long",
-            "entry_if_short", "target_if_long", "target_if_short"} <= set(q)
-    assert "LONG" in q["setup_if_long"]["instructions"] and "SHORT" in q["setup_if_short"]["instructions"]
-    assert jev.SETUP_NONE in q["setup_if_long"]["criteria"]                  # a no-match option (F4)
+    assert {"direction_0", "direction_1", "direction_2", "setup_if_long_0", "setup_if_short_0", "entry_if_long_0",
+            "entry_if_short_1", "target_if_long_1", "target_if_short_0"} <= set(q)
+    assert "LONG" in q["setup_if_long_0"]["instructions"] and "SHORT" in q["setup_if_short_0"]["instructions"]
+    assert jev.SETUP_NONE in jev.followup_labels(q, "setup_if_long")          # a no-match option (F4)
     assert "about 0.32% round-trip" in q["direction_0"]["instructions"]      # the measured cost, not "0.15%"
+
+  def test_every_follow_up_option_is_listed_first_exactly_once(self):
+    """2026-10-01: the follow-ups were asked in one fixed order and leaned on the first option (continuation 196
+    / breakout 0 / range_edge 0). Like the direction, each is now asked once per cyclic option order."""
+    q = jev.jev_questions(jev.jev_state("S", _analysis()), near_r=1.65, extended_r=3.3)
+    for name in ("setup_if_long", "setup_if_short", "entry_if_long", "target_if_short"):
+      labels = jev.followup_labels(q, name)
+      firsts = [list(q[f"{name}_{i}"]["criteria"])[0] for i in range(len(labels))]
+      assert sorted(firsts) == sorted(labels), name
+      assert f"{name}" not in q                                              # no unrotated copy as well
+
+  def test_the_old_wire_shape_is_still_available_for_the_fallback(self):
+    q = jev.jev_questions(jev.jev_state("S", _analysis()), near_r=1.65, extended_r=3.3, rotate_followups=False)
+    assert {"setup_if_long", "entry_if_short", "target_if_long"} <= set(q) and "setup_if_long_0" not in q
+    assert jev.followup_labels(q, "setup_if_long")[-1] == jev.SETUP_NONE
 
   def test_each_direction_option_is_listed_first_exactly_once(self):
     q = jev.jev_questions(jev.jev_state("S", _analysis()), near_r=1.65, extended_r=3.3)
@@ -317,11 +352,12 @@ class TestState:
 
   def test_funding_carry_is_offered_only_to_the_paid_side(self):
     plain = jev.jev_questions(jev.jev_state("S", _analysis()), near_r=1.65, extended_r=3.3)
-    assert "funding_carry" not in plain["setup_if_long"]["criteria"]
+    assert "funding_carry" not in jev.followup_labels(plain, "setup_if_long")
     carry = jev.jev_state("S", _analysis(funding_setup={"side": "sell", "reason": "funding +0.2%"}))
     assert carry["futures"]["carryTrade"] == "available: a short is paid to hold"
     q = jev.jev_questions(carry, near_r=1.65, extended_r=3.3)
-    assert "funding_carry" in q["setup_if_short"]["criteria"] and "funding_carry" not in q["setup_if_long"]["criteria"]
+    assert "funding_carry" in jev.followup_labels(q, "setup_if_short")
+    assert "funding_carry" not in jev.followup_labels(q, "setup_if_long")
 
   def test_long_and_short_are_worded_as_mirrors(self):
     q = jev.jev_questions(jev.jev_state("S", _analysis()), near_r=1.65, extended_r=3.3)
@@ -338,7 +374,8 @@ class TestState:
       return text
 
     for kind in ("setup", "entry", "target"):
-      assert mirror(json.dumps(q[f"{kind}_if_long"])) == json.dumps(q[f"{kind}_if_short"]), kind
+      for i in range(len(jev.followup_labels(q, f"{kind}_if_long"))):
+        assert mirror(json.dumps(q[f"{kind}_if_long_{i}"])) == json.dumps(q[f"{kind}_if_short_{i}"]), (kind, i)
 
 
 class TestBracket:
@@ -393,11 +430,15 @@ class TestWireFormat:
         if name.startswith("direction"):
           base = {"long": 0.15, "short": 0.6, "stand_aside": 0.25}
           probs = {k: base[k] + (0.15 if k == labels[0] else -0.075) for k in labels}
-        elif name == "setup_if_short":
-          probs = {k: (0.6 if k == "fade_extreme" else 0.4 / (len(labels) - 1)) for k in labels}
-        elif name == "entry_if_short":
+        elif name.startswith("setup_if_short"):
+          # a true 0.3 fade_extreme plus a 0.3 bonus on whichever playbook is listed FIRST: unrotated, the
+          # first-listed one would win; averaged over every order the true favourite does
+          n = len(labels)
+          base = {k: (0.3 if k == "fade_extreme" else 0.7 / (n - 1)) for k in labels}
+          probs = {k: base[k] + (0.3 if k == labels[0] else -0.3 / (n - 1)) for k in labels}
+        elif name.startswith("entry_if_short"):
           probs = {"at_market": 0.4, "pullback": 0.6}
-        elif name == "target_if_short":
+        elif name.startswith("target_if_short"):
           probs = {"near": 0.45, "extended": 0.55}
         else:
           probs = {k: 1.0 / len(labels) for k in labels}
@@ -419,7 +460,8 @@ class TestWireFormat:
     assert seen["auth"] == "Bearer test-key"
     assert seen["body"]["model"] == "jev-latest" and seen["body"]["state"]["symbol"] == "SOL-USDT"
     assert all(seen["body"]["questions"][f"direction_{i}"]["type"] == "choice" for i in range(3))
-    fams = {side: [f for f in questions[f"setup_if_{side}"]["criteria"] if f != jev.SETUP_NONE] for side in ("long", "short")}
+    fams = {side: [f for f in jev.followup_labels(questions, f"setup_if_{side}") if f != jev.SETUP_NONE]
+            for side in ("long", "short")}
     parsed = jev.parse_answers(resp, families_by_side=fams)
     # the order bonus lands on a different option in each rotation, so the average is the true distribution
     assert parsed["direction"] == "short" and parsed["confidence"] == pytest.approx(0.6)
@@ -510,7 +552,7 @@ class TestPass:
   def test_caps_already_used_turn_live_into_shadow(self, tmp_path):
     now = 1_790_000_000.0
     m = MemoryStore(str(tmp_path / "m.json"))
-    m.record_jev_decision({"symbol": "X-USDT", "outcome": "placed", "ts": int(now) - 60})
+    _jev_entry_order(m, "X-USDT")
     tools = _Tools({})
     _run(_cfg("live", max_entries_per_day=1), tools, m, _Client({"SOL-USDT": ("long", 0.9)}), now=now)
     assert [o["dry_run"] for o in tools.orders] == [True]
@@ -1099,3 +1141,243 @@ class TestRevisionReportAndWire:
   def test_jev_calls_carry_a_build_stamp_of_what_it_was_shown(self):
     b = jev.jev_build()
     assert set(b) <= {"code", "prompt"} and len(b.get("prompt", "")) == 12
+
+
+# ── 2026-10-01 review fixes ──────────────────────────────────────────────────────────────────────────
+class TestReviewFixes:
+  """Each test fails on the code as reviewed on 2026-10-01 and passes on the fix."""
+
+  def test_the_daily_cap_counts_orders_not_the_rolling_decision_log(self, tmp_path):
+    """The 400-row decision log spans ~6 h live, so 'placed' rows scrolled out and the 6/day cap reset by
+    mid-day. The cap now counts the durable entry orders of the UTC day."""
+    now = time.time()
+    m = MemoryStore(str(tmp_path / "m.json"))
+    _jev_entry_order(m, "WLD-USDT")
+    m.record_jev_decisions([{"symbol": f"S{i}-USDT", "outcome": "shadow", "ts": int(now)} for i in range(450)])
+    assert not any(r.get("outcome") == "placed" for r in m.jev_decisions(limit=0))   # the old count read 0
+    assert jev._entries_today(m, now) == 1
+    _jev_entry_order(m, "SOL-USDT", trader="llm")                                     # the LLM's are not Jev's
+    assert jev._entries_today(m, now) == 1
+
+  def test_an_unreadable_count_fails_closed(self):
+    class _Broken:
+      def entries_placed_since(self, trader, since):
+        raise OSError("disk")
+    assert jev._entries_today(_Broken(), time.time()) >= 10 ** 6
+
+  def test_protect_anchors_to_the_live_mark_not_the_snapshot(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    pos, stops = _jev_long(m)                                     # snapshot mark 102, stop 98
+    tools = _Tools({}, positions=[{"position": pos, "stops": stops}], held=["SOL-USDT"],
+                   live_marks={"SOL-USDT": 103.0})
+    _run(_manage_cfg(), tools, m, _Client({}, manage={"SOL-USDT": ("protect", 0.8)}), universe=[])
+    assert tools.protects[0]["stop"] == pytest.approx(103.0 - 2.5 * 0.5)   # one band behind the LIVE price
+
+  def test_no_live_mark_means_hold_not_a_guessed_stop(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    pos, stops = _jev_long(m)
+    tools = _Tools({}, positions=[{"position": pos, "stops": stops}], held=["SOL-USDT"], live_marks={})
+    _run(_manage_cfg(), tools, m, _Client({}, manage={"SOL-USDT": ("protect", 0.8)}), universe=[])
+    row = [r for r in m.jev_decisions(limit=0) if r.get("kind") == "manage"][0]
+    assert row["outcome"] == "held" and "live mark unavailable" in row["detail"] and tools.protects == []
+
+  def test_since_entry_compares_like_with_like(self):
+    """Entry biases are stored in the bot's 3-way words and the 1D after the gate's neutral rule; comparing them
+    with the raw labels reported changes that never happened."""
+    facts = {"side": "long", "family": "continuation", "currentR": 0.2,
+             "entryBias": {"15m": "bullish", "1h": "bearish", "4h": "bullish", "1D": "neutral"}}
+    market = {"timeframes": {"15min": {"trend": "neutral-to-bullish"}, "1hour": {"trend": "bearish"},
+                             "4hour": {"trend": "bullish (strong)"}, "1day": {"trend": "bullish"}},
+              "summary": {"dailyBias": "neutral"}}
+    since = jev.position_state(facts, market)["sinceEntry"]
+    assert all(v.endswith("(unchanged)") for v in since.values()), since
+    market["timeframes"]["1hour"]["trend"] = "neutral-to-bullish"
+    assert jev.position_state(facts, market)["sinceEntry"]["1h"] == "bearish → bullish (changed)"
+
+  def test_a_refused_rotated_set_falls_back_to_the_old_shape(self, tmp_path, caplog):
+    class _Picky(_Client):
+      async def system_one(self, state, questions):
+        if any(name.endswith("_0") and name.startswith("setup_if_") for name in questions):
+          err = RuntimeError("unprocessable: too many questions")
+          err.status = 422
+          raise err
+        return await super().system_one(state, questions)
+    m = MemoryStore(str(tmp_path / "m.json"))
+    tools = _Tools({"SOL-USDT": _analysis()})
+    jev._warned.discard("followups")
+    with caplog.at_level("WARNING"):
+      out = _run(_cfg("shadow"), tools, m, _Picky({"SOL-USDT": ("long", 0.9)}), universe=["SOL-USDT"])
+    row = [r for r in out["rows"] if r["symbol"] == "SOL-USDT"][0]
+    assert row["direction"] == "long" and row["setupFamily"] == "continuation" and row["outcome"] == "shadow"
+    assert "asking the follow-ups unrotated" in caplog.text
+
+  def test_a_server_error_does_not_trigger_the_fallback(self, tmp_path):
+    class _Down(_Client):
+      async def system_one(self, state, questions):
+        self.calls.append(1)
+        err = RuntimeError("upstream 500")
+        err.status = 500
+        raise err
+    m = MemoryStore(str(tmp_path / "m.json"))
+    client = _Down({})
+    out = _run(_cfg("shadow"), _Tools({"SOL-USDT": _analysis()}), m, client, universe=["SOL-USDT"])
+    assert [r["outcome"] for r in out["rows"]] == ["error"] and len(client.calls) == 1
+
+  def test_an_unusable_answer_is_no_direction_and_a_missing_playbook_is_other(self):
+    zero = SimpleNamespace(choices={f"direction_{i}": _choice("x", {"x": 0.9}) for i in range(3)}, nouls={})
+    assert jev.parse_answers(zero)["direction"] is None                   # was a 0.0-confidence 'long'
+    only_dir = SimpleNamespace(choices={f"direction_{i}": _choice("short", {"long": 0.1, "short": 0.8,
+                                                                           "stand_aside": 0.1}) for i in range(3)},
+                               nouls={})
+    parsed = jev.parse_answers(only_dir)
+    assert parsed["direction"] == "short" and parsed["setupFamily"] == "other"   # was a silent 'continuation'
+
+  def test_a_pass_writes_its_decisions_once(self, tmp_path, monkeypatch):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    writes = []
+    real = m._write
+    monkeypatch.setattr(m, "_write", lambda data: (writes.append(1), real(data))[1])
+    monkeypatch.setattr(m, "record_jev_decision", lambda row: (_ for _ in ()).throw(AssertionError("per-row write")))
+    _run(_cfg("shadow"), _Tools({s: _analysis() for s in ("BTC-USDT", "ETH-USDT", "SOL-USDT")}), m,
+         _Client({"SOL-USDT": ("stand_aside", 0.8)}))
+    assert len(m.jev_decisions(limit=0)) == 3
+
+  @pytest.mark.parametrize("text", ["deposit at least 2.5 USDT", "Need 12.34 more USDT", "cost 37.21",
+                                    "margin, required 23.10 USDT", "Insufficient balance: 5.03 USDT"])
+  def test_no_money_figure_survives_the_scrubber(self, text):
+    out = jev.scrub_detail(text)
+    assert not any(ch.isdigit() for ch in out), out
+
+
+class TestOwnershipAndRetention:
+  def test_a_fill_the_loop_has_not_marked_yet_still_belongs_to_its_trader(self, tmp_path):
+    """The live limit path records filled=False until the next poll; in that gap a fresh Jev position read as
+    the LLM's default (and Jev's 1-open cap could be exceeded)."""
+    m = MemoryStore(str(tmp_path / "m.json"))
+    _jev_entry_order(m, "SOL-USDT", side="sell")
+    open_ms = int(time.time() * 1000) + 30_000
+    assert m.trader_for_position("SOL-USDT", open_ms, "short") == "jev"
+
+  def test_a_fresh_llm_fill_is_not_taken_for_an_older_jev_lifecycle(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_trade("SOL-USDT", "buy", 20.0, paper=False, price=100.0, size=1, venue="futures", filled=True,
+                   track_position=False, client_oid=f"{LIMIT_ENTRY_CLIENT_OID_PREFIX}old",
+                   entry_context={"trader": "jev", "positionSide": "long"})
+    data = m._read()
+    data["trades"][-1]["fillTs"] = time.time() - 3600                      # Jev's long, an hour ago
+    m._write(data)
+    _jev_entry_order(m, "SOL-USDT", trader="llm")                          # the LLM's, not marked filled yet
+    assert m.trader_for_position("SOL-USDT", int(time.time() * 1000), "long") == "llm"
+
+  def test_gate_refusals_are_kept_per_trader(self, tmp_path):
+    from src.memory import MAX_GATE_PROBES_PER_GATE
+    m = MemoryStore(str(tmp_path / "m.json"))
+    for i in range(3):
+      m.record_gate_probe(f"L{i}-USDT", "sell", 1.0, "daily_opposing")
+    for i in range(MAX_GATE_PROBES_PER_GATE + 20):
+      m.record_gate_probe(f"J{i}-USDT", "sell", 1.0, "daily_opposing", trader="jev")
+    llm = m.gate_probes()
+    assert len([r for r in llm if r["symbol"].startswith("L")]) == 3      # the LLM's three survive Jev's flood
+
+  def test_exit_probes_are_kept_per_trader(self, tmp_path):
+    from src.memory import MAX_EXIT_PROBES
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_exit_probe("LLM-USDT", "long", 100, 98, 104, 101, closed_by="agent")
+    for i in range(MAX_EXIT_PROBES + 5):
+      m.record_exit_probe(f"J{i}-USDT", "long", 100, 98, 104, 101, closed_by="agent", trader="jev")
+    assert [r["symbol"] for r in m.exit_probes(limit=500)] == ["LLM-USDT"]
+
+  def test_ownership_is_checked_before_the_pending_entry_refusal(self):
+    """The LLM's call on a coin holding Jev's resting entry must get trader_conflict (recorded as a shadow call),
+    not a structural 'pending_entry' that recorded nothing."""
+    import inspect
+    from src import tools as tools_mod
+    src = inspect.getsource(tools_mod.build_tools)
+    body = src[src.index("async def _place_futures_limit_order_impl"):]
+    assert body.index("_not_yours(spot_symbol, trader)") < body.index("_pending_entry_for(_pre_futures_symbol_fl)")
+
+
+# ── each trader at its OWN holding mix ───────────────────────────────────────────────────────────────
+class _ClosesOnly:
+  def __init__(self, rows):
+    self.rows = rows
+
+  def realized_closes(self, limit=100, symbol=None):
+    return list(self.rows)[-max(1, int(limit)):]
+
+
+def _hold_close(family, minutes, ts, trader=None, stamp="entry"):
+  """A realized close held ``minutes``; ``stamp`` says where its owner is written (entry context or row)."""
+  ctx = {"setupFamily": family, "fillTs": ts - minutes * 60}
+  row = {"symbol": "SOL-USDT", "action": "futures_sell_triggered", "pnl": 0.1, "ts": ts, "entryContext": ctx}
+  if trader:
+    (ctx if stamp == "entry" else row)["trader"] = trader
+  return row
+
+
+class TestPerTraderHoldingMix:
+  """A verdict is scored over the holding mix of the trader it judges. Pooled, every Jev close moved the
+  LLM's mix — the knife-edge that benched continuation mid-rally on Sep 25 (edge._owned_hold_mix)."""
+
+  def test_jev_closes_never_move_the_llms_mix(self):
+    from src.edge import family_horizon_weights, safe_family_horizon_weights, safe_family_horizons
+    llm = [_hold_close("continuation", 240, 1_000_000 + i * 600) for i in range(8)]
+    mine = [_hold_close("continuation", 15, 2_000_000 + i * 600, trader="jev", stamp=("entry", "row")[i % 2])
+            for i in range(8)]
+    assert family_horizon_weights(llm + mine)["continuation"] == {15: 0.5, 240: 0.5}   # what pooling did
+    store = _ClosesOnly(llm + mine)
+    assert safe_family_horizon_weights(store) == {"continuation": {240: 1.0}}
+    assert safe_family_horizons(store) == {"continuation": 240}
+    assert safe_family_horizon_weights(store, trader="jev") == {"continuation": {15: 1.0}}
+
+  def test_jev_reads_the_llms_holds_until_it_has_closed_a_family_often_enough(self):
+    from src.edge import safe_family_horizon_weights, safe_family_horizons
+    llm = ([_hold_close("continuation", 240, 1_000_000 + i * 600) for i in range(8)]
+           + [_hold_close("fade_extreme", 15, 1_100_000 + i * 600) for i in range(8)])
+    mine = ([_hold_close("continuation", 60, 2_000_000 + i * 600, trader="jev") for i in range(6)]   # min_trades
+            + [_hold_close("fade_extreme", 240, 2_100_000 + i * 600, trader="jev") for i in range(5)]  # one short
+            + [_hold_close("breakout", 60, 2_200_000 + i * 600, trader="jev") for i in range(6)])     # Jev's alone
+    store = _ClosesOnly(llm + mine)
+    assert safe_family_horizon_weights(store, trader="jev") == {
+      "continuation": {60: 1.0}, "fade_extreme": {15: 1.0}, "breakout": {60: 1.0}}
+    assert safe_family_horizons(store, trader="jev") == {
+      "continuation": 60, "fade_extreme": 15, "breakout": 60}
+    assert safe_family_horizon_weights(store) == {"continuation": {240: 1.0}, "fade_extreme": {15: 1.0}}
+
+  def test_one_ownership_rule(self):
+    from src.edge import row_owner
+    cases = [
+      (None, "llm"), ("row", "llm"), ({}, "llm"), ({"trader": "jev"}, "jev"),
+      ({"entryContext": {"trader": "jev"}}, "jev"), ({"trader": "someone"}, "llm"),
+      ({"trader": "llm", "entryContext": {"trader": "jev"}}, "jev"), ({"trader": " JEV "}, "jev"),
+    ]
+    for row, want in cases:
+      assert row_owner(row) == want, row
+      assert (jev.row_trader(row) or "llm") == want, row
+
+  def test_jevs_repeat_guard_runs_on_jevs_own_mix(self, tmp_path):
+    """Order path, not the pure function: held 15m by Jev, a call 30 min after the same call is a new
+    observation for Jev — the LLM's 240m gap would have dropped it as a repeat."""
+    tools, memory = _limit_entry_tools(tmp_path, edge_extra={
+      "family_horizon_weights": {"continuation": {240: 1.0}},
+      "family_horizon_weights_jev": {"continuation": {15: 1.0}},
+    })
+    assert _jev_place(tools, dry_run=True).get("probeRecorded") is True
+    data = memory._read()
+    data["signal_probes"][-1]["ts"] -= 1800
+    memory._write(data)
+    assert _jev_place(tools, dry_run=True).get("probeRecorded") is True
+    assert len(memory.signal_probes(limit=0, trader="jev")) == 2
+
+  def test_every_jev_verdict_path_uses_jevs_mix_and_the_llms_stays_its_own(self):
+    import inspect
+    from src import agent as agent_mod
+    agent_src = inspect.getsource(agent_mod.run_trading_agent)
+    assert "_fam_weights = safe_family_horizon_weights(memory)\n" in agent_src            # the LLM: its own closes
+    assert '_jev_weights = safe_family_horizon_weights(memory, trader="jev")' in agent_src
+    assert 'state["family_horizon_weights_jev"] = _jev_weights' in agent_src
+    assert 'family_horizons=safe_family_horizons(memory, trader="jev"), family_horizon_weights=_jev_weights' in agent_src
+    assert 'safe_family_horizons(memory, trader="jev")' in inspect.getsource(jev._manage_positions)
+    report = inspect.getsource(jev.dual_run_report)
+    assert "family_horizons=safe_family_horizons(memory, trader=name)" in report
+    assert "family_horizon_weights=safe_family_horizon_weights(memory, trader=name)" in report

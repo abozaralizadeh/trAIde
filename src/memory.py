@@ -630,24 +630,42 @@ def _gate_probe_kind(row: Any) -> Optional[str]:
 def _trim_gate_probes(rows: Any) -> list:
   """Bound the ``gate_probes`` bucket, preserving chronological order. Never raises.
 
-  Refusal rows keep the newest ``MAX_GATE_PROBES_PER_GATE`` PER GATE (the per-family rule, for the
-  same reason). State rows are transient — folded into ``gate_state_days`` once settled — so they get
-  one backstop count cap that only bites if folding never runs. Rows of unknown kind are dropped.
+  Refusal rows keep the newest ``MAX_GATE_PROBES_PER_GATE`` PER (GATE, TRADER) (the per-family rule, for
+  the same reason): since the Jev dual run a second trader proposes ~8 calls a pass, and with one bucket per
+  gate its refusals evicted the LLM's (2026-10-01: anti_fomo 149 Jev : 1 LLM, daily_opposing 144 : 6 — the
+  LLM's gate scoreboard for those gates was under a day deep). State rows are transient — folded into
+  ``gate_state_days`` once settled — so they get one backstop count cap that only bites if folding never
+  runs. Rows of unknown kind are dropped.
   """
   kept = [r for r in (rows or []) if isinstance(r, dict) and _gate_probe_kind(r)]
   keep_ids: set[int] = set()
-  buckets: Dict[str, list] = {}
+  buckets: Dict[tuple, list] = {}
   states: list = []
   for row in kept:
     if _gate_probe_kind(row) == "state":
       states.append(row)
     else:
-      buckets.setdefault(str(row["entryContext"].get("gate") or "?"), []).append(row)
+      buckets.setdefault((str(row["entryContext"].get("gate") or "?"), _probe_trader(row)), []).append(row)
   for bucket in buckets.values():
     for row in bucket[-MAX_GATE_PROBES_PER_GATE:]:
       keep_ids.add(id(row))
   for row in states[-MAX_GATE_STATE_UNFOLDED:]:
     keep_ids.add(id(row))
+  return [r for r in kept if id(r) in keep_ids]
+
+
+def _trim_exit_probes(rows: Any) -> list:
+  """Keep the newest ``MAX_EXIT_PROBES`` exit probes PER TRADER, preserving chronological order.
+
+  One shared list let the second dual-run trader's closes evict the LLM's exit-discipline record (the same
+  rule as signal and gate probes: one trader's activity never erases the other's evidence). Exit probes carry
+  the trader at row level (absent = the LLM). Never raises; non-dict rows are dropped.
+  """
+  kept = [r for r in (rows or []) if isinstance(r, dict)]
+  by_trader: Dict[str, list] = {}
+  for row in kept:
+    by_trader.setdefault(_normalize_trader(row.get("trader")), []).append(row)
+  keep_ids = {id(r) for bucket in by_trader.values() for r in bucket[-MAX_EXIT_PROBES:]}
   return [r for r in kept if id(r) in keep_ids]
 
 
@@ -1022,7 +1040,7 @@ class MemoryStore:
     # count-capped, never clock-pruned, for the same reason signal probes are not.
     _xp = data.get("exit_probes") or []
     if len(_xp) > MAX_EXIT_PROBES:
-      data["exit_probes"] = _xp[-MAX_EXIT_PROBES:]
+      data["exit_probes"] = _trim_exit_probes(_xp)
     # Permanent notes are exempt from the retention-days cutoff by design — they persist
     # until manually deleted. Only the count cap (MAX_PERMANENT_NOTES) applies below.
     data.setdefault("supervisor_notes_permanent", [])
@@ -1575,6 +1593,33 @@ class MemoryStore:
       logger.warning("JEV decision not recorded (%s)", exc)
       return False
 
+  def record_jev_decisions(self, rows: Any) -> int:
+    """Append a whole pass of Jev answers in ONE read-modify-write (count-capped). Returns rows stored.
+
+    One write per row rewrote the full memory file ~10 times a pass (≈1.3 s and ~40 MB of fsync'd writes on the
+    2.6 MB store, measured 2026-10-01). Same cleaning as ``record_jev_decision``. Never raises."""
+    clean_rows = []
+    for row in rows or []:
+      try:
+        clean = json.loads(json.dumps(row, default=str))
+      except Exception:
+        continue
+      if isinstance(clean, dict):
+        clean.setdefault("ts", int(time.time()))
+        clean_rows.append(clean)
+    if not clean_rows:
+      return 0
+    try:
+      with self._lock:
+        data = self._read()
+        kept = [r for r in (data.get("jev_decisions") or []) if isinstance(r, dict)] + clean_rows
+        data["jev_decisions"] = kept[-MAX_JEV_DECISIONS:]
+        self._write(data)
+      return len(clean_rows)
+    except Exception as exc:
+      logger.warning("JEV decisions not recorded (%s)", exc)
+      return 0
+
   def mark_jev_decisions_scored(self, keys: Any, flag: str = "lsScored") -> int:
     """Flag Jev decisions (by (ts, symbol)) as scored in LangSmith (``flag``: forward returns ``lsScored``, the
     trade result ``lsResultScored``) so each is posted once. Never raises."""
@@ -1638,15 +1683,69 @@ class MemoryStore:
         return _probe_trader(trade)
     return None
 
-  def trader_for_position(self, symbol: str, position_open_time: Any, position_side: str | None) -> Optional[str]:
-    """Which trader owns an open position lifecycle (its filled entry's ``entryContext.trader``), or None."""
+  def trader_for_position(self, symbol: str, position_open_time: Any, position_side: str | None,
+                          *, window_seconds: int = 7200) -> Optional[str]:
+    """Which trader owns an open position lifecycle, or None when it cannot be told.
+
+    Resolved from the ENTRY ORDER that opened it — the same-symbol, same-direction tagged entry row placed
+    nearest before the position's open time — whether or not the poll loop has marked it filled yet. It used
+    to read only rows already flagged ``filled``, and the live limit path records ``filled=False`` until the
+    next poll marks the fill (after ProtectionManager has already run). In that gap a fresh Jev position read
+    as the LLM's default (Jev's ``held`` missed it, so its 1-open-position cap could be exceeded) and a fresh
+    LLM fill could read as an older Jev lifecycle on the same coin (2026-10-01 review). Only one trader can
+    hold a resting entry on a symbol at a time, so the nearest intent is the one that filled. Exact ties
+    between different traders are ambiguous: None. Never raises.
+    """
     try:
-      ctx = self.entry_context_for_position(symbol, position_open_time, position_side)
+      open_ms = self._position_open_time_ms({"positionOpenTime": position_open_time})
+      if open_ms is None:
+        return None
+      open_sec = open_ms / 1000.0
+      want = str(position_side or "").lower()
+      sym = _normalize_symbol(symbol)
+      with self._lock:
+        trades = list(self._read().get("trades") or [])
+      best: list[tuple[float, str]] = []
+      for trade in trades:
+        if not isinstance(trade, dict) or trade.get("symbol") != sym:
+          continue
+        ctx = trade.get("entryContext")
+        if not isinstance(ctx, dict) and not is_limit_entry_record(trade):
+          continue
+        fallback = "long" if str(trade.get("side") or "").lower() == "buy" else "short"
+        side = str((ctx or {}).get("positionSide") or fallback).lower()
+        if want in ("long", "short") and side != want:
+          continue
+        # The fill time when the poll loop has stamped it (it is the lifecycle's own moment), else the
+        # placement time (a fill the loop has not marked yet).
+        delta = open_sec - float(trade.get("fillTs") or trade.get("ts") or 0.0)
+        if -300 <= delta <= max(0, int(window_seconds)):
+          best.append((abs(delta), _probe_trader(trade)))
+      if not best:
+        return None
+      best.sort(key=lambda item: item[0])
+      if len(best) > 1 and abs(best[0][0] - best[1][0]) < 1.0 and best[0][1] != best[1][1]:
+        return None
+      return best[0][1]
     except Exception:
       return None
-    if not isinstance(ctx, dict):
-      return None
-    return _normalize_trader(ctx.get("trader"))
+
+  def entries_placed_since(self, trader: str, since_ts: float) -> int:
+    """Live entry ORDERS ``trader`` placed at or after ``since_ts`` — filled or not, ambiguous acks included.
+
+    Counted from the durable trades ledger (tagged limit-entry rows), the record every live entry writes. A
+    daily cap counted from a rolling decision log forgets: Jev's 400-row log spans ~6 h, so its 'per day' cap
+    read 0 again by mid-day (2026-10-01 review). Paper entries count too, so PAPER_TRADING runs the same cap.
+    Never raises on bad rows (the caller treats a failure as 'cap reached').
+    """
+    want = _normalize_trader(trader)
+    with self._lock:
+      trades = list(self._read().get("trades") or [])
+    return sum(
+      1 for t in trades
+      if is_limit_entry_record(t) and _probe_trader(t) == want
+      and float(t.get("ts") or 0.0) >= float(since_ts)
+    )
 
   def backfill_close_leverage(self, closes: Any) -> int:
     """Stamp the exchange's leverage onto realized-close rows recorded before it was captured.
@@ -2712,7 +2811,7 @@ class MemoryStore:
       data = self._read()
       data.setdefault("exit_probes", []).append(row)
       if len(data["exit_probes"]) > MAX_EXIT_PROBES:
-        data["exit_probes"] = data["exit_probes"][-MAX_EXIT_PROBES:]
+        data["exit_probes"] = _trim_exit_probes(data["exit_probes"])
       self._write(data)
 
   def set_exit_probe_stack(
