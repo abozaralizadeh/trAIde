@@ -584,6 +584,45 @@ def _probe_trader(row: Any) -> str:
   return _normalize_trader(ctx.get("trader") if isinstance(ctx, dict) else None)
 
 
+def _earliest_trader_ts(data: Dict[str, Any], trader: Any) -> Optional[int]:
+  """The earliest timestamp of any row ``trader`` wrote — its calls, gate refusals, orders and (for Jev) its
+  decision log — or None. Every one of those stores is count-capped, so this can only move LATER as old rows
+  are evicted; ``_stamp_trader_since`` saves it once."""
+  name = _normalize_trader(trader)
+  seen: list = []
+  for key in ("signal_probes", "gate_probes", "trades"):
+    for row in data.get(key) or []:
+      if isinstance(row, dict) and _probe_trader(row) == name:
+        seen.append(row.get("ts"))
+  if name == "jev":
+    seen.extend(r.get("ts") for r in data.get("jev_decisions") or [] if isinstance(r, dict))
+  stamps = []
+  for value in seen:
+    try:
+      ts = int(float(value))
+    except (TypeError, ValueError):
+      continue
+    if ts > 0:
+      stamps.append(ts)
+  return min(stamps) if stamps else None
+
+
+def _stamp_trader_since(data: Dict[str, Any], trader: Any, ts: Any) -> None:
+  """Save ``trader``'s first-call time once (``MemoryStore.trader_since``): the earliest of what is already on
+  record and ``ts``. Called inside a writer's read-modify-write; never moves a saved value; never raises."""
+  try:
+    name = _normalize_trader(trader)
+    marks = data.get("trader_since") if isinstance(data.get("trader_since"), dict) else {}
+    if marks.get(name):
+      return
+    candidates = [t for t in (_earliest_trader_ts(data, name), int(float(ts)) if ts is not None else None) if t]
+    if candidates:
+      marks[name] = min(candidates)
+      data["trader_since"] = marks
+  except Exception:
+    return
+
+
 def _probe_side(row: Any) -> Optional[str]:
   ctx = row.get("entryContext") if isinstance(row, dict) else None
   side = str(ctx.get("positionSide") or "").strip().lower() if isinstance(ctx, dict) else ""
@@ -1572,6 +1611,24 @@ class MemoryStore:
       self._write(data)
       return entry
 
+  def trader_since(self, trader: Any) -> Optional[int]:
+    """When ``trader`` made its first call on record — where the dual-run comparison window starts. Never raises.
+
+    Saved once by the decision writers (``_stamp_trader_since``) and never moved afterwards; until then derived
+    from the earliest row the trader wrote. It used to be the oldest row of the 400-answer decision log, which
+    on Oct 4 held 6.6 HOURS: the "since Jev started" panel compared 26 Jev calls with 11 LLM calls and showed
+    Jev 2 wins of 2 (+0.45R), because its −1R WLD loss was a day older than the log.
+    """
+    name = _normalize_trader(trader)
+    try:
+      with self._lock:
+        data = self._read()
+      marks = data.get("trader_since") if isinstance(data.get("trader_since"), dict) else {}
+      stored = marks.get(name)
+      return int(stored) if stored else _earliest_trader_ts(data, name)
+    except Exception:
+      return None
+
   def record_jev_decision(self, row: Dict[str, Any]) -> bool:
     """Append one Jev dual-run answer (see src/jev.py) to ``jev_decisions`` (count-capped). Never raises.
 
@@ -1586,6 +1643,7 @@ class MemoryStore:
         data = self._read()
         rows = [r for r in (data.get("jev_decisions") or []) if isinstance(r, dict)]
         rows.append(clean)
+        _stamp_trader_since(data, "jev", clean.get("ts"))
         data["jev_decisions"] = rows[-MAX_JEV_DECISIONS:]
         self._write(data)
       return True
@@ -1613,6 +1671,7 @@ class MemoryStore:
       with self._lock:
         data = self._read()
         kept = [r for r in (data.get("jev_decisions") or []) if isinstance(r, dict)] + clean_rows
+        _stamp_trader_since(data, "jev", min(r["ts"] for r in clean_rows))
         data["jev_decisions"] = kept[-MAX_JEV_DECISIONS:]
         self._write(data)
       return len(clean_rows)

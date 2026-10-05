@@ -403,6 +403,20 @@ def build_context(memory: Any, symbol: str, *, market_state: Any = None, now: Op
   return ctx
 
 
+def analysis_usable(analysis: Any) -> bool:
+  """Can Jev be asked about a coin from this analysis? The ONE test — `jev_state` and the pass's candidate
+  pick both use it. An analysis that failed its candle checks (`dataQuality.ok` False, e.g. a gap in the 4h or
+  daily bars) or has no live price / 15m ATR gives Jev nothing to decide on; picked anyway, it took one of the
+  pass's slots and became an 'analysis unusable' error row (37 of 400 rows on Oct 4, PUMP-USDT 26 of them).
+  """
+  if not isinstance(analysis, dict) or analysis.get("error"):
+    return False
+  if not (analysis.get("dataQuality") or {}).get("ok", False):
+    return False
+  emap = (analysis.get("summary") or {}).get("entryMap") or {}
+  return bool(_num(emap.get("price")) and _num(emap.get("atr15m")))
+
+
 def jev_state(
   symbol: str,
   analysis: Dict[str, Any],
@@ -417,14 +431,10 @@ def jev_state(
   no balance, equity, size, gate text or scoreboard (the survival layer is code's, and a classifier that saw
   its own record would learn to game it). ``context`` is ``build_context``'s output for this coin.
   """
-  if not isinstance(analysis, dict) or analysis.get("error"):
-    return None
-  if not (analysis.get("dataQuality") or {}).get("ok", False):
+  if not analysis_usable(analysis):
     return None
   summary = analysis.get("summary") or {}
   emap = summary.get("entryMap") or {}
-  if not _num(emap.get("price")) or not _num(emap.get("atr15m")):
-    return None
   frames = {}
   for snap in analysis.get("snapshots") or []:
     if isinstance(snap, dict) and snap.get("interval") in ("15min", "1hour", "4hour", "1day"):
@@ -1348,7 +1358,10 @@ async def run_jev_pass(
     # chose to look at.
     held = set(tools.trader_book("jev"))
     budget = max(1, int(jcfg.max_symbols_per_run))
+    # A coin whose analysis Jev cannot read (analysis_usable) never takes a slot: the next usable one does.
     ordered = [s for s in analyses if s in universe and s not in held]
+    unusable = [s for s in ordered if not analysis_usable(analyses.get(s))]
+    ordered = [s for s in ordered if s not in unusable]
     rest = sorted(s for s in universe if s not in analyses and s not in held)
     if rest:
       k = int(now // 3600) % len(rest)
@@ -1363,13 +1376,16 @@ async def run_jev_pass(
       except Exception as exc:
         logger.warning("JEV: analysis failed for %s (%s)", sym, exc)
         continue
-      if isinstance(res, dict) and not res.get("error"):
+      if analysis_usable(res):
         analyses[sym] = res
         candidates.append(sym)
+      elif isinstance(res, dict):
+        unusable.append(sym)
 
-    logger.info("JEV (%s) pass: asking %d symbol(s) with %s — %d from this run's analyses, %d analysed now%s",
+    logger.info("JEV (%s) pass: asking %d symbol(s) with %s — %d from this run's analyses, %d analysed now%s%s",
                 jcfg.mode, len(candidates), jcfg.model, from_run, len(candidates) - from_run,
-                f"; holding {', '.join(sorted(held))}" if held else "")
+                f"; holding {', '.join(sorted(held))}" if held else "",
+                f"; skipped {len(unusable)} unusable ({', '.join(unusable[:4])})" if unusable else "")
     near_r = max(float(cfg.trading.min_futures_rr or 0.0), 1.0) * NEAR_TARGET_CUSHION
     extended_r = near_r * EXTENDED_TARGET_MULT
     cost_pct = 2.0 * max(0.0, float(cost_rate or 0.0)) * 100.0
@@ -1785,6 +1801,17 @@ _MONEY_AFTER_RE = re.compile(r"[-+]?\d[\d.,]*((?:\s+[a-z]+){0,2}\s*)(usdt?|usd|\
 AGREEMENT_WINDOW_SEC = 1800
 
 
+def _t_of(row: Any) -> Optional[float]:
+  """net / SE of a scoreboard row — the t the stand-aside's release bar reads (``edge``: net_of_cost / stderr).
+  Horizon rows carry the net and its SE but no ``t_stat``, so the panel's t was always blank."""
+  if not isinstance(row, dict):
+    return None
+  if _num(row.get("t_stat")) is not None:
+    return _num(row.get("t_stat"))
+  net, se = _num(row.get("net_of_cost_pct")), _num(row.get("stderr_pct"))
+  return net / se if net is not None and se is not None and se > 0 else None
+
+
 def row_trader(d: Any) -> Optional[str]:
   """'jev' when a decision / close / probe row came from the dual run's second trader, else None."""
   owner = row_owner(d)        # the ONE ownership rule (edge.row_owner), also behind each trader's holding mix
@@ -1958,8 +1985,15 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
       return out
     out["model"] = getattr(jcfg, "model", None)
     out["status"] = public_status(memory.jev_status() if callable(getattr(memory, "jev_status", None)) else {})
-    since = min((int(r.get("ts") or 0) for r in recent if r.get("ts")), default=None)
+    # Jev's FIRST call on record (saved once in memory), never the oldest row of the 400-answer log: that log
+    # held 6.6h on Oct 4, so "since Jev started" compared 26 calls with 11 and hid Jev's −1R WLD loss.
+    since = memory.trader_since("jev") if callable(getattr(memory, "trader_since", None)) else None
+    recent_since = min((int(r.get("ts") or 0) for r in recent if r.get("ts")), default=None)
+    if since is None:
+      since = recent_since
     out["since"] = since
+    # outcomes / agreement / latency / order sensitivity / recent come from the capped answer log: their own window.
+    out["recentSince"], out["recentN"] = recent_since, len(recent)
     closes = memory.realized_closes(limit=400)
     traders: Dict[str, Any] = {}
     probes_by_trader = {name: memory.signal_probes(limit=0, trader=name) for name in KNOWN_TRADERS}
@@ -1980,7 +2014,7 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
         "verdict": stats.get("verdict", "insufficient data"),
         "bestHorizon": best,
         "netPct": _r(row.get("net_of_cost_pct"), 4),
-        "tStat": _r(row.get("t_stat"), 2),
+        "tStat": _r(_t_of(row), 2),
         "closes": len(mine),
         "wins": wins,
         "winRate": _r(wins / len(mine), 3) if mine else None,

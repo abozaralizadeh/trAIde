@@ -914,9 +914,10 @@ LLM agent run ──► analyses cached ──► Jev pass (src/jev.py)
   the caps or on the LLM's symbols are still recorded as shadow calls, so Jev's record does not depend on
   which symbols happened to be free.
 - **Reporting.** Every answer is kept in `jev_decisions` (probabilities, labels, outcome, gate code, latency).
-  The dashboard publishes a `dualRun` panel (both traders over the same window: calls, verdict, net %, t,
-  closes, win rate, R; outcomes; how often Jev agreed with the LLM) and tags Jev rows with a `JEV` chip — ratios
-  and counts only. The Supervisor's `get_dual_run_report` returns the same. One log line per pass:
+  The dashboard publishes a `dualRun` panel (both traders over the same window — since Jev's FIRST call, saved
+  once in memory (`memory.trader_since`): calls, verdict, net %, t, closes, win rate, R; then, over the last 400
+  answers only (`recentSince` / `recentN`): outcomes and how often Jev agreed with the LLM) and tags Jev rows
+  with a `JEV` chip — ratios and counts only. The Supervisor's `get_dual_run_report` returns the same. One log line per pass:
   `JEV (live): asked 8, stand aside 5 | SOL-USDT short 0.71 [placed]; ...`.
 
 Start with `JEV_MODE=shadow` for a few days, compare the two records in the panel, then `live`.
@@ -926,7 +927,7 @@ Start with `JEV_MODE=shadow` for a few days, compare the two records in the pane
 | Where | What you get |
 |---|---|
 | Log, at start | `JEV DUAL RUN: mode=shadow model=jev-latest key=set sdk=typesafe-sdk 0.7.2 caps: … langsmith=on` (also printed when off) |
-| Log, every pass | `JEV MANAGE SOL-USDT (long, up about its risk (1R), stop at breakeven…): PROTECT 0.71 (hold 0.20 / protect 0.71 / extend 0.05 / close 0.04), thesis intact 0.64 → protected` for each own position, `JEV (shadow) pass: asking 8 symbol(s) …`, then one line per symbol — `JEV SOL-USDT: LONG 0.71 (L 0.71 / S 0.10 / stand 0.19) continuation · at_market · near 1.65R \| entry … stop … tp … → shadow [scored] stake explore 0.40` — and the pass summary. Exit-manager lines on a Jev position read `PROFIT-LOCK … SOL-USDT [jev]` |
+| Log, every pass | `JEV MANAGE SOL-USDT (long, up about its risk (1R), stop at breakeven…): PROTECT 0.71 (hold 0.20 / protect 0.71 / extend 0.05 / close 0.04), thesis intact 0.64 → protected` for each own position, `JEV (shadow) pass: asking 8 symbol(s) … ; skipped 1 unusable (PUMP-USDT)` (a coin whose candle checks failed never takes one of the 8 slots), then one line per symbol — `JEV SOL-USDT: LONG 0.71 (L 0.71 / S 0.10 / stand 0.19) continuation · at_market · near 1.65R \| entry … stop … tp … → shadow [scored] stake explore 0.40` — and the pass summary. Exit-manager lines on a Jev position read `PROFIT-LOCK … SOL-USDT [jev]` |
 | Log, hourly | `JEV vs LLM since … — JEV calls n, @60m net %, hit % \| LLM … \| same side as the LLM a/b` |
 | Dashboard (`dualRun`, read from the published blob — never from the bot) | Last-pass health (or why it is idle), both traders side by side (incl. each one's early closes vs the exit rules), a 15m / 1h / 4h table of "right way" % and net of cost, a calibration table (stated confidence vs right-way share), option-order sensitivity, and every recent answer: Jev's call and probabilities, the LLM's call on the same coin at the same time, the code-built plan, what the order path did (scored / repeat / stake / gate), the trade's result once closed, how price moved its way after 15m / 1h / 4h — and Jev's management answers on its own positions |
 | LangSmith | One trace per pass, `Jev Dual Run (<mode>)`, with one `llm` run per position managed (`Jev manage SOL-USDT`) and per symbol asked: the exact state and questions sent, Jev's answers, the bracket / action and the outcome, input tokens. Once a traced call's 4h window settles, its forward returns are attached as feedback (`fwd_15m`, `fwd_60m`, `fwd_240m`, `right_way_60m`); a placed call also gets `realized_r` when its trade closes. Posted: the first pass after start, every pass with a live entry attempt, an action on a position, or an error, the rest at `LANGSMITH_SAMPLE_RATE` (the monthly trace cap) |

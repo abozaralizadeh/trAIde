@@ -1381,3 +1381,91 @@ class TestPerTraderHoldingMix:
     report = inspect.getsource(jev.dual_run_report)
     assert "family_horizons=safe_family_horizons(memory, trader=name)" in report
     assert "family_horizon_weights=safe_family_horizon_weights(memory, trader=name)" in report
+
+
+# ── a coin Jev cannot read never takes a slot ────────────────────────────────────────────────────────
+class TestUnusableAnalyses:
+  """Oct 4: 37 of 400 decision rows were 'analysis unusable' (PUMP-USDT 26) — a coin whose candle checks failed
+  took one of the pass's slots and became an error row, while a readable coin went unasked."""
+
+  def test_an_unreadable_run_analysis_never_takes_a_slot(self, tmp_path, caplog):
+    import logging
+    m = MemoryStore(str(tmp_path / "m.json"))
+    tools = _Tools({"SOL-USDT": _analysis("SOL-USDT", ok=False)})
+    client = _Client({"SOL-USDT": ("long", 0.9), "BTC-USDT": ("short", 0.7), "ETH-USDT": ("long", 0.7)})
+    with caplog.at_level(logging.INFO, logger="src.jev"):
+      _run(_cfg("shadow", max_symbols_per_run=2), tools, m, client)
+    rows = {r["symbol"]: r for r in m.jev_decisions(limit=0)}
+    assert sorted(rows) == ["BTC-USDT", "ETH-USDT"], rows               # both slots went to readable coins
+    assert all(r["outcome"] != "error" for r in rows.values())
+    assert "skipped 1 unusable (SOL-USDT)" in caplog.text               # still visible, just not a slot
+
+  def test_an_unreadable_coin_in_the_rotation_is_passed_over(self, tmp_path):
+    class _GappyTools(_Tools):
+      async def analyze_for(self, symbol):
+        self.analyzed.append(symbol)
+        return _analysis(symbol, ok=(symbol != "BTC-USDT"))
+
+    m = MemoryStore(str(tmp_path / "m.json"))
+    tools = _GappyTools({})
+    client = _Client({"BTC-USDT": ("long", 0.9), "ETH-USDT": ("short", 0.7), "SOL-USDT": ("long", 0.7)})
+    _run(_cfg("shadow", max_symbols_per_run=2), tools, m, client)       # rotation at this hour: SOL, BTC, ETH
+    rows = {r["symbol"]: r for r in m.jev_decisions(limit=0)}
+    assert sorted(rows) == ["ETH-USDT", "SOL-USDT"], rows
+    assert tools.analyzed == ["SOL-USDT", "BTC-USDT", "ETH-USDT"]       # BTC was looked at, then passed over
+
+  def test_one_usability_rule(self):
+    cases = [_analysis(), _analysis(ok=False), {"error": "No candles"}, None, "x", _analysis(atr=0.0),
+             _analysis(price=float("nan")), {"dataQuality": {"ok": True}}]
+    for a in cases:
+      assert (jev.jev_state("X", a) is None) == (not jev.analysis_usable(a)), a
+
+
+# ── the dual-run comparison covers the whole run, not the capped answer log ──────────────────────────
+class TestDualRunWindow:
+  """Oct 4: 'since Jev started' was the oldest row of the 400-answer log — 6.6 hours. The panel compared 26 Jev
+  calls with 11 LLM calls and showed Jev 2 wins of 2 (+0.45R): its −1R WLD loss was a day older than the log."""
+
+  @pytest.mark.parametrize("writer", ["one", "batch"])
+  def test_first_call_is_saved_once_and_never_moves(self, tmp_path, writer):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    t0 = int(time.time()) - 5 * 86400
+    m.record_signal_probe("SOL-USDT", "buy", 100.0, "continuation", trader="jev")
+    data = m._read()
+    data["signal_probes"][-1]["ts"] = t0
+    m._write(data)
+    assert m.trader_since("jev") == t0                                     # derived before anything is saved
+    row = {"symbol": "ETH-USDT", "direction": "stand_aside", "ts": t0 + 4 * 86400}
+    m.record_jev_decision(row) if writer == "one" else m.record_jev_decisions([row])
+    assert m._read()["trader_since"] == {"jev": t0}                         # the earliest on record, not "now"
+    data = m._read()
+    data["signal_probes"] = []                                             # the first call is evicted later...
+    m._write(data)
+    assert m.trader_since("jev") == t0                                     # ...and the start does not move
+
+  def test_the_report_covers_the_whole_run_not_the_answer_log(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    now = int(time.time())
+    t0 = now - 3 * 86400
+    m.record_signal_probe("WLD-USDT", "buy", 0.54, "continuation", trader="jev")      # Jev's first call...
+    m.log_decision("WLD-USDT", "futures_sell_triggered", 0.0, "stop", pnl=-0.18,     # ...and its −1R trade
+                   entry_context={"trader": "jev", "setupFamily": "continuation", "fillTs": t0 + 60,
+                                  "plannedMaxLossUsd": 0.18})
+    data = m._read()
+    data["signal_probes"][-1]["ts"] = t0
+    data["decisions"][-1]["ts"] = t0 + 3600
+    m._write(data)
+    m.record_jev_decisions([{"symbol": "ETH-USDT", "direction": "stand_aside", "outcome": "stand_aside",
+                             "ts": now - 3600 + i} for i in range(450)])               # a full log: the last hour
+    rep = jev.dual_run_report(m, _cfg("live"), cost_pct=0.0016)
+    assert rep["since"] == t0
+    assert (rep["recentSince"], rep["recentN"]) == (now - 3600 + 50, 400)
+    assert (rep["traders"]["jev"]["closes"], rep["traders"]["jev"]["wins"], rep["traders"]["jev"]["sumR"]) == (1, 0, -1.0)
+
+  def test_the_panel_shows_t_for_the_best_horizon(self, tmp_path):
+    """Horizon rows carry net and SE but no t_stat, so the panel's t row was always '—'."""
+    assert jev._t_of({"net_of_cost_pct": -0.3, "stderr_pct": 0.15}) == pytest.approx(-2.0)
+    assert jev._t_of({"t_stat": 1.4, "net_of_cost_pct": 9.0, "stderr_pct": 1.0}) == pytest.approx(1.4)
+    assert jev._t_of({"net_of_cost_pct": 0.3, "stderr_pct": 0.0}) is None and jev._t_of(None) is None
+    import inspect
+    assert '"tStat": _r(_t_of(row), 2)' in inspect.getsource(jev.dual_run_report)
