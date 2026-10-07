@@ -943,6 +943,15 @@ def _format_snapshot(snapshot: TradingSnapshot, balances_by_currency: Dict[str, 
   return json.dumps(user_content)
 
 
+def run_turn_budget(cfg: AppConfig, force_research: bool) -> int:
+  """Model turns one agent run may take. A run that MUST hand off to the Research Agent does two agents' work in
+  one budget — research (scan, news, calendar, list changes), then the trading pass — so each gets the configured
+  budget. Measured 2026-10-06: normal runs used at most 12 of 20 turns (median 7, n=80); forced-research runs
+  median 10, p90 16, and one hit 20 and died with MaxTurnsExceeded, losing the whole run."""
+  base = max(1, int(cfg.agent_max_turns))
+  return base * 2 if force_research else base
+
+
 async def _run_agent_with_tracing(
   trading_agent: Agent,
   input_payload: str,
@@ -950,15 +959,16 @@ async def _run_agent_with_tracing(
   langsmith_ctx: Any,
   run_name: str,
   unique_trace_id: str,
+  max_turns: int | None = None,
 ) -> Any:
-  """Execute the agent run inside a tracing context."""
+  """Execute the agent run inside a tracing context (``max_turns``: ``run_turn_budget``, default the configured one)."""
   with langsmith_ctx:
     provider = get_trace_provider()
     tr = provider.create_trace(run_name, trace_id=unique_trace_id)
     tr.start(mark_as_current=True)
     try:
       return await asyncio.wait_for(
-        Runner.run(trading_agent, input_payload, max_turns=cfg.agent_max_turns,
+        Runner.run(trading_agent, input_payload, max_turns=max_turns or cfg.agent_max_turns,
                    run_config=STATELESS_RUN_CONFIG),
         timeout=20 * 60,
       )
@@ -2776,6 +2786,7 @@ def run_trading_agent(
       langsmith_ctx,
       run_name,
       unique_trace_id,
+      max_turns=run_turn_budget(cfg, force_research),
     )
   )
   narrative = _strip_citation_tokens(str(result.final_output))

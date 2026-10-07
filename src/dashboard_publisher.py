@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 from .analytics import flow_reading_max_age_sec
 from .edge import (
+  account_pct,
   annotate_family_stakes,
   probe_taker_fee,
   confidence_edge_stats,
@@ -946,6 +947,9 @@ class DashboardPublisher:
     m = re.search(r"ROE\s*(-?\d+(?:\.\d+)?)\s*%", d.get("reason") or "")
     if m:
       out["roePct"] = round(float(m.group(1)), 4)
+    acct = self._account_pct(d)
+    if acct is not None:
+      out["accountPct"] = acct
     # Entries (futures_*_limit, logged with the applied leverage) and closes (the exchange's record) carry
     # leverage; ROE on a close is price return x leverage, so the outcome chart needs it to be read at all.
     lev = self._close_leverage(d)
@@ -955,6 +959,12 @@ class DashboardPublisher:
     if trader:
       out["trader"] = trader
     return out
+
+  @staticmethod
+  def _account_pct(d: Dict[str, Any]) -> Optional[float]:
+    """A close's effect on the ACCOUNT (% of equity at entry) — ``edge.account_pct``, the one rule. ROE is margin
+    return (price move x leverage): +35% ROE was +0.24% of the account on 2026-10-07."""
+    return account_pct(d)
 
   @staticmethod
   def _row_trader(d: Dict[str, Any]) -> Optional[str]:
@@ -1125,6 +1135,7 @@ class DashboardPublisher:
         "exitPrice": _round(d.get("exitPrice")),
         "win": bool(_f(d.get("pnl")) and _f(d.get("pnl")) > 0),
         "roePct": round(float(m.group(1)), 4) if m else None,
+        "accountPct": self._account_pct(d),
         "closeType": close_type or None,
         "realizedR": round(realized_r, 2) if realized_r is not None else None,
         "maeR": mae_r,

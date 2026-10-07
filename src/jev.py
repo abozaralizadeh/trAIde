@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional
 
 from .edge import (
   _probe_observations,
+  account_pct,
   _signed_probe_return,
   exit_discipline_stats,
   row_owner,
@@ -1799,6 +1800,8 @@ _MONEY_RE = re.compile(
 _MONEY_AFTER_RE = re.compile(r"[-+]?\d[\d.,]*((?:\s+[a-z]+){0,2}\s*)(usdt?|usd|\$)(?![a-z])", re.I)
 # An LLM call on the same symbol within this window counts as "the same moment" for the agreement tally.
 AGREEMENT_WINDOW_SEC = 1800
+# The dual-run race plots at most this many of each trader's newest closes (the blob stays small).
+CURVE_MAX_POINTS = 200
 
 
 def _t_of(row: Any) -> Optional[float]:
@@ -2009,7 +2012,15 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
               and (since is None or int(c.get("ts") or 0) >= since)]
       wins = sum(1 for c in mine if (_f(c.get("pnl")) or 0.0) > 0)
       rs = [r for r in (_f(c.get("realizedR")) for c in mine) if r is not None]
+      # The real-money race: every close in the window, oldest first, as ratios only (edge.account_pct — never $).
+      curve = [{"ts": int(c.get("ts") or 0), "symbol": c.get("symbol"), "accountPct": account_pct(c),
+                "r": _r(_f(c.get("realizedR")), 3), "win": (_f(c.get("pnl")) or 0.0) > 0}
+               for c in sorted(mine, key=lambda c: int(c.get("ts") or 0))][-CURVE_MAX_POINTS:]
+      acct = [p["accountPct"] for p in curve if p["accountPct"] is not None]
       traders[name] = {
+        # Which model made the calls (newest call's stamp) — the panel names the traders by it.
+        "model": next((str((p.get("entryContext") or {}).get("model")) for p in reversed(probes)
+                       if (p.get("entryContext") or {}).get("model")), None),
         "calls": int(stats.get("n") or 0),
         "verdict": stats.get("verdict", "insufficient data"),
         "bestHorizon": best,
@@ -2020,11 +2031,13 @@ def dual_run_report(memory: Any, cfg: Any, *, cost_pct: float) -> Dict[str, Any]
         "winRate": _r(wins / len(mine), 3) if mine else None,
         "avgR": _r(sum(rs) / len(rs), 3) if rs else None,
         "sumR": _r(sum(rs), 2) if rs else None,
+        "accountPctSum": _r(sum(acct), 3) if acct else None,
+        "curve": curve,
         # Every scored horizon, not only the best one: n (de-overlapped), mean and net of cost in %, and
         # how often the call pointed the right way — the like-for-like comparison of the two traders.
         "byHorizon": {
           h: {"n": int(v.get("n") or 0), "meanPct": _r(v.get("mean_pct"), 4),
-              "netPct": _r(v.get("net_of_cost_pct"), 4), "hitRate": _r(v.get("hit_rate"), 3)}
+              "netPct": _r(v.get("net_of_cost_pct"), 4), "hitRate": _r(v.get("hit_rate"), 3), "t": _r(_t_of(v), 2)}
           for h, v in (stats.get("by_horizon") or {}).items() if isinstance(v, dict)
         },
         # Does stated confidence mean anything? (F7) — and did its own early closes beat the exit stack?

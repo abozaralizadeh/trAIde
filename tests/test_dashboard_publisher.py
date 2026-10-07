@@ -1101,3 +1101,37 @@ class TestClosedTradeLeverage:
     src = (Path(__file__).resolve().parents[1] / "src" / "main.py").read_text()
     assert 'leverage=cp.get("leverage"),' in src
     assert "memory.backfill_close_leverage(_lev_rows)" in src
+
+
+class TestAccountEffectOfACloseOct7:
+  """Oct 7: the dashboard showed two closes at ROE +32% / +35% while the account grew a few cents. ROE is the
+  return on that position's own margin (price move x leverage); the account effect is P&L / equity at entry."""
+
+  ORCA = {
+    "symbol": "ORCA-USDT", "ts": 1791331610, "pnl": 0.30393751, "closeType": "CLOSE_LONG", "action": "futures_sell_triggered",
+    "entryPrice": 2.8165, "exitPrice": 3.1126, "realizedR": 0.706594, "leverage": 3.0,
+    "reason": "TP/SL triggered (CLOSE_LONG, ROE 32.35%)",
+    "entryContext": {"setupFamily": "funding_carry", "plannedMaxLossUsd": 0.43, "sizing": {"equityUsd": 75.4044}},
+  }
+
+  def test_the_account_effect_sits_next_to_roe(self):
+    pub = _publisher()
+    feed = pub._sanitize_decision(dict(self.ORCA))
+    card = pub._closed_position_lifecycles(SimpleNamespace(realized_closes=lambda limit=100, symbol=None: [dict(self.ORCA)]))[0]
+    for row in (feed, card):
+      assert row["roePct"] == pytest.approx(32.35)
+      assert row["accountPct"] == pytest.approx(0.30393751 / 75.4044 * 100, abs=1e-4)      # +0.40%, not +32%
+
+  def test_no_equity_or_dollars_reach_the_public_rows(self):
+    pub = _publisher("normalized")
+    feed = pub._sanitize_decision(dict(self.ORCA))
+    card = pub._closed_position_lifecycles(SimpleNamespace(realized_closes=lambda limit=100, symbol=None: [dict(self.ORCA)]))[0]
+    import json
+    blob = json.dumps([feed, card])
+    assert "75.40" not in blob and "equity" not in blob.lower() and "0.3039" not in blob and '"pnl"' not in blob
+
+  @pytest.mark.parametrize("ctx", [{}, {"sizing": {}}, {"sizing": {"equityUsd": 0}}, {"sizing": {"equityUsd": "x"}}])
+  def test_unknown_equity_is_no_figure_not_a_guess(self, ctx):
+    row = {**self.ORCA, "entryContext": ctx}
+    assert DashboardPublisher._account_pct(row) is None
+    assert DashboardPublisher._account_pct({**self.ORCA, "pnl": None}) is None

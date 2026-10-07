@@ -987,6 +987,25 @@ def row_owner(row: Any) -> str:
   return DEFAULT_TRADER
 
 
+def account_pct(row: Any) -> Optional[float]:
+  """A close's effect on the ACCOUNT: P&L as a % of equity at entry (``entryContext.sizing.equityUsd``), or None.
+
+  ROE is the return on that position's own margin (price move x leverage) and says nothing about the account:
+  on 2026-10-07 two closes read ROE +32% / +35% while adding +0.40% / +0.24% (+$0.30 / +$0.18) — a stop-sized
+  position at this account size is one contract. A ratio; the equity it is computed from stays in local memory.
+  The ONE rule — the dashboard's trade rows and the dual-run race (``jev.dual_run_report``) both read it.
+  """
+  if not isinstance(row, dict):
+    return None
+  pnl = _f(row.get("pnl"))
+  ctx = row.get("entryContext") if isinstance(row.get("entryContext"), dict) else {}
+  sizing = ctx.get("sizing") if isinstance(ctx.get("sizing"), dict) else {}
+  equity = _f(sizing.get("equityUsd"))
+  if pnl is None or equity is None or not (math.isfinite(pnl) and math.isfinite(equity)) or equity <= 0:
+    return None          # NaN would reach the public JSON as an invalid literal
+  return round(pnl / equity * 100.0, 4)
+
+
 def _owned_hold_mix(memory: Any, trader: str, derive: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
   """``derive`` over ``trader``'s OWN realized closes; another trader falls back to the LLM's per family.
 

@@ -1469,3 +1469,71 @@ class TestDualRunWindow:
     assert jev._t_of({"net_of_cost_pct": 0.3, "stderr_pct": 0.0}) is None and jev._t_of(None) is None
     import inspect
     assert '"tStat": _r(_t_of(row), 2)' in inspect.getsource(jev.dual_run_report)
+
+
+# ── the head-to-head panel's data: a race per trader, named by model, t per horizon ──────────────────
+class TestHeadToHeadData:
+  """Oct 7: the dashboard comparison was two text cards and two tables. The panel now draws a real-money race, so
+  the report carries each trader's closes as ratios (never $), the model that made its calls, and t per horizon."""
+
+  @staticmethod
+  def _close(m, sym, ts, pnl, r, trader=None, equity=75.0):
+    ctx = {"setupFamily": "funding_carry", "sizing": {"equityUsd": equity}}
+    if trader:
+      ctx["trader"] = trader
+    m.log_decision(sym, "futures_sell_triggered", 0.0, "TP/SL triggered (CLOSE_LONG, ROE 30.00%)", pnl=pnl,
+                   entry_context=ctx)
+    data = m._read()
+    data["decisions"][-1]["ts"] = ts
+    data["decisions"][-1]["realizedR"] = r
+    m._write(data)
+
+  def test_each_trader_gets_its_own_race_in_ratios_only(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    now = int(time.time())
+    m.record_jev_decision({"symbol": "ETH-USDT", "direction": "stand_aside", "ts": now - 5 * 86400})
+    self._close(m, "ORCA-USDT", now - 3600, 0.30, 0.71)                      # the LLM's
+    self._close(m, "NMR-USDT", now - 7200, 0.18, 0.64, trader="jev")
+    self._close(m, "WLD-USDT", now - 4 * 86400, -0.18, -1.0, trader="jev")
+    rep = jev.dual_run_report(m, _cfg("live"), cost_pct=0.0016)
+    jv, llm = rep["traders"]["jev"], rep["traders"]["llm"]
+    assert [p["symbol"] for p in jv["curve"]] == ["WLD-USDT", "NMR-USDT"]                 # oldest first
+    assert jv["curve"][0] == {"ts": now - 4 * 86400, "symbol": "WLD-USDT", "accountPct": -0.24, "r": -1.0, "win": False}
+    assert jv["accountPctSum"] == pytest.approx(-0.24 + 0.24)
+    assert [p["symbol"] for p in llm["curve"]] == ["ORCA-USDT"] and llm["accountPctSum"] == pytest.approx(0.4)
+    blob = json.dumps(rep)
+    assert "75.0" not in blob and "equity" not in blob.lower() and '"pnl"' not in blob
+
+  def test_the_race_is_capped_to_the_newest_closes(self, tmp_path, monkeypatch):
+    monkeypatch.setattr(jev, "CURVE_MAX_POINTS", 3)
+    m = MemoryStore(str(tmp_path / "m.json"))
+    now = int(time.time())
+    m.record_jev_decision({"symbol": "ETH-USDT", "direction": "stand_aside", "ts": now - 86400})
+    for i in range(5):
+      self._close(m, f"C{i}-USDT", now - 3600 * (10 - i), 0.01, 0.1, trader="jev")
+    curve = jev.dual_run_report(m, _cfg("live"), cost_pct=0.0016)["traders"]["jev"]["curve"]
+    assert [p["symbol"] for p in curve] == ["C2-USDT", "C3-USDT", "C4-USDT"]
+
+  def test_traders_are_named_by_the_model_that_made_their_calls(self, tmp_path):
+    m = MemoryStore(str(tmp_path / "m.json"))
+    m.record_jev_decision({"symbol": "ETH-USDT", "direction": "stand_aside", "ts": int(time.time()) - 60})
+    m.record_signal_probe("SOL-USDT", "buy", 100.0, "continuation", model="gpt-6-luna")
+    m.record_signal_probe("SOL-USDT", "buy", 100.0, "continuation", trader="jev", model="jev-1.13.0")
+    rep = jev.dual_run_report(m, _cfg("live"), cost_pct=0.0016)
+    assert (rep["traders"]["llm"]["model"], rep["traders"]["jev"]["model"]) == ("gpt-6-luna", "jev-1.13.0")
+
+  def test_every_horizon_carries_its_t(self):
+    import inspect
+    assert '"t": _r(_t_of(v), 2)' in inspect.getsource(jev.dual_run_report)
+
+  def test_one_account_rule_for_the_dashboard_and_the_race(self):
+    import inspect
+    from src.dashboard_publisher import DashboardPublisher
+    from src.edge import account_pct
+    assert "return account_pct(d)" in inspect.getsource(DashboardPublisher._account_pct)
+    assert "account_pct(c)" in inspect.getsource(jev.dual_run_report)
+    row = {"pnl": 0.30393751, "entryContext": {"sizing": {"equityUsd": 75.4044}}}
+    assert account_pct(row) == pytest.approx(0.4031, abs=1e-4)
+    for bad in ({"pnl": float("nan"), "entryContext": {"sizing": {"equityUsd": 75.0}}},
+                {"pnl": 0.3, "entryContext": {"sizing": {"equityUsd": float("inf")}}}, None, "x"):
+      assert account_pct(bad) is None                                    # NaN would be invalid JSON on the page

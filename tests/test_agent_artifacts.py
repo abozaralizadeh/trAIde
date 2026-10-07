@@ -509,3 +509,33 @@ class TestSpotDustIsNotAPosition:
     assert sig.parameters["min_value_usd"].default == utils_mod.SPOT_DUST_VALUE_USD
     assert inspect.signature(agent_mod.reconcile_spot_positions).parameters["dust_value_usd"].default \
       == utils_mod.SPOT_DUST_VALUE_USD
+
+
+def test_a_forced_research_run_gets_two_agents_turn_budget(monkeypatch):
+  """2026-10-06: research is a HANDOFF, so a forced-research run did research AND the trading pass inside one
+  20-turn budget — p90 16 turns, one run hit 20 and died (MaxTurnsExceeded), losing the whole run. Normal runs
+  peaked at 12, so they keep the configured budget."""
+  import asyncio
+  import contextlib
+  import src.agent as agent_mod
+
+  cfg = SimpleNamespace(agent_max_turns=20)
+  assert (agent_mod.run_turn_budget(cfg, False), agent_mod.run_turn_budget(cfg, True)) == (20, 40)
+  seen = {}
+
+  async def fake_run(agent, payload, max_turns=None, run_config=None):
+    seen["max_turns"] = max_turns
+    return "done"
+
+  class _Trace:
+    def start(self, **_k): pass
+    def finish(self, **_k): pass
+
+  monkeypatch.setattr(agent_mod.Runner, "run", fake_run)
+  monkeypatch.setattr(agent_mod, "get_trace_provider", lambda: SimpleNamespace(create_trace=lambda *a, **k: _Trace()))
+  run = lambda **kw: asyncio.run(agent_mod._run_agent_with_tracing(
+    None, "{}", cfg, contextlib.nullcontext(), "run", "trace_x", **kw))
+  assert run(max_turns=agent_mod.run_turn_budget(cfg, True)) == "done" and seen["max_turns"] == 40
+  run()
+  assert seen["max_turns"] == 20                                   # no budget passed -> the configured one
+  assert "max_turns=run_turn_budget(cfg, force_research)" in inspect.getsource(agent_mod.run_trading_agent)
