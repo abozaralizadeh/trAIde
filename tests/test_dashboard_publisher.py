@@ -1135,3 +1135,40 @@ class TestAccountEffectOfACloseOct7:
     row = {**self.ORCA, "entryContext": ctx}
     assert DashboardPublisher._account_pct(row) is None
     assert DashboardPublisher._account_pct({**self.ORCA, "pnl": None}) is None
+
+
+class TestTradeRowsBackfillOct7:
+  """Oct 7: the outcome chart drew ~38 trades at exactly ±0.40%. Table rows written before `accountPct` existed were
+  never re-sent (only closes inside the 50 newest decisions were), and the page filled the gap with a placeholder."""
+
+  OLD = {"symbol": "FET-USDT", "action": "futures_sell_triggered", "ts": 1790000000, "pnl": 0.2,
+         "closeType": "CLOSE_LONG", "exitPrice": 1.1, "entryContext": {"sizing": {"equityUsd": 75.0}}}
+
+  def _mem(self, decisions, closes):
+    return SimpleNamespace(latest_items=lambda kind, limit=50: {"items": list(decisions)},
+                           realized_closes=lambda limit=100, symbol=None: list(closes)[-limit:])
+
+  def test_a_close_older_than_the_decision_window_is_published_again(self):
+    newer = {**self.OLD, "symbol": "NMR-USDT", "ts": 1790090000}
+    rows = _publisher()._closed_trades(self._mem([newer, {"symbol": "X-USDT", "action": "decline", "ts": 1790095000}],
+                                                 [self.OLD, newer]))
+    assert [r["symbol"] for r in rows] == ["NMR-USDT", "FET-USDT"]                  # newest first, no duplicate
+
+  def test_rows_are_rewritten_only_when_they_change(self):
+    sent = []
+    pub = _publisher()
+    pub.cfg.index_base = 100.0
+    pub._table_client = SimpleNamespace(upsert_entity=lambda entity, mode=None: sent.append(entity))
+    row = pub._sanitize_decision(dict(self.OLD))
+    pub._write_tables({"trades": [row], "generatedTs": 1, "disclosure": "normalized"})
+    pub._write_tables({"trades": [row], "generatedTs": 1, "disclosure": "normalized"})
+    assert len([e for e in sent if e["PartitionKey"] == "trade"]) == 1             # unchanged -> not re-sent
+    stale = {k: v for k, v in row.items() if k != "accountPct"}
+    pub2 = _publisher()
+    pub2.cfg.index_base = 100.0
+    pub2._table_client = pub._table_client
+    pub2._write_tables({"trades": [stale], "generatedTs": 1, "disclosure": "normalized"})
+    pub2._write_tables({"trades": [row], "generatedTs": 1, "disclosure": "normalized"})                                          # the field arrives -> MERGE it
+    trade_rows = [e for e in sent if e["PartitionKey"] == "trade"]
+    assert len(trade_rows) == 3 and trade_rows[-1]["RowKey"] == trade_rows[0]["RowKey"]
+    assert '"accountPct"' in trade_rows[-1]["data"]

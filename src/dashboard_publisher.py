@@ -151,6 +151,7 @@ class DashboardPublisher:
     self._table_client = None
     self._last_hidden_points = -1
     self._last_unrenderable_closes = -1
+    self._trade_rows_sent: Dict[str, str] = {}   # trade-table RowKey -> data last written
     self._container_client = None
     self._init_failed = False
 
@@ -1065,7 +1066,7 @@ class DashboardPublisher:
     except Exception:
       return {}
 
-  def _closed_trades(self, memory: MemoryStore, limit: int = 100) -> List[Dict[str, Any]]:
+  def _closed_trades(self, memory: MemoryStore, limit: int = 60) -> List[Dict[str, Any]]:
     """Closed outcomes for the bar chart — counted the same way every other panel counts them.
 
     This read the raw decisions feed and filtered it itself, so it was the one closed-trade surface
@@ -1075,8 +1076,22 @@ class DashboardPublisher:
     closed" panel that correctly showed one win and one loss. Two panels disagreeing about how many
     trades happened destroys trust in both, so both now ask the same question of the same filter.
     """
-    items = memory.latest_items("decisions", limit=50).get("items", [])
-    closed = MemoryStore._authoritative_realized_rows(items)
+    items = list(memory.latest_items("decisions", limit=50).get("items", []))
+    # ...plus the dedicated realized-close bucket: the 50 newest decisions are mostly declines, so a close
+    # older than that was never written again and its table row could never gain a field added later
+    # (Oct 7: rows from before `accountPct` existed drew as placeholders). Same row -> same table RowKey,
+    # so re-sending it MERGES the new field into the existing row instead of adding a second bar.
+    try:
+      items += list(memory.realized_closes(limit=limit)) if callable(getattr(memory, "realized_closes", None)) else []
+    except Exception:
+      pass
+    seen, unique = set(), []
+    for d in items:
+      key = (d.get("ts"), d.get("symbol"), d.get("action"))
+      if key not in seen:
+        seen.add(key)
+        unique.append(d)
+    closed = MemoryStore._authoritative_realized_rows(unique)
     closed.sort(key=lambda d: d.get("ts") or 0, reverse=True)   # newest first, as the feed is
     return closed[:limit]
 
@@ -1374,11 +1389,18 @@ class DashboardPublisher:
         continue
       day = int(d.get("day") or (int(ts) // 86400))
       rk = f"{day:08d}-{int(ts)}-{_safe_key(sym)}-{_safe_key(d.get('action'))}"
+      data = json.dumps(d)[:MAX_TABLE_PROPERTY_CHARS]
+      # The trade list now reaches ~60 closes deep; resend a row only when it is new or changed, so a publish
+      # costs one write per NEW close (the first publish after a deploy backfills the rest once).
+      if self._trade_rows_sent.get(rk) == data:
+        continue
       tc.upsert_entity(
-        entity={"PartitionKey": PK_TRADE, "RowKey": rk, "ts": int(ts),
-                "data": json.dumps(d)[:MAX_TABLE_PROPERTY_CHARS]},
+        entity={"PartitionKey": PK_TRADE, "RowKey": rk, "ts": int(ts), "data": data},
         mode=UpdateMode.MERGE,
       )
+      self._trade_rows_sent[rk] = data
+    if len(self._trade_rows_sent) > 500:
+      self._trade_rows_sent = dict(list(self._trade_rows_sent.items())[-300:])
 
     # Research plans: the local store hard-caps at MAX_PLANS (3), so without durable accumulation
     # the dashboard could only ever show the last three. Write each published plan to its own
