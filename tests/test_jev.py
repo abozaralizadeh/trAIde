@@ -1326,23 +1326,24 @@ class TestPerTraderHoldingMix:
             for i in range(8)]
     assert family_horizon_weights(llm + mine)["continuation"] == {15: 0.5, 240: 0.5}   # what pooling did
     store = _ClosesOnly(llm + mine)
-    assert safe_family_horizon_weights(store) == {"continuation": {240: 1.0}}
-    assert safe_family_horizons(store) == {"continuation": 240}
-    assert safe_family_horizon_weights(store, trader="jev") == {"continuation": {15: 1.0}}
+    held = {"fade_extreme": {240: 1.0}}                        # regime.PLAYBOOK_HOLD_MIN: scored at its hold, always
+    assert safe_family_horizon_weights(store) == {"continuation": {240: 1.0}, **held}
+    assert safe_family_horizons(store) == {"continuation": 240, "fade_extreme": 240}
+    assert safe_family_horizon_weights(store, trader="jev") == {"continuation": {15: 1.0}, **held}
 
   def test_jev_reads_the_llms_holds_until_it_has_closed_a_family_often_enough(self):
     from src.edge import safe_family_horizon_weights, safe_family_horizons
     llm = ([_hold_close("continuation", 240, 1_000_000 + i * 600) for i in range(8)]
-           + [_hold_close("fade_extreme", 15, 1_100_000 + i * 600) for i in range(8)])
+           + [_hold_close("range_edge", 15, 1_100_000 + i * 600) for i in range(8)])
     mine = ([_hold_close("continuation", 60, 2_000_000 + i * 600, trader="jev") for i in range(6)]   # min_trades
-            + [_hold_close("fade_extreme", 240, 2_100_000 + i * 600, trader="jev") for i in range(5)]  # one short
+            + [_hold_close("range_edge", 240, 2_100_000 + i * 600, trader="jev") for i in range(5)]  # one short
             + [_hold_close("breakout", 60, 2_200_000 + i * 600, trader="jev") for i in range(6)])     # Jev's alone
     store = _ClosesOnly(llm + mine)
     assert safe_family_horizon_weights(store, trader="jev") == {
-      "continuation": {60: 1.0}, "fade_extreme": {15: 1.0}, "breakout": {60: 1.0}}
+      "continuation": {60: 1.0}, "range_edge": {15: 1.0}, "breakout": {60: 1.0}, "fade_extreme": {240: 1.0}}
     assert safe_family_horizons(store, trader="jev") == {
-      "continuation": 60, "fade_extreme": 15, "breakout": 60}
-    assert safe_family_horizon_weights(store) == {"continuation": {240: 1.0}, "fade_extreme": {15: 1.0}}
+      "continuation": 60, "range_edge": 15, "breakout": 60, "fade_extreme": 240}
+    assert safe_family_horizon_weights(store) == {"continuation": {240: 1.0}, "range_edge": {15: 1.0}, "fade_extreme": {240: 1.0}}
 
   def test_one_ownership_rule(self):
     from src.edge import row_owner

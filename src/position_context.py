@@ -18,7 +18,9 @@ import math
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from .memory import peak_fe_key, position_open_time
-from .regime import carry_hold_deadline, first_settlement_after, next_funding_settlement
+from .regime import (
+  PLAYBOOK_HOLD_MIN, carry_hold_deadline, first_settlement_after, next_funding_settlement, playbook_hold_deadline,
+)
 from .utils import normalize_symbol
 
 logger = logging.getLogger(__name__)
@@ -102,6 +104,13 @@ def trade_context(
       ctx, now_ts, next_settlement_ts=next_ts, interval_sec=interval,
       first_paid_ts=first_paid, unpaid_as_of_ts=unpaid_asof,
     )
+    if out["holdUntilTs"] is not None:
+      out["holdKind"] = "funding_carry"
+    else:
+      # A time-held playbook (regime.PLAYBOOK_HOLD_MIN — fades): left to its bracket for its measured horizon.
+      _ph = playbook_hold_deadline(ctx)
+      if _ph is not None:
+        out["holdUntilTs"], out["holdKind"] = _ph, str((ctx or {}).get("setupFamily") or "").strip().lower()
 
     if isinstance(ctx, dict):
       # Whose lifecycle this is (dual run; absent = the LLM) — used only to tag the manager's log lines.
@@ -235,6 +244,8 @@ def exit_probe_inputs(ctx: Any, side: Any) -> Dict[str, Any]:
     # Anchored on the FILL: carry_hold_deadline returns the first settlement after it (never None for a
     # carry trade when "now" is the fill itself), which is the hold the replay must reproduce.
     out["hold_until_ts"] = carry_hold_deadline(ctx, fill_ts) if fill_ts else None
+    if out["hold_until_ts"] is None and fill_ts:
+      out["hold_until_ts"] = playbook_hold_deadline(ctx, fill_ts)   # the live stack holds fades too: replay it
     bias = entry_bias(ctx)
     counter, htf = bias_tags(bias, side)
     out["entry_bias"] = bias
@@ -312,6 +323,12 @@ def entry_thesis(
     fill_ts = _pos_num(ctx.get("fillTs"))
     if fill_ts:
       thesis["heldMin"] = round(max(0.0, now - fill_ts) / 60.0)
+    if family in PLAYBOOK_HOLD_MIN:
+      # The code leaves this playbook to its bracket for its measured horizon (no early profit-taking).
+      hold = _pos_num(tc.get("holdUntilTs"))
+      thesis["holdUntil"] = _utc_iso(hold) if hold else None
+      thesis["playbookHoldActive"] = bool(hold and hold > now)
+      thesis["playbookHoldMin"] = PLAYBOOK_HOLD_MIN[family]
     if family == "funding_carry":
       hold = _pos_num(tc.get("holdUntilTs"))
       thesis["holdUntil"] = _utc_iso(hold) if hold else None

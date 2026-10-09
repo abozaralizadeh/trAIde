@@ -184,9 +184,17 @@ class TestEntryThesis:
 
   def test_non_carry_positions_get_no_carry_fields(self, tmp_path):
     state = _thesis_state()
+    _attach_entry_theses(state, _thesis_store(tmp_path, family="range_edge"), self.NOW)
+    th = state["futuresPositions"][0]["entryThesis"]
+    assert th["setupFamily"] == "range_edge" and "holdUntil" not in th and "fundingRateNow" not in th
+
+  def test_a_fade_shows_its_playbook_hold_and_no_carry_fields(self, tmp_path):
+    """Oct 9: the code leaves a fade to its bracket for 240 min (regime.PLAYBOOK_HOLD_MIN); the model sees it."""
+    state = _thesis_state()
     _attach_entry_theses(state, _thesis_store(tmp_path, family="fade_extreme"), self.NOW)
     th = state["futuresPositions"][0]["entryThesis"]
-    assert th["setupFamily"] == "fade_extreme" and "holdUntil" not in th and "fundingRateNow" not in th
+    assert th["playbookHoldMin"] == 240 and th["holdUntil"] and "playbookHoldActive" in th
+    assert "fundingRateNow" not in th and "carryHoldActive" not in th
 
   def test_missing_context_means_no_block_and_no_exception(self, tmp_path):
     from src.memory import MemoryStore

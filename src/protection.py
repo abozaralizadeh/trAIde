@@ -85,6 +85,7 @@ def decide_protection(
   hold_until_ts: Optional[float] = None,
   now_ts: Optional[float] = None,
   noise_band_r: Optional[float] = None,
+  hold_kind: Optional[str] = None,
 ) -> Dict[str, Any]:
   """Decide what protective action (if any) a position needs. Pure function.
 
@@ -128,11 +129,14 @@ def decide_protection(
     except (TypeError, ValueError):
       _remaining = 0.0
     if _remaining > 0:
+      _why = ("carry hold — {m:.0f}min to the funding settlement this trade was opened for"
+              if hold_kind in (None, "", "funding_carry") else
+              str(hold_kind) + " hold — {m:.0f}min left of the horizon this playbook's calls are measured to need")
       return {
         "action": "none",
         "reason": (
-          f"carry hold — {_remaining / 60.0:.0f}min to the funding settlement this trade was opened "
-          "for; keeping the model's original bracket (stop unchanged) instead of taking profit early"
+          _why.format(m=_remaining / 60.0)
+          + "; keeping the model's original bracket (stop unchanged) instead of taking profit early"
         ),
         "holdUntilTs": float(hold_until_ts),
         "holdRemainingMin": round(_remaining / 60.0, 1),
@@ -684,11 +688,12 @@ class ProtectionManager:
           self._naked_since.pop(fsym, None)
           self._emergency_placed_legs.pop(fsym, None)
 
-        hold_until = noise_band = owner = None
+        hold_until = noise_band = owner = hold_kind = None
         if self._trade_context_lookup is not None:
           try:
             _tc = self._trade_context_lookup(fsym, pos) or {}
             hold_until = _tc.get("holdUntilTs")
+            hold_kind = _tc.get("holdKind")
             noise_band = _tc.get("noiseBandR")
             owner = _tc.get("trader")
             # Restart safety. Both dicts below live only in this process. The live capture above
@@ -732,6 +737,7 @@ class ProtectionManager:
           risk_override=self._init_risk.get(fsym),
           hold_until_ts=hold_until,
           noise_band_r=noise_band,
+          hold_kind=hold_kind,
         )
         action = decision.get("action")
         if action == "none":

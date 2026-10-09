@@ -1259,3 +1259,68 @@ def test_replay_releases_the_carry_hold_at_the_settlement_bars_close():
     assert at_close["resolvedBy"] == "trail_stop" and at_close["stackR"] == pytest.approx(1.5)
     later = _replay_path(bars, hold_until_ts=_RT + 61)
     assert later["resolvedBy"] == "trail_close" and later["stackR"] == pytest.approx(1.4)
+
+
+# ── fade hold (2026-10-09): a fade is left to its bracket for the 4h its calls are measured to need ─────
+def test_fade_hold_deadline_is_four_hours_after_the_fill_and_only_for_fades():
+  from src.regime import PLAYBOOK_HOLD_MIN, playbook_hold_deadline
+  assert PLAYBOOK_HOLD_MIN == {"fade_extreme": 240}
+  assert playbook_hold_deadline({"setupFamily": "fade_extreme", "fillTs": 1000.0}) == 1000.0 + 240 * 60
+  assert playbook_hold_deadline({"setupFamily": "fade_extreme"}, 2000.0) == 2000.0 + 240 * 60
+  for ctx in ({"setupFamily": "continuation", "fillTs": 1000.0}, {"setupFamily": "funding_carry", "fillTs": 1000.0},
+              {"setupFamily": "fade_extreme"}, {"setupFamily": "fade_extreme", "fillTs": "x"}, None):
+    assert playbook_hold_deadline(ctx) is None
+
+
+def test_fade_hold_suppresses_early_profit_taking_and_says_why():
+  """Oct 9: the bot's 16 fades closed after a median 12 min at -0.14R (31% won) — the ratchet shook them out —
+  while the same calls held 4h with a 2-2.5x ATR stop replayed at +0.22R. Inside the hold the bracket stays."""
+  cfg = _cfg(breakeven_trigger_r=0.5, trail_arm_r=0.5)
+  entry, risk = 100.0, 10.0
+  peak = 0.97 * risk
+  base = dict(side_long=False, avg_entry=entry, sl_price=entry + risk, peak_fe=peak,
+              cfg=cfg, opened_min_ago=30.0, risk_override=risk)
+  assert decide_protection(mark=entry - peak, **base)["action"] == "move_breakeven"
+  held = decide_protection(mark=entry - peak, hold_until_ts=1_000.0, now_ts=0.0, hold_kind="fade_extreme", **base)
+  assert held["action"] == "none" and "fade_extreme hold" in held["reason"] and "carry" not in held["reason"]
+  carry = decide_protection(mark=entry - peak, hold_until_ts=1_000.0, now_ts=0.0, **base)
+  assert "carry hold" in carry["reason"]                                       # the carry wording is unchanged
+  assert decide_protection(mark=entry - peak, hold_until_ts=1_000.0, now_ts=1_001.0, hold_kind="fade_extreme",
+                           **base)["action"] == "move_breakeven"               # past the hold: normal rules
+
+
+def test_the_fade_hold_reaches_the_manager_and_the_replay(tmp_path):
+  import inspect
+  import time as _time
+  from src.memory import MemoryStore
+  from src.position_context import exit_probe_inputs, trade_context
+  from src.protection import ProtectionManager
+  fill = 1_790_000_000.0
+  assert exit_probe_inputs({"setupFamily": "fade_extreme", "fillTs": fill, "entryPrice": 1.0,
+                            "stopLossPrice": 1.03}, "short")["hold_until_ts"] == fill + 240 * 60
+  store = MemoryStore(str(tmp_path / "m.json"))
+  opened = int(_time.time() * 1000)
+  store.record_trade("SPX-USDT", "sell", 20.0, paper=True, price=1.0, size=20, venue="futures", filled=True,
+                     track_position=False, client_oid="fade-1",
+                     entry_context={"positionSide": "short", "setupFamily": "fade_extreme"})
+  data = store._read()
+  data["trades"][-1]["fillTs"] = fill_ts = opened / 1000.0                    # live fills carry their fill time
+  store._write(data)
+  pos = {"symbol": "SPXUSDTM", "currentQty": -20, "openingTimestamp": opened, "avgEntryPrice": 1.0, "markPrice": 1.0}
+  tc = trade_context(store, "SPXUSDTM", pos, _time.time())
+  assert tc["holdKind"] == "fade_extreme" and tc["holdUntilTs"] == pytest.approx(fill_ts + 240 * 60)
+  src = inspect.getsource(ProtectionManager.run)
+  assert 'hold_kind = _tc.get("holdKind")' in src and "hold_kind=hold_kind" in src
+
+
+def test_fades_are_scored_at_their_hold_even_with_short_old_holds():
+  """The deadlock that kept fades benched since Sep 14: scored at the 12 min the old exits gave them, a coin flip."""
+  from types import SimpleNamespace
+  from src.edge import safe_family_horizon_weights, safe_family_horizons
+  closes = [{"ts": 10_000 + i * 900, "pnl": 0.01,
+             "entryContext": {"setupFamily": "fade_extreme", "fillTs": 10_000 + i * 900 - 720}} for i in range(10)]
+  closes += [{"ts": 50_000 + i * 900, "pnl": 0.01,
+              "entryContext": {"setupFamily": "continuation", "fillTs": 50_000 + i * 900 - 3600}} for i in range(8)]
+  store = SimpleNamespace(realized_closes=lambda limit=100, symbol=None: closes)
+  assert safe_family_horizon_weights(store) == {"fade_extreme": {240: 1.0}, "continuation": {60: 1.0}}
+  assert safe_family_horizons(store) == {"fade_extreme": 240, "continuation": 60}

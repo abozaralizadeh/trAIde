@@ -20,6 +20,7 @@ do with the results.
 from __future__ import annotations
 
 import math
+from typing import Any, Dict
 
 from .config import RegimeConfig
 
@@ -656,6 +657,33 @@ def _pos_finite(value) -> float | None:
   except (TypeError, ValueError):
     return None
   return out if math.isfinite(out) and out > 0 else None
+
+
+# Playbooks whose thesis needs TIME that the exit stack's minute-scale profit-taking (breakeven ratchet, trail, early
+# cut — tuned for trend trades) never gives it. A fade bets that a 15m RSI extreme reverts over HOURS: the playbook was
+# first measured at a 4h hold (edge.family_size_factor's 50-day study: positive in both halves), and on 2026-10-09 the
+# LLM's own fade-short calls (31 independent, 16 days, up/flat/down days) were a coin flip at 15m (-0.04%, 48% right)
+# but +1.96% / 74% right at 4h; replayed on 5m futures bars with a 2-2.5x ATR15 stop and a 4h exit they made +0.22R a
+# trade (+6.9R) where the bot, closing them after a median 12 min, made -0.14R (-2.2R over 16). The hold suppresses
+# only the code's EARLY PROFIT-TAKING; the stop the model set stays live on the exchange, so the loss cap is unchanged.
+# The same horizon is what the playbook is scored at (edge.family_horizon_weights): a family judged at the 12 minutes
+# it used to be held for was benched for good on the coin flip its exits produced.
+PLAYBOOK_HOLD_MIN: Dict[str, int] = {"fade_extreme": 240}
+
+
+def playbook_hold_deadline(entry_context: Any, fill_ts: Any = None) -> float | None:
+  """Until when a time-held playbook (``PLAYBOOK_HOLD_MIN``) is left to its bracket, or None if it is not one.
+
+  Anchored on the fill (``fill_ts``, else the entry context's own ``fillTs``). Never raises."""
+  try:
+    ctx = entry_context if isinstance(entry_context, dict) else {}
+    hold_min = PLAYBOOK_HOLD_MIN.get(str(ctx.get("setupFamily") or "").strip().lower())
+    if not hold_min:
+      return None
+    anchor = float(fill_ts if fill_ts is not None else ctx.get("fillTs"))
+    return anchor + hold_min * 60.0 if math.isfinite(anchor) and anchor > 0 else None
+  except (TypeError, ValueError):
+    return None
 
 
 def carry_hold_deadline(

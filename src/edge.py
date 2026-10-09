@@ -28,6 +28,7 @@ from typing import Any, Dict, List, Optional
 
 from .config import EdgeConfig
 from .memory import DEFAULT_TRADER, KNOWN_TRADERS
+from .regime import PLAYBOOK_HOLD_MIN
 
 
 def _f(value: Any) -> float | None:
@@ -1020,6 +1021,15 @@ def _owned_hold_mix(memory: Any, trader: str, derive: Any, kwargs: Dict[str, Any
   out = dict(derive([c for c in closes if row_owner(c) == DEFAULT_TRADER], **kwargs))
   if name != DEFAULT_TRADER:
     out.update(derive([c for c in closes if row_owner(c) == name], **kwargs))
+  # A playbook the CODE holds for a fixed horizon (regime.PLAYBOOK_HOLD_MIN — fades) is scored at that horizon,
+  # not at the holding times its OLD exits produced: judged at the ~12 minutes the trend-tuned profit-lock used to
+  # give fades, the family read as a coin flip and stayed benched, so it could never trade long enough to show the
+  # 4h edge its calls have (2026-10-09). The hold and the score read one number, so they cannot disagree. Applied
+  # here, where every verdict path (agent state -> order path, dashboard, Supervisor, resettle, Jev) gets its mix.
+  opts = sorted({int(h) for h in kwargs.get("available", (5, 15, 60, 240)) if int(h) > 0})
+  for fam, hold_min in PLAYBOOK_HOLD_MIN.items():
+    h = _nearest_horizon(hold_min, opts)
+    out[fam] = {h: 1.0} if derive is family_horizon_weights else h
   return out
 
 
