@@ -1538,3 +1538,47 @@ class TestHeadToHeadData:
     for bad in ({"pnl": float("nan"), "entryContext": {"sizing": {"equityUsd": 75.0}}},
                 {"pnl": 0.3, "entryContext": {"sizing": {"equityUsd": float("inf")}}}, None, "x"):
       assert account_pct(bad) is None                                    # NaN would be invalid JSON on the page
+
+
+# ── a hand close inside a code hold (2026-10-14) ─────────────────────────────────────────────────────
+class TestHandCloseInsideACodeHold:
+  """The model hand-closed carry trades INSIDE the carry hold 5 times (Sep 23-30): 5 of 5 worse than holding, -5.4R.
+  The code's own exits already waited for the settlement; the hand close now does too, unless no stop is live."""
+
+  def _held(self, tmp_path, *, family="funding_carry", settle_in_min=60, stop=True, filled_min_ago=10):
+    tools, memory, holder = _held_tools(tmp_path)
+    snap = _snapshot_of(tools)
+    now = time.time()
+    ctx = {"positionSide": "short", "setupFamily": family,
+           "funding": {"intervalSec": 14400.0, "nextSettlementTs": now + settle_in_min * 60}}
+    memory.record_trade("SPX-USDT", "sell", 20.0, paper=True, price=1.0, size=20, venue="futures", filled=True,
+                        track_position=False, client_oid="held-carry", entry_context=ctx)
+    data = memory._read()
+    data["trades"][-1]["fillTs"] = now - filled_min_ago * 60
+    memory._write(data)
+    pos = {"symbol": "SPXUSDTM", "currentQty": -20, "openingTimestamp": int((now - filled_min_ago * 60) * 1000),
+           "avgEntryPrice": 1.0, "markPrice": 1.0}
+    holder["pos"] = pos
+    snap.futures_positions = [pos]
+    snap.futures_stop_orders = [{"id": "sl-1", "symbol": "SPXUSDTM", "stop": "up"}] if stop else []
+    return tools
+
+  def _close(self, tools):
+    return _invoke_tool(tools.place_futures_market_order, symbol="SPX-USDT", side="buy", notional_usd=10.0,
+                        reduce_only=True)
+
+  def test_a_carry_inside_its_hold_is_not_hand_closed(self, tmp_path):
+    out = self._close(self._held(tmp_path))
+    assert out.get("rejected") is True and "funding_carry hold" in out["reason"] and out.get("holdUntil"), out
+
+  def test_a_fade_inside_its_playbook_hold_is_not_hand_closed(self, tmp_path):
+    out = self._close(self._held(tmp_path, family="fade_extreme"))
+    assert out.get("rejected") is True and "fade_extreme hold" in out["reason"], out
+
+  @pytest.mark.parametrize("kw", [{"stop": False},                         # no live stop: never trap a position
+                                  {"settle_in_min": -5, "filled_min_ago": 300},   # the settlement already passed
+                                  {"family": "fade_extreme", "filled_min_ago": 300},   # the 240-min fade hold is over
+                                  {"family": "continuation"}])            # not a held playbook
+  def test_the_close_goes_through_otherwise(self, tmp_path, kw):
+    out = self._close(self._held(tmp_path, **kw))
+    assert "holdUntil" not in out and "hold until" not in str(out.get("reason", "")), out

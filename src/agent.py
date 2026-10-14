@@ -1657,6 +1657,9 @@ def run_trading_agent(
     # Cache-only reader of the poll loop's hourly market state; stamped on every entry and probe.
     market_state=market_state,
     build_stamp=build_stamp,
+    # The poll loop's cache-only per-contract funding clock: the hand-close hold check reads the same carry hold
+    # the exit manager uses (tools._code_hold_refusal -> position_context.trade_context).
+    funding_clock=funding_clock,
   ))
   place_market_order = _tools.place_market_order
   place_limit_order = _tools.place_limit_order

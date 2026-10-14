@@ -38,6 +38,7 @@ from .analytics import (
 )
 from .kucoin import KucoinFuturesOrderRequest, KucoinOrderRequest
 from .protection import should_block_chase
+from .position_context import trade_context as _trade_context
 from .regime import (
   allow_declared_setup,
   allow_mechanical_setup,
@@ -3190,6 +3191,40 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
 
 
   # ── Futures trading — orders, stops & positions ─────────────────────────────────────────────────
+  def _code_hold_refusal(fsym: str, pos: Dict[str, Any]) -> Dict[str, Any] | None:
+    """A hand close of a position the CODE is holding (carry: to the funding settlement it was opened for; a
+    time-held playbook: regime.PLAYBOOK_HOLD_MIN) is refused until the hold ends — the same hold, from the same
+    lookup (position_context.trade_context), that already keeps the code's own trail and breakeven off it.
+
+    2026-10-14: the model hand-closed carry trades INSIDE the carry hold 5 times (Sep 23-30) — 5 of 5 worse than
+    holding, +0.77R taken vs +6.20R left to the system (-5.4R) — while its other early closes were mixed. Survival
+    is untouched: the stop the model set is live on the exchange, and with NO live stop on the book the close always
+    goes through. Any lookup failure lets the close through too (never trap a position)."""
+    try:
+      now = time.time()
+      tc = _trade_context(memory, fsym, pos, now, funding_clock=getattr(ctx, "funding_clock", None)) or {}
+      until = _to_float(tc.get("holdUntilTs"))
+      if not until or until <= now:
+        return None
+      if not any(isinstance(o, dict) and str(o.get("symbol") or "").upper() == fsym.upper()
+                 for o in (snapshot.futures_stop_orders or [])):
+        return None
+      kind = str(tc.get("holdKind") or "funding_carry")
+      until_txt = time.strftime("%H:%M UTC", time.gmtime(until))
+      why = ("the funding settlement this carry trade was opened for — closing before it forfeits the payment"
+             if kind == "funding_carry" else
+             "the end of the horizon this playbook's calls are measured over — its edge shows up there, not before")
+      logger.info("CODE HOLD: refused a hand close of %s (%s hold, %.0fmin left, stop live)", fsym, kind, (until - now) / 60)
+      return {
+        "rejected": True,
+        "reason": f"{fsym} is in a {kind} hold until {until_txt} ({(until - now) / 60:.0f}min): {why}. "
+                  "Your stop is live on the exchange, so the loss stays capped; the code's own exits wait for the hold too.",
+        "holdUntil": until_txt,
+      }
+    except Exception as exc:
+      logger.debug("code-hold check failed for %s: %s", fsym, exc)
+      return None
+
   async def _place_futures_market_order_impl(
     symbol: str,
     side: str,
@@ -3238,6 +3273,10 @@ def build_tools(ctx: SimpleNamespace) -> SimpleNamespace:
     authority_error = _authority_error()
     if authority_error:
       return {"rejected": True, "reason": authority_error}
+    if reduce_only and _pre_existing and _pre_qty:
+      _held = _code_hold_refusal(_pre_futures_symbol, _pre_existing)
+      if _held:
+        return _held
     if is_entry:
       return {
         "rejected": True,
